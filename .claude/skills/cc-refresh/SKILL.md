@@ -1,5 +1,5 @@
 ---
-name: cc-fresh
+name: cc-refresh
 description: Claude Code Alias 管理；用于在不同 Claude/G LM 配置之间快速切换（glm/claude/cc）；支持环境变量配置、模型选择与凭据管理；默认交互式确认后应用配置。
 ---
 
@@ -32,25 +32,26 @@ description: Claude Code Alias 管理；用于在不同 Claude/G LM 配置之间
   - Haiku: `claude-haiku-4-5-20250929`
 - **Auth**: 使用 Anthropic 官方认证
 
-### 1.3 cc（aiscendtech@gmail.com Organization Subscription）
-- **API Endpoint**: `https://api.anthropic.com`
+### 1.3 cc（Neurax API Key 认证）
+- **API Endpoint**: `http://47.122.42.83:8080`
 - **Models**:
   - Opus: `claude-opus-4-5-20251101`
   - Sonnet: `claude-sonnet-4-5-20250929`
   - Haiku: `claude-haiku-4-5-20250929`
-- **Auth**: 使用 Organization Subscription 凭据
+- **Auth**: 使用 Neurax API Key 认证（API Key: sk-neurax-ab0244236571241006e93bf950496d09）
+- **配置方式**: 在 ~/.bashrc 中定义为函数，使用 export 设置环境变量
 
 ## 2. 使用方式
 
-### 2.1 通过 Shell Alias
+### 2.1 通过 Shell Alias/Function
 ```bash
 # 使用 GLM 模型
 glm <your-command>
 
-# 使用 Claude 官方模型（htdong@gmail.com）
+# 使用 Claude 官方模型（htdong@gmail.com，付费）
 claude <your-command>
 
-# 使用 Claude 官方模型（aiscendtech@gmail.com Org）
+# 使用 API Key 认证（cc 函数）
 cc <your-command>
 ```
 
@@ -61,9 +62,12 @@ export ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
 export ANTHROPIC_DEFAULT_OPUS_MODEL=glm-4.7
 export ANTHROPIC_AUTH_TOKEN=<your-zai-key>
 
-# Claude 官方配置
-export ANTHROPIC_BASE_URL=https://api.anthropic.com
-export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101
+# Claude 官方配置（htdong@gmail.com）
+# 不设置环境变量，使用默认认证
+
+# CC 配置（Neurax API Key）
+export ANTHROPIC_BASE_URL=https://200.xstx.info
+export ANTHROPIC_API_KEY=sk-etcBrsMBRmBOybA9E1Ev9FMiQpdS9lx2yVqvMvamn9Q2T8WE
 ```
 
 ### 2.3 通过 settings.json
@@ -101,7 +105,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101
 
 ## Workflow 1：初始化 Alias 配置
 
-**触发**：用户首次使用 cc-fresh skill
+**触发**：用户首次使用 cc-refresh skill
 
 **步骤**：
 1. 检查当前 shell 配置（~/.bashrc 或 ~/.zshrc）
@@ -148,13 +152,14 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101
 
 ## A. 环境变量参考
 
-| 变量名 | 说明 | GLM 示例 | Claude 示例 |
-|--------|------|----------|-------------|
-| `ANTHROPIC_BASE_URL` | API Endpoint | `https://api.z.ai/api/anthropic` | `https://api.anthropic.com` |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Opus 模型 | `glm-4.7` | `claude-opus-4-5-20251101` |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Sonnet 模型 | `glm-4.7` | `claude-sonnet-4-5-20250929` |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Haiku 模型 | `glm-4.5-air` | `claude-haiku-4-5-20250929` |
-| `ANTHROPIC_AUTH_TOKEN` | API Token | Z.AI API Key | Anthropic API Key |
+| 变量名 | 说明 | GLM 示例 | Claude 示例 | CC 示例 |
+|--------|------|----------|-------------|---------|
+| `ANTHROPIC_BASE_URL` | API Endpoint | `https://api.z.ai/api/anthropic` | `https://api.anthropic.com` | `http://47.122.42.83:8080` |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Opus 模型 | `glm-4.7` | `claude-opus-4-5-20251101` | `claude-opus-4-5-20251101` |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Sonnet 模型 | `glm-4.7` | `claude-sonnet-4-5-20250929` | `claude-sonnet-4-5-20250929` |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Haiku 模型 | `glm-4.5-air` | `claude-haiku-4-5-20250929` | `claude-haiku-4-5-20250929` |
+| `ANTHROPIC_AUTH_TOKEN` | API Token (GLM) | Z.AI API Key | - | - |
+| `ANTHROPIC_API_KEY` | API Key | - | - | Neurax API Key |
 
 ## B. 故障排查
 
@@ -187,7 +192,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101
 
 - Shell 配置：`~/.bashrc` 或 `~/.zshrc`
 - Claude Code 配置：`~/.claude/settings.json`
-- Skill 脚本：`~/.claude/skills/cc-fresh/scripts/`
+- Skill 脚本：`~/.claude/skills/cc-refresh/scripts/`
 
 ## D. 相关资源
 
@@ -202,12 +207,12 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101
 ## Example 1：首次设置 GLM Alias
 
 ```bash
-# 1. 加载 cc-fresh skill
+# 1. 加载 cc-refresh skill
 # 2. 执行初始化
-cc-fresh init --alias glm
+cc-refresh init --alias glm
 
 # 3. 添加到 shell 配置
-echo "source ~/.claude/skills/cc-fresh/scripts/alias_setup.sh" >> ~/.bashrc
+echo "source ~/.claude/skills/cc-refresh/scripts/alias_setup.sh" >> ~/.bashrc
 source ~/.bashrc
 
 # 4. 测试
@@ -223,19 +228,7 @@ ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-5-20251101 \
 claude --help
 ```
 
-## Example 3：查看当前配置
 
-```bash
-# 使用 cc-fresh 检查配置
-cc-fresh status
-
-# 输出示例：
-# Current Configuration:
-#   API Endpoint: https://api.z.ai/api/anthropic
-#   Opus Model: glm-4.7
-#   Sonnet Model: glm-4.7
-#   Haiku Model: glm-4.5-air
-```
 
 ---
 
@@ -259,8 +252,3 @@ A: 大部分 Anthropic API 功能都支持，但可能有细微差异
 
 # Changelog
 
-## 2026-01-03
-- 初始版本
-- 支持 glm/claude/cc 三种 alias
-- 添加环境变量管理
-- 添加配置验证功能
