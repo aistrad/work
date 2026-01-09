@@ -36,11 +36,12 @@ class ToolCall:
 ### 2. Tool 定义模块 (`apps/api/services/vibe_engine/tools.py`)
 
 **工具分类**:
-- **共享工具** (4个): 所有 skill 可用
+- **共享工具** (5个): 所有 skill 可用
   - `show_report`: 展示报告
   - `show_relationship`: 关系分析
   - `show_insight`: 洞察卡片
   - `request_info`: 请求用户信息
+  - `search_knowledge`: 知识库检索（RAG）
 
 - **八字工具** (3个):
   - `show_bazi_chart`: 八字命盘
@@ -141,6 +142,39 @@ python tests/test_tool_calling.py
 }
 ```
 
+### search_knowledge 工具（RAG 检索）
+
+**用途**: LLM 智能判断是否需要检索知识库，实现按需 RAG。
+
+**工具定义** (来自 `RAGService.get_search_knowledge_tool()`):
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "search_knowledge",
+        "description": "当用户询问命理专业知识、运势分析、性格解读、八字术语、星座特质等需要专业知识支撑的问题时调用此工具。不要用于闲聊或与命理无关的问题。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索查询，应包含用户问题的关键词"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+```
+
+**执行流程**:
+1. Chat 端点将 `search_knowledge` 工具加入工具列表
+2. LLM 根据用户问题判断是否需要检索
+3. 如果 LLM 调用 `search_knowledge`，后端执行 RAG 检索
+4. 检索结果注入到 context 中，再次调用 LLM 生成最终回复
+
+**代码位置**: `routes/chat.py` 中的 `handle_search_knowledge()` 函数
+
 ### 流式 Tool Call 处理
 
 智谱 API 在流式模式下，tool_calls 会被分片返回：
@@ -190,6 +224,8 @@ python tests/test_tool_calling.py
 **新增文件**:
 - `apps/api/services/vibe_engine/tools.py`
 - `apps/api/tests/test_tool_calling.py`
+- `apps/api/services/knowledge/rag_service.py` - RAG 服务（含 search_knowledge 工具定义）
+- `apps/api/services/knowledge/term_service.py` - 术语管理服务
 - `.claude/tool-calling-implementation.md` (本文件)
 
 **修改文件**:

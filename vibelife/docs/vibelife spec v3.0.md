@@ -1742,9 +1742,12 @@ Step 2: 结果展示 - RelationshipCard
 │   │   • 例：聊职业 → 注入 career 和 ai_insights.growth_areas           │   │
 │   │   • 例：聊关系 → 注入 relationship 和 relationship_patterns        │   │
 │   │                                                                     │   │
-│   │   3. 知识库检索结果                                                 │   │
+│   │   3. 知识库检索结果 (RAG)                                            │   │
 │   │   ─────────────────────────────────────────────────────────         │   │
-│   │   • 根据话题从知识库检索相关内容                                    │   │
+│   │   • 通过 RAGService 统一检索                                        │   │
+│   │   • Skill 配置化: 不同 skill 有不同的查询构建策略                   │   │
+│   │   • 混合检索: 向量 70% + 全文 30% + RRF 融合                        │   │
+│   │   • 自动术语词典: 入库时 LLM 提取专业术语到 Jieba                   │   │
 │   │   • 八字理论、格局解读、星座特质等                                  │   │
 │   │                                                                     │   │
 │   │   4. 对话历史                                                       │   │
@@ -2037,32 +2040,33 @@ Step 2: 结果展示 - RelationshipCard
 │   后端                                                                      │
 │   ─────────────────────────────────────────────────────────────────────     │
 │   • 框架：FastAPI                                                           │
-│   • LLM（多模型支持）：                                                     │
-│     ├── Claude (claude-3-opus / claude-3-sonnet) - 主力                     │
-│     ├── Gemini (gemini-1.5-pro) - 备选                                      │
-│     ├── Zhipu (glm-4) - 中文优化                                            │
-│     └── Deepseek (deepseek-chat) - 成本优化                                 │
-│   • AI SDK：Claude Agent SDK, Gemini SDK                                    │
+│   • LLM（完全配置化，支持自动 Fallback）：                                  │
+│     ├── 配置文件: apps/api/config/models.yaml                               │
+│     ├── Gemini (gemini-2.5-flash) - 主力对话                                │
+│     ├── GLM (glm-4-flash / glm-4.7) - 中文优化 + 兜底                       │
+│     ├── Claude (claude-opus-4-5) - 高级分析                                 │
+│     └── Fallback 链: API 失败或配额超限自动切换                             │
+│   • 模型路由: services/model_router/ (动态路由 + 配额管理)                  │
 │   • Embedding：                                                             │
-│     ├── BAAI/bge-m3 - 多语言                                                │
-│     └── gte-Qwen2-7B-instruct - 中文优化                                    │
-│   • 图像生成：Google Gemini Imagen (Nano Banana)                            │
+│     ├── BAAI/bge-m3 - 多语言 (1024维)                                       │
+│     └── 本地 SentenceTransformers 推理                                      │
+│   • 图像生成：Gemini (gemini-2.5-flash-image)                               │
 │                                                                             │
 │   数据存储                                                                  │
 │   ─────────────────────────────────────────────────────────────────────     │
-│   • 主数据库：PostgreSQL                                                    │
-│   • 向量数据库：pgvector（PostgreSQL 扩展）                                 │
-│   • 缓存：Redis                                                             │
-│   • 文件存储：S3 / Cloudflare R2                                            │
-│   • 认证：自建 JWT + OAuth (Google/Apple)                                    │
+│   • 主数据库：PostgreSQL 16                                                 │
+│   • 向量数据库：pgvector（PostgreSQL 扩展，1024维）                         │
+│   • 缓存：内存缓存 (RouteCache)                                             │
+│   • 文件存储：本地 /data/vibelife/                                          │
+│   • 认证：自建 JWT + OAuth (Google/Apple)                                   │
 │                                                                             │
 │   部署                                                                      │
 │   ─────────────────────────────────────────────────────────────────────     │
-│   • 前端：Vercel                                                            │
-│   • 后端：Railway / Fly.io                                                  │
+│   • 前端：Vercel / 阿里云香港                                               │
+│   • 后端：aiscend 服务器 (106.37.170.238)                                   │
 │   • 域名：vibelife.app                                                      │
 │                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────���────────────────────────────────────┘
 ```
 
 ## 4.3 核心 API 设计

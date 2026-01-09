@@ -153,7 +153,7 @@ pnpm dev --port 8232
 | 配置项 | 值 |
 |--------|-----|
 | API Key | 需配置 `CLAUDE_API_KEY` |
-| 模型 | `claude-3-5-sonnet-20241022` |
+| 模型 | `claude-opus-4-5-20251101` |
 
 ## 3.1 Google Gemini (对话 + 图像生成默认)
 
@@ -218,21 +218,96 @@ pnpm dev --port 8232
 
 动态模型选择系统，支持按用户等级、任务类型、技能自动路由到最佳模型。
 
-### 路由规则
+### 配置文件 (完全配置化) 🆕
+
+所有模型配置现在统一在 `apps/api/config/models.yaml` 中管理，代码中无硬编码。
+
+**配置优先级**：
+1. 环境变量（最高）
+2. `config/models.yaml` 配置文件
+3. 数据库动态规则（用户层级、A/B测试）
+4. 代码默认值（仅作为最终兜底）
+
+**配置文件位置**: `apps/api/config/models.yaml`
+
+```yaml
+# 提供商配置
+providers:
+  glm:
+    base_url: "${GLM_BASE_URL:https://open.bigmodel.cn/api/paas/v4}"
+    api_key_env: "GLM_API_KEY"
+  gemini:
+    base_url: "${GEMINI_BASE_URL:https://new.12ai.org/v1}"
+    api_key_env: "GEMINI_API_KEY"
+    backup_urls: ["https://hk.12ai.org/v1", "https://api2.qiandao.mom/v1"]
+  claude:
+    base_url: "${CLAUDE_BASE_URL:https://www.zz166.cn/api}"
+    api_key_env: "CLAUDE_API_KEY"
+
+# 模型定义
+models:
+  glm-4-flash:
+    provider: glm
+    model_name: "${GLM_CHAT_MODEL:glm-4-flash}"
+    capabilities: [chat]
+  gemini-flash:
+    provider: gemini
+    model_name: "${GEMINI_CHAT_MODEL:gemini-2.5-flash}"
+    capabilities: [chat, analysis]
+  claude-opus:
+    provider: claude
+    model_name: "${CLAUDE_MODEL:claude-opus-4-5-20251101}"
+    capabilities: [chat, analysis, vision]
+
+# 默认路由（带 fallback 链）
+defaults:
+  chat:
+    primary: gemini-flash
+    fallback: [glm-4-flash, claude-opus]
+  image_gen:
+    primary: gemini-image
+    fallback: []
+
+# 全局兜底
+global_fallback: glm-4-flash
+```
+
+### 便捷更新配置
+
+```bash
+# 列出当前配置
+python apps/api/scripts/update_model_config.py --list
+
+# 从 docs/apikey.md 同步
+python apps/api/scripts/update_model_config.py --sync-from-docs
+
+# 设置主力模型
+python apps/api/scripts/update_model_config.py --set-primary chat claude-opus
+
+# 验证配置
+python apps/api/scripts/update_model_config.py --validate
+```
+
+### Fallback 触发条件
+
+- **API 调用失败**：网络错误、超时、API 返回错误码（4xx/5xx）
+- **配额超限**：当前模型配额用完时自动切换到下一个模型
+
+### 路由规则（数据库动态配置）
 
 | 优先级 | 规则名称 | 匹配条件 | 目标模型 | 降级链 |
 |--------|----------|----------|----------|--------|
-| 20 | 图像生成默认 | task=image_gen | gemini:gemini-3-image | - |
-| 30 | VIP用户用Gemini Pro | tier=vip | gemini:gemini-3-pro | glm-4.7 → glm-4-flash |
-| 35 | Pro用户用Gemini Pro | tier=pro | gemini:gemini-3-pro | glm-4.7 → glm-4-flash |
-| 100 | 全局默认 | - | glm:glm-4.7 | glm-4-flash → gemini-3-pro |
+| 20 | 图像生成默认 | task=image_gen | gemini:gemini-image | - |
+| 30 | VIP用户 | tier=vip | claude:claude-opus | gemini-flash → glm-4-flash |
+| 35 | Pro用户 | tier=pro | gemini:gemini-flash | glm-4-flash |
+| 100 | 全局默认 | - | gemini:gemini-flash | glm-4-flash |
 
 ### 配额规则
 
 | 规则 | 范围 | 限制 | 超额处理 |
 |------|------|------|----------|
-| Gemini 全局日限 | provider=gemini | 5000次/天 | 降级到 glm-4.7 |
-| Claude 全局日限 | provider=claude | 1000次/天 | 降级到 gemini-3-pro |
+| Gemini 全局日限 | provider=gemini | 5000次/天 | 降级到 glm-4-flash |
+| Claude 全局日限 | provider=claude | 1000次/天 | 降级到 gemini-flash |
 | 免费用户日限 | tier=free | 50次/天 | 拒绝 |
 | 图像生成全局日限 | task=image_gen | 500张/天 | 拒绝 |
 
@@ -240,18 +315,20 @@ pnpm dev --port 8232
 
 | ID | 提供商 | 模型名 | 能力 |
 |----|--------|--------|------|
-| glm:glm-4.7 | GLM | glm-4.7 | chat, analysis |
-| glm:glm-4-flash | GLM | glm-4-flash | chat |
-| glm:glm-4-plus | GLM | glm-4-plus | chat, analysis |
-| gemini:gemini-3-pro | Gemini | gemini-3-pro-preview | chat, analysis |
-| gemini:gemini-3-image | Gemini | gemini-3-pro-image-preview | image_gen |
-| claude:claude-3-5-sonnet | Claude | claude-3-5-sonnet-20241022 | chat, analysis, vision |
+| glm-4-flash | GLM | glm-4-flash | chat |
+| glm-4.7 | GLM | glm-4.7 | chat, analysis |
+| gemini-flash | Gemini | gemini-2.5-flash | chat, analysis |
+| gemini-image | Gemini | gemini-2.5-flash-image | image_gen |
+| claude-opus | Claude | claude-opus-4-5-20251101 | chat, analysis, vision |
 
 ### 代码位置
 
-- **Router**: `apps/api/services/model_router/`
+- **配置文件**: `apps/api/config/models.yaml`
+- **配置加载器**: `apps/api/services/model_router/config.py`
+- **统一客户端**: `apps/api/services/model_router/client.py`
+- **路由器**: `apps/api/services/model_router/router.py`
+- **更新脚本**: `apps/api/scripts/update_model_config.py`
 - **Migration**: `migrations/003_model_router.sql`, `migrations/004_update_model_routes.sql`
-- **测试脚本**: `apps/api/scripts/test_model_router.py`
 
 ## 8. 数据目录配置
 

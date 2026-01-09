@@ -278,7 +278,7 @@ POST /report/generate (假设存在)
 ├────────────────────────────────────────────────────────────────┤
 │                                                                │
 │  1. 查询预处理                                                  │
-│     └─ Jieba 分词 (中文处理)                                   │
+│     └─ Jieba 分词 (中文处理) + 自动术语词典                    │
 │                                                                │
 │  2. 混合检索 (Hybrid Search)                                   │
 │     ├─ 向量检索: embedding → cosine similarity                 │
@@ -289,70 +289,96 @@ POST /report/generate (假设存在)
 │     ├─ 向量权重: 0.7                                           │
 │     └─ 文本权重: 0.3                                           │
 │                                                                │
-│  4. 返回 Top-K 结果 (默认 3 条)                                │
+│  4. 返回 Top-K 结果 (默认 5 条)                                │
 │     └─ 注入到 Context 的 <knowledge> 标签                      │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### 实际实现 (retrieval.py + knowledge_repo.py)
+### 实际实现 (rag_service.py + term_service.py + retrieval.py)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    RAG 服务架构 (v4.1)                          │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  RAGService (统一入口)                                          │
+│  ├─ build_query()      ← Skill 配置化查询构建                  │
+│  ├─ get_knowledge()    ← 混合检索 + 术语加载                   │
+│  ├─ format_for_prompt() ← XML 格式化                           │
+│  └─ get_context_for_service() ← 一站式方法                     │
+│                                                                │
+│  TermService (术语管理)                                         │
+│  ├─ extract_terms_from_content() ← LLM 自动提取                │
+│  ├─ load_terms_to_jieba()        ← 加载到分词器                │
+│  └─ load_skill_config()          ← 加载 Skill 配置             │
+│                                                                │
+│  RetrievalService (检索层)                                      │
+│  ├─ preprocess_query() ← Jieba 分词                            │
+│  └─ search()           ← 混合检索                              │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
 
 ```python
-# 文件: apps/api/services/knowledge/retrieval.py
+# 文件: apps/api/services/knowledge/rag_service.py
 
 @classmethod
-async def search(
+async def build_query(
     cls,
-    query: str,
-    skill_id: str,
-    top_k: int = 5,
-    use_hybrid: bool = True,
-    vector_weight: float = 0.7,
-    text_weight: float = 0.3
-) -> List[Dict[str, Any]]:
+    profile: Dict[str, Any],
+    skill_id: str,           # 新增: skill 感知
+    context_type: str,
+    extra_keywords: Optional[List[str]] = None,
+) -> str:
+    # 加载 skill 配置
+    config = await TermService.load_skill_config(skill_id)
 
-    # 1. 生成 query embedding ✅
-    query_embedding = await EmbeddingService.embed_query(query)
+    if config:
+        # 配置驱动的字段提取
+        for field_path in config.profile_fields:
+            value = cls._get_nested_value(profile, field_path)
+            if value:
+                fmt = config.field_formats.get(field_path, "{value}")
+                parts.append(fmt.format(value=value))
 
-    if use_hybrid:
-        # 2. Jieba 分词预处理 ✅
-        query_preprocessed = cls.preprocess_query(query)
-
-        # 3. 调用 SQL 函数进行混合检索 ✅
-        results = await KnowledgeRepository.hybrid_search(
-            query_preprocessed=query_preprocessed,
-            embedding=query_embedding,
-            skill_id=skill_id,
-            top_k=top_k,
-            vector_weight=vector_weight,
-            text_weight=text_weight
-        )
+        # 场景关键词
+        context_kw = config.context_keywords.get(context_type, [])
+        parts.extend(context_kw)
     else:
-        # 仅向量检索
-        results = await KnowledgeRepository.vector_search(...)
+        # 回退到旧逻辑
+        parts = cls._build_query_legacy(profile, context_type)
 
-    return results
+    return " ".join(filter(None, parts))
 
 # ──────────────────────────────────────────────────────────
 
-# 文件: apps/api/stores/knowledge_repo.py
+# 文件: apps/api/services/knowledge/term_service.py
 
-@staticmethod
-async def hybrid_search(...) -> List[dict]:
-    """调用 PostgreSQL SQL 函数 hybrid_search_v2()"""
-    async with get_connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT * FROM hybrid_search_v2($1, $2::vector, $3, $4, 60, $5, $6)
-            """,
-            query_preprocessed,  # Jieba 分词后的查询
-            embedding,           # 向量
-            skill_id,
-            top_k,
-            vector_weight,
-            text_weight
+@classmethod
+async def extract_terms_from_content(
+    cls,
+    content: str,
+    skill_id: str,
+    source_doc_id: Optional[str] = None,
+) -> List[str]:
+    """入库时 LLM 自动提取专业术语"""
+
+    response = await llm.chat([create_user_message(
+        cls.EXTRACT_PROMPT.format(
+            skill_name=config.display_name,
+            content=content[:3000]
         )
-        return [dict(row) for row in rows]
+    )])
+
+    terms = json.loads(response.content)
+    await cls.save_terms(skill_id, terms, source_doc_id)
+
+    # 立即加载到 Jieba
+    for term in terms:
+        jieba.add_word(term)
+
+    return terms
 ```
 
 ### 差异分析
@@ -362,27 +388,91 @@ async def hybrid_search(...) -> List[dict]:
 | **Jieba 分词** | 应用层分词 | ✅ `preprocess_query()` | 一致 |
 | **混合检索** | Vector + FTS + RRF | ✅ SQL 函数 `hybrid_search_v2()` | 一致 |
 | **权重** | 向量 0.7, 文本 0.3 | ✅ 默认参数一致 | 一致 |
-| **Top-K** | 默认 3 条 | 默认 5 条，chat.py 传 3 | ✅ 灵活配置 |
-| **结果注入** | `<knowledge>` 标签 | ✅ `format_knowledge_context()` | 一致 |
+| **Top-K** | 默认 3 条 | 默认 5 条，可配置 | ✅ 灵活配置 |
+| **结果注入** | `<knowledge>` 标签 | ✅ `format_for_prompt()` | 一致 |
+| **Skill 配置化** | 未定义 | ✅ `skill_configs` 表 | 🆕 新增 |
+| **术语自动提取** | 未定义 | ✅ LLM 入库时提取 | 🆕 新增 |
+| **术语词典** | 未定义 | ✅ `skill_terms` 表 + Jieba | 🆕 新增 |
 
-### SQL 函数依赖
+### 数据库表
 
 ```sql
--- 需要在 PostgreSQL 中创建:
--- hybrid_search_v2(query_text, embedding::vector, skill_id, top_k, k_param, vec_weight, text_weight)
--- vector_search_v2(embedding::vector, skill_id, top_k)
--- 表: knowledge_chunks_v2 (含 search_vector tsvector 列)
+-- Skill 配置表
+CREATE TABLE skill_configs (
+    skill_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    extract_terms BOOLEAN DEFAULT true,
+    term_min_frequency INT DEFAULT 1,
+    rag_top_k INT DEFAULT 5,
+    rag_max_chars INT DEFAULT 4000,
+    query_config JSONB DEFAULT '{}'  -- profile_fields, context_keywords
+);
+
+-- 术语表 (自动提取)
+CREATE TABLE skill_terms (
+    skill_id TEXT NOT NULL,
+    term TEXT NOT NULL,
+    frequency INT DEFAULT 1,
+    source_doc_id UUID,
+    extracted_by TEXT DEFAULT 'llm',
+    UNIQUE(skill_id, term)
+);
 ```
 
 ### 关键代码路径
 
 ```
-chat_stream() (chat.py:150)
-    └─ RetrievalService.search(query, skill_id, top_k=3)  # L185
-        ├─ EmbeddingService.embed_query(query)            # 生成向量
-        ├─ preprocess_query(query)                        # Jieba 分词
-        └─ KnowledgeRepository.hybrid_search(...)         # SQL 函数
-            └─ hybrid_search_v2()                         # PostgreSQL
+专业服务调用 RAG:
+report_service.py / greeting_service.py / letter_service.py
+    └─ RAGService.get_context_for_service(profile, skill_id, context_type)
+        ├─ build_query()                          # 配置化查询构建
+        │   └─ TermService.load_skill_config()    # 加载 skill 配置
+        ├─ get_knowledge()
+        │   ├─ TermService.load_terms_to_jieba()  # 加载术语到分词器
+        │   └─ RetrievalService.search()          # 内部调用
+        │       ├─ EmbeddingService.embed_query() # 生成向量
+        │       ├─ preprocess_query()             # Jieba 分词 (含术语)
+        │       └─ KnowledgeRepository.hybrid_search()
+        └─ format_for_prompt()                    # XML 格式化
+
+普通对话 RAG (Function Call 机制):
+routes/chat.py
+    └─ LLM 推理 (带 search_knowledge 工具)
+        ├─ LLM 判断不需要检索 → 直接回答
+        └─ LLM 调用 search_knowledge
+            └─ RAGService.get_context_for_chat(message, profile, skill_id)
+                ├─ 结合 message + profile 构建 query
+                └─ get_knowledge() + format_for_prompt()
+            └─ 注入知识到 messages
+            └─ LLM 继续生成回答
+
+Agent 运行时 RAG:
+services/agent/runtime.py
+    └─ RAGService.get_context_for_agent(task, profile, skill_id)
+        └─ 结合 task + profile 构建 query
+        └─ get_knowledge() + format_for_prompt()
+
+知识入库时术语提取:
+workers/ingestion.py
+    └─ _process_document()
+        └─ TermService.extract_terms_from_content()  # LLM 提取
+            ├─ save_terms()                          # 存入数据库
+            └─ jieba.add_word()                      # 加载到分词器
+```
+
+### RAGService 统一接口
+
+```python
+RAGService (唯一对外暴露)
+├─ get_context_for_service()    # 专业服务 (报告/问候/信件)
+├─ get_context_for_chat()       # 普通对话 (Function Call 调用)
+├─ get_context_for_agent()      # Agent 运行时
+└─ get_search_knowledge_tool()  # Function Call 工具定义
+
+内部实现 (不对外暴露)
+├─ RetrievalService             # 纯检索
+├─ TermService                  # 术语管理
+└─ EmbeddingService             # 向量生成
 ```
 
 ---
