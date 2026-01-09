@@ -1,6 +1,6 @@
 # VibeLife 部署指南
 
-> 最后更新: 2026-01-07 | v3.0 已验证
+> 最后更新: 2026-01-09 | v3.0 已验证 | 数据目录重构
 
 ---
 
@@ -70,6 +70,10 @@ export GLM_CHAT_MODEL="glm-4.7"
 export GLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export DEFAULT_LLM_PROVIDER="glm"
 export VIBELIFE_DB_URL="postgresql://postgres:<PASSWORD>@106.37.170.238:8224/vibelife"
+
+# 若使用 Claude 作为默认模型 (仍建议保留 GLM 作为 fallback):
+# export CLAUDE_API_KEY="your-claude-api-key"  # 兼容 ANTHROPIC_API_KEY
+# export DEFAULT_LLM_PROVIDER="claude"
 
 # 启动服务
 uvicorn main:app --port 8000 --host 0.0.0.0 --reload
@@ -183,6 +187,17 @@ GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 # Claude (备选)
 # ─────────────────────────────────────────────────────────────────
 CLAUDE_API_KEY=your-claude-api-key
+# 兼容变量名 (与部分文档/部署系统一致)
+ANTHROPIC_API_KEY=your-anthropic-api-key
+
+# ─────────────────────────────────────────────────────────────────
+# 数据目录 (独立数据盘)
+# ─────────────────────────────────────────────────────────────────
+VIBELIFE_DATA_ROOT=/data/vibelife
+VIBELIFE_KNOWLEDGE_ROOT=/data/vibelife/knowledge
+VIBELIFE_UPLOADS_ROOT=/data/vibelife/uploads
+VIBELIFE_CACHE_ROOT=/data/vibelife/cache
+VIBELIFE_LOGS_ROOT=/data/vibelife/logs
 
 # ─────────────────────────────────────────────────────────────────
 # Embedding - BAAI/bge-m3 (本地)
@@ -205,7 +220,7 @@ STRIPE_PUBLISHABLE_KEY=pk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 
 # ─────────────────────────────────────────────────────────────────
-# 默认 LLM 提供商 (支持 'glm' 或 'zhipu')
+# 默认 LLM 提供商 (支持 'glm'/'zhipu' 或 'claude')
 # ─────────────────────────────────────────────────────────────────
 DEFAULT_LLM_PROVIDER=glm
 ```
@@ -276,6 +291,10 @@ export GLM_CHAT_MODEL="glm-4.7"
 export GLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export DEFAULT_LLM_PROVIDER="glm"
 export VIBELIFE_DB_URL="postgresql://postgres:<PASSWORD>@106.37.170.238:8224/vibelife"
+
+# 若使用 Claude 作为默认模型 (仍建议保留 GLM 作为 fallback):
+# export CLAUDE_API_KEY="your-claude-api-key"  # 兼容 ANTHROPIC_API_KEY
+# export DEFAULT_LLM_PROVIDER="claude"
 
 # 启动服务
 uvicorn main:app --port 8000 --host 0.0.0.0

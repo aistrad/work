@@ -16,7 +16,7 @@ description: VibeLife 知识库管理；用于同步和处理 bazi/zodiac/mbti �
 ## 1. 知识库结构
 
 ```
-vibelife/knowledge/
+/data/vibelife/knowledge/
 ├── bazi/       # 八字知识 → skill_id: "bazi"
 ├── zodiac/     # 星座知识 → skill_id: "zodiac"
 └── mbti/       # MBTI知识 → skill_id: "mbti" (P1)
@@ -39,7 +39,7 @@ vibelife/knowledge/
 
 # Quick Start
 
-1) 将知识文档放入 `knowledge/<skill_id>/` 目录
+1) 将知识文档放入 `/data/vibelife/knowledge/<skill_id>/` 目录
 2) 执行 `/vibeknowledge` 完成扫描+处理（一键完成）
 
 **分步执行：**
@@ -72,7 +72,7 @@ vibelife/knowledge/
 ```
 
 **步骤**：
-1. 扫描 `knowledge/` 下所有 skill 文件夹
+1. 扫描 `/data/vibelife/knowledge/` 下所有 skill 文件夹
 2. 计算文件 MD5 hash，检测变更
 3. 新文件/变更文件标记为 `pending`
 4. 删除的文件标记为 `archived`
@@ -132,6 +132,8 @@ mbti         0          0            2            0        45
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
 | `VIBELIFE_ROOT` | 项目根目录 | `/home/aiscend/work/vibelife` |
+| `VIBELIFE_DATA_ROOT` | 数据根目录 | `/data/vibelife` |
+| `VIBELIFE_KNOWLEDGE_ROOT` | 知识库目录 | `/data/vibelife/knowledge` |
 | `VIBELIFE_DB_URL` | PostgreSQL 连接字符串 | 必需 |
 | `EMBEDDING_MODEL_NAME` | Embedding 模型 | `BAAI/bge-m3` |
 | `EMBEDDING_DIMENSION` | 向量维度 | `1024` |
@@ -182,7 +184,7 @@ class EmbeddingService:
 
 ```bash
 # 1. 准备文档
-cp 天干地支.md ~/work/vibelife/knowledge/bazi/
+cp 天干地支.md /data/vibelife/knowledge/bazi/
 
 # 2. 同步
 /vibeknowledge sync --skill bazi
@@ -199,7 +201,7 @@ cp 天干地支.md ~/work/vibelife/knowledge/bazi/
 
 ```bash
 # 1. 复制多个文档
-cp zodiac_docs/*.pdf ~/work/vibelife/knowledge/zodiac/
+cp zodiac_docs/*.pdf /data/vibelife/knowledge/zodiac/
 
 # 2. 同步所有
 /vibeknowledge sync
@@ -229,8 +231,8 @@ cp zodiac_docs/*.pdf ~/work/vibelife/knowledge/zodiac/
 /vibeknowledge stats
 
 # 当前知识文件：
-# - knowledge/bazi/: 2 个 PDF（八字教材）
-# - knowledge/zodiac/: 12 个 PDF（星座书籍）
+# - /data/vibelife/knowledge/bazi/: 2 个 PDF（八字教材）
+# - /data/vibelife/knowledge/zodiac/: 12 个 PDF（星座书籍）
 ```
 
 ---
@@ -272,6 +274,11 @@ print(f'Device: {EmbeddingService.DEVICE}')
 ---
 
 # Changelog
+
+## 2026-01-09
+- 重构知识库目录：`vibelife/knowledge/` → `/data/vibelife/knowledge/`
+- 新增环境变量：`VIBELIFE_DATA_ROOT`, `VIBELIFE_KNOWLEDGE_ROOT`
+- 更新所有路径引用和示例
 
 ## 2026-01-07
 - 更新 Embedding 配置：Gemini → BAAI/bge-m3 (本地推理)

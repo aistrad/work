@@ -375,10 +375,10 @@ rmdir apps/web/src/components/landing/ 2>/dev/null || true
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **Phase 1** | 前端架构重构 (bazi/zodiac 路由组) | 待实施 |
-| **Phase 2** | 聊天页布局优化 (左对齐 + 边栏可调 + 输入框) | 待实施 |
-| **Phase 3** | AI SDK 6 升级 (useChat + Generative UI) | 待实施 |
-| **Phase 4** | 冗余代码清理 (布局修复时顺带) | 待实施 |
+| **Phase 1** | 前端架构重构 (bazi/zodiac 路由组) | ✅ 已完成 (2026-01-08) |
+| **Phase 2** | 聊天页布局优化 (左对齐 + 边栏可调 + 输入框) | ✅ 已完成 (2026-01-08) |
+| **Phase 3** | AI SDK 6 升级 (useChat + Generative UI) | ✅ 已完成 (2026-01-08) |
+| **Phase 4** | 冗余代码清理 (布局修复时顺带) | ✅ 已完成 (2026-01-08) |
 | **Phase 5** | UX 增强 (空状态 + 运势预览) | 待实施 |
 | **Phase 6** | 支付系统完善 (Stripe + Airwallex) | 待实施 |
 | **Phase 7** | 认证系统迁移 (Clerk) | 待实施 |
@@ -393,55 +393,55 @@ rmdir apps/web/src/components/landing/ 2>/dev/null || true
 ### 5.3 执行优先级
 
 ```
-优先级 P0 (立即执行):
-├── 子域名路由组重构
-├── Vercel AI SDK 6 升级
-├── 认证系统 Clerk 迁移
-├── 支付系统完善
-├── 主动推送系统完善
-└── 可视化组件增强
+✅ 已完成 (2026-01-08):
+├── ✅ 子域名路由组重构 (Phase 1)
+├── ✅ Vercel AI SDK 6 升级 (Phase 3)
+├── ✅ 聊天页布局优化 (Phase 2)
+└── ✅ 冗余代码清理 (Phase 4)
+
+优先级 P0 (下一步):
+├── 认证系统 Clerk 迁移 (Phase 7)
+├── 支付系统完善 (Phase 6)
+└── 主动推送系统完善 (Phase 8)
 
 优先级 P1 (并行执行):
-├── 聊天页布局优化
-├── 冗余代码清理
-└── UX 增强
+└── UX 增强 (Phase 5)
 ```
 
 ### 5.4 关键文件修改清单
 
 **新建文件**:
-| 文件 | 用途 |
-|------|------|
-| `apps/web/src/app/(www)/layout.tsx` | 主站布局 |
-| `apps/web/src/app/(bazi)/layout.tsx` | Bazi 专属布局 |
-| `apps/web/src/app/(zodiac)/layout.tsx` | Zodiac 专属布局 |
-| `apps/web/src/components/layout/ResizablePanel.tsx` | 可调节边栏 |
-| `apps/web/src/hooks/useVibeChat.ts` | AI SDK useChat 封装 |
-| `apps/web/src/app/api/chat/route.ts` | Next.js Route Handler |
-| `apps/web/src/components/greeting/FortunePreview.tsx` | 运势预览卡片 |
-| `apps/api/services/billing/airwallex_service.py` | Airwallex 服务 |
+| 文件 | 用途 | 状态 |
+|------|------|------|
+| `apps/web/src/app/bazi/` | Bazi 路由组 (chat/relationship/report) | ✅ 已创建 |
+| `apps/web/src/app/zodiac/` | Zodiac 路由组 (chat/relationship/report) | ✅ 已创建 |
+| `apps/web/src/components/layout/ResizablePanel.tsx` | 可调节边栏 (320-600px) | ✅ 已创建 |
+| `apps/web/src/hooks/useVibeChat.ts` | AI SDK 6 useChat 封装 | ✅ 已创建 |
+| `apps/web/src/app/api/chat/route.ts` | Next.js Route Handler (Data Stream Protocol) | ✅ 已创建 |
+| `apps/web/src/components/greeting/FortunePreview.tsx` | 运势预览卡片 | 待实施 |
+| `apps/api/services/billing/airwallex_service.py` | Airwallex 服务 | 待实施 |
 
 **修改文件**:
-| 文件 | 修改内容 |
-|------|---------|
-| `apps/web/src/middleware.ts` | 完善子域名路由 |
-| `apps/web/src/components/layout/AppShell.tsx` | 集成 ResizablePanel |
-| `apps/web/src/components/chat/ChatContainer.tsx` | 左对齐 + useChat + 空状态增强 |
-| `apps/web/src/components/chat/ChatInput.tsx` | 输入框左对齐 |
-| `apps/web/src/app/globals.css` | 消息自适应宽度 |
-| `apps/api/routes/chat.py` | SSE 格式适配 AI SDK |
-| `apps/api/routes/payment.py` | 删除 mock-pay |
-| `apps/api/services/billing/stripe_service.py` | 完善 Stripe |
-| `apps/api/services/reminder/scheduler.py` | 完善触发逻辑 |
-| `apps/api/services/reminder/generator.py` | 个性化内容生成 |
+| 文件 | 修改内容 | 状态 |
+|------|---------|------|
+| `apps/web/src/middleware.ts` | 完善子域名路由 | ✅ 已完成 |
+| `apps/web/src/components/layout/AppShell.tsx` | 集成 ResizablePanel | ✅ 已完成 |
+| `apps/web/src/components/chat/ChatContainer.tsx` | 左对齐 + AI SDK 6 useChat | ✅ 已完成 |
+| `apps/web/src/components/chat/ChatInput.tsx` | 输入框左对齐 | ✅ 已完成 |
+| `apps/web/src/components/ui/index.ts` | 更新导出 VoiceModeToggle | ✅ 已完成 |
+| `apps/web/src/components/vibelife/index.ts` | 更新导出 VoiceModeToggle | ✅ 已完成 |
+| `apps/api/routes/chat.py` | SSE 格式适配 AI SDK | 待实施 (使用 API Route 代理) |
+| `apps/api/routes/payment.py` | 删除 mock-pay | 待实施 |
+| `apps/api/services/billing/stripe_service.py` | 完善 Stripe | 待实施 |
 
 **删除文件**:
-| 文件 | 原因 |
-|------|------|
-| `apps/web/src/components/fortune/LifeKLine.tsx` | 被 trend 版本替代 |
-| `apps/web/src/components/ui/VoiceToggle.tsx` | 与 VoiceModeToggle 重复 |
-| `apps/web/src/app/(main)/` | 空目录 |
-| `apps/web/src/components/landing/` | 空目录 |
+| 文件 | 原因 | 状态 |
+|------|------|------|
+| `apps/web/src/components/fortune/LifeKLine.tsx` | 被 trend 版本替代 | ✅ 已删除 |
+| `apps/web/src/components/ui/VoiceToggle.tsx` | 与 VoiceModeToggle 重复 | ✅ 已删除 |
+| `apps/web/src/app/(main)/` | 空目录 | ✅ 已删除 |
+| `apps/web/src/components/landing/` | 空目录 | ✅ 已删除 |
+| `apps/web/src/lib/chat.ts` | 被 useVibeChat hook 替代 | ✅ 已删除 |
 
 ### 5.5 验证方案
 

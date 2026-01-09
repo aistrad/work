@@ -1,6 +1,6 @@
 # VibeLife - 资源配置
 
-> 最后更新: 2026-01-07 | v3.0 Schema 已部署
+> 最后更新: 2026-01-09 | v3.0 Schema 已部署 | AI SDK 6 已集成 | 动态模型路由系统 | 数据目录重构 ✨
 
 ---
 
@@ -70,7 +70,7 @@
 # 后端 API
 cd /home/aiscend/work/vibelife/apps/api
 export GLM_API_KEY="your-key"
-export GLM_CHAT_MODEL="glm-4.7"
+export GLM_CHAT_MODEL="glm-4.7-flash"
 export GLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export DEFAULT_LLM_PROVIDER="glm"
 export VIBELIFE_DB_URL="postgresql://postgres:<PASSWORD>@106.37.170.238:8224/vibelife"
@@ -113,7 +113,7 @@ pnpm dev --port 8232
 | 表名 | 说明 |
 |------|------|
 | `users` | 用户核心表 (vibe_id) |
-| `user_auth` | 认证方式表 (email, phone, wechat, apple, google) |
+| `user_auth` | 认证方式表 (email, phone, google, apple) |
 | `user_profiles` | 用户画像 (JSONB, 版本化) |
 | `conversations` | 对话会话 |
 | `messages` | 消息记录 |
@@ -127,17 +127,21 @@ pnpm dev --port 8232
 | `daily_greetings` | 每日问候缓存 |
 | `user_events` | 用户事件 |
 
-**Migration 文件**: `migrations/001_v3_schema.sql`
+**Migration 文件**:
+- `migrations/001_v3_schema.sql` - v3.0 数据库 Schema
+- `migrations/002_interview_sessions.sql` - 访谈会话表
+- `migrations/003_model_router.sql` - 模型路由系统
+- `migrations/004_update_model_routes.sql` - 路由规则更新 (VIP/Pro→Gemini, 默认→GLM-4.7)
+- `migrations/005_user_gender_voice_mode.sql` - 用户性别和人格字段
 
-## 2. 智谱 GLM (对话/图片)
+## 2. 智谱 GLM (对话)
 
 **API 控制台**: https://bigmodel.cn/usercenter/equity-mgmt/user-rights
 
 | 配置项 | 值 |
 |--------|-----|
 | API Key | `<REDACTED>` (环境变量: `GLM_API_KEY`) |
-| 对话模型 | `glm-4.7` ✅ (最新旗舰) |
-| 图片理解 | `glm-4.6v` ✅ (最新视觉) |
+| 对话模型 | `glm-4.7` ✅ (全局默认) |
 | Base URL | `https://open.bigmodel.cn/api/paas/v4` |
 
 **API 文档**: https://docs.bigmodel.cn/cn/guide/models/text/glm-4.7
@@ -150,6 +154,23 @@ pnpm dev --port 8232
 |--------|-----|
 | API Key | 需配置 `CLAUDE_API_KEY` |
 | 模型 | `claude-3-5-sonnet-20241022` |
+
+## 3.1 Google Gemini (对话 + 图像生成默认)
+
+**API 端点**: OpenAI 兼容格式 (中转)
+
+| 配置项 | 值 |
+|--------|-----|
+| API Key | `<REDACTED>` (环境变量: `GEMINI_API_KEY`) |
+| Base URL | `https://api2.qiandao.mom/v1` |
+| 对话模型 | `gemini-3-pro-preview` |
+| 图像生成模型 | `gemini-3-pro-image-preview` ✅ 默认 |
+
+**功能**:
+- OpenAI 兼容 API 格式
+- 支持 Chat Completions (`/chat/completions`)
+- 支持 Image Generation (`/images/generations`)
+- 流式响应 (SSE)
 
 ## 4. Embedding (默认 BAAI/bge-m3)
 
@@ -185,14 +206,74 @@ pnpm dev --port 8232
 
 | 服务 | 提供商 | 模型/规格 | 状态 |
 |------|--------|----------|------|
-| 对话生成 | GLM | glm-4.7 | ✅ 已验证 |
-| 图片理解 | GLM | glm-4.6v | ✅ 已配置 |
+| **对话 (全局默认)** | **GLM** | **glm-4.7** | ✅ 默认 |
+| 对话 (VIP/Pro) | Gemini | gemini-3-pro-preview | ✅ 动态路由 |
+| **图像生成** | **Gemini** | **gemini-3-pro-image-preview** | ✅ **默认** |
 | 向量嵌入 | BGE | BAAI/bge-m3 (1024维) | ✅ 已验证 |
 | 向量存储 | PostgreSQL pgvector | 1024维 | ✅ 已验证 |
 | 星盘计算 | swisseph | Swiss Ephemeris | ✅ 已配置 |
 | 支付 | Stripe | Checkout + Subscription | ⏳ 待配置 |
 
-## 8. 环境变量
+## 7.1 模型路由系统 ✨
+
+动态模型选择系统，支持按用户等级、任务类型、技能自动路由到最佳模型。
+
+### 路由规则
+
+| 优先级 | 规则名称 | 匹配条件 | 目标模型 | 降级链 |
+|--------|----------|----------|----------|--------|
+| 20 | 图像生成默认 | task=image_gen | gemini:gemini-3-image | - |
+| 30 | VIP用户用Gemini Pro | tier=vip | gemini:gemini-3-pro | glm-4.7 → glm-4-flash |
+| 35 | Pro用户用Gemini Pro | tier=pro | gemini:gemini-3-pro | glm-4.7 → glm-4-flash |
+| 100 | 全局默认 | - | glm:glm-4.7 | glm-4-flash → gemini-3-pro |
+
+### 配额规则
+
+| 规则 | 范围 | 限制 | 超额处理 |
+|------|------|------|----------|
+| Gemini 全局日限 | provider=gemini | 5000次/天 | 降级到 glm-4.7 |
+| Claude 全局日限 | provider=claude | 1000次/天 | 降级到 gemini-3-pro |
+| 免费用户日限 | tier=free | 50次/天 | 拒绝 |
+| 图像生成全局日限 | task=image_gen | 500张/天 | 拒绝 |
+
+### 模型清单
+
+| ID | 提供商 | 模型名 | 能力 |
+|----|--------|--------|------|
+| glm:glm-4.7 | GLM | glm-4.7 | chat, analysis |
+| glm:glm-4-flash | GLM | glm-4-flash | chat |
+| glm:glm-4-plus | GLM | glm-4-plus | chat, analysis |
+| gemini:gemini-3-pro | Gemini | gemini-3-pro-preview | chat, analysis |
+| gemini:gemini-3-image | Gemini | gemini-3-pro-image-preview | image_gen |
+| claude:claude-3-5-sonnet | Claude | claude-3-5-sonnet-20241022 | chat, analysis, vision |
+
+### 代码位置
+
+- **Router**: `apps/api/services/model_router/`
+- **Migration**: `migrations/003_model_router.sql`, `migrations/004_update_model_routes.sql`
+- **测试脚本**: `apps/api/scripts/test_model_router.py`
+
+## 8. 数据目录配置
+
+数据目录位于独立数据盘 `/data/vibelife/`，便于生产环境管理。
+
+| 目录 | 用途 | 环境变量 |
+|------|------|----------|
+| `/data/vibelife/` | 数据根目录 | `VIBELIFE_DATA_ROOT` |
+| `/data/vibelife/knowledge/` | 知识库源文件 | `VIBELIFE_KNOWLEDGE_ROOT` |
+| `/data/vibelife/uploads/` | 用户上传文件 | `VIBELIFE_UPLOADS_ROOT` |
+| `/data/vibelife/cache/` | 缓存数据 | `VIBELIFE_CACHE_ROOT` |
+| `/data/vibelife/logs/` | 日志文件 | `VIBELIFE_LOGS_ROOT` |
+
+**知识库结构**:
+```
+/data/vibelife/knowledge/
+├── bazi/       # 八字知识 → skill_id: "bazi"
+├── zodiac/     # 星座知识 → skill_id: "zodiac"
+└── mbti/       # MBTI知识 → skill_id: "mbti"
+```
+
+## 9. 环境变量
 
 完整环境变量已配置在 `/home/aiscend/work/vibelife/.env`
 
@@ -217,14 +298,26 @@ VIBELIFE_DEV=1
 # CORS (测试环境)
 VIBELIFE_CORS_ORIGINS=http://106.37.170.238:8230,http://106.37.170.238:8231,http://106.37.170.238:8232,http://localhost:3000
 
-# 智谱 GLM (对话/图片) - 支持 GLM_* 或 ZHIPU_* 前缀
+# 数据目录
+VIBELIFE_DATA_ROOT=/data/vibelife
+VIBELIFE_KNOWLEDGE_ROOT=/data/vibelife/knowledge
+VIBELIFE_UPLOADS_ROOT=/data/vibelife/uploads
+VIBELIFE_CACHE_ROOT=/data/vibelife/cache
+VIBELIFE_LOGS_ROOT=/data/vibelife/logs
+
+# 智谱 GLM (对话) - 支持 GLM_* 或 ZHIPU_* 前缀
 GLM_API_KEY=<REDACTED>
 GLM_CHAT_MODEL=glm-4.7
-GLM_VISION_MODEL=glm-4.6v
 GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 
 # Claude (备选)
 CLAUDE_API_KEY=your-claude-api-key
+
+# Google Gemini (图像生成默认)
+GEMINI_API_KEY=<REDACTED>
+GEMINI_BASE_URL=https://api2.qiandao.mom/v1
+GEMINI_CHAT_MODEL=gemini-3-pro-preview
+GEMINI_IMAGE_MODEL=gemini-3-pro-image-preview
 
 # Embedding (默认 bge-m3)
 EMBEDDING_MODEL_NAME=BAAI/bge-m3
@@ -236,13 +329,22 @@ EMBEDDING_LOCAL_DIR=/home/aiscend/.cache/vibelife/models/bge-m3
 PINECONE_API_KEY=<REDACTED>
 PINECONE_HOST=mentis-streams-nkchadl.svc.aped-4627-b74a.pinecone.io
 
-# 默认 LLM 提供商 (支持 'glm' 或 'zhipu')
-DEFAULT_LLM_PROVIDER=glm
+# 默认提供商配置
+DEFAULT_LLM_PROVIDER=glm    # 对话 (支持 'glm', 'zhipu', 'gemini', 'claude')
+DEFAULT_IMAGE_PROVIDER=gemini  # 图像生成 (默认 gemini)
 
 # Stripe
 STRIPE_SECRET_KEY=sk_test_xxx
 STRIPE_PUBLISHABLE_KEY=pk_test_xxx
 STRIPE_WEBHOOK_SECRET=whsec_xxx
+
+# OAuth (Google/Apple)
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+APPLE_CLIENT_ID=your-apple-client-id
+APPLE_TEAM_ID=your-apple-team-id
+APPLE_KEY_ID=your-apple-key-id
+APPLE_PRIVATE_KEY=your-apple-private-key
 
 # 前端配置
 NEXT_PUBLIC_API_URL=http://106.37.170.238:8000
@@ -322,6 +424,12 @@ curl http://106.37.170.238:8232
 │   │   │   │   ├── llm.py       # LLM 服务
 │   │   │   │   ├── context.py   # 上下文构建
 │   │   │   │   └── portrait.py  # 用户画像
+│   │   │   ├── model_router/    # 动态模型路由 ✨
+│   │   │   │   ├── router.py    # 路由核心逻辑
+│   │   │   │   ├── quota.py     # 配额管理
+│   │   │   │   ├── cache.py     # 内存缓存
+│   │   │   │   ├── repository.py # 数据库操作
+│   │   │   │   └── models.py    # 数据模型
 │   │   │   ├── interview/       # 访谈系统
 │   │   │   ├── report/          # 报告生成
 │   │   │   ├── fortune/         # 运势计算
@@ -337,19 +445,41 @@ curl http://106.37.170.238:8232
 │   │       └── zodiac/          # 星盘计算
 │   │
 │   └── web/                     # Next.js 14 前端
-│       ├── package.json
+│       ├── package.json         # ai@6.0.20, @ai-sdk/react@3.0.20
 │       ├── tailwind.config.ts
 │       └── src/
-│           ├── app/             # 14 页面路由
-│           ├── components/      # 37 组件文件
+│           ├── app/
+│           │   ├── page.tsx             # 品牌首页 (Skill 选择器)
+│           │   ├── api/chat/route.ts    # AI SDK 6 Data Stream Protocol ✨
+│           │   ├── bazi/                # 八字路由组 ✨
+│           │   │   ├── page.tsx         # Bazi Landing
+│           │   │   ├── chat/page.tsx    # Bazi Chat
+│           │   │   ├── relationship/    # Bazi 关系
+│           │   │   └── report/          # Bazi 报告
+│           │   ├── zodiac/              # 星座路由组 ✨
+│           │   │   ├── page.tsx         # Zodiac Landing
+│           │   │   ├── chat/page.tsx    # Zodiac Chat
+│           │   │   ├── relationship/    # Zodiac 关系
+│           │   │   └── report/          # Zodiac 报告
+│           │   ├── chat/page.tsx        # 旧链接重定向
+│           │   └── ...
+│           ├── hooks/
+│           │   └── useVibeChat.ts       # AI SDK 6 useChat 封装 ✨
+│           ├── components/
 │           │   ├── core/        # LUMINOUS PAPER 设计系统
-│           │   ├── chat/        # 对话组件
+│           │   ├── chat/        # 对话组件 (AI SDK 6 集成)
+│           │   ├── layout/
+│           │   │   ├── AppShell.tsx      # 主布局
+│           │   │   └── ResizablePanel.tsx # 可调节边栏 ✨
 │           │   ├── ui/          # UI 基础组件
 │           │   └── insight/     # 洞察面板
 │           └── lib/             # API 客户端
 │
 ├── migrations/
-│   └── 001_v3_schema.sql        # v3.0 数据库 Schema
+│   ├── 001_v3_schema.sql        # v3.0 数据库 Schema
+│   ├── 002_interview_sessions.sql # 访谈会话
+│   ├── 003_model_router.sql     # 模型路由系统 ✨
+│   └── 004_update_model_routes.sql # 路由规则更新 ✨
 │
 ├── deploy/
 │   ├── aiscend/                 # 后端部署配置
@@ -362,7 +492,19 @@ curl http://106.37.170.238:8232
 │
 ├── .env                         # 环境变量
 └── docker-compose.yml           # 本地开发
+
+# 数据目录 (独立数据盘)
+/data/vibelife/
+├── knowledge/                   # 知识库源文件
+│   ├── bazi/                   # 八字知识
+│   ├── zodiac/                 # 星座知识
+│   └── mbti/                   # MBTI知识
+├── uploads/                     # 用户上传文件
+├── cache/                       # 缓存数据
+└── logs/                        # 日志文件
 ```
+
+> ✨ = 2026-01-08 新增/更新
 
 ## 12. 功能状态
 
@@ -370,14 +512,23 @@ curl http://106.37.170.238:8232
 
 - [x] 多技能对话系统 (Bazi/Zodiac)
 - [x] SSE 流式响应
-- [x] 语音模式切换 (温暖/吐槽)
+- [x] 语音模式切换 (暖心闺蜜/毒舌损友/人生导师)
 - [x] 智能访谈系统
-- [x] 报告生成 (Lite/Full Preview)
+- [x] 报告生��� (Lite/Full Preview)
 - [x] 人生 K-Line 可视化
 - [x] 大运周期计算
 - [x] 每日问候
 - [x] 关系分析 & Vibe Link
 - [x] 文件上传提取
+- [x] 用户注册 (邮箱+密码 / 手机号+密码)
+- [x] OAuth 登录 (Google / Apple)
+
+### UX 优化 (2026-01-08) - ✅ 已完成
+
+- [x] **Phase 1**: 前端架构重构 - bazi/zodiac 路由组
+- [x] **Phase 2**: 聊天页布局优化 - ResizablePanel (320-600px)
+- [x] **Phase 3**: AI SDK 6 升级 - useChat + Data Stream Protocol
+- [x] **Phase 4**: 冗余代码清理 - 删除重复组件
 
 ### P1 (待开发)
 
@@ -385,6 +536,8 @@ curl http://106.37.170.238:8232
 - [ ] Mirror 周/月回顾
 - [ ] MBTI 技能
 - [ ] 语音交互
+- [ ] Clerk 认证迁移
+- [ ] Stripe/Airwallex 支付完善
 
 ## 13. 下一步
 
