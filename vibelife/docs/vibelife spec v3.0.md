@@ -1,11 +1,11 @@
 # VibeLife 产品设计文档 V3.0
 
-> **版本**: 3.2
-> **日期**: 2026-01-08
+> **版本**: 3.3
+> **日期**: 2026-01-10
 > **定位**: Phase 1 产品落地的唯一真理来源 (Source of Truth)
 > **北极星指标**: 1000 个付费用户
 > **交付周期**: 12 周
-> **更新**: AI SDK 6 集成、前端架构重构 (bazi/zodiac 路由组)、ResizablePanel 边栏
+> **更新**: AI SDK 6 集成、前端架构重构 (bazi/zodiac 路由组)、ResizablePanel 边栏、Knowledge v2.0 目录结构
 
 ---
 

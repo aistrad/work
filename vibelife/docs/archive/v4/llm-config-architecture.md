@@ -166,3 +166,50 @@ python apps/api/scripts/update_model_config.py --reload
 ## 更新历史
 
 - **2026-01-10**: 初始版本，完全配置化实现
+- **2026-01-10**: 完成 11 个服务迁移到 model_router.client
+- **2026-01-10**: 完成全部迁移，删除 llm_orchestrator.py
+
+## 服务迁移状态
+
+所有服务已迁移到统一的 `model_router.client`：
+
+| 服务 | 文件 | 状态 |
+|------|------|------|
+| 术语提取 | `services/knowledge/term_service.py` | ✅ 已迁移 |
+| 每日问候 | `services/greeting/greeting_service.py` | ✅ 已迁移 |
+| 报告生成 | `services/report/report_service.py` | ✅ 已迁移 |
+| 信件生成 | `services/persona/letter_service.py` | ✅ 已迁移 |
+| 用户画像 | `services/vibe_engine/portrait.py` | ✅ 已迁移 |
+| 卷首语生成 | `services/report/prologue_generator.py` | ✅ 已迁移 |
+| 图像生成 | `services/report/image_generator.py` | ✅ 已迁移 |
+| 访谈服务 | `services/interview/interview_service.py` | ✅ 已迁移 |
+| 追问生成 | `services/interview/question_generator.py` | ✅ 已迁移 |
+| 信息提取 | `services/extraction/extraction_service.py` | ✅ 已迁移 |
+| 关系分析 | `services/relationship/relationship_service.py` | ✅ 已迁移 |
+| Chat 路由 | `routes/chat.py` | ✅ 已迁移 |
+| 画像服务(旧) | `services/vibe_engine/portrait_service.py` | ✅ 已迁移 |
+| 情绪引擎 | `services/vibe_engine/emotion_engine.py` | ✅ 已迁移 |
+| 记忆系统 | `services/vibe_engine/memory_system.py` | ✅ 已迁移 |
+| 洞察生成 | `services/vibe_engine/insight_generator.py` | ✅ 已迁移 |
+| Agent 运行时 | `services/agent/runtime.py` | ✅ 已迁移 |
+
+**已删除文件**：
+- `services/vibe_engine/llm_orchestrator.py` - 已删除，功能合并到 `model_router.client`
+
+### 迁移模式
+
+```python
+# 旧方式
+from services.vibe_engine.llm import get_llm_service, create_user_message
+llm = get_llm_service()
+response = await llm.chat([create_user_message(prompt)])
+
+# 新方式
+from services.model_router.client import chat as llm_chat
+response = await llm_chat(
+    messages=[{"role": "user", "content": prompt}],
+    capability="analysis",
+    skill="bazi",
+    task="report_section",
+)
+```

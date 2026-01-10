@@ -1,6 +1,6 @@
 # VibeLife - 资源配置
 
-> 最后更新: 2026-01-09 | v3.0 Schema 已部署 | AI SDK 6 已集成 | 动态模型路由系统 | 数据目录重构 ✨
+> 最后更新: 2026-01-10 | v3.0 Schema 已部署 | AI SDK 6 已集成 | 动态模型路由系统 | 数据目录重构 | Knowledge v2.0 目录结构 ✨
 
 ---
 
@@ -342,13 +342,47 @@ python apps/api/scripts/update_model_config.py --validate
 | `/data/vibelife/cache/` | 缓存数据 | `VIBELIFE_CACHE_ROOT` |
 | `/data/vibelife/logs/` | 日志文件 | `VIBELIFE_LOGS_ROOT` |
 
-**知识库结构**:
+**知识库结构** (v2.0 新目录结构):
 ```
 /data/vibelife/knowledge/
-├── bazi/       # 八字知识 → skill_id: "bazi"
-├── zodiac/     # 星座知识 → skill_id: "zodiac"
-└── mbti/       # MBTI知识 → skill_id: "mbti"
+├── bazi/                      # 八字知识 → skill_id: "bazi"
+│   ├── source/                # 源文件 (PDF, EPUB, DOCX 等)
+│   │   ├── book1.pdf
+│   │   └── notes.docx
+│   └── converted/             # 转换后的 Markdown
+│       ├── book1.converted.md
+│       └── notes.converted.md
+├── zodiac/                    # 星座知识 → skill_id: "zodiac"
+│   ├── source/
+│   └── converted/
+└── mbti/                      # MBTI知识 → skill_id: "mbti"
+    ├── source/
+    └── converted/
 ```
+
+**知识库管理命令**:
+```bash
+# 同步知识库（自动迁移旧文件到 source/ 目录）
+python -m apps.api.scripts.sync_knowledge
+
+# 同步指定技能
+python -m apps.api.scripts.sync_knowledge --skill bazi
+
+# 强制重新处理所有文件
+python -m apps.api.scripts.sync_knowledge --force
+
+# 运行入库 Worker
+python -m apps.api.scripts.run_ingestion
+
+# 查看统计
+python -m apps.api.scripts.sync_knowledge --stats
+```
+
+**手动审核/校对流程**:
+1. 运行同步，生成 `.converted.md` 文件
+2. 打开 `knowledge/{skill}/converted/` 目录
+3. 用编辑器修改 `.converted.md` 文件
+4. 再次运行同步，系统自动检测变更并重新入库
 
 ## 9. 环境变量
 
