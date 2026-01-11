@@ -1,6 +1,6 @@
 # VibeLife 部署指南
 
-> 最后更新: 2026-01-09 | v3.0 已验证 | 数据目录重构
+> 最后更新: 2026-01-11 | v3.1 已验证 | 支付系统双轨制
 
 ---
 
@@ -213,11 +213,25 @@ PINECONE_API_KEY=your-pinecone-api-key
 PINECONE_HOST=your-index.pinecone.io
 
 # ─────────────────────────────────────────────────────────────────
-# Stripe 支付
+# Stripe 支付 - 双轨制配置 (payment-design v2.0)
 # ─────────────────────────────────────────────────────────────────
 STRIPE_SECRET_KEY=sk_live_...
 STRIPE_PUBLISHABLE_KEY=pk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
+
+# 海外订阅 Price IDs (USD, Recurring)
+STRIPE_PRICE_SUB_MONTHLY_USD=price_xxx
+STRIPE_PRICE_SUB_QUARTERLY_USD=price_xxx
+STRIPE_PRICE_SUB_YEARLY_USD=price_xxx
+
+# 大陆/香港预付 Price IDs (HKD, One-time)
+STRIPE_PRICE_PREPAID_1M_HKD=price_xxx
+STRIPE_PRICE_PREPAID_3M_HKD=price_xxx
+STRIPE_PRICE_PREPAID_12M_HKD=price_xxx
+
+# 支付回调 URLs
+PAYMENT_SUCCESS_URL=https://vibelife.app/payment/success
+PAYMENT_CANCEL_URL=https://vibelife.app/pricing
 
 # ─────────────────────────────────────────────────────────────────
 # 默认 LLM 提供商 (支持 'glm'/'zhipu' 或 'claude')
@@ -543,5 +557,6 @@ pnpm build
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| v3.1 | 2026-01-11 | 支付系统双轨制 (Stripe HK)，移除 Airwallex |
 | v3.0 | 2026-01-07 | Schema v3.0, LLM 配置优化, 前端 Suspense 修复 |
 | v2.0 | 2026-01-05 | 初始部署配置 |
