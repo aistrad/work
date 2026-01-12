@@ -1,0 +1,563 @@
+# VibeLife 系统配置手册
+
+> 本文档包含配置和运行整个系统所需的全部核心信息
+
+---
+
+## 1. 系统路径
+
+### 数据目录 `/data/vibelife/`
+```
+/data/vibelife/
+├── knowledge/     # 知识库原始文件
+├── uploads/       # 用户上传文件
+├── cache/         # 缓存文件
+├── logs/          # 应用日志
+│   └── test/      # 测试环境日志
+└── tmp/           # 临时文件
+```
+
+### 部署目录 `/opt/vibelife/`
+```
+/opt/vibelife/
+├── apps/
+│   ├── api/       # API 应用
+│   └── web/       # Web 应用
+└── logs/
+    ├── api_requests.log    # API 请求日志
+    ├── vibelife_api.log    # API 服务日志
+    ├── vibelife_web.log    # Web 服务日志
+    └── nginx_*.log         # Nginx 日志
+```
+
+### 模型缓存
+```
+/home/aiscend/.cache/vibelife/models/bge-m3   # 本地嵌入模型
+```
+
+---
+
+## 2. 完整环境变量
+
+复制到项目根目录 `.env`:
+
+```bash
+# ═══════════════════════════════════════════════════════════════
+# 数据库 (必需)
+# ═══════════════════════════════════════════════════════════════
+VIBELIFE_DB_URL=postgresql://postgres:Ak4_9lScd-69WX@106.37.170.238:8224/vibelife
+VIBELIFE_DB_HOST=106.37.170.238
+VIBELIFE_DB_PORT=8224
+VIBELIFE_DB_NAME=vibelife
+VIBELIFE_DB_USER=postgres
+VIBELIFE_DB_PASSWORD=Ak4_9lScd-69WX
+VIBELIFE_DB_SSLMODE=prefer
+
+# ═══════════════════════════════════════════════════════════════
+# JWT 认证 (必需)
+# ═══════════════════════════════════════════════════════════════
+VIBELIFE_JWT_SECRET=vibelife-jwt-secret-key-2026-aiscend
+VIBELIFE_ACCESS_TOKEN_EXPIRE_MINUTES=60
+VIBELIFE_REFRESH_TOKEN_EXPIRE_DAYS=30
+
+# ═══════════════════════════════════════════════════════════════
+# API 服务 (必需)
+# ═══════════════════════════════════════════════════════════════
+VIBELIFE_API_PORT=8000
+VIBELIFE_API_HOST=0.0.0.0
+VIBELIFE_DEV=1
+VIBELIFE_ENV=test
+VIBELIFE_WORKER_ENABLED=1
+VIBELIFE_CORS_ORIGINS=http://106.37.170.238:8230,http://106.37.170.238:8231,http://106.37.170.238:8232,http://localhost:3000
+
+# ═══════════════════════════════════════════════════════════════
+# LLM 服务
+# ═══════════════════════════════════════════════════════════════
+
+# 智谱 GLM (主要)
+GLM_API_KEY=your_glm_api_key_here
+GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+GLM_CHAT_MODEL=glm-4-flash
+GLM_VISION_MODEL=glm-4.6v
+
+# Claude (备选)
+CLAUDE_API_KEY=your_claude_api_key_here
+CLAUDE_BASE_URL=https://api2.qiandao.mom/v1
+CLAUDE_MODEL=claude-3-5-sonnet-20241022
+
+# Gemini (生图)
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_BASE_URL=https://new.12ai.org/v1
+GEMINI_CHAT_MODEL=gemini-2.5-flash
+GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
+
+# 默认提供商
+DEFAULT_LLM_PROVIDER=glm
+DEFAULT_IMAGE_PROVIDER=gemini
+
+# ═══════════════════════════════════════════════════════════════
+# 向量嵌入 (本地)
+# ═══════════════════════════════════════════════════════════════
+EMBEDDING_MODEL_NAME=BAAI/bge-m3
+EMBEDDING_DIMENSION=1024
+EMBEDDING_DEVICE=cuda
+EMBEDDING_LOCAL_DIR=/home/aiscend/.cache/vibelife/models/bge-m3
+DEFAULT_EMBEDDING_PROVIDER=local
+
+# ═══════════════════════════════════════════════════════════════
+# 向量存储 Pinecone
+# ═══════════════════════════════════════════════════════════════
+PINECONE_API_KEY=your_pinecone_api_key_here
+PINECONE_HOST=mentis-streams-nkchadl.svc.aped-4627-b74a.pinecone.io
+PINECONE_INDEX=vibelife-knowledge
+DEFAULT_VECTOR_PROVIDER=pinecone
+# 维度: 3072, Metric: cosine
+
+# ═══════════════════════════════════════════════════════════════
+# Stripe 支付
+# ═══════════════════════════════════════════════════════════════
+STRIPE_SECRET_KEY=your_stripe_secret_key_here
+STRIPE_PUBLISHABLE_KEY=your_stripe_publishable_key_here
+# STRIPE_WEBHOOK_SECRET=whsec_xxx
+
+# ═══════════════════════════════════════════════════════════════
+# 数据目录
+# ═══════════════════════════════════════════════════════════════
+VIBELIFE_DATA_ROOT=/data/vibelife
+VIBELIFE_KNOWLEDGE_ROOT=/data/vibelife/knowledge
+VIBELIFE_UPLOADS_ROOT=/data/vibelife/uploads
+VIBELIFE_CACHE_ROOT=/data/vibelife/cache
+VIBELIFE_LOGS_ROOT=/data/vibelife/logs
+
+# ═══════════════════════════════════════════════════════════════
+# 域名
+# ═══════════════════════════════════════════════════════════════
+VIBELIFE_DOMAIN=vibelife.app
+BAZI_DOMAIN=bazi.vibelife.app
+ZODIAC_DOMAIN=zodiac.vibelife.app
+MBTI_DOMAIN=mbti.vibelife.app
+ID_DOMAIN=id.vibelife.app
+VIBELIFE_WEB_URL=http://106.37.170.238:8232
+
+# ═══════════════════════════════════════════════════════════════
+# 前端配置
+# ═══════════════════════════════════════════════════════════════
+NEXT_PUBLIC_API_URL=http://106.37.170.238:8000
+NEXT_PUBLIC_API_BASE=http://106.37.170.238:8000/api/v1
+NEXT_PUBLIC_WS_URL=ws://106.37.170.238:8000/ws
+```
+
+---
+
+## 3. 前端环境变量
+
+`apps/web/.env.local`:
+```bash
+NEXT_PUBLIC_API_URL=http://106.37.170.238:8100
+NEXT_PUBLIC_API_BASE=http://106.37.170.238:8100/api/v1
+NEXT_PUBLIC_WS_URL=ws://106.37.170.238:8100/ws
+VIBELIFE_API_INTERNAL=http://127.0.0.1:8100
+NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=your_stripe_publishable_key_here
+```
+
+---
+
+## 4. 用户等级与权益
+
+### 用户等级 (UserTier)
+```python
+FREE = "free"   # 免费用户
+PRO = "pro"     # Pro 用户
+VIP = "vip"     # VIP 用户
+```
+
+### 订阅等级 (SubscriptionTier)
+```python
+FREE = "free"   # 免费
+PAID = "paid"   # 付费
+```
+
+### 权益配额
+```python
+TIER_CONFIG = {
+    "free": {"daily_limit": 3},   # 免费用户每天 3 次对话
+    "paid": {"daily_limit": 30},  # 付费用户每天 30 次对话
+}
+```
+
+### 订阅计划
+| 计划 | 价格(月) | 价格(年) | 功能 |
+|------|----------|----------|------|
+| 免费版 | ¥0 | ¥0 | 每天3次对话, 基础功能 |
+| 付费会员 | ¥29.9 | ¥299 | 每天30次对话, 所有功能 |
+
+### 双轨制类型 (VipType)
+```python
+PREPAID = "prepaid"           # 预付（大陆/香港）
+SUBSCRIPTION = "subscription"  # 订阅（海外）
+```
+
+---
+
+## 5. 付费墙触发点 (PaywallTrigger)
+
+### 八字
+- `deep_pattern_analysis` - 深度格局分析
+- `detailed_transit` - 详细运势
+- `compatibility_analysis` - 合婚分析
+- `ten_gods_deep` - 十神深度解读
+
+### 星座
+- `full_natal_chart` - 完整本命盘
+- `synastry_chart` - 双人合盘
+- `transit_forecast` - 行运预测
+- `aspect_analysis` - 相位分析
+
+### MBTI
+- `cognitive_functions_deep` - 认知功能深度
+- `type_compatibility` - 类型兼容性
+
+### 通用
+- `unlimited_chat` - 无限对话
+- `premium_insights` - 高级洞察
+- `export_data` - 数据导出
+
+---
+
+## 6. 人格系统
+
+### 语音模式 (VoiceMode)
+| 模式 | 值 | 风格 |
+|------|-----|------|
+| 暖心向导 | `warm` | 共情、支持、鼓励 (+80% 情绪价值) |
+| 毒舌损友 | `sarcastic` | 直接、犀利、有趣 (-20% 情绪价值) |
+| 人生导师 | `wise` | 理性、深度、像长辈指点 (+50% 情绪价值) |
+
+存储位置: `user_profiles.profile.preferences.voice_mode`
+
+---
+
+## 7. 模型路由配置
+
+### 任务类型 (TaskType)
+```python
+CHAT = "chat"           # 对话
+IMAGE_GEN = "image_gen" # 生图
+ANALYSIS = "analysis"   # 分析
+INTERVIEW = "interview" # 访谈
+REPORT = "report"       # 报告
+VISION = "vision"       # 视觉
+EMBEDDING = "embedding" # 嵌入
+```
+
+### 配额范围 (QuotaScope)
+```python
+GLOBAL = "global"       # 全局
+PROVIDER = "provider"   # 提供商
+MODEL = "model"         # 模型
+USER = "user"           # 用户
+TIER = "tier"           # 等级
+TASK = "task"           # 任务
+```
+
+### 配额周期 (Period)
+```python
+HOURLY = "hourly"
+DAILY = "daily"
+WEEKLY = "weekly"
+MONTHLY = "monthly"
+```
+
+### 超额策略 (ExceedAction)
+```python
+DOWNGRADE = "downgrade"  # 降级到备选模型
+REJECT = "reject"        # 拒绝请求
+QUEUE = "queue"          # 排队等待
+```
+
+### 默认路由 (apps/api/config/models.yaml)
+```yaml
+defaults:
+  chat:
+    primary: glm-4-flash
+    fallback: [gemini-flash, claude-sonnet]
+  analysis:
+    primary: glm-4-flash
+    fallback: [glm-4.7, claude-opus]
+  vision:
+    primary: glm-4v-plus
+    fallback: [claude-opus]
+  image_gen:
+    primary: gemini-image
+    fallback: []
+
+tier_overrides:
+  vip:
+    chat:
+      primary: claude-opus
+      fallback: [gemini-flash, glm-4.7]
+  pro:
+    chat:
+      primary: gemini-flash
+      fallback: [claude-sonnet, glm-4.7]
+
+fallback_triggers:
+  on_api_error: true
+  on_quota_exceeded: true
+  timeout: 30
+  max_retries: 2
+```
+
+---
+
+## 8. Worker 配置
+
+### IngestionWorker (文档入库)
+```python
+POLL_INTERVAL = 5       # 空闲时轮询间隔（秒）
+BATCH_SIZE = 10         # 每批最大嵌入数
+LOCK_TIMEOUT = 30       # 锁超时（分钟）
+CONVERTED_SUFFIX = ".converted.md"
+CONVERTED_DIR = "converted"
+```
+
+### Worker 文件
+- `apps/api/workers/ingestion.py` - 文档入库
+- `apps/api/workers/chunker.py` - 智能分块
+- `apps/api/workers/converters.py` - 文档转换
+- `apps/api/workers/daily_extraction.py` - 每日信息抽取
+
+---
+
+## 9. Context 配置
+
+```python
+max_history_messages = 20  # 最多保留的历史消息数
+token_budget = 8000        # 总 token 预算
+```
+
+### 缓存 TTL
+```python
+DEFAULT_TTL = 300  # 5 分钟 (模型路由缓存、Profile 缓存)
+```
+
+---
+
+## 10. Prompt 模板位置
+
+| 文件 | 用途 |
+|------|------|
+| `apps/api/services/vibe_engine/context.py` | 系统 Prompt (VIBE_PERSONA_BASE, BAZI_SKILL_CONTEXT, ZODIAC_SKILL_CONTEXT) |
+| `apps/api/services/vibe_engine/portrait.py` | Profile 更新 Prompt |
+| `apps/api/services/relationship/relationship_service.py` | 关系分析 Prompt |
+| `apps/api/services/report/report_service.py` | 报告生成 Prompt |
+| `apps/api/services/report/prologue_generator.py` | 卷首语 Prompt |
+| `apps/api/services/greeting/greeting_service.py` | 问候 Prompt |
+| `apps/api/services/persona/persona_service.py` | 人格 Prompt |
+
+---
+
+## 11. 数据库迁移
+
+按顺序执行:
+```bash
+psql $VIBELIFE_DB_URL -f migrations/001_v3_schema.sql
+psql $VIBELIFE_DB_URL -f migrations/002_interview_sessions.sql
+psql $VIBELIFE_DB_URL -f migrations/003_model_router.sql
+psql $VIBELIFE_DB_URL -f migrations/004_update_model_routes.sql
+psql $VIBELIFE_DB_URL -f migrations/005_user_gender_voice_mode.sql
+psql $VIBELIFE_DB_URL -f migrations/006_fix_knowledge_table_refs.sql
+psql $VIBELIFE_DB_URL -f migrations/007_skill_terms.sql
+psql $VIBELIFE_DB_URL -f migrations/008_knowledge_converted_path.sql
+psql $VIBELIFE_DB_URL -f migrations/009_user_notifications.sql
+psql $VIBELIFE_DB_URL -f migrations/010_user_entitlements.sql
+psql $VIBELIFE_DB_URL -f migrations/011_guest_sessions.sql
+psql $VIBELIFE_DB_URL -f migrations/012_payment_dual_track.sql
+psql $VIBELIFE_DB_URL -f migrations/013_fortune_cache.sql
+psql $VIBELIFE_DB_URL -f migrations/014_user_skill_data.sql
+```
+
+必需扩展: `uuid-ossp`, `pgcrypto`, `vector`
+
+---
+
+## 12. 数据库枚举值
+
+### user_entitlements
+- `tier`: `free` | `paid`
+- `daily_conversations_limit`: 默认 3
+- `daily_conversations_used`: 默认 0
+
+### model_routes
+- `match_user_tier`: `free` | `pro` | `vip`
+- `match_task`: `chat` | `image_gen` | `analysis` | `interview` | `report`
+
+### quota_rules
+- `scope`: `global` | `provider` | `model` | `user` | `tier` | `task`
+- `period`: `hourly` | `daily` | `weekly` | `monthly`
+- `on_exceed`: `downgrade` | `reject` | `queue`
+
+### subscriptions
+- `vip_type`: `prepaid` | `subscription`
+- `status`: `active` | `trialing` | `past_due` | `canceled` | `expired` | `suspended`
+- `region`: `CN` | `GLOBAL`
+
+### conversations
+- `skill`: `bazi` | `zodiac`
+- `voice_mode`: `warm` | `sarcastic` | `wise`
+
+### messages
+- `role`: `user` | `assistant` | `system`
+
+### reports
+- `skill`: `bazi` | `zodiac`
+- `report_type`: `brief` | `full`
+
+---
+
+## 13. 端口分配
+
+| 服务 | 开发 | 测试 | 生产 |
+|------|------|------|------|
+| API | 8000 | 8100 | 8000 |
+| Web | 3000 | 8232 | 3000 |
+| PostgreSQL | - | 8224 | 8224 |
+
+---
+
+## 14. 启动命令
+
+```bash
+# 安装依赖
+pnpm install
+pip install -r apps/api/requirements.txt
+
+# 开发环境
+cd apps/api && uvicorn main:app --reload --host 0.0.0.0 --port 8000
+cd apps/web && pnpm dev
+
+# 测试环境
+cd apps/api && uvicorn main:app --host 0.0.0.0 --port 8100
+cd apps/web && PORT=8232 pnpm dev
+
+# 生产环境
+cd deploy/aiscend && docker-compose up -d
+```
+
+---
+
+## 15. 目录结构
+
+```
+apps/api/
+├── main.py                    # 入口
+├── config/models.yaml         # 模型路由配置
+├── routes/                    # API 路由 (17个)
+├── services/                  # 业务服务
+│   ├── vibe_engine/           # 核心引擎
+│   │   ├── context.py         # 上下文组装
+│   │   ├── llm.py             # LLM 编排
+│   │   ├── portrait.py        # 画像管理
+│   │   └── profile_cache.py   # Profile 缓存
+│   ├── model_router/          # 模型路由
+│   │   ├── router.py          # 路由核心
+│   │   ├── models.py          # 数据模型
+│   │   ├── quota.py           # 配额管理
+│   │   └── cache.py           # 缓存
+│   ├── persona/               # 人格系统
+│   ├── knowledge/             # RAG 知识检索
+│   ├── identity/              # 认证
+│   ├── billing/               # 账单
+│   │   ├── subscription.py    # 订阅
+│   │   └── paywall.py         # 付费墙
+│   ├── entitlement/           # 权益
+│   └── ...
+├── stores/db.py               # 数据库连接
+├── tools/                     # 命理计算
+│   ├── bazi/                  # 八字
+│   └── zodiac/                # 星座
+└── workers/                   # 后台任务
+
+apps/web/src/
+├── app/                       # Next.js 页面
+├── components/                # React 组件
+└── hooks/                     # Hooks
+```
+
+---
+
+## 16. API 路由
+
+| 路由 | 前缀 | 核心端点 |
+|------|------|----------|
+| health | / | GET /health |
+| auth | /api/v1 | POST /auth/login, /auth/register |
+| guest | /api/v1 | POST /guest/session |
+| users | /api/v1 | GET /users/me, PUT /users/profile |
+| chat | /api/v1 | POST /chat/message (SSE) |
+| onboarding | /api/v1 | POST /onboarding/start |
+| report | /api/v1 | POST /report/generate |
+| relationship | /api/v1 | POST /relationship/analyze |
+| fortune | /api/v1 | GET /fortune/yearly |
+| payment | /api/v1 | POST /payment/create-session |
+| billing | /api/v1 | GET /billing/subscription |
+| entitlement | /api/v1 | GET /entitlement/check |
+| bazi | /api/v1 | POST /bazi/calculate |
+| zodiac | /api/v1 | POST /zodiac/chart |
+| memories | /api/v1 | GET /memories/insights |
+| identity | /api/v1 | POST /identity/link |
+| notifications | /api/v1 | GET /notifications |
+
+---
+
+## 17. 数据库核心表
+
+| 表 | 关键字段 |
+|----|----------|
+| vibe_users | vibe_id, email, phone, is_guest |
+| user_auth | user_id, auth_type, auth_identifier, password_hash |
+| user_profiles | user_id, version, profile (JSONB) |
+| conversations | user_id, skill, voice_mode |
+| messages | conversation_id, role, content |
+| reports | user_id, skill, report_type, content (JSONB), is_paid |
+| relationships | initiator_id, partner_id, analysis (JSONB) |
+| subscriptions | user_id, plan_id, status, vip_type, region |
+| payments | user_id, amount, currency, status |
+| user_entitlements | user_id, tier, daily_conversations_limit |
+| insights | user_id, category, content |
+| model_routes | match_user_tier, match_task, model_id |
+| quota_rules | scope, period, max_count, on_exceed |
+
+---
+
+## 18. 健康检查
+
+```bash
+# API
+curl http://localhost:8000/health
+
+# 数据库
+psql $VIBELIFE_DB_URL -c "SELECT 1"
+
+# Pinecone
+curl -H "Api-Key: $PINECONE_API_KEY" https://$PINECONE_HOST/describe_index_stats
+```
+
+---
+
+## 19. 常见问题
+
+**Q: API 启动失败 "VIBELIFE_DB_URL not set"**
+A: 确保 `.env` 在项目根目录
+
+**Q: 前端无法连接 API**
+A: 检查 `VIBELIFE_CORS_ORIGINS`
+
+**Q: 向量嵌入报错**
+A: 首次运行会自动下载模型到 `EMBEDDING_LOCAL_DIR`
+
+**Q: Worker 不工作**
+A: 检查 `VIBELIFE_WORKER_ENABLED=1`
+
+**Q: 付费功能不生效**
+A: 检查 `user_entitlements` 表中用户的 `tier` 值

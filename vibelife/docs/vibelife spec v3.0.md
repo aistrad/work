@@ -1,11 +1,11 @@
 # VibeLife 产品设计文档 V3.0
 
-> **版本**: 3.3
-> **日期**: 2026-01-10
+> **版本**: 3.4
+> **日期**: 2026-01-11
 > **定位**: Phase 1 产品落地的唯一真理来源 (Source of Truth)
 > **北极星指标**: 1000 个付费用户
 > **交付周期**: 12 周
-> **更新**: AI SDK 6 集成、前端架构重构 (bazi/zodiac 路由组)、ResizablePanel 边栏、Knowledge v2.0 目录结构
+> **更新**: 首屏运势卡片集成、智能通知系统前端展示、DailyFortuneCard + NotificationCenter 组件
 
 ---
 
@@ -183,10 +183,11 @@
 ║   P0+ - 提升优先级（原 P1，现必须上线）                                       ║
 ║   ─────────────────────────────────────────────────────────────────────────   ║
 ║                                                                               ║
-║   7. Daily Greeting (每日问候) ★ 强制展示                                     ║
+║   7. Daily Greeting (每日问候) ★ 强制展示 ✅ 已实现                           ║
 ║      • 用户打开网页必须首先看到 Greeting                                      ║
 ║      • 节气/天象/用户运势相关                                                 ║
 ║      • 是「主动关心」的核心体现（Phase 1 替代 Push）                          ║
+║      • 实现: DailyFortuneCard + NotificationCenter 组件                       ║
 ║                                                                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
@@ -1701,6 +1702,33 @@ Step 2: 结果展示 - RelationshipCard
 │   • 保留最近 10 个版本                                                      │
 │   • 支持回溯查看「你当时是这么说的...」                                     │
 │                                                                             │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   Skill Data 分层架构 (v5.3 新增)                                           │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   命盘数据（八字、星座等）存储在独立的 user_skill_data 表：                 │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                     │   │
+│   │   user_profiles 表（共享层）                                        │   │
+│   │   • basic: 用户基础信息 + 关键字段副本                              │   │
+│   │   • life_context, ai_insights, identity_prism, preferences          │   │
+│   │                                                                     │   │
+│   │   user_skill_data 表（Skill 层）                                    │   │
+│   │   • user_id, skill, data (JSONB), input_hash                        │   │
+│   │   • bazi: 完整八字命盘数据                                          │   │
+│   │   • zodiac: 完整星盘数据                                            │   │
+│   │   • 未来可扩展：mbti, numerology 等                                 │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   优势：                                                                    │
+│   • 解耦：用户基础信息与 Skill 特定数据分离                                │
+│   • 可扩展：新增 Skill 只需添加新记录                                      │
+│   • 高效缓存：合并缓存 + input_hash 避免重复计算                           │
+│   • 向后兼容：关键字段副本保证旧代码正常工作                               │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -2047,6 +2075,10 @@ Step 2: 结果展示 - RelationshipCard
 │     ├── Claude (claude-opus-4-5) - 高级分析                                 │
 │     └── Fallback 链: API 失败或配额超限自动切换                             │
 │   • 模型路由: services/model_router/ (动态路由 + 配额管理)                  │
+│   • UI Tool 执行器: services/vibe_engine/tool_executor.py                   │
+│     └── UI Tools 在后端直接执行，避免 Next.js 回环                          │
+│   • Profile 缓存: services/vibe_engine/profile_cache.py                     │
+│     └── 内存缓存 TTL 5min，减少 DB 查询                                     │
 │   • Embedding：                                                             │
 │     ├── BAAI/bge-m3 - 多语言 (1024维)                                       │
 │     └── 本地 SentenceTransformers 推理                                      │
@@ -2056,7 +2088,7 @@ Step 2: 结果展示 - RelationshipCard
 │   ─────────────────────────────────────────────────────────────────────     │
 │   • 主数据库：PostgreSQL 16                                                 │
 │   • 向量数据库：pgvector（PostgreSQL 扩展，1024维）                         │
-│   • 缓存：内存缓存 (RouteCache)                                             │
+│   • 缓存：内存缓存 (RouteCache + ProfileCache)                              │
 │   • 文件存储：本地 /data/vibelife/                                          │
 │   • 认证：自建 JWT + OAuth (Google/Apple)                                   │
 │                                                                             │
