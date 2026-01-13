@@ -82,6 +82,17 @@ for proj in AIS fortune_ai vibelife cli_worker mentis; do
     fi
 done
 
+# 同步主项目 .claude/
+for proj in vibelife; do
+    if [ -d "$WORK_DIR/$proj/.claude" ]; then
+        echo ""
+        echo "Syncing $proj/.claude/..."
+        mkdir -p "$SYNC_DIR/$proj/.claude"
+        rsync -av --delete "${EXCLUDE_OPTS[@]}" \
+            "$WORK_DIR/$proj/.claude/" "$SYNC_DIR/$proj/.claude/"
+    fi
+done
+
 # 创建 .gitignore
 if [ ! -f "$SYNC_DIR/.gitignore" ]; then
     echo ""
