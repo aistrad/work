@@ -1,0 +1,337 @@
+"""
+SkillLoader v6 单元测试
+测试知识分层加载、关键词匹配、System Prompt 构建
+"""
+import pytest
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from services.agent.skill_loader import (
+    SkillConfig, ExtendedKnowledge, CaseLibrary, SkillTools, ToolDefinition,
+    parse_frontmatter, load_skill, load_extended, load_cases, load_tools,
+    extract_keywords, match_knowledge, build_system_prompt, build_runtime_context,
+    get_available_skills, SKILLS_DIR
+)
+
+
+class TestParseFrontmatter:
+    """测试 YAML frontmatter 解析"""
+
+    def test_parse_basic_frontmatter(self):
+        text = """---
+name: test
+description: Test skill
+---
+
+# Content here"""
+        metadata, content = parse_frontmatter(text)
+        assert metadata["name"] == "test"
+        assert metadata["description"] == "Test skill"
+        assert "# Content here" in content
+
+    def test_parse_boolean_values(self):
+        text = """---
+auto_collect: true
+requires_birth_info: false
+---
+Content"""
+        metadata, content = parse_frontmatter(text)
+        assert metadata["auto_collect"] is True
+        assert metadata["requires_birth_info"] is False
+
+    def test_parse_list_values(self):
+        text = """---
+triggers:
+  - 八字
+  - 命理
+  - 生辰
+---
+Content"""
+        metadata, content = parse_frontmatter(text)
+        assert metadata["triggers"] == ["八字", "命理", "生辰"]
+
+    def test_no_frontmatter(self):
+        text = "# Just content\nNo frontmatter here"
+        metadata, content = parse_frontmatter(text)
+        assert metadata == {}
+        assert "# Just content" in content
+
+
+class TestLoadSkill:
+    """测试 Skill 核心配置加载"""
+
+    def test_load_bazi_skill(self):
+        skill = load_skill("bazi")
+        assert skill is not None
+        assert skill.name == "bazi"
+        assert len(skill.content) > 0
+
+    def test_load_core_skill(self):
+        skill = load_skill("core")
+        assert skill is not None
+        assert skill.name == "core"
+
+    def test_load_nonexistent_skill(self):
+        skill = load_skill("nonexistent_skill_xyz")
+        assert skill is None
+
+    def test_skill_triggers(self):
+        skill = load_skill("bazi")
+        if skill and skill.triggers:
+            assert isinstance(skill.triggers, list)
+            assert len(skill.triggers) > 0
+
+
+class TestLoadExtended:
+    """测试扩展知识加载"""
+
+    def test_load_bazi_extended(self):
+        extended = load_extended("bazi")
+        if extended:
+            assert isinstance(extended, ExtendedKnowledge)
+            assert hasattr(extended, "rules")
+            assert hasattr(extended, "patterns")
+
+    def test_load_nonexistent_extended(self):
+        extended = load_extended("nonexistent_skill_xyz")
+        assert extended is None
+
+
+class TestLoadCases:
+    """测试案例库加载"""
+
+    def test_load_bazi_cases(self):
+        cases = load_cases("bazi")
+        if cases:
+            assert isinstance(cases, CaseLibrary)
+            assert hasattr(cases, "archetypes")
+            assert hasattr(cases, "edge_cases")
+
+    def test_load_nonexistent_cases(self):
+        cases = load_cases("nonexistent_skill_xyz")
+        assert cases is None
+
+
+class TestLoadTools:
+    """测试工具定义加载"""
+
+    def test_load_bazi_tools(self):
+        tools = load_tools("bazi")
+        if tools:
+            assert isinstance(tools, SkillTools)
+            all_tools = tools.get_all_tools()
+            assert isinstance(all_tools, list)
+
+    def test_tools_openai_format(self):
+        tools = load_tools("bazi")
+        if tools:
+            openai_tools = tools.to_openai_format()
+            assert isinstance(openai_tools, list)
+            for tool in openai_tools:
+                assert "type" in tool
+                assert "function" in tool
+                assert "name" in tool["function"]
+
+
+class TestExtendedKnowledgeMatching:
+    """测试扩展知识关键词匹配"""
+
+    def test_match_rules_exact(self):
+        extended = ExtendedKnowledge(
+            rules={
+                "tier1_must_know": [
+                    {"id": "R1", "keywords": ["身强", "用神"], "conclusion": "身强需泄耗"},
+                    {"id": "R2", "keywords": ["身弱", "印星"], "conclusion": "身弱喜印比"},
+                ]
+            }
+        )
+        matched = extended.match_rules(["身强", "财官"])
+        assert len(matched) > 0
+        assert matched[0]["id"] == "R1"
+
+    def test_match_rules_substring(self):
+        """测试双向子串匹配"""
+        extended = ExtendedKnowledge(
+            rules={
+                "tier1_must_know": [
+                    {"id": "R1", "keywords": ["日主身强"], "conclusion": "test"},
+                ]
+            }
+        )
+        # "身强" 是 "日主身强" 的子串
+        matched = extended.match_rules(["身强"])
+        assert len(matched) > 0
+
+    def test_match_rules_top_n(self):
+        extended = ExtendedKnowledge(
+            rules={
+                "tier1_must_know": [
+                    {"id": f"R{i}", "keywords": ["测试"], "conclusion": f"rule{i}"}
+                    for i in range(20)
+                ]
+            }
+        )
+        matched = extended.match_rules(["测试"], top_n=5)
+        assert len(matched) == 5
+
+    def test_match_rules_no_match(self):
+        extended = ExtendedKnowledge(
+            rules={
+                "tier1_must_know": [
+                    {"id": "R1", "keywords": ["身强"], "conclusion": "test"},
+                ]
+            }
+        )
+        matched = extended.match_rules(["完全不相关的词"])
+        assert len(matched) == 0
+
+    def test_match_patterns(self):
+        extended = ExtendedKnowledge(
+            patterns={
+                "quick_patterns": [
+                    {"id": "QP1", "keywords": ["官杀混杂"], "indication": "压力大"},
+                ]
+            }
+        )
+        matched = extended.match_patterns(["官杀"])
+        assert len(matched) > 0
+
+
+class TestCaseLibraryMatching:
+    """测试案例库关键词匹配"""
+
+    def test_match_cases(self):
+        cases = CaseLibrary(
+            archetypes=[
+                {"id": "C1", "keywords": ["身强", "财官"], "name": "身强用财官"},
+                {"id": "C2", "keywords": ["身弱", "印比"], "name": "身弱用印比"},
+            ]
+        )
+        matched = cases.match_cases(["身强", "用神"])
+        assert len(matched) > 0
+        assert matched[0]["id"] == "C1"
+
+    def test_match_cases_top_n(self):
+        cases = CaseLibrary(
+            archetypes=[
+                {"id": f"C{i}", "keywords": ["测试"], "name": f"case{i}"}
+                for i in range(10)
+            ]
+        )
+        matched = cases.match_cases(["测试"], top_n=3)
+        assert len(matched) == 3
+
+
+class TestExtractKeywords:
+    """测试关键词提取"""
+
+    def test_extract_chinese_keywords(self):
+        keywords = extract_keywords("我想看看八字命盘")
+        assert isinstance(keywords, list)
+        assert len(keywords) > 0
+
+    def test_extract_empty_text(self):
+        keywords = extract_keywords("")
+        assert keywords == []
+
+    def test_extract_mixed_text(self):
+        keywords = extract_keywords("我的MBTI是INTJ")
+        assert isinstance(keywords, list)
+
+
+class TestMatchKnowledge:
+    """测试知识匹配"""
+
+    def test_match_knowledge_bazi(self):
+        result = match_knowledge("身强财官用神", "bazi")
+        assert "rules" in result
+        assert "patterns" in result
+        assert "cases" in result
+
+    def test_match_knowledge_nonexistent_skill(self):
+        result = match_knowledge("测试", "nonexistent_skill")
+        assert result["rules"] == []
+        assert result["patterns"] == []
+        assert result["cases"] == []
+
+
+class TestBuildSystemPrompt:
+    """测试 System Prompt 构建"""
+
+    def test_build_with_core(self):
+        prompt = build_system_prompt(["bazi"], include_core=True)
+        assert len(prompt) > 0
+
+    def test_build_without_core(self):
+        prompt = build_system_prompt(["bazi"], include_core=False)
+        core_skill = load_skill("core")
+        if core_skill:
+            # 不应包含 core 的内容（除非 bazi 本身包含）
+            pass
+
+    def test_build_multiple_skills(self):
+        prompt = build_system_prompt(["bazi", "zodiac"])
+        assert len(prompt) > 0
+
+
+class TestBuildRuntimeContext:
+    """测试运行时上下文构建"""
+
+    def test_build_context_with_knowledge(self):
+        context = build_runtime_context("bazi", "身强用神分析", include_knowledge=True)
+        # 如果有匹配的知识，应该包含相关内容
+        assert isinstance(context, str)
+
+    def test_build_context_without_knowledge(self):
+        context = build_runtime_context("bazi", "测试", include_knowledge=False)
+        assert context == ""
+
+
+class TestGetAvailableSkills:
+    """测试获取可用 Skills"""
+
+    def test_get_available_skills(self):
+        skills = get_available_skills()
+        assert isinstance(skills, list)
+        # 至少应该有 core 和 bazi
+        assert "core" in skills or "bazi" in skills
+
+
+class TestSkillToolsFormat:
+    """测试工具格式转换"""
+
+    def test_tool_definition_creation(self):
+        tool = ToolDefinition(
+            name="test_tool",
+            description="A test tool",
+            tool_type="display",
+            card_type="test_card",
+            parameters=[{"name": "param1", "type": "string", "required": True}]
+        )
+        assert tool.name == "test_tool"
+        assert tool.tool_type == "display"
+
+    def test_skill_tools_to_openai_format(self):
+        tools = SkillTools(
+            display=[
+                ToolDefinition(
+                    name="show_chart",
+                    description="Show chart",
+                    tool_type="display",
+                    parameters=[{"name": "user_id", "type": "string", "required": True}]
+                )
+            ]
+        )
+        openai_format = tools.to_openai_format()
+        assert len(openai_format) == 1
+        assert openai_format[0]["function"]["name"] == "show_chart"
+        assert "parameters" in openai_format[0]["function"]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

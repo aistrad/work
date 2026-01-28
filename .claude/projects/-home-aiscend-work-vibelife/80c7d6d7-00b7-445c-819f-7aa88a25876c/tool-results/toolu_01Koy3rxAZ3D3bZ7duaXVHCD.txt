@@ -1,0 +1,713 @@
+     1→"""
+     2→Prompt Builder v10 - System Prompt 构建
+     3→
+     4→从 core.py 拆分出来的 Prompt 构建逻辑，支持：
+     5→- Phase 1/Phase 2 分阶段 Prompt
+     6→- 会话恢复 Prompt（断点续传）
+     7→- SOP 规则注入
+     8→- 案例匹配
+     9→
+    10→与 ContextManager 协作：
+    11→- 读取会话上下文
+    12→- 注入断点信息
+    13→"""
+    14→import json
+    15→import logging
+    16→from typing import Optional, Dict, Any, List
+    17→
+    18→from .skill_loader import (
+    19→    load_skill, build_system_prompt,
+    20→    skill_requires_birth_info, skill_requires_compute,
+    21→    get_skill_compute_type, get_skill_compute_tool, get_skill_collect_tool,
+    22→    get_skill_required_data
+    23→)
+    24→# 简化：仅保留 inject_placeholders 的最小实现以兼容调用
+    25→def inject_placeholders(template: str, context: Optional[Dict[str, Any]] = None) -> str:
+    26→    if not template:
+    27→        return template
+    28→    replacements = dict(context or {})
+    29→    result = template
+    30→    for k, v in replacements.items():
+    31→        result = result.replace("{" + k + "}", str(v))
+    32→    return result
+    33→from .context_manager import SessionContext
+    34→
+    35→logger = logging.getLogger(__name__)
+    36→
+    37→
+    38→class PromptBuilder:
+    39→    """
+    40→    System Prompt 构建器
+    41→
+    42→    职责：
+    43→    1. 根据 Phase 构建不同的 Prompt
+    44→    2. 注入会话恢复上下文
+    45→    3. 注入 SOP 规则
+    46→    4. 动态加载案例
+    47→    5. v10.1: 用户画像注入（让 Coach 了解用户）
+    48→    """
+    49→
+    50→    # 需要详细用户画像的 Skill（注入 goals, patterns, findings）
+    51→    PORTRAIT_FULL_SKILLS = {"lifecoach", "career"}
+    52→
+    53→    # 需要出生信息的 Skill
+    54→    BIRTH_INFO_SKILLS = {"bazi", "zodiac", "jungastro"}
+    55→
+    56→    def __init__(self):
+    57→        self.case_index = None  # Lazy init
+    58→
+    59→    async def build(
+    60→        self,
+    61→        skill_id: Optional[str],
+    62→        rule_id: Optional[str],
+    63→        message: str,
+    64→        profile: Optional[Dict[str, Any]] = None,
+    65→        skill_data: Optional[Dict[str, Any]] = None,
+    66→        session_context: Optional[SessionContext] = None,
+    67→        protocol_prompt: Optional[str] = None
+    68→    ) -> str:
+    69→        """
+    70→        构建 System Prompt
+    71→
+    72→        Args:
+    73→            skill_id: 当前技能 ID
+    74→            rule_id: 当前规则 ID
+    75→            message: 用户消息
+    76→            profile: 用户 Profile
+    77→            skill_data: Skill 数据
+    78→            session_context: 会话上下文（断点续传）
+    79→            protocol_prompt: 协议专用 Prompt（可选）
+    80→
+    81→        Returns:
+    82→            完整的 System Prompt
+    83→        """
+    84→        parts = []
+    85→
+    86→        # ═══════════════════════════════════════════════════════════════
+    87→        # 协议模式：使用协议专用 Prompt
+    88→        # ═══════════════════════════════════════════════════════════════
+    89→        if protocol_prompt:
+    90→            skill = load_skill("lifecoach")
+    91→            if skill:
+    92→                parts.append(f"# {skill.name}\n\n{skill.expert_persona}")
+    93→            parts.append("\n---\n")
+    94→            parts.append(protocol_prompt)
+    95→            return "\n".join(parts)
+    96→
+    97→        if skill_id:
+    98→            # ═══════════════════════════════════════════════════════════════
+    99→            # Phase 2: Skill 执行阶段 - 完整上下文
+   100→            # ═══════════════════════════════════════════════════════════════
+   101→
+   102→            # 基础 Skill Prompt
+   103→            user_ctx = dict(profile) if profile else {}
+   104→            base_prompt = build_system_prompt(skill_id, rule_id, user_ctx)
+   105→            parts.append(base_prompt)
+   106→
+   107→            # ═══════════════════════════════════════════════════════════════
+   108→            # Profile 注入（简化版 v2.2）- 两层架构
+   109→            # ═══════════════════════════════════════════════════════════════
+   110→            profile_context = self._build_profile_context(profile, skill_data, skill_id)
+   111→            if profile_context:
+   112→                parts.append(profile_context)
+   113→
+   114→            # 会话恢复上下文（断点续传核心）
+   115→            if session_context and session_context.has_checkpoint:
+   116→                resume_context = session_context.to_prompt_context()
+   117→                if resume_context:
+   118→                    parts.append(resume_context)
+   119→
+   120→            # SOP 规则
+   121→            sop_rules = self._build_sop_rules(skill_id, profile, skill_data)
+   122→            if sop_rules:
+   123→                parts.append(sop_rules)
+   124→
+   125→            # 案例匹配
+   126→            cases_text = await self._match_cases(skill_id, skill_data)
+   127→            if cases_text:
+   128→                parts.append(cases_text)
+   129→
+   130→        else:
+   131→            # ═══════════════════════════════════════════════════════════════
+   132→            # Phase 1: Skill 选择阶段 - v11 个性化路由
+   133→            # ═══════════════════════════════════════════════════════════════
+   134→
+   135→            # LLM-First: 构建最小 Phase 1 提示（不依赖 routing.yaml）
+   136→            from .skill_loader import build_phase1_prompt
+   137→            core_prompt = build_phase1_prompt()
+   138→            # 注入用户画像和订阅信息（用于个性化路由）
+   139→            if profile:
+   140→                core_prompt = self._inject_phase1_context(core_prompt, profile)
+   141→            parts.append(core_prompt)
+   142→
+   143→        return "\n".join(parts)
+   144→
+   145→    def _build_profile_context(
+   146→        self,
+   147→        profile: Optional[Dict[str, Any]],
+   148→        skill_data: Optional[Dict[str, Any]],
+   149→        skill_id: str
+   150→    ) -> str:
+   151→        """
+   152→        构建 Profile 上下文（v3.0 三层架构）
+   153→
+   154→        三层架构：
+   155→        - Layer 1: Identity（共享）- 基本信息
+   156→        - Layer 2: Skills（当前 Skill 专属）- skills.{skill_id}
+   157→        - Layer 3: Vibe（共享深度信息）- vibe.insight + vibe.target
+   158→        """
+   159→        parts = []
+   160→
+   161→        # ═══════════════════════════════════════════════════════════════
+   162→        # Layer 1: Identity（所有 Skill 共享，~200 tokens）
+   163→        # ═══════════════════════════════════════════════════════════════
+   164→        if profile:
+   165→            identity = profile.get("identity", {})
+   166→
+   167→            base_info = []
+   168→
+   169→            # 用户名
+   170→            name = identity.get("display_name")
+   171→            if name:
+   172→                base_info.append(f"- 用户名：{name}")
+   173→
+   174→            # 出生信息（如有）
+   175→            birth = identity.get("birth_info", {})
+   176→            if birth:
+   177→                birth_date = birth.get("birth_date") or birth.get("date")
+   178→                if birth_date:
+   179→                    base_info.append(f"- 出生日期：{birth_date}")
+   180→                birth_time = birth.get("birth_time") or birth.get("time")
+   181→                if birth_time:
+   182→                    base_info.append(f"- 出生时间：{birth_time}")
+   183→                birth_place = birth.get("birth_place") or birth.get("location")
+   184→                if birth_place:
+   185→                    base_info.append(f"- 出生地点：{birth_place}")
+   186→
+   187→            if base_info:
+   188→                parts.append("## 用户信息\n\n" + "\n".join(base_info))
+   189→
+   190→        # ═══════════════════════════════════════════════════════════════
+   191→        # Layer 2: Skills（当前 Skill 专属，~300 tokens）
+   192→        # ═══════════════════════════════════════════════════════════════
+   193→        if skill_data:
+   194→            # 获取该 Skill 需要的 skill_data（从 SKILL.md 配置读取）
+   195→            skill_ids = get_skill_required_data(skill_id)
+   196→
+   197→            for sid in skill_ids:
+   198→                data = skill_data.get(sid, {})
+   199→                if data:
+   200→                    # 过滤掉内部字段（以 _ 开头）
+   201→                    filtered_data = {k: v for k, v in data.items() if not k.startswith("_")}
+   202→                    if filtered_data:
+   203→                        parts.append(f"\n## {sid} 数据\n\n```json\n{json.dumps(filtered_data, ensure_ascii=False, indent=2)}\n```")
+   204→
+   205→        # ═══════════════════════════════════════════════════════════════
+   206→        # Layer 3: Vibe（共享深度信息，~200 tokens）
+   207→        # ═══════════════════════════════════════════════════════════════
+   208→        if profile:
+   209→            vibe = profile.get("vibe", {})
+   210→
+   211→            # VibeInsight - 我是谁
+   212→            insight = vibe.get("insight", {})
+   213→            if insight:
+   214→                insight_parts = []
+   215→
+   216→                # 本质
+   217→                essence = insight.get("essence", {})
+   218→                if essence:
+   219→                    archetype = essence.get("archetype", {})
+   220→                    if archetype.get("primary"):
+   221→                        insight_parts.append(f"- 主要原型：{archetype['primary']}")
+   222→                    traits = essence.get("traits", [])
+   223→                    if traits:
+   224→                        trait_text = ", ".join([t.get("trait", str(t)) if isinstance(t, dict) else str(t) for t in traits[:3]])
+   225→                        insight_parts.append(f"- 核心特质：{trait_text}")
+   226→
+   227→                # 动态
+   228→                dynamic = insight.get("dynamic", {})
+   229→                if dynamic:
+   230→                    emotion = dynamic.get("emotion", {})
+   231→                    if emotion.get("current"):
+   232→                        insight_parts.append(f"- 当前情绪：{emotion['current']}")
+   233→                    energy = dynamic.get("energy", {})
+   234→                    if energy.get("level"):
+   235→                        insight_parts.append(f"- 能量水平：{energy['level']}")
+   236→
+   237→                # 规律
+   238→                pattern = insight.get("pattern", {})
+   239→                if pattern:
+   240→                    insights_list = pattern.get("insights", [])
+   241→                    if insights_list:
+   242→                        insight_parts.append(f"- 洞察：{insights_list[0]}")
+   243→
+   244→                if insight_parts:
+   245→                    parts.append("\n## 用户画像\n\n" + "\n".join(insight_parts))
+   246→
+   247→            # VibeTarget - 我要成为谁
+   248→            target = vibe.get("target", {})
+   249→            if target:
+   250→                target_parts = []
+   251→
+   252→                # 北极星
+   253→                north_star = target.get("north_star", {})
+   254→                if north_star.get("vision_scene"):
+   255→                    vision = north_star["vision_scene"]
+   256→                    if len(vision) > 100:
+   257→                        vision = vision[:100] + "..."
+   258→                    target_parts.append(f"- 愿景：{vision}")
+   259→
+   260→                # 目标
+   261→                goals = target.get("goals", [])
+   262→                if goals:
+   263→                    active_goals = [g for g in goals if g.get("status") == "in_progress"][:2]
+   264→                    if active_goals:
+   265→                        goals_text = ", ".join([g.get("title", "") for g in active_goals])
+   266→                        target_parts.append(f"- 当前目标：{goals_text}")
+   267→
+   268→                # 聚焦
+   269→                focus = target.get("focus", {})
+   270→                if focus.get("primary"):
+   271→                    target_parts.append(f"- 关注领域：{focus['primary']}")
+   272→
+   273→                if target_parts:
+   274→                    parts.append("\n## 用户目标\n\n" + "\n".join(target_parts))
+   275→
+   276→        return "\n".join(parts) if parts else ""
+   277→
+   278→    def _build_sop_rules(
+   279→        self,
+   280→        skill_id: str,
+   281→        profile: Optional[Dict[str, Any]],
+   282→        skill_data: Optional[Dict[str, Any]]
+   283→    ) -> str:
+   284→        """
+   285→        构建 SOP 规则（自然语言版）
+   286→
+   287→        根据当前状态生成教练式指导。
+   288→        """
+   289→        needs_birth = skill_requires_birth_info(skill_id)
+   290→        needs_compute = skill_requires_compute(skill_id)
+   291→
+   292→        # 计算当前状态
+   293→        status = self._compute_status(skill_id, profile, skill_data)
+   294→
+   295→        # 如果已经可以分析，使用简洁的状态提示
+   296→        if status["ready_for_analysis"]:
+   297→            return self._get_ready_prompt()
+   298→
+   299→        rules_parts = []
+   300→
+   301→        # P1: 需要收集信息
+   302→        if needs_birth and not status["has_birth_info"]:
+   303→            collect_tool = get_skill_collect_tool(skill_id) or "request_info"
+   304→            rules_parts.append(self._get_need_birth_prompt(collect_tool))
+   305→
+   306→        # P2: 需要计算
+   307→        elif needs_compute and not status["has_chart_data"]:
+   308→            compute_type = get_skill_compute_type(skill_id) or skill_id
+   309→            compute_tool = get_skill_compute_tool(skill_id) or f"calculate_{compute_type}"
+   310→
+   311→            rules_parts.append(self._get_need_compute_prompt(compute_tool))
+   312→
+   313→        return "\n".join(rules_parts)
+   314→
+   315→    def _compute_status(
+   316→        self,
+   317→        skill_id: str,
+   318→        profile: Optional[Dict[str, Any]],
+   319→        skill_data: Optional[Dict[str, Any]]
+   320→    ) -> Dict[str, Any]:
+   321→        """计算当前 SOP 状态"""
+   322→        needs_birth = skill_requires_birth_info(skill_id)
+   323→        needs_compute = skill_requires_compute(skill_id)
+   324→
+   325→        # 检查出生信息
+   326→        has_birth = False
+   327→        if profile:
+   328→            identity = profile.get("identity", {})
+   329→            birth_info = identity.get("birth_info", {})
+   330→            has_birth = bool(birth_info.get("birth_date") or birth_info.get("date"))
+   331→
+   332→        # 检查命盘数据
+   333→        has_chart = False
+   334→        if skill_data:
+   335→            compute_type = get_skill_compute_type(skill_id) or skill_id
+   336→            data = skill_data.get(compute_type, {})
+   337→            has_chart = bool(data.get("chart") or data.get("cards"))
+   338→
+   339→        return {
+   340→            "skill_id": skill_id,
+   341→            "needs_birth_info": needs_birth,
+   342→            "has_birth_info": has_birth,
+   343→            "needs_compute": needs_compute,
+   344→            "has_chart_data": has_chart,
+   345→            "ready_for_analysis": (not needs_birth or has_birth) and (not needs_compute or has_chart)
+   346→        }
+   347→
+   348→    def _extract_chart_summary(
+   349→        self,
+   350→        skill_id: str,
+   351→        skill_data: Optional[Dict[str, Any]]
+   352→    ) -> str:
+   353→        """从命盘数据中提取关键摘要"""
+   354→        if not skill_data:
+   355→            return "无命盘数据"
+   356→
+   357→        compute_type = get_skill_compute_type(skill_id) or skill_id
+   358→        data = skill_data.get(compute_type, {})
+   359→
+   360→        if not data:
+   361→            return "无命盘数据"
+   362→
+   363→        summary_parts = []
+   364→
+   365→        # 八字
+   366→        if compute_type == "bazi" and "chart" in data:
+   367→            chart = data["chart"]
+   368→            if "pillars" in chart and len(chart["pillars"]) > 2:
+   369→                day_pillar = chart["pillars"][2]
+   370→                summary_parts.append(f"日主{day_pillar.get('day_stem', '')}{day_pillar.get('day_branch', '')}")
+   371→            if "month_order" in chart:
+   372→                summary_parts.append(f"月令{chart['month_order']}")
+   373→
+   374→        # 星盘
+   375→        elif compute_type == "zodiac" and "chart" in data:
+   376→            chart = data["chart"]
+   377→            planets = chart.get("planets", {})
+   378→            if "sun" in planets:
+   379→                summary_parts.append(f"太阳{planets['sun'].get('sign', '')}")
+   380→            if "moon" in planets:
+   381→                summary_parts.append(f"月亮{planets['moon'].get('sign', '')}")
+   382→
+   383→        # 塔罗
+   384→        elif compute_type == "tarot" and "cards" in data:
+   385→            cards = data["cards"]
+   386→            if isinstance(cards, list) and len(cards) > 0:
+   387→                summary_parts.append(f"{len(cards)}张牌")
+   388→
+   389→        if summary_parts:
+   390→            return "、".join(summary_parts)
+   391→        else:
+   392→            return "已生成命盘"
+   393→
+   394→    async def _match_cases(
+   395→        self,
+   396→        skill_id: str,
+   397→        skill_data: Optional[Dict[str, Any]]
+   398→    ) -> str:
+   399→        """匹配相关案例"""
+   400→        if not skill_data:
+   401→            return ""
+   402→
+   403→        try:
+   404→            from .case_index import get_case_index, extract_features
+   405→
+   406→            if self.case_index is None:
+   407→                self.case_index = get_case_index()
+   408→
+   409→            features = extract_features(skill_data)
+   410→            if not features:
+   411→                return ""
+   412→
+   413→            cases = await self.case_index.get_matched_cases(skill_id, features, top_k=2)
+   414→            if not cases:
+   415→                return ""
+   416→
+   417→            cases_text = "\n## 相关案例\n\n"
+   418→            for case in cases:
+   419→                cases_text += f"### {case.name}\n{case.content}\n\n"
+   420→
+   421→            return cases_text
+   422→
+   423→        except Exception as e:
+   424→            logger.warning(f"[PromptBuilder] Case matching failed: {e}")
+   425→            return ""
+   426→
+   427→    # ═══════════════════════════════════════════════════════════════════════════
+   428→    # Phase 1 个性化路由 (v11 新增)
+   429→    # ═══════════════════════════════════════════════════════════════════════════
+   430→
+   431→    def _inject_phase1_context(self, prompt: str, profile: Dict[str, Any]) -> str:
+   432→        """
+   433→        注入 Phase 1 上下文（v11 个性化路由）
+   434→
+   435→        将以下占位符替换为实际内容：
+   436→        - {user_portrait} - 用户画像
+   437→        - {subscribed_skills} - 已订阅服务
+   438→        - {recommendable_skills} - 可推荐服务
+   439→        - {personalization_hint} - 个性化提示
+   440→        - {boundary_rules_shared} - 能力边界规则 (v2.0)
+   441→        """
+   442→        # v2.0: 注入能力边界规则
+   443→        prompt = inject_placeholders(prompt, {})
+   444→
+   445→        # 用户画像
+   446→        user_portrait = self._build_user_portrait(profile)
+   447→        prompt = prompt.replace("{user_portrait}", user_portrait)
+   448→
+   449→        # 已订阅服务
+   450→        subscribed = profile.get("subscribed_skills", [])
+   451→        subscribed_text = self._build_subscribed_skills_text(subscribed)
+   452→        prompt = prompt.replace("{subscribed_skills}", subscribed_text)
+   453→
+   454→        # 可推荐服务
+   455→        recommendable_text = self._build_recommendable_skills_text(subscribed)
+   456→        prompt = prompt.replace("{recommendable_skills}", recommendable_text)
+   457→
+   458→        # 个性化提示
+   459→        hint = self._build_personalization_hint(profile)
+   460→        prompt = prompt.replace("{personalization_hint}", hint)
+   461→
+   462→        return prompt
+   463→
+   464→    def _build_user_portrait(self, profile: Dict[str, Any]) -> str:
+   465→        """构建用户画像（~100 tokens）"""
+   466→        if not profile:
+   467→            return ""
+   468→
+   469→        lines = []
+   470→
+   471→        # 身份
+   472→        identity = profile.get("identity", {})
+   473→        if identity.get("display_name"):
+   474→            lines.append(f"- 用户名：{identity['display_name']}")
+   475→
+   476→        # v2.0: 出生信息（用于直接回答 Profile 查询）
+   477→        birth_info = identity.get("birth_info", {})
+   478→        if birth_info:
+   479→            birth_date = birth_info.get("birth_date") or birth_info.get("date")
+   480→            if birth_date:
+   481→                lines.append(f"- 出生日期：{birth_date}")
+   482→            birth_time = birth_info.get("birth_time") or birth_info.get("time")
+   483→            if birth_time:
+   484→                lines.append(f"- 出生时间：{birth_time}")
+   485→            birth_place = birth_info.get("birth_place") or birth_info.get("location")
+   486→            if birth_place:
+   487→                lines.append(f"- 出生地点：{birth_place}")
+   488→
+   489→        # Vibe.insight（原型）
+   490→        vibe = profile.get("vibe", {})
+   491→        insight = vibe.get("insight", {})
+   492→        essence = insight.get("essence", {})
+   493→
+   494→        archetype = essence.get("archetype", {})
+   495→        if archetype.get("primary"):
+   496→            lines.append(f"- 原型：{archetype['primary']}")
+   497→
+   498→        traits = essence.get("traits", [])
+   499→        if traits:
+   500→            trait_names = [t.get("trait", str(t)) if isinstance(t, dict) else str(t) for t in traits[:3]]
+   501→            lines.append(f"- 特质：{', '.join(trait_names)}")
+   502→
+   503→        # Vibe.target（关注领域）
+   504→        target = vibe.get("target", {})
+   505→
+   506→        north_star = target.get("north_star", {})
+   507→        if north_star.get("statement"):
+   508→            statement = north_star["statement"]
+   509→            if len(statement) > 50:
+   510→                statement = statement[:50] + "..."
+   511→            lines.append(f"- 愿景：{statement}")
+   512→
+   513→        focus = target.get("focus", {})
+   514→        if focus.get("primary"):
+   515→            lines.append(f"- 关注：{focus['primary']}")
+   516→
+   517→        if not lines:
+   518→            return ""
+   519→
+   520→        return "## 用户画像\n\n" + "\n".join(lines)
+   521→
+   522→    def _build_subscribed_skills_text(self, subscribed: List[str]) -> str:
+   523→        """构建已订阅服务列表（LLM-First，不依赖 routing.yaml）"""
+   524→        from .skill_loader import load_skill
+   525→
+   526→        if not subscribed:
+   527→            return "用户暂未订阅任何服务。"
+   528→
+   529→        lines = ["用户已订阅的服务，可直接激活：\n"]
+   530→
+   531→        for skill_id in subscribed:
+   532→            skill = load_skill(skill_id)
+   533→            if skill:
+   534→                desc = (skill.description or "").strip().replace('\n', ' ')
+   535→                if len(desc) > 30:
+   536→                    desc = desc[:30] + "..."
+   537→                lines.append(f"- **{skill_id}**: {desc}")
+   538→
+   539→        return "\n".join(lines)
+   540→
+   541→    def _build_recommendable_skills_text(self, subscribed: List[str]) -> str:
+   542→        """构建可推荐服务列表（LLM-First，不依赖 routing.yaml）"""
+   543→        from .skill_loader import load_skill, get_available_skills
+   544→
+   545→        all_skills = [s for s in get_available_skills() if s != "core"]
+   546→        not_subscribed = [s for s in all_skills if s not in subscribed]
+   547→
+   548→        if not not_subscribed:
+   549→            return "用户已订阅所有服务。"
+   550→
+   551→        lines = ["用户未订阅但可能感兴趣：\n"]
+   552→
+   553→        for skill_id in not_subscribed[:4]:  # 最多显示 4 个
+   554→            skill = load_skill(skill_id)
+   555→            if skill:
+   556→                desc = (skill.description or "").strip().replace('\n', ' ')
+   557→                if len(desc) > 30:
+   558→                    desc = desc[:30] + "..."
+   559→                lines.append(f"- **{skill_id}**: {desc}")
+   560→
+   561→        return "\n".join(lines)
+   562→
+   563→    def _build_personalization_hint(self, profile: Dict[str, Any]) -> str:
+   564→        """根据用户画像生成个性化路由提示"""
+   565→        if not profile:
+   566→            return ""
+   567→
+   568→        hints = []
+   569→
+   570→        vibe = profile.get("vibe", {})
+   571→        target = vibe.get("target", {})
+   572→        insight = vibe.get("insight", {})
+   573→
+   574→        # 如果有北极星目标
+   575→        if target.get("north_star", {}).get("vision_scene"):
+   576→            hints.append("用户有明确的人生愿景，优先考虑 lifecoach")
+   577→
+   578→        # 如果有关注领域
+   579→        focus = target.get("focus", {}).get("primary")
+   580→        if focus:
+   581→            if "career" in focus.lower() or "职业" in focus:
+   582→                hints.append("用户关注职业发展，优先考虑 career/lifecoach")
+   583→            elif "relationship" in focus.lower() or "关系" in focus or "感情" in focus:
+   584→                hints.append("用户关注关系，适合 bazi/zodiac 合盘分析")
+   585→            elif "health" in focus.lower() or "健康" in focus:
+   586→                hints.append("用户关注健康，适合 mindfulness")
+   587→
+   588→        # 如果有原型
+   589→        archetype = insight.get("essence", {}).get("archetype", {}).get("primary")
+   590→        if archetype:
+   591→            if archetype in ["成长者", "探索者"]:
+   592→                hints.append(f"用户是{archetype}人格，适合规划类服务")
+   593→            elif archetype in ["智慧者", "洞察者"]:
+   594→                hints.append(f"用户是{archetype}人格，适合深度分析服务")
+   595→            elif archetype in ["稳定者", "守护者"]:
+   596→                hints.append(f"用户是{archetype}人格，适合陪伴类服务")
+   597→
+   598→        if hints:
+   599→            return "\n## 个性化提示\n\n" + "\n".join(f"- {h}" for h in hints)
+   600→        return ""
+   601→
+   602→    def _get_fallback_phase1_prompt(self) -> str:
+   603→        """Fallback Phase 1 Prompt"""
+   604→        return """# Vibe
+   605→
+   606→你是 Vibe，生命对话者。你的任务是理解用户意图，引导 Ta 到合适的服务。
+   607→
+   608→## 行为准则
+   609→
+   610→1. **识别意图 → 调用工具**：不要只用文字回复，要调用工具
+   611→2. **简短回应 + 工具**：调用工具时配合一句暖心的话
+   612→3. **不确定 → 推荐**：调用 recommend_skills 让用户选择
+   613→
+   614→## 语气
+   615→
+   616→温暖、简洁、不啰嗦。像一个懂你的老朋友。
+   617→
+   618→示例：
+   619→- "嗨～ 今天想聊点什么？"
+   620→- "好的，让我来帮你看看～"
+   621→- "迷茫的时候来找我就对了。"
+   622→"""
+   623→
+   624→    def _get_ready_prompt(self) -> str:
+   625→        """已准备好分析的 Prompt"""
+   626→        return """## 当前状态
+   627→
+   628→用户信息已完整，命盘已生成。你可以开始分析了。
+   629→
+   630→**分析流程**：
+   631→1. 快速扫描命盘中的关键特征
+   632→2. 根据用户问题聚焦分析
+   633→3. 用 `show_xxx` 工具展示分析结果
+   634→4. 回答用户的追问
+   635→"""
+   636→
+   637→    def _get_need_birth_prompt(self, collect_tool: str) -> str:
+   638→        """需要收集出生信息的 Prompt"""
+   639→        return f"""## 当前状态
+   640→
+   641→用户还没有告诉你出生信息。在深入分析之前，你需要先了解 Ta 的出生时间。
+   642→
+   643→**下一步**：调用 `{collect_tool}` 工具，让用户填写出生信息表单。
+   644→不要用文字问"请问你的生日是？"——表单体验更好。
+   645→"""
+   646→
+   647→    def _get_need_compute_prompt(self, compute_tool: str) -> str:
+   648→        """需要计算的 Prompt"""
+   649→        return f"""## 当前状态
+   650→
+   651→用户已提供出生信息，但还没有生成命盘。
+   652→
+   653→**下一步**：调用 `{compute_tool}` 工具生成命盘数据。
+   654→计算完成后你就可以开始分析了。
+   655→"""
+   656→
+   657→    def build_session_resume_prompt(
+   658→        self,
+   659→        session_context: SessionContext,
+   660→        rule_name: Optional[str] = None
+   661→    ) -> str:
+   662→        """
+   663→        构建会话恢复 Prompt（用于 SOP 模板）
+   664→
+   665→        专门用于断点续传场景
+   666→        """
+   667→        if not session_context or not session_context.has_checkpoint:
+   668→            return ""
+   669→
+   670→        cp = session_context.checkpoint
+   671→        session = session_context.session
+   672→
+   673→        lines = ["## 会话恢复模式\n"]
+   674→
+   675→        if cp:
+   676→            lines.append(f"用户上次完成了 {cp.step} 个步骤。\n")
+   677→
+   678→            if cp.collected_data:
+   679→                lines.append("**已收集信息**：")
+   680→                for key, value in cp.collected_data.items():
+   681→                    lines.append(f"- {key}: {value}")
+   682→                lines.append("")
+   683→
+   684→            next_step = cp.step + 1
+   685→            lines.append(f"**下一步**：")
+   686→            lines.append(f"继续第 {next_step} 个问题\n")
+   687→
+   688→        lines.append("**处理方式**：")
+   689→        lines.append("1. 简短问候：「欢迎回来！上次我们聊到了...」")
+   690→        lines.append("2. 快速回顾（1-2 句）")
+   691→        lines.append("3. 直接问下一个问题")
+   692→
+   693→        return "\n".join(lines)
+   694→
+   695→
+   696→# ═══════════════════════════════════════════════════════════════════════════
+   697→# Singleton
+   698→# ═══════════════════════════════════════════════════════════════════════════
+   699→
+   700→_prompt_builder: Optional[PromptBuilder] = None
+   701→
+   702→
+   703→def get_prompt_builder() -> PromptBuilder:
+   704→    """获取 PromptBuilder 单例"""
+   705→    global _prompt_builder
+   706→    if _prompt_builder is None:
+   707→        _prompt_builder = PromptBuilder()
+   708→    return _prompt_builder
+   709→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

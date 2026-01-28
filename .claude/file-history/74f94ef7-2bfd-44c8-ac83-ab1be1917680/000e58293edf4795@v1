@@ -1,0 +1,262 @@
+"""
+VibeLife Weekly Review Generator
+周运回顾卡生成器 - 星座周运回顾与展望
+"""
+
+from datetime import date, datetime, timedelta
+from typing import Optional
+from pydantic import BaseModel
+import asyncpg
+
+from ..vibe_engine.llm_orchestrator import LLMOrchestrator
+
+
+ZODIAC_SIGNS = [
+    ("白羊座", "Aries", (3, 21), (4, 19)),
+    ("金牛座", "Taurus", (4, 20), (5, 20)),
+    ("双子座", "Gemini", (5, 21), (6, 20)),
+    ("巨蟹座", "Cancer", (6, 21), (7, 22)),
+    ("狮子座", "Leo", (7, 23), (8, 22)),
+    ("处女座", "Virgo", (8, 23), (9, 22)),
+    ("天秤座", "Libra", (9, 23), (10, 22)),
+    ("天蝎座", "Scorpio", (10, 23), (11, 21)),
+    ("射手座", "Sagittarius", (11, 22), (12, 21)),
+    ("摩羯座", "Capricorn", (12, 22), (1, 19)),
+    ("水瓶座", "Aquarius", (1, 20), (2, 18)),
+    ("双鱼座", "Pisces", (2, 19), (3, 20)),
+]
+
+
+class WeeklyReviewData(BaseModel):
+    """周运回顾数据"""
+    user_id: str
+    week_start: date
+    week_end: date
+    sun_sign: str
+
+    # 本周回顾
+    overall_rating: int  # 1-5星
+    current_week_summary: str
+    key_events: list[str]
+    emotional_theme: str
+
+    # 下周展望
+    next_week_outlook: str
+    lucky_day: str
+    lucky_color: str
+    key_advice: str
+
+    # 元数据
+    generated_at: datetime
+    share_url: Optional[str] = None
+
+
+class WeeklyReviewGenerator:
+    """周运回顾生成器"""
+
+    def __init__(self, db_pool: asyncpg.Pool, llm: LLMOrchestrator = None):
+        self.db = db_pool
+        self.llm = llm
+
+    async def generate_review(self, user_id: str) -> WeeklyReviewData:
+        """生成周运回顾"""
+        today = date.today()
+        # 本周日是一周的最后一天
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        # 获取用户星座信息
+        user_profile = await self._get_user_zodiac_profile(user_id)
+        sun_sign = user_profile.get("sun_sign", "未知") if user_profile else "未知"
+
+        # 生成回顾内容
+        review_content = await self._generate_review_content(
+            user_profile, sun_sign, week_start, week_end
+        )
+
+        return WeeklyReviewData(
+            user_id=user_id,
+            week_start=week_start,
+            week_end=week_end,
+            sun_sign=sun_sign,
+            overall_rating=review_content["overall_rating"],
+            current_week_summary=review_content["current_summary"],
+            key_events=review_content["key_events"],
+            emotional_theme=review_content["emotional_theme"],
+            next_week_outlook=review_content["next_outlook"],
+            lucky_day=review_content["lucky_day"],
+            lucky_color=review_content["lucky_color"],
+            key_advice=review_content["key_advice"],
+            generated_at=datetime.now()
+        )
+
+    async def _get_user_zodiac_profile(self, user_id: str) -> Optional[dict]:
+        """获取用户星座档案"""
+        row = await self.db.fetchrow("""
+            SELECT u.birth_datetime, sp.profile_data
+            FROM vibe_users u
+            LEFT JOIN skill_profiles sp ON u.id = sp.user_id AND sp.skill_id = 'zodiac'
+            WHERE u.id = $1::uuid
+        """, user_id)
+
+        if row:
+            profile_data = row["profile_data"] or {}
+
+            # 如果没有星座信息，从出生日期计算
+            if "sun_sign" not in profile_data and row["birth_datetime"]:
+                birth = row["birth_datetime"]
+                sun_sign = self._calculate_sun_sign(birth.month, birth.day)
+                profile_data["sun_sign"] = sun_sign
+
+            return profile_data
+        return None
+
+    def _calculate_sun_sign(self, month: int, day: int) -> str:
+        """根据月日计算太阳星座"""
+        for sign_cn, sign_en, start, end in ZODIAC_SIGNS:
+            start_month, start_day = start
+            end_month, end_day = end
+
+            # 处理跨年的摩羯座
+            if start_month > end_month:
+                if (month == start_month and day >= start_day) or \
+                   (month == end_month and day <= end_day):
+                    return sign_cn
+            else:
+                if (month == start_month and day >= start_day) or \
+                   (month == end_month and day <= end_day) or \
+                   (start_month < month < end_month):
+                    return sign_cn
+
+        return "未知"
+
+    async def _generate_review_content(
+        self,
+        user_profile: dict,
+        sun_sign: str,
+        week_start: date,
+        week_end: date
+    ) -> dict:
+        """使用 LLM 生成周运内容"""
+        if not self.llm or sun_sign == "未知":
+            return self._get_default_content(sun_sign)
+
+        # 获取当前行星位置信息
+        planetary_info = await self._get_planetary_info()
+
+        prompt = f"""作为一个温暖的占星师，请为{sun_sign}生成周运回顾内容：
+
+时间范围：{week_start.strftime('%m月%d日')} - {week_end.strftime('%m月%d日')}
+当前行星位置：{planetary_info}
+
+请以JSON格式返回，包含以下字段：
+{{
+    "overall_rating": 4,  // 1-5的整体评分
+    "current_summary": "本周总结（2-3句话）",
+    "key_events": ["重要事件1", "重要事件2"],
+    "emotional_theme": "本周情绪主题（如：反思、突破、平静）",
+    "next_outlook": "下周展望（2句话）",
+    "lucky_day": "周三",
+    "lucky_color": "蓝色",
+    "key_advice": "核心建议（1句话）"
+}}
+
+要求：
+1. 语气温暖亲切，有洞察力
+2. 结合行星能量给出具体建议
+3. 保持积极正向
+4. 简洁有力"""
+
+        try:
+            response = await self.llm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600
+            )
+
+            import json
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            return json.loads(content)
+        except Exception:
+            return self._get_default_content(sun_sign)
+
+    async def _get_planetary_info(self) -> str:
+        """获取当前行星位置信息"""
+        # 简化版本，实际应从 zodiac tools 获取
+        return "太阳在摩羯座，水星顺行，金星在水瓶座"
+
+    def _get_default_content(self, sun_sign: str) -> dict:
+        """默认周运内容"""
+        return {
+            "overall_rating": 3,
+            "current_summary": f"本周对{sun_sign}来说是平稳的一周，适合处理日常事务，整理思绪。",
+            "key_events": ["工作上有新进展", "人际关系需要多沟通"],
+            "emotional_theme": "平静",
+            "next_outlook": "下周能量开始上升，是开启新计划的好时机。",
+            "lucky_day": "周四",
+            "lucky_color": "蓝色",
+            "key_advice": "保持耐心，好事正在路上"
+        }
+
+    async def get_review_history(
+        self,
+        user_id: str,
+        limit: int = 12
+    ) -> list[dict]:
+        """获取历史周运回顾"""
+        rows = await self.db.fetch("""
+            SELECT content, created_at
+            FROM skill_insights
+            WHERE user_id = $1::uuid
+              AND skill_id = 'zodiac'
+              AND insight_type = 'weekly_review'
+            ORDER BY created_at DESC
+            LIMIT $2
+        """, user_id, limit)
+
+        return [
+            {
+                "content": row["content"],
+                "created_at": row["created_at"].isoformat()
+            }
+            for row in rows
+        ]
+
+    async def save_review(self, review: WeeklyReviewData) -> str:
+        """保存周运回顾"""
+        import json
+        result = await self.db.fetchrow("""
+            INSERT INTO skill_insights (
+                id, user_id, skill_id, insight_type, title, content, created_at
+            ) VALUES (
+                uuid_generate_v4(), $1::uuid, 'zodiac', 'weekly_review',
+                $2, $3, NOW()
+            )
+            RETURNING id
+        """,
+            review.user_id,
+            f"{review.week_start.strftime('%m/%d')}-{review.week_end.strftime('%m/%d')} 周运回顾",
+            json.dumps(review.model_dump(), ensure_ascii=False, default=str)
+        )
+        return str(result["id"])
+
+    async def generate_sign_weekly(self, sun_sign: str) -> dict:
+        """为特定星座生成周运（通用版本，不需要用户ID）"""
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        review_content = await self._generate_review_content(
+            {}, sun_sign, week_start, week_end
+        )
+
+        return {
+            "sun_sign": sun_sign,
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            **review_content
+        }

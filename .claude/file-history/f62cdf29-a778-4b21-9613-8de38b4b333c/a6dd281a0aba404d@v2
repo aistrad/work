@@ -1,0 +1,133 @@
+"""
+Embedding Service - Vector embeddings using Alibaba GTE-Qwen2
+
+Model: Alibaba-NLP/gte-Qwen2-7B-instruct (via sentence-transformers)
+"""
+import os
+import asyncio
+from typing import List, Optional
+import numpy as np
+from loguru import logger
+
+
+class EmbeddingService:
+    """
+    Embedding service using Alibaba GTE-Qwen2.
+
+    - Default model: Alibaba-NLP/gte-Qwen2-7B-instruct
+    - Default dimension: 3584 (configurable via EMBEDDING_DIMENSION)
+    - Local inference (no external API)
+    """
+
+    # Configuration (env-overridable)
+    MODEL_NAME = os.getenv(
+        "EMBEDDING_MODEL_NAME",
+        "Alibaba-NLP/gte-Qwen2-7B-instruct",
+    )
+    DEFAULT_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3584"))
+    DEVICE = os.getenv("EMBEDDING_DEVICE", "auto")  # "auto" | "cuda" | "cpu"
+    BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
+
+    # Internal lazy-loaded model
+    _model = None
+
+    @classmethod
+    def _get_model(cls):
+        """Lazy-load SentenceTransformer model."""
+        if cls._model is not None:
+            return cls._model
+
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as e:
+            raise RuntimeError(
+                "sentence-transformers is required for GTE embeddings. "
+                "Please install: pip install 'sentence-transformers>=2.7.0' 'transformers>=4.45' 'torch>=2.2'"
+            ) from e
+
+        device = None
+        if cls.DEVICE == "auto":
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                device = "cpu"
+        else:
+            device = cls.DEVICE
+
+        logger.info(f"Loading embedding model: {cls.MODEL_NAME} on {device}")
+        # Trust remote code is not required for ST models converted on HF hub.
+        # If the model isn't an ST package, SentenceTransformer will auto-wrap.
+        cls._model = SentenceTransformer(cls.MODEL_NAME, device=device)
+        return cls._model
+
+    @classmethod
+    async def embed_text(
+        cls,
+        text: str,
+        output_dimensionality: Optional[int] = None,
+        normalize: bool = True,
+    ) -> List[float]:
+        """Generate embedding for a single text.
+
+        Note: GTE-Qwen2 produces 3584-d vectors by default.
+        """
+        _ = output_dimensionality  # kept for API compatibility (ignored)
+        model = cls._get_model()
+
+        # Use a thread to avoid blocking the event loop
+        vec = await asyncio.to_thread(
+            lambda: model.encode(
+                [text],
+                batch_size=1,
+                normalize_embeddings=normalize,
+                show_progress_bar=False,
+            )
+        )
+        embedding = vec[0].tolist()
+        return embedding
+
+    @classmethod
+    async def embed_query(
+        cls,
+        query: str,
+        output_dimensionality: Optional[int] = None,
+        normalize: bool = True,
+    ) -> List[float]:
+        """Generate embedding for a search query."""
+        return await cls.embed_text(query, output_dimensionality, normalize)
+
+    @classmethod
+    async def embed_batch(
+        cls,
+        texts: List[str],
+        output_dimensionality: Optional[int] = None,
+        normalize: bool = True,
+    ) -> List[List[float]]:
+        """Generate embeddings for multiple texts efficiently."""
+        _ = output_dimensionality  # kept for API compatibility (ignored)
+        model = cls._get_model()
+
+        vecs = await asyncio.to_thread(
+            lambda: model.encode(
+                texts,
+                batch_size=max(1, cls.BATCH_SIZE),
+                normalize_embeddings=normalize,
+                show_progress_bar=False,
+            )
+        )
+        return [v.tolist() for v in np.asarray(vecs)]
+
+    @classmethod
+    def get_dimension(cls) -> int:
+        """Return current embedding dimension"""
+        return cls.DEFAULT_DIMENSION
+
+    @staticmethod
+    def _normalize(embedding: List[float]) -> List[float]:
+        """L2 normalize embedding vector."""
+        arr = np.array(embedding)
+        norm = np.linalg.norm(arr)
+        if norm > 0:
+            arr = arr / norm
+        return arr.tolist()

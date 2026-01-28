@@ -1,0 +1,337 @@
+"""
+ProactiveAgentAdapter - Agent Adapter for Proactive Content Generation
+
+Responsibilities:
+- Encapsulate Proactive → CoreAgent call logic
+- Build Proactive-specific Prompts
+- Extract structured content from Agent output
+
+Content extraction uses Pydantic validation + field truncation + fallback template.
+"""
+
+from typing import Dict, Any, Optional
+from dataclasses import dataclass
+import json
+import re
+import logging
+
+from .models import ReminderContent
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProactivePromptConfig:
+    """Proactive Prompt Configuration"""
+    skill_id: str
+    reminder_id: str
+    rule_path: str
+    event_info: Optional[Dict] = None
+    profile_summary: Optional[str] = None
+
+
+class ProactiveAgentAdapter:
+    """Agent Adapter for Proactive Content Generation"""
+
+    # Field length limits
+    MAX_TITLE_LENGTH = 20
+    MAX_BODY_LENGTH = 200
+    MAX_HINT_LENGTH = 50
+
+    async def generate_content(
+        self,
+        user_id: str,
+        profile: Dict,
+        skill_id: str,
+        reminder: Dict,
+        event_info: Optional[Dict] = None,
+    ) -> ReminderContent:
+        """
+        Call Agent to generate push content.
+
+        Flow:
+        1. Build Agent context
+        2. Build Proactive Prompt
+        3. Run Agent (non-streaming)
+        4. Extract structured content
+
+        Args:
+            user_id: User ID
+            profile: User profile data
+            skill_id: Skill ID
+            reminder: Reminder configuration
+            event_info: Optional trigger event info
+
+        Returns:
+            ReminderContent with generated content
+        """
+        from services.agent import create_agent, AgentContext
+
+        # 1. Build context
+        rule_id = self._resolve_rule_id(reminder)
+        context = AgentContext(
+            user_id=user_id,
+            profile=profile,
+            skill=skill_id,
+            scenario=rule_id,
+        )
+
+        # 2. Build Prompt
+        proactive_prompt = self._build_proactive_prompt(
+            reminder=reminder,
+            event_info=event_info,
+            profile=profile,
+        )
+
+        # 3. Run Agent (non-streaming, direct result)
+        try:
+            agent = create_agent(max_iterations=3)
+            content_buffer = ""
+
+            async for event in agent.run(proactive_prompt, context):
+                if event.type == "content":
+                    content_buffer += event.data.get("content", "")
+
+            # 4. Extract content
+            return self._extract_content(content_buffer, reminder)
+        except Exception as e:
+            logger.error(f"Agent content generation failed: {e}")
+            return self._get_fallback_content(reminder)
+
+    def _build_proactive_prompt(
+        self,
+        reminder: Dict,
+        event_info: Optional[Dict],
+        profile: Dict,
+    ) -> str:
+        """
+        Build Proactive Prompt.
+
+        Args:
+            reminder: Reminder configuration
+            event_info: Optional trigger event info
+            profile: User profile data
+
+        Returns:
+            Prompt string for Agent
+        """
+        rule_path = reminder.get("content", {}).get("rule", "")
+        rule_id = self._resolve_rule_id(reminder)
+
+        prompt_parts = [
+            "# 推送内容生成任务",
+            "",
+            "## 场景",
+            f"- 推送类型: {reminder.get('name', reminder.get('id', 'unknown'))}",
+            f"- 规则文件: {rule_path}",
+            f"- 规则 ID: {rule_id or 'N/A'}",
+        ]
+
+        if event_info:
+            prompt_parts.extend([
+                "",
+                "## 触发事件",
+                "```json",
+                json.dumps(event_info, ensure_ascii=False, indent=2),
+                "```",
+            ])
+
+        prompt_parts.extend([
+            "",
+            "## 用户画像摘要",
+            self._build_profile_summary(profile),
+            "",
+            "## 任务",
+            f"1. 读取规则文件 `{rule_path}` 中的生成要求",
+            "2. 根据用户画像和触发事件生成个性化推送内容",
+            "3. 输出 JSON 格式：",
+            "```json",
+            "{",
+            '  "title": "推送标题（≤20字）",',
+            '  "body": "推送正文（≤100字）",',
+            '  "fortune_hint": "可选，运势提示",',
+            '  "action_tip": "可选，行动建议"',
+            "}",
+            "```",
+        ])
+
+        return "\n".join(prompt_parts)
+
+    def _build_profile_summary(self, profile: Dict) -> str:
+        """
+        Build user profile summary.
+
+        Uses unified v9 profile paths (identity/skills/vibe/preferences).
+
+        Args:
+            profile: User profile data
+
+        Returns:
+            Profile summary string
+        """
+        if not profile or not isinstance(profile, dict):
+            return "（无画像信息）"
+
+        lines = []
+
+        # Identity
+        identity = profile.get("identity")
+        if isinstance(identity, dict):
+            birth = identity.get("birth_info")
+            if isinstance(birth, dict) and birth.get("date"):
+                lines.append(f"- 生日: {birth.get('date')}")
+
+        # Vibe target/focus
+        vibe = profile.get("vibe")
+        if isinstance(vibe, dict):
+            target = vibe.get("target")
+            if isinstance(target, dict):
+                focus = target.get("focus")
+                if isinstance(focus, dict):
+                    primary = focus.get("primary")
+                    if primary:
+                        lines.append(f"- 关注领域: {primary}")
+                elif isinstance(focus, list) and focus:
+                    focus_str = ", ".join(str(f) for f in focus if f)
+                    if focus_str:
+                        lines.append(f"- 关注领域: {focus_str}")
+
+        # Skills - lifecoach goals
+        skills = profile.get("skills")
+        if isinstance(skills, dict):
+            lifecoach = skills.get("lifecoach")
+            if isinstance(lifecoach, dict):
+                goals = lifecoach.get("goals")
+                # Handle both dict and list formats
+                if isinstance(goals, dict):
+                    goals = goals.get("items", [])
+                if isinstance(goals, list) and goals:
+                    goal_names = []
+                    for g in goals[:3]:
+                        if isinstance(g, dict):
+                            name = g.get("name")
+                            if name:
+                                goal_names.append(str(name))
+                        elif g:
+                            goal_names.append(str(g))
+                    if goal_names:
+                        lines.append(f"- 目标: {', '.join(goal_names)}")
+
+        # Preferences
+        preferences = profile.get("preferences")
+        if isinstance(preferences, dict):
+            voice_mode = preferences.get("voice_mode")
+            if voice_mode:
+                lines.append(f"- 语气偏好: {voice_mode}")
+
+        return "\n".join(lines) if lines else "（无画像信息）"
+
+    def _resolve_rule_id(self, reminder: Dict) -> Optional[str]:
+        """Resolve rule_id from content.rule path."""
+        rule_path = reminder.get("content", {}).get("rule")
+        if not rule_path:
+            return None
+        # Normalize to relative rule id under rules/
+        if rule_path.startswith("rules/"):
+            rule_path = rule_path[len("rules/"):]
+        if rule_path.endswith(".md"):
+            rule_path = rule_path[:-3]
+        return rule_path
+
+    def _extract_content(
+        self,
+        content_buffer: str,
+        reminder: Dict,
+    ) -> ReminderContent:
+        """
+        Extract structured content.
+
+        Uses strict validation + field truncation + fallback template.
+
+        Args:
+            content_buffer: Raw content from Agent
+            reminder: Reminder configuration
+
+        Returns:
+            ReminderContent with validated content
+        """
+        from pydantic import BaseModel, Field, ValidationError
+        from typing import Optional
+
+        # Pydantic model definition
+        class ContentSchema(BaseModel):
+            title: str = Field(max_length=self.MAX_TITLE_LENGTH)
+            body: str = Field(max_length=self.MAX_BODY_LENGTH)
+            fortune_hint: Optional[str] = Field(None, max_length=self.MAX_HINT_LENGTH)
+            action_tip: Optional[str] = Field(None, max_length=self.MAX_HINT_LENGTH)
+
+        # 1. Try to extract JSON
+        data = None
+        try:
+            json_match = re.search(r'```json\s*(.*?)\s*```', content_buffer, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(1))
+            else:
+                # Try parsing entire buffer as JSON
+                data = json.loads(content_buffer)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse JSON from content: {content_buffer[:100]}")
+
+        # 2. Pydantic validation + field truncation
+        if data:
+            try:
+                validated = ContentSchema(**data)
+                data = validated.model_dump()
+            except ValidationError as e:
+                logger.warning(f"Content validation failed: {e}")
+                # Try with truncation
+                data = {
+                    "title": str(data.get("title", ""))[:self.MAX_TITLE_LENGTH],
+                    "body": str(data.get("body", ""))[:self.MAX_BODY_LENGTH],
+                    "fortune_hint": str(data.get("fortune_hint", ""))[:self.MAX_HINT_LENGTH] if data.get("fortune_hint") else None,
+                    "action_tip": str(data.get("action_tip", ""))[:self.MAX_HINT_LENGTH] if data.get("action_tip") else None,
+                }
+
+        # 3. Fallback template if extraction failed
+        if not data or not data.get("title"):
+            return self._get_fallback_content(reminder)
+
+        # Attach conversation guidance
+        content_config = reminder.get("content", {})
+
+        return ReminderContent(
+            title=data.get("title"),
+            body=data.get("body", ""),
+            fortune_hint=data.get("fortune_hint"),
+            action_tip=data.get("action_tip"),
+            card_type=content_config.get("card_type"),
+            suggested_prompt=content_config.get("suggested_prompt"),
+            quick_actions=content_config.get("quick_actions", []),
+        )
+
+    def _get_fallback_content(self, reminder: Dict) -> ReminderContent:
+        """
+        Get fallback content when generation fails.
+
+        Args:
+            reminder: Reminder configuration
+
+        Returns:
+            ReminderContent with fallback values
+        """
+        logger.warning(f"Using fallback template for reminder: {reminder.get('id')}")
+
+        content_config = reminder.get("content", {})
+        templates = content_config.get("templates", {})
+
+        # Use template if available
+        title = templates.get("title", reminder.get("name", "推送通知"))
+        body = templates.get("body", templates.get("body_default", "点击查看详情"))
+
+        return ReminderContent(
+            title=title[:self.MAX_TITLE_LENGTH] if isinstance(title, str) else "推送通知",
+            body=body[:self.MAX_BODY_LENGTH] if isinstance(body, str) else "点击查看详情",
+            card_type=content_config.get("card_type"),
+            suggested_prompt=content_config.get("suggested_prompt"),
+            quick_actions=content_config.get("quick_actions", []),
+        )

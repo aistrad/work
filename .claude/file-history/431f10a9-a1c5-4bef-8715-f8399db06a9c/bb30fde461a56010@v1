@@ -1,0 +1,329 @@
+"""
+Knowledge Repository - Data access layer for knowledge
+"""
+from typing import Optional, List, Dict, Any
+from uuid import UUID
+
+from .db import get_connection
+
+
+class KnowledgeRepository:
+    """Repository for knowledge operations"""
+
+    # ─────────────────────────────────────────────────────────────────
+    # Knowledge Chunks
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_chunk(
+        skill_id: str,
+        content: str,
+        content_type: Optional[str] = None,
+        source_file: Optional[str] = None,
+        source_section: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None
+    ) -> dict:
+        """Create a knowledge chunk"""
+        async with get_connection() as conn:
+            # Create search vector from content
+            row = await conn.fetchrow(
+                """
+                INSERT INTO knowledge_chunks (
+                    skill_id, content, content_type, source_file,
+                    source_section, metadata, embedding,
+                    search_vector
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    to_tsvector('chinese', $2)
+                )
+                RETURNING id, skill_id, content, content_type,
+                          source_file, source_section, metadata, created_at
+                """,
+                skill_id, content, content_type, source_file,
+                source_section, metadata, embedding
+            )
+            return dict(row)
+
+    @staticmethod
+    async def get_chunk(chunk_id: UUID) -> Optional[dict]:
+        """Get chunk by ID"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, skill_id, content, content_type,
+                       source_file, source_section, metadata, created_at
+                FROM knowledge_chunks WHERE id = $1
+                """,
+                chunk_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def delete_chunk(chunk_id: UUID) -> bool:
+        """Delete a chunk"""
+        async with get_connection() as conn:
+            result = await conn.execute(
+                "DELETE FROM knowledge_chunks WHERE id = $1",
+                chunk_id
+            )
+            return "DELETE 1" in result
+
+    @staticmethod
+    async def update_embedding(
+        chunk_id: UUID,
+        embedding: List[float]
+    ) -> bool:
+        """Update chunk embedding"""
+        async with get_connection() as conn:
+            result = await conn.execute(
+                "UPDATE knowledge_chunks SET embedding = $2 WHERE id = $1",
+                chunk_id, embedding
+            )
+            return "UPDATE 1" in result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Vector Search
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def vector_search(
+        embedding: List[float],
+        skill_id: str,
+        top_k: int = 5,
+        content_types: Optional[List[str]] = None
+    ) -> List[dict]:
+        """Search by vector similarity"""
+        async with get_connection() as conn:
+            if content_types:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, skill_id, content, content_type,
+                           source_file, source_section, metadata, created_at,
+                           1 - (embedding <=> $1::vector) as score
+                    FROM knowledge_chunks
+                    WHERE skill_id = $2
+                      AND content_type = ANY($4)
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $3
+                    """,
+                    embedding, skill_id, top_k, content_types
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, skill_id, content, content_type,
+                           source_file, source_section, metadata, created_at,
+                           1 - (embedding <=> $1::vector) as score
+                    FROM knowledge_chunks
+                    WHERE skill_id = $2 AND embedding IS NOT NULL
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $3
+                    """,
+                    embedding, skill_id, top_k
+                )
+            return [dict(row) for row in rows]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Full-Text Search
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def text_search(
+        query: str,
+        skill_id: str,
+        top_k: int = 5,
+        content_types: Optional[List[str]] = None
+    ) -> List[dict]:
+        """Search by full-text search"""
+        async with get_connection() as conn:
+            if content_types:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, skill_id, content, content_type,
+                           source_file, source_section, metadata, created_at,
+                           ts_rank(search_vector, plainto_tsquery('chinese', $1)) as score
+                    FROM knowledge_chunks
+                    WHERE skill_id = $2
+                      AND content_type = ANY($4)
+                      AND search_vector @@ plainto_tsquery('chinese', $1)
+                    ORDER BY score DESC
+                    LIMIT $3
+                    """,
+                    query, skill_id, top_k, content_types
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, skill_id, content, content_type,
+                           source_file, source_section, metadata, created_at,
+                           ts_rank(search_vector, plainto_tsquery('chinese', $1)) as score
+                    FROM knowledge_chunks
+                    WHERE skill_id = $2
+                      AND search_vector @@ plainto_tsquery('chinese', $1)
+                    ORDER BY score DESC
+                    LIMIT $3
+                    """,
+                    query, skill_id, top_k
+                )
+            return [dict(row) for row in rows]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Hybrid Search (RRF)
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def hybrid_search(
+        query: str,
+        embedding: List[float],
+        skill_id: str,
+        top_k: int = 5,
+        content_types: Optional[List[str]] = None,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3
+    ) -> List[dict]:
+        """Hybrid search with Reciprocal Rank Fusion"""
+        # Get results from both methods
+        vector_results = await KnowledgeRepository.vector_search(
+            embedding, skill_id, top_k * 2, content_types
+        )
+        text_results = await KnowledgeRepository.text_search(
+            query, skill_id, top_k * 2, content_types
+        )
+
+        # RRF scoring
+        k = 60  # RRF constant
+        scores = {}
+
+        for rank, result in enumerate(vector_results):
+            chunk_id = str(result['id'])
+            scores[chunk_id] = scores.get(chunk_id, 0) + vector_weight / (k + rank + 1)
+            if chunk_id not in scores:
+                scores[chunk_id] = {'data': result, 'score': 0}
+
+        for rank, result in enumerate(text_results):
+            chunk_id = str(result['id'])
+            scores[chunk_id] = scores.get(chunk_id, 0) + text_weight / (k + rank + 1)
+
+        # Merge and sort
+        all_results = {str(r['id']): r for r in vector_results + text_results}
+        sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
+        final_results = []
+        for chunk_id in sorted_ids[:top_k]:
+            result = all_results[chunk_id]
+            result['score'] = scores[chunk_id]
+            final_results.append(result)
+
+        return final_results
+
+    # ─────────────────────────────────────────────────────────────────
+    # QA Pairs
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_qa_pair(
+        skill_id: str,
+        question: str,
+        answer: str,
+        chunk_id: Optional[UUID] = None,
+        question_embedding: Optional[List[float]] = None
+    ) -> dict:
+        """Create a QA pair"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO knowledge_qa_pairs (
+                    skill_id, chunk_id, question, answer, question_embedding
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                skill_id, chunk_id, question, answer, question_embedding
+            )
+            return dict(row)
+
+    @staticmethod
+    async def search_qa_pairs(
+        embedding: List[float],
+        skill_id: str,
+        top_k: int = 3
+    ) -> List[dict]:
+        """Search QA pairs by question embedding"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT *, 1 - (question_embedding <=> $1::vector) as score
+                FROM knowledge_qa_pairs
+                WHERE skill_id = $2 AND question_embedding IS NOT NULL
+                ORDER BY question_embedding <=> $1::vector
+                LIMIT $3
+                """,
+                embedding, skill_id, top_k
+            )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def increment_qa_usage(qa_id: UUID) -> bool:
+        """Increment QA pair usage count"""
+        async with get_connection() as conn:
+            result = await conn.execute(
+                """
+                UPDATE knowledge_qa_pairs
+                SET usage_count = usage_count + 1
+                WHERE id = $1
+                """,
+                qa_id
+            )
+            return "UPDATE 1" in result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Batch Operations
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def batch_create_chunks(chunks: List[dict]) -> int:
+        """Batch create knowledge chunks"""
+        async with get_connection() as conn:
+            count = 0
+            for chunk in chunks:
+                await conn.execute(
+                    """
+                    INSERT INTO knowledge_chunks (
+                        skill_id, content, content_type, source_file,
+                        source_section, metadata, embedding, search_vector
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        to_tsvector('chinese', $2)
+                    )
+                    """,
+                    chunk.get('skill_id'),
+                    chunk.get('content'),
+                    chunk.get('content_type'),
+                    chunk.get('source_file'),
+                    chunk.get('source_section'),
+                    chunk.get('metadata'),
+                    chunk.get('embedding')
+                )
+                count += 1
+            return count
+
+    @staticmethod
+    async def get_chunks_without_embedding(
+        skill_id: str,
+        limit: int = 100
+    ) -> List[dict]:
+        """Get chunks that need embeddings"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, content FROM knowledge_chunks
+                WHERE skill_id = $1 AND embedding IS NULL
+                LIMIT $2
+                """,
+                skill_id, limit
+            )
+            return [dict(row) for row in rows]

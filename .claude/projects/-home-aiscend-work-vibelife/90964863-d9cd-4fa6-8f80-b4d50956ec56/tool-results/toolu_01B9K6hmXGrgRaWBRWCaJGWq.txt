@@ -1,0 +1,204 @@
+     1→"""
+     2→Tool Schema v6 - 统一工具定义系统
+     3→
+     4→从 YAML 文件加载工具定义，自动生成：
+     5→- Python OpenAI 格式工具定义
+     6→- TypeScript 类型定义（可选）
+     7→
+     8→V6.1 更新：
+     9→- 移除 GLOBAL_TOOLS 硬编码
+    10→- 全局工具从 skills/core/tools/tools.yaml 加载
+    11→"""
+    12→import yaml
+    13→import logging
+    14→from pathlib import Path
+    15→from typing import Dict, Any, List, Optional
+    16→from dataclasses import dataclass, field
+    17→from functools import lru_cache
+    18→
+    19→logger = logging.getLogger(__name__)
+    20→
+    21→SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+    22→
+    23→
+    24→@dataclass
+    25→class ToolParam:
+    26→    """工具参数"""
+    27→    name: str
+    28→    type: str
+    29→    required: bool = False
+    30→    description: str = ""
+    31→    default: Any = None
+    32→    enum: Optional[List[str]] = None
+    33→
+    34→
+    35→@dataclass
+    36→class ToolDef:
+    37→    """工具定义"""
+    38→    name: str
+    39→    description: str
+    40→    tool_type: str  # collect, compute, display, search
+    41→    parameters: List[ToolParam] = field(default_factory=list)
+    42→    card_type: Optional[str] = None
+    43→    fallback_type: Optional[str] = None  # V7.1: 无专用卡片时的降级类型
+    44→    card_props: Optional[Dict] = None
+    45→    when_to_call: Optional[str] = None
+    46→    implementation: Optional[str] = None
+    47→    skill_id: Optional[str] = None  # 所属 Skill ID
+    48→    is_global: bool = False  # 是否为全局工具
+    49→
+    50→    def to_openai_format(self) -> Dict[str, Any]:
+    51→        """转换为 OpenAI 工具格式"""
+    52→        properties = {}
+    53→        required = []
+    54→
+    55→        for param in self.parameters:
+    56→            prop = {"type": param.type, "description": param.description}
+    57→            if param.enum:
+    58→                prop["enum"] = param.enum
+    59→            if param.default is not None:
+    60→                prop["default"] = param.default
+    61→            properties[param.name] = prop
+    62→            if param.required:
+    63→                required.append(param.name)
+    64→
+    65→        return {
+    66→            "type": "function",
+    67→            "function": {
+    68→                "name": self.name,
+    69→                "description": self.description,
+    70→                "parameters": {
+    71→                    "type": "object",
+    72→                    "properties": properties,
+    73→                    "required": required
+    74→                }
+    75→            },
+    76→            "_metadata": {
+    77→                "tool_type": self.tool_type,
+    78→                "card_type": self.card_type,
+    79→                "fallback_type": self.fallback_type,  # V7.1
+    80→                "when_to_call": self.when_to_call
+    81→            }
+    82→        }
+    83→
+    84→
+    85→def _parse_yaml_tool(tool_data: Dict, tool_type: str) -> ToolDef:
+    86→    """解析 YAML 工具定义"""
+    87→    params = []
+    88→    for p in tool_data.get("parameters", []):
+    89→        params.append(ToolParam(
+    90→            name=p["name"],
+    91→            type=p.get("type", "string"),
+    92→            required=p.get("required", False),
+    93→            description=p.get("description", ""),
+    94→            default=p.get("default"),
+    95→            enum=p.get("enum")
+    96→        ))
+    97→
+    98→    return ToolDef(
+    99→        name=tool_data["name"],
+   100→        description=tool_data.get("description", ""),
+   101→        tool_type=tool_type,
+   102→        parameters=params,
+   103→        card_type=tool_data.get("card_type"),
+   104→        fallback_type=tool_data.get("fallback_type"),  # V7.1
+   105→        card_props=tool_data.get("card_props"),
+   106→        when_to_call=tool_data.get("when_to_call"),
+   107→        implementation=tool_data.get("implementation")
+   108→    )
+   109→
+   110→
+   111→@lru_cache(maxsize=16)
+   112→def load_skill_tools(skill_id: str) -> List[ToolDef]:
+   113→    """从 YAML 加载 Skill 工具定义
+   114→
+   115→    支持两种格式：
+   116→    1. 旧格式：按类型分组 (collect, compute, display, search, action)
+   117→    2. 新格式：tools 列表，每个工具有 type 字段
+   118→    """
+   119→    tools_file = SKILLS_DIR / skill_id / "tools" / "tools.yaml"
+   120→    if not tools_file.exists():
+   121→        logger.debug(f"Tools file not found: {tools_file}")
+   122→        return []
+   123→
+   124→    try:
+   125→        with open(tools_file, "r", encoding="utf-8") as f:
+   126→            data = yaml.safe_load(f)
+   127→
+   128→        tools = []
+   129→
+   130→        # 新格式：tools 列表
+   131→        if "tools" in data and isinstance(data["tools"], list):
+   132→            for tool_data in data["tools"]:
+   133→                tool_type = tool_data.get("type", "display")
+   134→                tool = _parse_yaml_tool(tool_data, tool_type)
+   135→                tool.skill_id = skill_id
+   136→                tool.is_global = (skill_id == "core")
+   137→                tools.append(tool)
+   138→        else:
+   139→            # 旧格式：按类型分组
+   140→            for tool_type in ["collect", "compute", "display", "search", "action", "data"]:
+   141→                for tool_data in data.get(tool_type, []):
+   142→                    tool = _parse_yaml_tool(tool_data, tool_type)
+   143→                    tool.skill_id = skill_id
+   144→                    tool.is_global = (skill_id == "core")
+   145→                    tools.append(tool)
+   146→
+   147→        logger.debug(f"Loaded {len(tools)} tools for skill: {skill_id}")
+   148→        return tools
+   149→    except Exception as e:
+   150→        logger.error(f"Failed to load tools for {skill_id}: {e}")
+   151→        return []
+   152→
+   153→
+   154→@lru_cache(maxsize=1)
+   155→def get_global_tools() -> List[ToolDef]:
+   156→    """获取全局工具（从 core skill 加载）"""
+   157→    return load_skill_tools("core")
+   158→
+   159→
+   160→def get_skill_tools_openai(skill_id: str) -> List[Dict[str, Any]]:
+   161→    """获取 Skill 工具的 OpenAI 格式"""
+   162→    tools = load_skill_tools(skill_id)
+   163→    return [t.to_openai_format() for t in tools]
+   164→
+   165→
+   166→def get_global_tools_openai() -> List[Dict[str, Any]]:
+   167→    """获取全局工具的 OpenAI 格式"""
+   168→    return [t.to_openai_format() for t in get_global_tools()]
+   169→
+   170→
+   171→def get_all_tools_for_skill(skill_id: str) -> List[Dict[str, Any]]:
+   172→    """获取 Skill 的所有工具（全局 + Skill 专属）"""
+   173→    tools = get_global_tools_openai()
+   174→    if skill_id != "core":
+   175→        tools.extend(get_skill_tools_openai(skill_id))
+   176→    return tools
+   177→
+   178→
+   179→def get_tool_card_type(tool_name: str, skill_id: Optional[str] = None) -> Optional[str]:
+   180→    """获取工具对应的卡片类型"""
+   181→    # 先查全局工具
+   182→    for tool in get_global_tools():
+   183→        if tool.name == tool_name:
+   184→            return tool.card_type
+   185→
+   186→    # 再查 Skill 工具
+   187→    if skill_id:
+   188→        for tool in load_skill_tools(skill_id):
+   189→            if tool.name == tool_name:
+   190→                return tool.card_type
+   191→
+   192→    return None
+   193→
+   194→
+   195→def clear_tool_cache():
+   196→    """清除工具缓存"""
+   197→    load_skill_tools.cache_clear()
+   198→    get_global_tools.cache_clear()
+   199→    logger.info("Tool cache cleared")
+   200→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

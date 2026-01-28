@@ -1,0 +1,176 @@
+     1→/**
+     2→ * Next.js API Route for Chat - AI SDK 6 UI Message Stream
+     3→ *
+     4→ * Proxies to Python backend and converts SSE {type:"chunk"/"done"} events
+     5→ * into AI SDK v6 UIMessageChunk JSON event stream.
+     6→ */
+     7→
+     8→import { NextRequest, NextResponse } from 'next/server';
+     9→import { createUIMessageStreamResponse, type UIMessageChunk } from 'ai';
+    10→
+    11→// 服务端使用内部地址直接访问后端 API
+    12→// VIBELIFE_API_INTERNAL 是服务端环境变量（非 NEXT_PUBLIC_）
+    13→const API_BASE = process.env.VIBELIFE_API_INTERNAL
+    14→  ? `${process.env.VIBELIFE_API_INTERNAL}/api/v1`
+    15→  : "http://127.0.0.1:8000/api/v1";
+    16→
+    17→export const runtime = 'edge';
+    18→
+    19→export async function POST(req: NextRequest) {
+    20→  const body = await req.json();
+    21→  const { messages, skill, voice_mode, conversation_id } = body;
+    22→
+    23→  // Extract the latest user message
+    24→  const lastMessage = messages?.[messages.length - 1];
+    25→  const userMessage = typeof lastMessage === 'string'
+    26→    ? lastMessage
+    27→    : lastMessage?.content || lastMessage?.parts?.[0]?.text || body.message || '';
+    28→
+    29→  // Get auth token from header
+    30→  const authHeader = req.headers.get('authorization');
+    31→
+    32→  // Prepare request to Python backend
+    33→  const chatRequest = {
+    34→    message: userMessage,
+    35→    skill: skill || 'bazi',
+    36→    voice_mode: voice_mode || 'warm',
+    37→    conversation_id: conversation_id,
+    38→  };
+    39→
+    40→  try {
+    41→    // Call Python backend SSE endpoint
+    42→    const response = await fetch(`${API_BASE}/chat/stream`, {
+    43→      method: 'POST',
+    44→      headers: {
+    45→        'Content-Type': 'application/json',
+    46→        ...(authHeader && { Authorization: authHeader }),
+    47→      },
+    48→      body: JSON.stringify(chatRequest),
+    49→      signal: req.signal,
+    50→    });
+    51→
+    52→    if (!response.ok || !response.body) {
+    53→      const errorText = await response.text().catch(() => 'Chat failed');
+    54→      const errorStream = new ReadableStream<UIMessageChunk>({
+    55→        start(controller) {
+    56→          controller.enqueue({ type: 'error', errorText: errorText || 'Chat failed' });
+    57→          controller.close();
+    58→        },
+    59→      });
+    60→      return createUIMessageStreamResponse({ stream: errorStream, status: response.status });
+    61→    }
+    62→
+    63→    const textPartId = `text-${Date.now()}`;
+    64→    const assistantMessageId = `msg-${Date.now()}`;
+    65→
+    66→    const stream = new ReadableStream<UIMessageChunk>({
+    67→      async start(controller) {
+    68→        const reader = response.body?.getReader();
+    69→        const decoder = new TextDecoder();
+    70→
+    71→        if (!reader) {
+    72→          controller.close();
+    73→          return;
+    74→        }
+    75→
+    76→        let buffer = '';
+    77→        let textStarted = false;
+    78→        let finished = false;
+    79→        let shouldStop = false;
+    80→
+    81→        // Initialize message + text part early so UI can stream instantly.
+    82→        controller.enqueue({ type: 'start', messageId: assistantMessageId });
+    83→        controller.enqueue({ type: 'text-start', id: textPartId });
+    84→        textStarted = true;
+    85→
+    86→        try {
+    87→          while (true) {
+    88→            const { done, value } = await reader.read();
+    89→            if (done) break;
+    90→
+    91→            buffer += decoder.decode(value, { stream: true });
+    92→            const lines = buffer.split('\n');
+    93→            buffer = lines.pop() || '';
+    94→
+    95→            for (const line of lines) {
+    96→              if (line.startsWith('data: ')) {
+    97→                const dataStr = line.slice(6).trim();
+    98→                if (!dataStr) continue;
+    99→
+   100→                try {
+   101→                  const data = JSON.parse(dataStr);
+   102→
+   103→                  if (data.type === 'chunk') {
+   104→                    controller.enqueue({
+   105→                      type: 'text-delta',
+   106→                      id: textPartId,
+   107→                      delta: String(data.content ?? ''),
+   108→                    });
+   109→                  } else if (data.type === 'done') {
+   110→                    if (textStarted) {
+   111→                      controller.enqueue({ type: 'text-end', id: textPartId });
+   112→                    }
+   113→                    controller.enqueue({
+   114→                      type: 'finish',
+   115→                      finishReason: 'stop',
+   116→                      messageMetadata: {
+   117→                        ...(data.conversation_id ? { conversation_id: data.conversation_id } : {}),
+   118→                        ...(data.skill ? { skill: data.skill } : {}),
+   119→                        ...(data.voice_mode ? { voice_mode: data.voice_mode } : {}),
+   120→                      },
+   121→                    });
+   122→                    finished = true;
+   123→                    shouldStop = true;
+   124→                    break;
+   125→                  } else if (data.type === 'error') {
+   126→                    controller.enqueue({
+   127→                      type: 'error',
+   128→                      errorText: String(data.message ?? 'Chat error'),
+   129→                    });
+   130→                    finished = true;
+   131→                    shouldStop = true;
+   132→                    break;
+   133→                  }
+   134→                } catch {
+   135→                  // Skip malformed JSON
+   136→                }
+   137→              }
+   138→            }
+   139→
+   140→            if (shouldStop) break;
+   141→          }
+   142→
+   143→          // If backend ended without a done marker, close gracefully.
+   144→          if (!finished) {
+   145→            if (textStarted) controller.enqueue({ type: 'text-end', id: textPartId });
+   146→            controller.enqueue({ type: 'finish', finishReason: 'stop' });
+   147→          }
+   148→        } catch (error) {
+   149→          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+   150→          controller.enqueue({ type: 'error', errorText: errorMsg });
+   151→          finished = true;
+   152→        } finally {
+   153→          controller.close();
+   154→        }
+   155→      },
+   156→    });
+   157→
+   158→    return createUIMessageStreamResponse({ stream });
+   159→  } catch (error) {
+   160→    const errorStream = new ReadableStream<UIMessageChunk>({
+   161→      start(controller) {
+   162→        controller.enqueue({
+   163→          type: 'error',
+   164→          errorText: error instanceof Error ? error.message : 'Unknown error',
+   165→        });
+   166→        controller.close();
+   167→      },
+   168→    });
+   169→    return createUIMessageStreamResponse({ stream: errorStream, status: 500 });
+   170→  }
+   171→}
+   172→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

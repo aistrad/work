@@ -1,0 +1,341 @@
+"""
+Model Router - Repository Layer
+Database operations for model routing system
+"""
+import logging
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+
+from stores.db import get_db_pool
+from .models import (
+    ModelProvider, Model, ModelRoute, QuotaRule, QuotaUsage,
+    ModelCallLog, ModelContext
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ModelRouterRepository:
+    """模型路由数据库操作"""
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Provider & Model Queries
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def get_all_providers(self) -> List[ModelProvider]:
+        """获取所有启用的提供商"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, name, base_url, api_key_env, enabled, config
+                FROM model_providers
+                WHERE enabled = TRUE
+            """)
+            return [ModelProvider(**dict(row)) for row in rows]
+
+    async def get_provider(self, provider_id: str) -> Optional[ModelProvider]:
+        """获取单个提供商"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, name, base_url, api_key_env, enabled, config
+                FROM model_providers
+                WHERE id = $1
+            """, provider_id)
+            return ModelProvider(**dict(row)) if row else None
+
+    async def get_all_models(self) -> List[Model]:
+        """获取所有启用的模型"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, provider_id, model_name, display_name, capabilities,
+                       cost_per_1k_input, cost_per_1k_output, cost_per_image,
+                       max_tokens, context_window, enabled
+                FROM models
+                WHERE enabled = TRUE
+            """)
+            return [Model(**dict(row)) for row in rows]
+
+    async def get_model(self, model_id: str) -> Optional[Model]:
+        """获取单个模型"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, provider_id, model_name, display_name, capabilities,
+                       cost_per_1k_input, cost_per_1k_output, cost_per_image,
+                       max_tokens, context_window, enabled
+                FROM models
+                WHERE id = $1
+            """, model_id)
+            return Model(**dict(row)) if row else None
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Route Queries
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def get_all_routes(self) -> List[ModelRoute]:
+        """获取所有启用的路由规则（按优先级排序）"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, name, description, priority,
+                       match_user_id, match_user_tier, match_skill, match_task,
+                       model_id, fallback_chain,
+                       ab_test_group, ab_test_percentage, enabled
+                FROM model_routes
+                WHERE enabled = TRUE
+                ORDER BY priority ASC
+            """)
+            return [ModelRoute(**dict(row)) for row in rows]
+
+    async def get_matching_routes(self, context: ModelContext) -> List[ModelRoute]:
+        """
+        获取匹配上下文的路由规则
+        按优先级排序，返回所有可能匹配的规则
+        """
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # 构建动态查询
+            # NULL 表示该条件不限制（匹配任何值）
+            rows = await conn.fetch("""
+                SELECT id, name, description, priority,
+                       match_user_id, match_user_tier, match_skill, match_task,
+                       model_id, fallback_chain,
+                       ab_test_group, ab_test_percentage, enabled
+                FROM model_routes
+                WHERE enabled = TRUE
+                  AND (match_user_id IS NULL OR match_user_id = $1::uuid)
+                  AND (match_user_tier IS NULL OR match_user_tier = $2)
+                  AND (match_skill IS NULL OR match_skill = $3)
+                  AND (match_task IS NULL OR match_task = $4)
+                ORDER BY priority ASC
+            """,
+                context.user_id if context.user_id else None,
+                context.user_tier,
+                context.skill,
+                context.task
+            )
+            return [ModelRoute(**dict(row)) for row in rows]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Quota Queries
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def get_all_quota_rules(self) -> List[QuotaRule]:
+        """获取所有启用的配额规则"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, name, description, scope,
+                       scope_provider_id, scope_model_id, scope_user_tier, scope_task,
+                       period, max_calls, max_input_tokens, max_output_tokens, max_cost,
+                       on_exceed, downgrade_to_model, exceed_message, enabled
+                FROM quota_rules
+                WHERE enabled = TRUE
+            """)
+            return [QuotaRule(**dict(row)) for row in rows]
+
+    async def get_applicable_quota_rules(
+        self,
+        context: ModelContext,
+        model_id: str
+    ) -> List[QuotaRule]:
+        """获取适用于当前上下文和模型的配额规则"""
+        pool = await get_db_pool()
+        provider_id = model_id.split(":")[0] if ":" in model_id else None
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, name, description, scope,
+                       scope_provider_id, scope_model_id, scope_user_tier, scope_task,
+                       period, max_calls, max_input_tokens, max_output_tokens, max_cost,
+                       on_exceed, downgrade_to_model, exceed_message, enabled
+                FROM quota_rules
+                WHERE enabled = TRUE
+                  AND (
+                    -- 全局规则
+                    scope = 'global'
+                    -- 提供商规则
+                    OR (scope = 'provider' AND scope_provider_id = $1)
+                    -- 模型规则
+                    OR (scope = 'model' AND scope_model_id = $2)
+                    -- 用户等级规则
+                    OR (scope = 'tier' AND scope_user_tier = $3)
+                    -- 任务规则
+                    OR (scope = 'task' AND scope_task = $4)
+                    -- 用户规则（所有用户适用）
+                    OR scope = 'user'
+                  )
+            """, provider_id, model_id, context.user_tier, context.task)
+            return [QuotaRule(**dict(row)) for row in rows]
+
+    async def get_quota_usage(
+        self,
+        rule_id: int,
+        user_id: Optional[str] = None,
+        period: str = "daily"
+    ) -> Optional[QuotaUsage]:
+        """获取配额使用情况"""
+        pool = await get_db_pool()
+
+        # 计算周期边界
+        now = datetime.utcnow()
+        if period == "hourly":
+            period_start = now.replace(minute=0, second=0, microsecond=0)
+        elif period == "daily":
+            period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "weekly":
+            period_start = now - timedelta(days=now.weekday())
+            period_start = period_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "monthly":
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT rule_id, user_id::text, period_start, period_end,
+                       call_count, input_tokens, output_tokens, estimated_cost
+                FROM quota_usage
+                WHERE rule_id = $1
+                  AND (user_id = $2::uuid OR ($2 IS NULL AND user_id IS NULL))
+                  AND period_start = $3
+            """, rule_id, user_id, period_start)
+            return QuotaUsage(**dict(row)) if row else None
+
+    async def increment_quota_usage(
+        self,
+        rule_id: int,
+        user_id: Optional[str] = None,
+        calls: int = 1,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost: float = 0.0
+    ) -> None:
+        """增加配额使用量"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                SELECT increment_quota_usage($1, $2::uuid, $3, $4, $5, $6)
+            """, rule_id, user_id, calls, input_tokens, output_tokens, cost)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logging
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def log_model_call(self, log: ModelCallLog) -> None:
+        """记录模型调用日志"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO model_call_logs (
+                    user_id, session_id, skill, task,
+                    route_id, requested_model, actual_model,
+                    was_downgraded, downgrade_reason,
+                    input_tokens, output_tokens, estimated_cost,
+                    status, latency_ms, error_code, error_message,
+                    request_id, metadata
+                ) VALUES (
+                    $1::uuid, $2::uuid, $3, $4,
+                    $5, $6, $7,
+                    $8, $9,
+                    $10, $11, $12,
+                    $13, $14, $15, $16,
+                    $17, $18::jsonb
+                )
+            """,
+                log.user_id, log.session_id, log.skill, log.task,
+                log.route_id, log.requested_model, log.actual_model,
+                log.was_downgraded, log.downgrade_reason,
+                log.input_tokens, log.output_tokens, log.estimated_cost,
+                log.status, log.latency_ms, log.error_code, log.error_message,
+                log.request_id, log.metadata or {}
+            )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # A/B Testing
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def get_ab_test_assignment(
+        self,
+        user_id: str,
+        test_name: str
+    ) -> Optional[str]:
+        """获取用户的 A/B 测试分组"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT group_name
+                FROM ab_test_assignments
+                WHERE user_id = $1::uuid AND test_name = $2
+            """, user_id, test_name)
+            return row["group_name"] if row else None
+
+    async def set_ab_test_assignment(
+        self,
+        user_id: str,
+        test_name: str,
+        group_name: str
+    ) -> None:
+        """设置用户的 A/B 测试分组"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO ab_test_assignments (user_id, test_name, group_name)
+                VALUES ($1::uuid, $2, $3)
+                ON CONFLICT (user_id, test_name) DO UPDATE SET
+                    group_name = EXCLUDED.group_name,
+                    assigned_at = NOW()
+            """, user_id, test_name, group_name)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Statistics
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def get_usage_stats(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        group_by: str = "model"  # model, provider, user, task
+    ) -> List[Dict[str, Any]]:
+        """获取使用统计"""
+        pool = await get_db_pool()
+
+        group_column = {
+            "model": "actual_model",
+            "provider": "split_part(actual_model, ':', 1)",
+            "user": "user_id",
+            "task": "task"
+        }.get(group_by, "actual_model")
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT
+                    {group_column} as group_key,
+                    COUNT(*) as total_calls,
+                    SUM(input_tokens) as total_input_tokens,
+                    SUM(output_tokens) as total_output_tokens,
+                    SUM(estimated_cost) as total_cost,
+                    AVG(latency_ms) as avg_latency_ms,
+                    COUNT(*) FILTER (WHERE status = 'success') as success_count,
+                    COUNT(*) FILTER (WHERE status = 'error') as error_count,
+                    COUNT(*) FILTER (WHERE was_downgraded) as downgrade_count
+                FROM model_call_logs
+                WHERE created_at >= $1 AND created_at < $2
+                GROUP BY {group_column}
+                ORDER BY total_calls DESC
+            """, start_time, end_time)
+            return [dict(row) for row in rows]
+
+
+# 全局实例
+_repository: Optional[ModelRouterRepository] = None
+
+
+def get_repository() -> ModelRouterRepository:
+    """获取仓库实例"""
+    global _repository
+    if _repository is None:
+        _repository = ModelRouterRepository()
+    return _repository

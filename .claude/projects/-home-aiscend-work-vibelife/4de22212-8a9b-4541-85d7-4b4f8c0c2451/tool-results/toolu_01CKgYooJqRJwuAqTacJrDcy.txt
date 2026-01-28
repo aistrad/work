@@ -1,0 +1,406 @@
+     1→# Proactive 模块设计规范 v1.0
+     2→
+     3→## 概述
+     4→
+     5→Proactive 模块负责主动触达用户，通过推送通知增强用户粘性和业务转化。本模块与 Skill Management 深度集成，实现订阅感知的精准推送。
+     6→
+     7→## 核心原则
+     8→
+     9→| 原则 | 说明 |
+    10→|-----|------|
+    11→| 订阅感知 | 根据 Skill 订阅状态决定是否推送 |
+    12→| 配置独立 | reminders.yaml 独立于 SKILL.md，便于运营调整 |
+    13→| Skill 级开关 | 用户通过 Skill 总开关控制推送，简化设置 |
+    14→| 对话引导 | 每条推送提供一键开始对话入口 |
+    15→
+    16→## 架构设计
+    17→
+    18→```
+    19→┌─────────────────────────────────────────────────────────────────┐
+    20→│                    Proactive 架构                               │
+    21→├─────────────────────────────────────────────────────────────────┤
+    22→│                                                                 │
+    23→│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
+    24→│  │  Scheduler  │───▶│   Engine    │───▶│  Delivery   │        │
+    25→│  │  (Cron)     │    │             │    │  (Push)     │        │
+    26→│  └─────────────┘    └──────┬──────┘    └─────────────┘        │
+    27→│                            │                                   │
+    28→│           ┌────────────────┼────────────────┐                  │
+    29→│           │                │                │                  │
+    30→│           ▼                ▼                ▼                  │
+    31→│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+    32→│  │  Trigger    │  │  Content    │  │ Subscription │            │
+    33→│  │  Detector   │  │  Generator  │  │   Checker    │            │
+    34→│  └─────────────┘  └─────────────┘  └─────────────┘            │
+    35→│         │                │                │                    │
+    36→│         │                │                │                    │
+    37→│         ▼                ▼                ▼                    │
+    38→│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+    39→│  │ reminders   │  │   rules/    │  │ user_skill  │            │
+    40→│  │   .yaml     │  │   *.md      │  │ subscriptions│           │
+    41→│  └─────────────┘  └─────────────┘  └─────────────┘            │
+    42→│                                                                 │
+    43→└─────────────────────────────────────────────────────────────────┘
+    44→```
+    45→
+    46→## 配置模型
+    47→
+    48→### reminders.yaml 结构
+    49→
+    50→reminders.yaml 独立存放于 `apps/api/skills/{skill_id}/reminders.yaml`，与 SKILL.md 通过 skill_id 关联。
+    51→
+    52→```yaml
+    53→# apps/api/skills/bazi/reminders.yaml
+    54→skill_id: bazi
+    55→enabled: true
+    56→
+    57→reminders:
+    58→  - id: daily_fortune
+    59→    name: 每日运势
+    60→    trigger:
+    61→      type: time_based
+    62→      schedule: "0 4 * * *"  # 每天早上4点
+    63→    content:
+    64→      generator: rules/daily-fortune.md  # 复用 rules/ 架构
+    65→      card_type: DailyFortuneCard
+    66→      # 对话引导配置
+    67→      suggested_prompt: "想了解今天的运势详情？"
+    68→      quick_actions:
+    69→        - label: "今日宜忌"
+    70→          prompt: "今天适合做什么？有什么需要注意的？"
+    71→        - label: "开运建议"
+    72→          prompt: "今天如何提升运势？"
+    73→    priority: medium
+    74→
+    75→  - id: dayun_transition
+    76→    name: 大运交接
+    77→    trigger:
+    78→      type: event_based
+    79→      event: dayun_change
+    80→      advance_days: [30, 7, 0]  # 提前30天、7天、当天提醒
+    81→    content:
+    82→      generator: rules/dayun-transition.md
+    83→      card_type: InsightCard
+    84→      suggested_prompt: "想了解新大运的详细分析？"
+    85→      quick_actions:
+    86→        - label: "大运解读"
+    87→          prompt: "请详细分析我即将进入的新大运"
+    88→        - label: "机遇与挑战"
+    89→          prompt: "新大运会带来哪些机遇和挑战？"
+    90→    priority: high
+    91→
+    92→  - id: fortune_alert
+    93→    name: 运势预警
+    94→    trigger:
+    95→      type: threshold_based
+    96→      metric: daily_fortune_score
+    97→      condition: "<"
+    98→      threshold: 40
+    99→      cooldown_days: 7  # 7天内不重复提醒
+   100→    content:
+   101→      generator: rules/fortune-alert.md
+   102→      suggested_prompt: "想了解如何化解？"
+   103→      quick_actions:
+   104→        - label: "化解方法"
+   105→          prompt: "请告诉我如何化解当前的不利因素"
+   106→    priority: medium
+   107→```
+   108→
+   109→### 触发器类型
+   110→
+   111→| 类型 | 说明 | 参数 |
+   112→|-----|------|------|
+   113→| time_based | 定时触发 | schedule (cron) |
+   114→| event_based | 事件触发 | event, advance_days |
+   115→| threshold_based | 阈值触发 | metric, condition, threshold, cooldown_days |
+   116→
+   117→## Subscription 集成
+   118→
+   119→### 推送决策逻辑
+   120→
+   121→```python
+   122→async def _should_send_to_user(
+   123→    self,
+   124→    user_id: UUID,
+   125→    skill_id: str,
+   126→) -> bool:
+   127→    """
+   128→    检查是否应该发送推送
+   129→    - 粒度: Skill 级别总开关
+   130→    """
+   131→    # 1. 获取 Skill 元数据
+   132→    skill_meta = self._skill_metadata.get(skill_id, {})
+   133→    category = skill_meta.get("category", "professional")
+   134→
+   135→    # 2. Core Skill 始终发送
+   136→    if category == "core":
+   137→        return True
+   138→
+   139→    # 3. 获取用户订阅状态
+   140→    subscription = await SkillSubscriptionRepo.get(user_id, skill_id)
+   141→
+   142→    # 4. Default Skill: 检查是否取消订阅或关闭推送
+   143→    if category == "default":
+   144→        if subscription and subscription.status == "unsubscribed":
+   145→            return False
+   146→        if subscription and not subscription.push_enabled:
+   147→            return False
+   148→        return True
+   149→
+   150→    # 5. Professional Skill: 需要有效订阅且开启推送
+   151→    if not subscription or subscription.status != "subscribed":
+   152→        return False
+   153→
+   154→    return subscription.push_enabled
+   155→```
+   156→
+   157→### 订阅状态与推送关系
+   158→
+   159→| Skill 类别 | 订阅状态 | push_enabled | 是否推送 |
+   160→|-----------|---------|--------------|---------|
+   161→| core | - | - | ✅ 始终推送 |
+   162→| default | 无/subscribed | true (默认) | ✅ 推送 |
+   163→| default | unsubscribed | - | ❌ 不推送 |
+   164→| default | subscribed | false | ❌ 不推送 |
+   165→| professional | subscribed | true | ✅ 推送 |
+   166→| professional | 无/unsubscribed | - | ❌ 不推送 |
+   167→| professional | subscribed | false | ❌ 不推送 |
+   168→
+   169→## ContentGenerator 设计
+   170→
+   171→### 复用 Rules 架构
+   172→
+   173→```python
+   174→class ContentGenerator:
+   175→    """复用 Skill Rules 的内容生成器"""
+   176→
+   177→    async def generate(
+   178→        self,
+   179→        task: ReminderTask,
+   180→        profile: Dict[str, Any],
+   181→        config: Dict[str, Any],
+   182→    ) -> ReminderContent:
+   183→        """
+   184→        流程:
+   185→        1. 加载 content.generator 指定的 rule 文件
+   186→        2. 使用 rule 中的分析要点和检索 Query
+   187→        3. 调用 LLM 生成个性化内容
+   188→        4. 附加对话引导信息
+   189→        """
+   190→        skill_id = task.skill_id
+   191→        generator_path = config.get("content", {}).get("generator", "")
+   192→
+   193→        # 如果指定了 rule 文件，加载并使用
+   194→        if generator_path.startswith("rules/"):
+   195→            rule_content = await self._load_rule(skill_id, generator_path)
+   196→            content = await self._generate_from_rule(
+   197→                task=task,
+   198→                profile=profile,
+   199→                rule=rule_content,
+   200→                card_type=config.get("content", {}).get("card_type"),
+   201→            )
+   202→        else:
+   203→            # 降级到默认生成器
+   204→            content = await self._generate_default(task, profile, config)
+   205→
+   206→        # 附加对话引导
+   207→        content.suggested_prompt = config.get("content", {}).get("suggested_prompt")
+   208→        content.quick_actions = config.get("content", {}).get("quick_actions", [])
+   209→
+   210→        return content
+   211→```
+   212→
+   213→## 通知数据结构
+   214→
+   215→### ProactiveNotification
+   216→
+   217→```typescript
+   218→interface ProactiveNotification {
+   219→  id: string;
+   220→  skill_id: string;
+   221→  reminder_type: string;
+   222→  title: string;
+   223→  content: {
+   224→    body: string;
+   225→    fortune_hint?: string;
+   226→    action_tip?: string;
+   227→    // 对话引导 (必须)
+   228→    suggested_prompt: string;
+   229→    quick_actions: Array<{
+   230→      label: string;
+   231→      prompt: string;  // 点击后发送的消息
+   232→    }>;
+   233→  };
+   234→  card_type?: string;
+   235→  created_at: string;
+   236→  read_at?: string;
+   237→}
+   238→```
+   239→
+   240→## 前端对话引导
+   241→
+   242→### 通知卡片组件
+   243→
+   244→```tsx
+   245→function NotificationCard({ notification }: { notification: ProactiveNotification }) {
+   246→  const router = useRouter();
+   247→
+   248→  const handleStartChat = (prompt: string) => {
+   249→    // 1. 跳转到聊天页面
+   250→    // 2. 传递 skill_id 和初始消息
+   251→    router.push({
+   252→      pathname: '/chat',
+   253→      query: {
+   254→        skill: notification.skill_id,
+   255→        prompt: encodeURIComponent(prompt),
+   256→      },
+   257→    });
+   258→  };
+   259→
+   260→  return (
+   261→    <Card>
+   262→      <CardHeader>
+   263→        <SkillIcon skillId={notification.skill_id} />
+   264→        <span>{notification.title}</span>
+   265→      </CardHeader>
+   266→      <CardBody>
+   267→        <p>{notification.content.body}</p>
+   268→
+   269→        {/* 一键开始对话 */}
+   270→        <div className="mt-4 flex gap-2">
+   271→          {notification.content.quick_actions.map(action => (
+   272→            <Button
+   273→              key={action.label}
+   274→              variant="outline"
+   275→              onClick={() => handleStartChat(action.prompt)}
+   276→            >
+   277→              {action.label}
+   278→            </Button>
+   279→          ))}
+   280→        </div>
+   281→      </CardBody>
+   282→    </Card>
+   283→  );
+   284→}
+   285→```
+   286→
+   287→### 聊天页面接收
+   288→
+   289→```tsx
+   290→// apps/web/src/app/chat/page.tsx
+   291→export default function ChatPage() {
+   292→  const searchParams = useSearchParams();
+   293→  const skillParam = searchParams.get('skill');
+   294→  const promptParam = searchParams.get('prompt');
+   295→
+   296→  const { sendMessage, switchSkill } = useVibeChat();
+   297→
+   298→  useEffect(() => {
+   299→    if (skillParam) {
+   300→      // 切换到指定 Skill
+   301→      switchSkill(skillParam);
+   302→    }
+   303→    if (promptParam) {
+   304→      // 自动发送预设消息
+   305→      const decodedPrompt = decodeURIComponent(promptParam);
+   306→      sendMessage(decodedPrompt);
+   307→    }
+   308→  }, [skillParam, promptParam]);
+   309→
+   310→  // ...
+   311→}
+   312→```
+   313→
+   314→## 目录结构
+   315→
+   316→```
+   317→apps/api/
+   318→├── skills/{skill_id}/
+   319→│   ├── SKILL.md
+   320→│   ├── reminders.yaml        # Proactive 配置 (独立文件)
+   321→│   ├── rules/
+   322→│   │   ├── daily-fortune.md  # 复用为推送内容生成
+   323→│   │   └── ...
+   324→│   └── tools/
+   325→│
+   326→├── services/
+   327→│   └── proactive/
+   328→│       ├── engine.py         # 集成 Subscription 检查
+   329→│       ├── trigger_detector.py
+   330→│       ├── content_generator.py  # 复用 rules/ 架构
+   331→│       └── scheduler.py
+   332→│
+   333→└── workers/
+   334→    └── proactive_worker.py
+   335→
+   336→apps/web/
+   337→├── components/
+   338→│   ├── notification/
+   339→│   │   └── NotificationCard.tsx  # 支持对话引导
+   340→│   └── skill/
+   341→│       └── SkillPushToggle.tsx   # Skill 级推送开关
+   342→│
+   343→└── app/
+   344→    ├── chat/
+   345→    │   └── page.tsx              # 支持 skill/prompt 参数
+   346→    └── settings/
+   347→        └── page.tsx              # Skill 管理入口
+   348→```
+   349→
+   350→## 实施优先级
+   351→
+   352→| 优先级 | 任务 | 复杂度 | 价值 |
+   353→|-------|------|-------|------|
+   354→| P0 | Subscription 检查集成 | 低 | 高 |
+   355→| P1 | 推送→对话引导实现 | 中 | 高 |
+   356→| P2 | ContentGenerator 复用 rules/ | 中 | 中 |
+   357→| P3 | 设置页 Skill 推送开关 | 低 | 高 |
+   358→
+   359→## API 接口
+   360→
+   361→### 获取推送通知列表
+   362→
+   363→```
+   364→GET /api/notifications
+   365→```
+   366→
+   367→Response:
+   368→```json
+   369→{
+   370→  "notifications": [
+   371→    {
+   372→      "id": "uuid",
+   373→      "skill_id": "bazi",
+   374→      "reminder_type": "daily_fortune",
+   375→      "title": "今日运势",
+   376→      "content": {
+   377→        "body": "甲木日主，今日戊土当令...",
+   378→        "suggested_prompt": "想了解今天的运势详情？",
+   379→        "quick_actions": [
+   380→          {"label": "今日宜忌", "prompt": "今天适合做什么？"},
+   381→          {"label": "开运建议", "prompt": "今天如何提升运势？"}
+   382→        ]
+   383→      },
+   384→      "created_at": "2025-01-19T04:00:00Z"
+   385→    }
+   386→  ]
+   387→}
+   388→```
+   389→
+   390→### 更新 Skill 推送开关
+   391→
+   392→```
+   393→PUT /api/skills/{skill_id}/subscription
+   394→```
+   395→
+   396→Request:
+   397→```json
+   398→{
+   399→  "push_enabled": false
+   400→}
+   401→```
+   402→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

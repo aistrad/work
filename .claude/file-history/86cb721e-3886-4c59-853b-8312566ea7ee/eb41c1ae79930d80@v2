@@ -1,0 +1,237 @@
+"""
+VibeLife API - The Living Companion Backend
+"""
+import os
+import time
+import logging
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+from stores.db import init_db, close_db
+from workers import IngestionWorker
+
+# ─────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────
+
+# 确保日志目录存在 (支持环境变量配置，fallback 到 /tmp)
+log_dir = Path(os.environ.get("VIBELIFE_LOGS_ROOT", "/tmp/vibelife/logs"))
+log_dir.mkdir(parents=True, exist_ok=True)
+
+# 配置请求日志
+request_logger = logging.getLogger("vibelife.requests")
+request_logger.setLevel(logging.INFO)
+
+# 文件处理器
+file_handler = logging.FileHandler(log_dir / "api_requests.log")
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+request_logger.addHandler(file_handler)
+
+# ─────────────────────────────────────────────────────────────────
+# Load environment (.env at repo root)
+# ─────────────────────────────────────────────────────────────────
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+if load_dotenv:
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+# ─────────────────────────────────────────────────────────────────
+# Lifespan (startup/shutdown)
+# ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler"""
+    # Startup
+    print("Starting VibeLife API...")
+    await init_db()
+    print("Database connected")
+
+    # Initialize Tool Registry (v6.0)
+    from services.agent import ToolRegistry
+    # 导入全局处理器以触发 @tool_handler 装饰器注册
+    import services.agent.global_handlers  # noqa: F401
+    ToolRegistry.initialize()
+    print(f"ToolRegistry initialized: {len(ToolRegistry._handlers)} handlers")
+
+    # Start ingestion worker (if enabled)
+    ingestion_worker = None
+    if os.getenv("VIBELIFE_WORKER_ENABLED", "1") == "1":
+        ingestion_worker = IngestionWorker()
+        await ingestion_worker.start()
+        print("Ingestion worker started")
+
+    yield
+
+    # Shutdown
+    print("Shutting down VibeLife API...")
+
+    # Stop worker
+    if ingestion_worker:
+        await ingestion_worker.stop()
+        print("Ingestion worker stopped")
+
+    await close_db()
+    print("Database closed")
+
+
+# ─────────────────────────────────────────────────────────────────
+# App Creation
+# ─────────────────────────────────────────────────────────────────
+
+# 生产环境禁用文档
+app = FastAPI(
+    title="VibeLife API",
+    description="The Living Companion - AI-powered personal growth platform",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
+
+# ─────────────────────────────────────────────────────────────────
+# CORS Middleware
+# ─────────────────────────────────────────────────────────────────
+
+cors_origins = os.getenv("VIBELIFE_CORS_ORIGINS", "http://localhost:3000").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────���───────────────────────────────────
+# Request Logging Middleware
+# ─────────────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有 HTTP 请求的详细信息"""
+    start_time = time.time()
+
+    # 获取客户端信息
+    client_ip = request.client.host if request.client else "unknown"
+    xff = request.headers.get("x-forwarded-for", "-")
+    x_real_ip = request.headers.get("x-real-ip", "-")
+    cf_ip = request.headers.get("cf-connecting-ip", "-")
+
+    # 处理请求
+    response = await call_next(request)
+
+    # 计算处理时间
+    process_time = (time.time() - start_time) * 1000  # 转换为毫秒
+
+    # 记录日志
+    request_logger.info(
+        f'{client_ip} "{request.method} {request.url.path}" '
+        f'{response.status_code} {process_time:.2f}ms '
+        f'xff="{xff}" xrealip="{x_real_ip}" cf_ip="{cf_ip}" '
+        f'ua="{request.headers.get("user-agent", "-")}"'
+    )
+
+    return response
+
+
+# ─────────────────────────────────────────────────────────────────
+# Routes Import
+# ─────────────────────────────────────────────────────────────────
+
+from routes.health import router as health_router
+from routes.auth import router as auth_router
+from routes.users import router as users_router
+from routes.chat import router as chat_router
+from routes.billing import router as billing_router
+from routes.guest import router as guest_router
+
+# v3.0 new routes
+from routes.report import router as report_router
+from routes.relationship import router as relationship_router
+from routes.fortune import router as fortune_router
+from routes.payment import router as payment_router
+from routes.bazi import router as bazi_router
+from routes.zodiac import router as zodiac_router
+from routes.onboarding import router as onboarding_router
+from routes.notifications import router as notifications_router
+from routes.entitlement import router as entitlement_router
+from routes.memories import router as memories_router
+from routes.identity import router as identity_router
+
+# v5.0 CoreAgent routes
+from routes.chat_v5 import router as chat_v5_router
+from routes.context import router as context_router
+
+# v6.0 Tools routes
+from routes.tools import router as tools_router
+
+# Register routers
+app.include_router(health_router, tags=["Health"])
+app.include_router(auth_router, prefix="/api/v1", tags=["Authentication"])
+app.include_router(guest_router, prefix="/api/v1", tags=["Guest Session"])
+app.include_router(users_router, prefix="/api/v1", tags=["Users"])
+app.include_router(chat_router, prefix="/api/v1", tags=["Chat"])
+app.include_router(billing_router, prefix="/api/v1", tags=["Billing"])
+
+# v3.0 new routers
+app.include_router(report_router, prefix="/api/v1", tags=["Report"])
+app.include_router(relationship_router, prefix="/api/v1", tags=["Relationship"])
+app.include_router(fortune_router, prefix="/api/v1", tags=["Fortune"])
+app.include_router(payment_router, prefix="/api/v1", tags=["Payment"])
+app.include_router(bazi_router, prefix="/api/v1", tags=["Bazi"])
+app.include_router(zodiac_router, prefix="/api/v1", tags=["Zodiac"])
+app.include_router(onboarding_router, prefix="/api/v1", tags=["Onboarding"])
+app.include_router(notifications_router, prefix="/api/v1", tags=["Notifications"])
+app.include_router(entitlement_router, prefix="/api/v1", tags=["Entitlement"])
+app.include_router(memories_router, prefix="/api/v1", tags=["Memories"])
+app.include_router(identity_router, prefix="/api/v1", tags=["Identity"])
+
+# v5.0 CoreAgent routers
+app.include_router(chat_v5_router, prefix="/api/v1", tags=["Chat V5"])
+app.include_router(context_router, prefix="/api/v1", tags=["Context"])
+
+# v6.0 Tools routers
+app.include_router(tools_router, prefix="/api/v1", tags=["Tools"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Root Endpoint
+# ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    """Root endpoint - return 404 to hide API info"""
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Run with uvicorn (for development)
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("VIBELIFE_API_PORT", 8000))
+    host = os.getenv("VIBELIFE_API_HOST", "0.0.0.0")
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=os.getenv("VIBELIFE_DEV", "0") == "1",
+    )

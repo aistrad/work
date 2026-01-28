@@ -1,0 +1,241 @@
+     1→from __future__ import annotations
+     2→
+     3→import os
+     4→from contextlib import contextmanager
+     5→from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+     6→
+     7→try:
+     8→    import psycopg2
+     9→    from psycopg2 import pool
+    10→    from psycopg2.extras import RealDictCursor
+    11→except ImportError:  # pragma: no cover
+    12→    psycopg2 = None  # type: ignore[assignment]
+    13→    pool = None  # type: ignore[assignment]
+    14→    RealDictCursor = None  # type: ignore[assignment]
+    15→
+    16→
+    17→class FortuneDbConfigError(RuntimeError):
+    18→    pass
+    19→
+    20→
+    21→_pool: Optional["pool.ThreadedConnectionPool"] = None
+    22→
+    23→
+    24→def _require_env(name: str) -> str:
+    25→    v = (os.getenv(name) or "").strip()
+    26→    if not v:
+    27→        raise FortuneDbConfigError(f"missing_env:{name}")
+    28→    return v
+    29→
+    30→
+    31→def _get_dsn() -> str:
+    32→    url = (os.getenv("FORTUNE_AI_DB_URL") or os.getenv("FORTUNE_DB_URL") or "").strip()
+    33→    if url:
+    34→        return url
+    35→
+    36→    host = _require_env("FORTUNE_DB_HOST")
+    37→    port = _require_env("FORTUNE_DB_PORT")
+    38→    dbname = _require_env("FORTUNE_DB_NAME")
+    39→    user = _require_env("FORTUNE_DB_USER")
+    40→    password = _require_env("FORTUNE_DB_PASSWORD")
+    41→    sslmode = (os.getenv("FORTUNE_DB_SSLMODE") or "prefer").strip()
+    42→    return f"host={host} port={port} dbname={dbname} user={user} password={password} sslmode={sslmode}"
+    43→
+    44→
+    45→def init_pool(minconn: int = 1, maxconn: int = 10) -> None:
+    46→    global _pool
+    47→    if psycopg2 is None or pool is None:
+    48→        raise RuntimeError("psycopg2 not installed")
+    49→    if _pool is not None:
+    50→        return
+    51→    dsn = _get_dsn()
+    52→    _pool = pool.ThreadedConnectionPool(minconn, maxconn, dsn=dsn)
+    53→
+    54→
+    55→def get_pool() -> "pool.ThreadedConnectionPool":
+    56→    global _pool
+    57→    if _pool is None:
+    58→        minconn = int(os.getenv("FORTUNE_DB_POOL_MIN", "1"))
+    59→        maxconn = int(os.getenv("FORTUNE_DB_POOL_MAX", "10"))
+    60→        init_pool(minconn=minconn, maxconn=maxconn)
+    61→    assert _pool is not None
+    62→    return _pool
+    63→
+    64→
+    65→def close_pool() -> None:
+    66→    global _pool
+    67→    if _pool is None:
+    68→        return
+    69→    try:
+    70→        _pool.closeall()
+    71→    finally:
+    72→        _pool = None
+    73→
+    74→
+    75→@contextmanager
+    76→def db_conn():
+    77→    p = get_pool()
+    78→    conn = p.getconn()
+    79→    try:
+    80→        try:
+    81→            if getattr(conn, "closed", 0):
+    82→                try:
+    83→                    p.putconn(conn, close=True)
+    84→                except Exception:
+    85→                    pass
+    86→                conn = p.getconn()
+    87→        except Exception:
+    88→            pass
+    89→        yield conn
+    90→    finally:
+    91→        try:
+    92→            if getattr(conn, "closed", 0):
+    93→                p.putconn(conn, close=True)
+    94→            else:
+    95→                p.putconn(conn)
+    96→        except Exception:
+    97→            try:
+    98→                p.putconn(conn, close=True)
+    99→            except Exception:
+   100→                pass
+   101→
+   102→
+   103→@contextmanager
+   104→def db_cursor(dict_cursor: bool = True):
+   105→    with db_conn() as conn:
+   106→        cur = conn.cursor(cursor_factory=RealDictCursor if dict_cursor else None)
+   107→        try:
+   108→            yield cur
+   109→            conn.commit()
+   110→        except Exception:
+   111→            try:
+   112→                conn.rollback()
+   113→            except Exception:
+   114→                pass
+   115→            raise
+   116→        finally:
+   117→            cur.close()
+   118→
+   119→
+   120→def fetch_one(sql: str, params: Sequence[Any] | None = None) -> Optional[Dict[str, Any]]:
+   121→    with db_cursor(dict_cursor=True) as cur:
+   122→        cur.execute(sql, tuple(params or []))
+   123→        row = cur.fetchone()
+   124→        return dict(row) if row else None
+   125→
+   126→
+   127→def fetch_all(sql: str, params: Sequence[Any] | None = None) -> List[Dict[str, Any]]:
+   128→    with db_cursor(dict_cursor=True) as cur:
+   129→        cur.execute(sql, tuple(params or []))
+   130→        rows = cur.fetchall() or []
+   131→        return [dict(r) for r in rows]
+   132→
+   133→
+   134→def execute(sql: str, params: Sequence[Any] | None = None) -> int:
+   135→    with db_cursor(dict_cursor=False) as cur:
+   136→        cur.execute(sql, tuple(params or []))
+   137→        return int(cur.rowcount or 0)
+   138→
+   139→
+   140→def execute_returning_one(sql: str, params: Sequence[Any] | None = None) -> Optional[Dict[str, Any]]:
+   141→    with db_cursor(dict_cursor=True) as cur:
+   142→        cur.execute(sql, tuple(params or []))
+   143→        row = cur.fetchone()
+   144→        return dict(row) if row else None
+   145→
+   146→
+   147→# =============================================================================
+   148→# Transaction Context for Multi-Step Atomic Operations
+   149→# =============================================================================
+   150→
+   151→class TransactionContext:
+   152→    """
+   153→    事务上下文，支持多步操作原子化。
+   154→
+   155→    用于解决 FOR UPDATE 锁在独立事务中立即释放的问题。
+   156→    所有操作在同一个数据库连接和事务中执行。
+   157→
+   158→    Usage:
+   159→        with fortune_db.transaction() as tx:
+   160→            row = tx.fetch_one("SELECT * FROM t WHERE id = %s FOR UPDATE", [id])
+   161→            tx.execute("UPDATE t SET x = %s WHERE id = %s", [new_val, id])
+   162→            tx.execute_returning_one("INSERT INTO log (...) RETURNING id", [...])
+   163→            # 退出 with 块时自动 commit，异常时自动 rollback
+   164→    """
+   165→
+   166→    def __init__(self, cursor):
+   167→        self._cur = cursor
+   168→
+   169→    def fetch_one(self, sql: str, params: Sequence[Any] | None = None) -> Optional[Dict[str, Any]]:
+   170→        """Execute query and return single row as dict."""
+   171→        self._cur.execute(sql, tuple(params or []))
+   172→        row = self._cur.fetchone()
+   173→        return dict(row) if row else None
+   174→
+   175→    def fetch_all(self, sql: str, params: Sequence[Any] | None = None) -> List[Dict[str, Any]]:
+   176→        """Execute query and return all rows as list of dicts."""
+   177→        self._cur.execute(sql, tuple(params or []))
+   178→        rows = self._cur.fetchall() or []
+   179→        return [dict(r) for r in rows]
+   180→
+   181→    def execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
+   182→        """Execute statement and return affected row count."""
+   183→        self._cur.execute(sql, tuple(params or []))
+   184→        return int(self._cur.rowcount or 0)
+   185→
+   186→    def execute_returning_one(self, sql: str, params: Sequence[Any] | None = None) -> Optional[Dict[str, Any]]:
+   187→        """Execute statement with RETURNING and return single row."""
+   188→        self._cur.execute(sql, tuple(params or []))
+   189→        row = self._cur.fetchone()
+   190→        return dict(row) if row else None
+   191→
+   192→    def execute_many(self, sql: str, params_list: Iterable[Sequence[Any]]) -> int:
+   193→        """Execute statement for multiple parameter sets."""
+   194→        total = 0
+   195→        for params in params_list:
+   196→            self._cur.execute(sql, tuple(params))
+   197→            total += int(self._cur.rowcount or 0)
+   198→        return total
+   199→
+   200→
+   201→@contextmanager
+   202→def transaction():
+   203→    """
+   204→    事务上下文管理器，用于多步原子操作。
+   205→
+   206→    解决问题：
+   207→    - fetch_one/execute 等函数每次调用都是独立事务
+   208→    - FOR UPDATE 锁在函数返回时立即释放
+   209→    - 多步操作无法保证原子性
+   210→
+   211→    使用场景：
+   212→    - twin_service.update_twin(): SELECT FOR UPDATE + UPDATE + INSERT log
+   213→    - currency_service.add_currency(): UPDATE balance + INSERT ledger
+   214→    - social_service.join_luck_chain(): SELECT FOR UPDATE + INSERT + UPDATE count
+   215→
+   216→    Example:
+   217→        with fortune_db.transaction() as tx:
+   218→            # 所有操作在同一事务中
+   219→            row = tx.fetch_one("SELECT * FROM t WHERE id = %s FOR UPDATE", [id])
+   220→            if row:
+   221→                tx.execute("UPDATE t SET val = %s WHERE id = %s", [new_val, id])
+   222→            # 退出时自动 commit
+   223→    """
+   224→    with db_conn() as conn:
+   225→        cur = conn.cursor(cursor_factory=RealDictCursor)
+   226→        try:
+   227→            yield TransactionContext(cur)
+   228→            conn.commit()
+   229→        except Exception:
+   230→            try:
+   231→                conn.rollback()
+   232→            except Exception:
+   233→                pass
+   234→            raise
+   235→        finally:
+   236→            cur.close()
+   237→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

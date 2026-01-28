@@ -1,0 +1,381 @@
+-- ═══════════════════════════════════════════════════════════════
+-- VIBELIFE KNOWLEDGE SYSTEM V2 - OPTIMIZED SCHEMA
+-- Version: 002
+-- Description: Multi-format documents, intelligent chunking, hybrid search
+-- ═══════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────────
+-- DROP OLD TABLES (direct replacement strategy)
+-- ─────────────────────────────────────────────────────────────────
+
+DROP TABLE IF EXISTS knowledge_qa_pairs CASCADE;
+DROP TABLE IF EXISTS knowledge_chunks CASCADE;
+
+-- ─────────────────────────────────────────────────────────────────
+-- DOCUMENT TABLE (doubles as task queue)
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    skill_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_hash TEXT NOT NULL,                -- MD5 for change detection
+    file_type TEXT NOT NULL,                -- pdf, md, txt, epub, docx, html
+    file_size_bytes BIGINT DEFAULT 0,
+    content_md TEXT,                        -- Converted Markdown (archived)
+    status TEXT DEFAULT 'pending',          -- pending/processing/completed/failed/archived
+    error_message TEXT,
+    chunk_count INT DEFAULT 0,
+    retry_count INT DEFAULT 0,
+    locked_by TEXT,                         -- Worker ID for SKIP LOCKED
+    locked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(skill_id, filename)
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- KNOWLEDGE CHUNKS TABLE V2
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks_v2 (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID REFERENCES knowledge_documents(id) ON DELETE SET NULL,
+    skill_id TEXT NOT NULL,
+    chunk_index INT NOT NULL DEFAULT 0,
+    content TEXT NOT NULL,
+    content_type TEXT DEFAULT 'knowledge',  -- knowledge, qa, summary
+
+    -- Hierarchical path info
+    section_path TEXT[],                    -- ARRAY['Ten Gods', 'Companion', 'Traits']
+    section_title TEXT,
+
+    -- Metadata
+    metadata JSONB DEFAULT '{}',
+    has_table BOOLEAN DEFAULT FALSE,
+    has_list BOOLEAN DEFAULT FALSE,
+    char_count INT DEFAULT 0,
+
+    -- Jieba pre-tokenized text stored here
+    search_text_preprocessed TEXT,
+
+    -- Auto-generated FTS vector (using 'simple' config, no pg_jieba needed)
+    search_vector TSVECTOR GENERATED ALWAYS AS (
+        to_tsvector('simple', COALESCE(search_text_preprocessed, ''))
+    ) STORED,
+
+    -- Gemini 3072-dim embedding
+    embedding vector(3072),
+
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- INDEXES
+-- ─────────────────────────────────────────────────────────────────
+
+-- Document indexes
+CREATE INDEX IF NOT EXISTS idx_docs_status ON knowledge_documents(status);
+CREATE INDEX IF NOT EXISTS idx_docs_skill ON knowledge_documents(skill_id);
+CREATE INDEX IF NOT EXISTS idx_docs_pending ON knowledge_documents(status, updated_at)
+    WHERE status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS idx_docs_locked ON knowledge_documents(locked_by, locked_at)
+    WHERE locked_by IS NOT NULL;
+
+-- Chunk indexes
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_skill ON knowledge_chunks_v2(skill_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_doc ON knowledge_chunks_v2(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_type ON knowledge_chunks_v2(content_type);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_fts ON knowledge_chunks_v2 USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_vec ON knowledge_chunks_v2 USING hnsw(embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- ─────────────────────────────────────────────────────────────────
+-- TRIGGER: Auto-update updated_at for documents
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE TRIGGER update_knowledge_documents_updated_at
+    BEFORE UPDATE ON knowledge_documents
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ─────────────────────────────────────────────────────────────────
+-- HYBRID SEARCH SQL FUNCTION (RRF)
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION hybrid_search_v2(
+    query_text_processed TEXT,
+    query_embedding vector(3072),
+    match_skill_id TEXT,
+    top_k INT DEFAULT 5,
+    rrf_k INT DEFAULT 60,
+    vector_weight FLOAT DEFAULT 0.7,
+    text_weight FLOAT DEFAULT 0.3
+)
+RETURNS TABLE (
+    id UUID,
+    content TEXT,
+    content_type TEXT,
+    section_title TEXT,
+    section_path TEXT[],
+    metadata JSONB,
+    score FLOAT,
+    match_type TEXT
+) LANGUAGE sql STABLE AS $$
+WITH semantic AS (
+    SELECT
+        kc.id,
+        ROW_NUMBER() OVER (ORDER BY kc.embedding <=> query_embedding) as rank
+    FROM knowledge_chunks_v2 kc
+    WHERE kc.skill_id = match_skill_id
+      AND kc.embedding IS NOT NULL
+    ORDER BY kc.embedding <=> query_embedding
+    LIMIT top_k * 2
+),
+keyword AS (
+    SELECT
+        kc.id,
+        ROW_NUMBER() OVER (
+            ORDER BY ts_rank(kc.search_vector, plainto_tsquery('simple', query_text_processed)) DESC
+        ) as rank
+    FROM knowledge_chunks_v2 kc
+    WHERE kc.skill_id = match_skill_id
+      AND kc.search_vector @@ plainto_tsquery('simple', query_text_processed)
+    LIMIT top_k * 2
+),
+combined AS (
+    SELECT
+        COALESCE(s.id, k.id) as chunk_id,
+        (COALESCE(1.0/(rrf_k + s.rank), 0.0) * vector_weight +
+         COALESCE(1.0/(rrf_k + k.rank), 0.0) * text_weight)::FLOAT as rrf_score,
+        CASE
+            WHEN s.id IS NOT NULL AND k.id IS NOT NULL THEN 'hybrid'
+            WHEN s.id IS NOT NULL THEN 'vector'
+            ELSE 'keyword'
+        END as mt
+    FROM semantic s
+    FULL OUTER JOIN keyword k ON s.id = k.id
+)
+SELECT
+    c.id,
+    c.content,
+    c.content_type,
+    c.section_title,
+    c.section_path,
+    c.metadata,
+    cb.rrf_score as score,
+    cb.mt as match_type
+FROM combined cb
+JOIN knowledge_chunks_v2 c ON c.id = cb.chunk_id
+ORDER BY cb.rrf_score DESC
+LIMIT top_k;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────
+-- VECTOR-ONLY SEARCH FUNCTION
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION vector_search_v2(
+    query_embedding vector(3072),
+    match_skill_id TEXT,
+    top_k INT DEFAULT 5
+)
+RETURNS TABLE (
+    id UUID,
+    content TEXT,
+    content_type TEXT,
+    section_title TEXT,
+    section_path TEXT[],
+    metadata JSONB,
+    score FLOAT
+) LANGUAGE sql STABLE AS $$
+SELECT
+    kc.id,
+    kc.content,
+    kc.content_type,
+    kc.section_title,
+    kc.section_path,
+    kc.metadata,
+    (1 - (kc.embedding <=> query_embedding))::FLOAT as score
+FROM knowledge_chunks_v2 kc
+WHERE kc.skill_id = match_skill_id
+  AND kc.embedding IS NOT NULL
+ORDER BY kc.embedding <=> query_embedding
+LIMIT top_k;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────
+-- TASK QUEUE FUNCTIONS (SKIP LOCKED pattern)
+-- ─────────────────────────────────────────────────────────────────
+
+-- Claim a pending document for processing
+CREATE OR REPLACE FUNCTION claim_pending_document(
+    worker_id TEXT,
+    lock_timeout_minutes INT DEFAULT 30
+)
+RETURNS TABLE (
+    id UUID,
+    skill_id TEXT,
+    filename TEXT,
+    file_path TEXT,
+    file_type TEXT
+) LANGUAGE sql AS $$
+UPDATE knowledge_documents
+SET
+    status = 'processing',
+    locked_by = worker_id,
+    locked_at = NOW()
+WHERE id = (
+    SELECT kd.id
+    FROM knowledge_documents kd
+    WHERE kd.status = 'pending'
+       OR (kd.status = 'processing'
+           AND kd.locked_at < NOW() - (lock_timeout_minutes || ' minutes')::INTERVAL)
+       OR (kd.status = 'failed' AND kd.retry_count < 3)
+    ORDER BY
+        CASE kd.status
+            WHEN 'pending' THEN 0
+            WHEN 'failed' THEN 1
+            ELSE 2
+        END,
+        kd.updated_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING
+    knowledge_documents.id,
+    knowledge_documents.skill_id,
+    knowledge_documents.filename,
+    knowledge_documents.file_path,
+    knowledge_documents.file_type;
+$$;
+
+-- Mark document as completed
+CREATE OR REPLACE FUNCTION complete_document(
+    doc_id UUID,
+    chunks_created INT,
+    md_content TEXT DEFAULT NULL
+)
+RETURNS VOID LANGUAGE sql AS $$
+UPDATE knowledge_documents
+SET
+    status = 'completed',
+    chunk_count = chunks_created,
+    content_md = md_content,
+    locked_by = NULL,
+    locked_at = NULL,
+    error_message = NULL,
+    updated_at = NOW()
+WHERE id = doc_id;
+$$;
+
+-- Mark document as failed
+CREATE OR REPLACE FUNCTION fail_document(
+    doc_id UUID,
+    error_msg TEXT
+)
+RETURNS VOID LANGUAGE sql AS $$
+UPDATE knowledge_documents
+SET
+    status = 'failed',
+    error_message = error_msg,
+    retry_count = retry_count + 1,
+    locked_by = NULL,
+    locked_at = NULL,
+    updated_at = NOW()
+WHERE id = doc_id;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────
+-- SYNC HELPER FUNCTIONS
+-- ─────────────────────────────────────────────────────────────────
+
+-- Upsert document (for sync script)
+CREATE OR REPLACE FUNCTION upsert_document(
+    p_skill_id TEXT,
+    p_filename TEXT,
+    p_file_path TEXT,
+    p_file_hash TEXT,
+    p_file_type TEXT,
+    p_file_size BIGINT
+)
+RETURNS UUID LANGUAGE plpgsql AS $$
+DECLARE
+    v_doc_id UUID;
+    v_existing_hash TEXT;
+BEGIN
+    -- Check if document exists
+    SELECT id, file_hash INTO v_doc_id, v_existing_hash
+    FROM knowledge_documents
+    WHERE skill_id = p_skill_id AND filename = p_filename;
+
+    IF v_doc_id IS NULL THEN
+        -- Insert new document
+        INSERT INTO knowledge_documents (
+            skill_id, filename, file_path, file_hash, file_type, file_size_bytes, status
+        )
+        VALUES (
+            p_skill_id, p_filename, p_file_path, p_file_hash, p_file_type, p_file_size, 'pending'
+        )
+        RETURNING id INTO v_doc_id;
+    ELSIF v_existing_hash != p_file_hash THEN
+        -- File changed, mark for reprocessing
+        UPDATE knowledge_documents
+        SET
+            file_path = p_file_path,
+            file_hash = p_file_hash,
+            file_size_bytes = p_file_size,
+            status = 'pending',
+            chunk_count = 0,
+            retry_count = 0,
+            error_message = NULL,
+            updated_at = NOW()
+        WHERE id = v_doc_id;
+
+        -- Delete old chunks
+        DELETE FROM knowledge_chunks_v2 WHERE document_id = v_doc_id;
+    END IF;
+
+    RETURN v_doc_id;
+END;
+$$;
+
+-- Archive deleted files
+CREATE OR REPLACE FUNCTION archive_missing_documents(
+    p_skill_id TEXT,
+    p_existing_filenames TEXT[]
+)
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE
+    v_archived INT;
+BEGIN
+    UPDATE knowledge_documents
+    SET status = 'archived', updated_at = NOW()
+    WHERE skill_id = p_skill_id
+      AND filename != ALL(p_existing_filenames)
+      AND status != 'archived';
+
+    GET DIAGNOSTICS v_archived = ROW_COUNT;
+    RETURN v_archived;
+END;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────
+-- STATS VIEW
+-- ─────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE VIEW knowledge_stats AS
+SELECT
+    skill_id,
+    COUNT(*) FILTER (WHERE status = 'pending') as pending_docs,
+    COUNT(*) FILTER (WHERE status = 'processing') as processing_docs,
+    COUNT(*) FILTER (WHERE status = 'completed') as completed_docs,
+    COUNT(*) FILTER (WHERE status = 'failed') as failed_docs,
+    COUNT(*) FILTER (WHERE status = 'archived') as archived_docs,
+    SUM(chunk_count) FILTER (WHERE status = 'completed') as total_chunks,
+    SUM(file_size_bytes) FILTER (WHERE status = 'completed') as total_bytes
+FROM knowledge_documents
+GROUP BY skill_id;
+
+-- Done
+SELECT 'Knowledge System V2 schema initialized successfully' as result;

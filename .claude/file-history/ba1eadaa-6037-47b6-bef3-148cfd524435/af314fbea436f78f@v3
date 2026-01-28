@@ -1,0 +1,349 @@
+"""
+Push Notification Service.
+
+REQ: REQ-JITAI-004
+Design: §3.5.2 Push Integration
+
+Provides unified push notification interface supporting:
+- In-app push (fortune_push_event table)
+- WebPush (future)
+- FCM/APNs (future)
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+class PushChannel(str, Enum):
+    """Push notification channels."""
+    IN_APP = "in_app"       # fortune_push_event table, polled by frontend
+    WEB_PUSH = "web_push"   # WebPush API (future)
+    FCM = "fcm"             # Firebase Cloud Messaging (future)
+    APNS = "apns"           # Apple Push Notification Service (future)
+
+
+class PushPriority(str, Enum):
+    """Push notification priority."""
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+class PushServiceError(Exception):
+    """Base exception for push service errors."""
+    pass
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# =============================================================================
+# Push Event Management
+# =============================================================================
+
+def create_push_event(
+    user_id: int,
+    push_type: str,
+    title: str,
+    body: str,
+    action: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    scheduled_at: Optional[datetime] = None,
+    priority: PushPriority = PushPriority.NORMAL,
+    source: str = "system",
+) -> int:
+    """
+    Create a push event for delivery.
+
+    REQ: REQ-JITAI-004
+
+    Args:
+        user_id: Target user ID
+        push_type: Type of push (jitai, plan_daily, social, etc.)
+        title: Notification title
+        body: Notification body
+        action: Action to perform when clicked
+        payload: Additional payload data
+        scheduled_at: When to deliver (None = immediate)
+        priority: Push priority
+        source: Source of the push (jitai, system, social)
+
+    Returns:
+        push_id of created event
+    """
+    now = _now_utc()
+    scheduled = scheduled_at or now
+
+    full_payload = {
+        "title": title,
+        "body": body,
+        "action": action or {},
+        "priority": priority.value,
+        "source": source,
+        **(payload or {}),
+    }
+
+    row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_push_event (
+            user_id, push_type, scheduled_at, payload, created_at
+        ) VALUES (%s, %s, %s, %s::jsonb, %s)
+        RETURNING push_id
+        """,
+        [user_id, push_type, scheduled, json.dumps(full_payload, ensure_ascii=False), now],
+    )
+
+    push_id = row["push_id"] if row else 0
+
+    logger.info(
+        "push_event_created push_id=%s user=%s type=%s source=%s",
+        push_id, user_id, push_type, source
+    )
+
+    return push_id
+
+
+def get_pending_pushes(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Get pending push events for a user.
+
+    Returns undelivered pushes scheduled for now or earlier.
+    Uses status field for consistency with schema.
+    """
+    now = _now_utc()
+
+    rows = fortune_db.fetch_all(
+        """
+        SELECT push_id, push_type, scheduled_at, payload, created_at
+        FROM fortune_push_event
+        WHERE user_id = %s
+        AND scheduled_at <= %s
+        AND status IN ('scheduled', 'sent')
+        AND delivered_at IS NULL
+        ORDER BY scheduled_at ASC
+        LIMIT %s
+        """,
+        [user_id, now, limit],
+    )
+
+    return [
+        {
+            "push_id": row["push_id"],
+            "push_type": row["push_type"],
+            "scheduled_at": row["scheduled_at"].isoformat() if row["scheduled_at"] else None,
+            "payload": row.get("payload") or {},
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+
+
+def mark_push_sent(push_id: int) -> None:
+    """Mark a push event as sent (dispatched to delivery channel)."""
+    now = _now_utc()
+    fortune_db.execute(
+        "UPDATE fortune_push_event SET status = 'sent', sent_at = %s WHERE push_id = %s",
+        [now, push_id],
+    )
+
+
+def mark_push_delivered(push_id: int) -> None:
+    """Mark a push event as delivered (received by client)."""
+    now = _now_utc()
+    fortune_db.execute(
+        "UPDATE fortune_push_event SET status = 'delivered', delivered_at = %s WHERE push_id = %s",
+        [now, push_id],
+    )
+
+
+def mark_push_clicked(push_id: int) -> None:
+    """Mark a push event as clicked (user interacted)."""
+    now = _now_utc()
+    fortune_db.execute(
+        "UPDATE fortune_push_event SET status = 'clicked', clicked_at = %s WHERE push_id = %s",
+        [now, push_id],
+    )
+
+
+def mark_push_dismissed(push_id: int) -> None:
+    """Mark a push event as dismissed (user dismissed without clicking)."""
+    now = _now_utc()
+    fortune_db.execute(
+        "UPDATE fortune_push_event SET status = 'dismissed', dismissed_at = %s WHERE push_id = %s",
+        [now, push_id],
+    )
+
+
+def mark_push_failed(push_id: int, error: str) -> None:
+    """Mark a push event as failed."""
+    fortune_db.execute(
+        "UPDATE fortune_push_event SET status = 'failed', error = %s WHERE push_id = %s",
+        [error, push_id],
+    )
+
+
+# =============================================================================
+# JITAI Integration
+# =============================================================================
+
+# Map trigger_id to valid push_type values
+JITAI_TRIGGER_TYPE_MAP = {
+    "energy_low": "jitai_energy_low",
+    "mood_check": "jitai_mood_check",
+    "activity_prompt": "jitai_activity_prompt",
+}
+
+
+def _get_jitai_push_type(trigger_id: str) -> str:
+    """Map JITAI trigger_id to valid push_type."""
+    return JITAI_TRIGGER_TYPE_MAP.get(trigger_id, "jitai_custom")
+
+
+def send_jitai_push(
+    user_id: int,
+    trigger_id: str,
+    intervention_content: Dict[str, Any],
+    intervention_id: Optional[int] = None,
+) -> int:
+    """
+    Send a push notification from JITAI intervention.
+
+    REQ: REQ-JITAI-004
+    Design: §3.5.2
+
+    Processes intervention template and creates push event.
+    """
+    import re
+
+    # Extract and process template
+    title = intervention_content.get("title", "Fortune AI")
+    body = intervention_content.get("body", "")
+    action = intervention_content.get("action", {})
+
+    # Process template variables
+    # TODO: Implement template variable substitution based on user context
+    # For now, strip unresolved variables
+    body = re.sub(r'\{[^}]+\}', '', body).strip()
+
+    # Map trigger_id to valid push_type
+    push_type = _get_jitai_push_type(trigger_id)
+
+    # Create push event
+    push_id = create_push_event(
+        user_id=user_id,
+        push_type=push_type,
+        title=title,
+        body=body,
+        action=action,
+        payload={
+            "trigger_id": trigger_id,
+            "intervention_id": intervention_id,
+        },
+        priority=PushPriority.NORMAL,
+        source="jitai",
+    )
+
+    logger.info(
+        "jitai_push_sent push_id=%s user=%s trigger=%s type=%s",
+        push_id, user_id, trigger_id, push_type
+    )
+
+    return push_id
+
+
+# =============================================================================
+# User Device Management (Future)
+# =============================================================================
+
+def register_device(
+    user_id: int,
+    device_token: str,
+    channel: PushChannel,
+    device_info: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Register a device for push notifications.
+
+    Future implementation for FCM/APNs/WebPush.
+    """
+    # TODO: Implement device registration
+    # CREATE TABLE fortune_push_device (
+    #     device_id BIGSERIAL PRIMARY KEY,
+    #     user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    #     channel TEXT NOT NULL,
+    #     device_token TEXT NOT NULL,
+    #     device_info JSONB,
+    #     enabled BOOLEAN DEFAULT TRUE,
+    #     created_at TIMESTAMPTZ DEFAULT NOW(),
+    #     updated_at TIMESTAMPTZ DEFAULT NOW(),
+    #     UNIQUE (user_id, channel, device_token)
+    # );
+    raise NotImplementedError("Device registration not yet implemented")
+
+
+def send_native_push(
+    user_id: int,
+    title: str,
+    body: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Send native push notification via FCM/APNs.
+
+    Future implementation.
+    """
+    # TODO: Implement native push via FCM/APNs
+    # 1. Get user's registered devices
+    # 2. For each device, send via appropriate channel
+    # 3. Handle delivery receipts
+    logger.warning("Native push not implemented, falling back to in-app push")
+    return False
+
+
+# =============================================================================
+# Push Statistics
+# =============================================================================
+
+def get_push_stats(user_id: int, days: int = 7) -> Dict[str, Any]:
+    """Get push statistics for a user."""
+    from datetime import timedelta
+
+    threshold = _now_utc() - timedelta(days=days)
+
+    row = fortune_db.fetch_one(
+        """
+        SELECT
+            COUNT(*) as total,
+            COUNT(delivered_at) as delivered,
+            COUNT(clicked_at) as clicked,
+            COUNT(dismissed_at) as dismissed
+        FROM fortune_push_event
+        WHERE user_id = %s AND created_at > %s
+        """,
+        [user_id, threshold],
+    )
+
+    if not row:
+        return {"total": 0, "delivered": 0, "clicked": 0, "dismissed": 0, "ctr": 0}
+
+    total = row["total"] or 0
+    delivered = row["delivered"] or 0
+    clicked = row["clicked"] or 0
+
+    return {
+        "total": total,
+        "delivered": delivered,
+        "clicked": clicked,
+        "dismissed": row["dismissed"] or 0,
+        "ctr": round(clicked / delivered * 100, 1) if delivered > 0 else 0,
+    }

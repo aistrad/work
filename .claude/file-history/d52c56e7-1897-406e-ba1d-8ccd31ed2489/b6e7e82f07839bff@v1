@@ -1,0 +1,157 @@
+# VibeLife 订阅系统架构 v2
+> 精简高效版 | 2026-01-15
+
+---
+
+## 核心问题
+
+```
+payment.py webhook → TODO 注释 → 从未持久化订阅状态
+```
+
+## 目标架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│                     Routes                          │
+│  auth.py  payment.py  chat.py                       │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│              SubscriptionService                    │
+│  (唯一订阅入口，合并现有 3 个重叠服务)              │
+│                                                     │
+│  activate()  check()  expire()  extend()            │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│              subscription_repo.py                   │
+│  (已存在，直接复用)                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+## 数据模型
+
+```sql
+-- 现有表 user_subscriptions 已够用，仅需确保字段完整
+ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS
+  daily_used INT DEFAULT 0,
+  daily_reset_at DATE DEFAULT CURRENT_DATE;
+```
+
+## 核心服务 (单一文件)
+
+```python
+# services/subscription/service.py (~100行)
+
+class SubscriptionService:
+    """唯一订阅管理入口"""
+
+    @staticmethod
+    async def activate(user_id: UUID, source: str, days: int = None, stripe_sub_id: str = None) -> bool:
+        """激活订阅 - Webhook 调用此方法"""
+        if source == "prepaid":
+            await SubscriptionRepo.create_prepaid(user_id, days)
+        else:
+            await SubscriptionRepo.create_stripe(user_id, stripe_sub_id)
+        return True
+
+    @staticmethod
+    async def check(user_id: UUID) -> dict:
+        """检查订阅状态 - API 调用此方法"""
+        sub = await SubscriptionRepo.get_active(user_id)
+        if not sub:
+            return {"tier": "free", "can_chat": True, "remaining": 3}
+
+        # 检查每日限额
+        if sub.daily_reset_at < date.today():
+            await SubscriptionRepo.reset_daily(user_id)
+            used = 0
+        else:
+            used = sub.daily_used
+
+        limit = 200 if sub.tier == "paid" else 3
+        return {
+            "tier": sub.tier,
+            "can_chat": used < limit,
+            "remaining": limit - used,
+            "expires_at": sub.expires_at
+        }
+
+    @staticmethod
+    async def consume(user_id: UUID) -> bool:
+        """消耗一次对话额度"""
+        return await SubscriptionRepo.increment_daily(user_id)
+
+    @staticmethod
+    async def expire_overdue() -> int:
+        """定时任务: 过期处理"""
+        return await SubscriptionRepo.mark_expired()
+```
+
+## Webhook 修复 (关键变更)
+
+```python
+# routes/payment.py - 修改 _handle_checkout_completed()
+
+# 删除 TODO，改为:
+if region == "CN":
+    await SubscriptionService.activate(user_id, "prepaid", days=service_days)
+else:
+    await SubscriptionService.activate(user_id, "stripe", stripe_sub_id=subscription_id)
+```
+
+## CurrentUser 增强
+
+```python
+# services/identity/auth.py
+
+class CurrentUser:
+    user_id: UUID
+    vibe_id: str
+    tier: str = "free"           # 新增
+    can_chat: bool = True        # 新增
+    remaining: int = 3           # 新增
+
+    @classmethod
+    async def load(cls, user_id: UUID) -> "CurrentUser":
+        user = await UserRepo.get(user_id)
+        sub = await SubscriptionService.check(user_id)
+        return cls(
+            user_id=user_id,
+            vibe_id=user.vibe_id,
+            tier=sub["tier"],
+            can_chat=sub["can_chat"],
+            remaining=sub["remaining"]
+        )
+```
+
+## 实施清单
+
+| 步骤 | 文件 | 变更 |
+|------|------|------|
+| 1 | `services/subscription/service.py` | 新建，~100行 |
+| 2 | `routes/payment.py:743-779` | 删除 TODO，调用 Service |
+| 3 | `services/identity/auth.py` | CurrentUser 增加 3 字段 |
+| 4 | 删除 | `services/entitlement/` (合并到 subscription) |
+| 5 | 删除 | `services/identity/usage_limits.py` (重复) |
+
+## 定时任务
+
+```bash
+# crontab
+0 2 * * * python -c "from services.subscription import SubscriptionService; import asyncio; asyncio.run(SubscriptionService.expire_overdue())"
+```
+
+---
+
+## 精简原则
+
+1. **单一入口** - 所有订阅操作走 SubscriptionService
+2. **删除重复** - 合并 EntitlementService + UsageLimitsService
+3. **复用现有** - subscription_repo.py 已实现大部分逻辑
+4. **最小变更** - 核心修复仅 payment.py 的 TODO 行
+
+**预计工作量**: 新增 ~100 行，删除 ~300 行，净减少 ~200 行

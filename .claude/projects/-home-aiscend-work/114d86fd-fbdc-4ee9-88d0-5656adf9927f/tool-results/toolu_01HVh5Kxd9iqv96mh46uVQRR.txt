@@ -1,0 +1,516 @@
+     1→from __future__ import annotations
+     2→
+     3→import json
+     4→import os
+     5→import re
+     6→from string import Template
+     7→from typing import Any, Dict, List, Optional, Tuple
+     8→
+     9→from fastapi import APIRouter, Request
+    10→from fastapi.responses import JSONResponse
+    11→from pydantic import BaseModel, Field
+    12→
+    13→from api.deps import require_auth, require_csrf
+    14→from common.a2ui import validate_a2ui
+    15→from services import chat_service
+    16→from services import glm_client
+    17→from services import bazi_facts
+    18→from services import kb_service
+    19→from stores import fortune_db
+    20→
+    21→
+    22→router = APIRouter(prefix="/api/chat", tags=["chat"])
+    23→
+    24→
+    25→def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    26→    return JSONResponse({"ok": True, "data": data or {}})
+    27→
+    28→
+    29→def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    30→    return JSONResponse(
+    31→        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+    32→        status_code=status,
+    33→    )
+    34→
+    35→
+    36→class ChatSendRequest(BaseModel):
+    37→    session_id: Optional[str] = Field(None)
+    38→    text: str = Field(..., min_length=1)
+    39→
+    40→
+    41→_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+    42→
+    43→
+    44→SYSTEM_PROMPT_TEMPLATE = Template("""你是 Fortune AI 的对话 Agent，角色是积极心理学教练（Performance Coach）。
+    45→
+    46→【产品定位】
+    47→人生导航 / 陪伴 / 提升。系统和交互保持“有效而极简”。
+    48→
+    49→【你的优先级（不可逆）】
+    50→Coach > Teaching Assistant > Customer Support > Sales
+    51→
+    52→【硬性规则（必须遵守）】
+    53→1) 禁止恐吓、羞辱、宿命论断言；负面信息必须紧接“你可以做什么”的行动处方。
+    54→2) 禁止自行计算八字事实；只能基于提供的 facts + evidence 输出。
+    55→3) 每次输出必须包含：结论(conclusion) + 依据(why) + ≤3条处方(prescriptions) + 承诺邀请(commitment_ask)。
+    56→4) 时间窗口默认只给干预窗口（intervention）；forecast 只能条件句+低置信度。
+    57→5) 输出必须是 A2UI JSON，且第一组件必须是 markdown_text。
+    58→6) 必须给出可点击 actions（start_task / schedule_task / open_panel / opt_out）。
+    59→
+    60→【语言风格 persona_style】
+    61→standard：清晰、中性、专业
+    62→warm：共情、支持性（默认）
+    63→roast：轻毒舌但不羞辱、不对人格做负面定性
+    64→
+    65→【输入（系统已注入）】
+    66→persona_style: $persona_style
+    67→user_context: $user_context_json
+    68→facts: $facts_json
+    69→evidence: $evidence_json
+    70→
+    71→【输出（必须严格仅输出 JSON）】
+    72→返回 A2UI JSON，结构：
+    73→- meta.summary：一句话摘要
+    74→- ui_components[0]：markdown_text（必须，包含：结论要点/依据/处方/时间窗口/边界/承诺邀请）
+    75→- ui_components[1]：action_buttons（必须，按钮结构：{label, action:{type, ...}}）
+    76→
+    77→严格按以下字段名输出（不要用 content/actions/action_type/payload 等变体；不要代码块；不要额外文本）：
+    78→{
+    79→  "meta": {"summary": "..."},
+    80→  "ui_components": [
+    81→    {"type":"markdown_text","title":"教练回复","data":"...markdown..."},
+    82→    {"type":"action_buttons","title":"下一步","data":[
+    83→      {"label":"开始（2-5分钟）","action":{"type":"start_task","task_id":"..."}},
+    84→      {"label":"加入今日计划","action":{"type":"schedule_task","task_id":"..."}},
+    85→      {"label":"打开功能区","action":{"type":"open_panel","panel":"bento"}},
+    86→      {"label":"先不需要","action":{"type":"opt_out"}}
+    87→    ]}
+    88→  ]
+    89→}
+    90→""")
+    91→
+    92→
+    93→def _load_user_context(user_id: int) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    94→    profile = fortune_db.fetch_one(
+    95→        "SELECT name, gender, birthday_local, tz_offset_hours, location FROM fortune_user WHERE user_id=%s AND deleted_at IS NULL",
+    96→        (int(user_id),),
+    97→    ) or {}
+    98→    prefs = fortune_db.fetch_one(
+    99→        "SELECT persona_style, push_enabled, push_time, quiet_hours_start, quiet_hours_end, chat_backend FROM fortune_user_preferences WHERE user_id=%s",
+   100→        (int(user_id),),
+   101→    ) or {}
+   102→    snap = fortune_db.fetch_one(
+   103→        "SELECT facts, facts_hash, compute_version FROM fortune_bazi_snapshot WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+   104→        (int(user_id),),
+   105→    ) or {}
+   106→    return profile, prefs, snap
+   107→
+   108→
+   109→def _write_agent_run_log(
+   110→    user_id: int,
+   111→    session_id: Optional[str],
+   112→    agent_name: str,
+   113→    prompt_version: str,
+   114→    facts_hash: Optional[str],
+   115→    input_data: Dict[str, Any],
+   116→    output_data: Dict[str, Any],
+   117→    tool_calls: Optional[List[Dict[str, Any]]] = None,
+   118→    usage: Optional[Dict[str, Any]] = None,
+   119→    latency_ms: Optional[int] = None,
+   120→    error: Optional[str] = None,
+   121→) -> None:
+   122→    """
+   123→    Write audit log to fortune_agent_run table.
+   124→
+   125→    REQ: REQ-AGENT-006 (Audit)
+   126→    """
+   127→    try:
+   128→        fortune_db.execute(
+   129→            """
+   130→            INSERT INTO fortune_agent_run (
+   131→                user_id, session_id, agent_name, prompt_version, facts_hash,
+   132→                input, output, tool_calls, usage, latency_ms, error, created_at
+   133→            ) VALUES (%s, %s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, now())
+   134→            """,
+   135→            [
+   136→                user_id,
+   137→                session_id if session_id else None,
+   138→                agent_name,
+   139→                prompt_version,
+   140→                facts_hash,
+   141→                json.dumps(input_data, ensure_ascii=False, default=str),
+   142→                json.dumps(output_data, ensure_ascii=False, default=str),
+   143→                json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+   144→                json.dumps(usage, ensure_ascii=False) if usage else None,
+   145→                latency_ms,
+   146→                error,
+   147→            ],
+   148→        )
+   149→    except Exception as e:
+   150→        # Log but don't fail the request
+   151→        import logging
+   152→        logging.getLogger(__name__).warning("Failed to write agent run log: %s", str(e))
+   153→
+   154→
+   155→def _a2ui_from_text(text: str) -> Dict[str, Any]:
+   156→    raw = (text or "").strip()
+   157→    obj = glm_client.extract_json_object(raw)
+   158→    if isinstance(obj, dict):
+   159→        norm = _normalize_a2ui(obj)
+   160→        if isinstance(norm, dict):
+   161→            try:
+   162→                validate_a2ui(norm)
+   163→                return norm
+   164→            except Exception:
+   165→                pass
+   166→    # Fallback: wrap as markdown_text A2UI
+   167→    summary = raw.splitlines()[0].strip()[:120] if raw else "输出"
+   168→    return {
+   169→        "meta": {"summary": summary},
+   170→        "ui_components": [
+   171→            {"type": "markdown_text", "title": "输出", "data": raw or "（空）"},
+   172→            {"type": "action_buttons", "title": "下一步", "data": []},
+   173→        ],
+   174→    }
+   175→
+   176→
+   177→def _normalize_action(action: Dict[str, Any]) -> Dict[str, Any]:
+   178→    a = dict(action or {})
+   179→    # common variants
+   180→    if a.get("type") == "open_panel" and "panel" not in a and "panel_id" in a:
+   181→        a["panel"] = a.get("panel_id")
+   182→    return a
+   183→
+   184→
+   185→def _normalize_action_button(btn: Any) -> Dict[str, Any]:
+   186→    if not isinstance(btn, dict):
+   187→        return {"label": str(btn), "action": {"type": "opt_out"}}
+   188→    label = str(btn.get("label") or btn.get("text") or "下一步")
+   189→    action = btn.get("action")
+   190→    if isinstance(action, dict):
+   191→        a = _normalize_action(action)
+   192→        if not a.get("type"):
+   193→            a["type"] = "opt_out"
+   194→        return {"label": label, "action": a}
+   195→    action_type = btn.get("action_type") or btn.get("type") or "opt_out"
+   196→    payload = btn.get("payload") if isinstance(btn.get("payload"), dict) else {}
+   197→    a = {"type": str(action_type)}
+   198→    a.update(payload)
+   199→    return {"label": label, "action": _normalize_action(a)}
+   200→
+   201→
+   202→def _normalize_a2ui(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+   203→    if not isinstance(obj, dict):
+   204→        return None
+   205→    meta = obj.get("meta")
+   206→    if not isinstance(meta, dict):
+   207→        meta = {}
+   208→
+   209→    comps = obj.get("ui_components")
+   210→    if not isinstance(comps, list):
+   211→        # tolerate alternative root key
+   212→        comps = obj.get("components") if isinstance(obj.get("components"), list) else []
+   213→
+   214→    out_comps: List[Dict[str, Any]] = []
+   215→    for c in comps:
+   216→        if not isinstance(c, dict):
+   217→            continue
+   218→        t = str(c.get("type") or "").strip()
+   219→        if not t:
+   220→            continue
+   221→        title = str(c.get("title") or ("教练回复" if t == "markdown_text" else "下一步" if t == "action_buttons" else "组件"))
+   222→        data = c.get("data")
+   223→        if data is None and "content" in c:
+   224→            data = c.get("content")
+   225→        if t == "action_buttons":
+   226→            if data is None and "actions" in c:
+   227→                data = c.get("actions")
+   228→            if isinstance(data, list):
+   229→                data = [_normalize_action_button(b) for b in data]
+   230→            else:
+   231→                data = []
+   232→        if t == "markdown_text" and not isinstance(data, str):
+   233→            data = "" if data is None else str(data)
+   234→        out_comps.append({"type": t, "title": title, "data": data})
+   235→
+   236→    if not out_comps:
+   237→        return None
+   238→    # Ensure markdown_text is first component for renderer compatibility.
+   239→    for i, c in enumerate(out_comps):
+   240→        if c.get("type") == "markdown_text":
+   241→            if i != 0:
+   242→                out_comps.insert(0, out_comps.pop(i))
+   243→            break
+   244→
+   245→    meta_out = dict(meta)
+   246→    if not isinstance(meta_out.get("summary"), str):
+   247→        meta_out["summary"] = str(meta_out.get("summary") or "")
+   248→    return {"meta": meta_out, "ui_components": out_comps}
+   249→
+   250→
+   251→_PRES_LINE_RE = re.compile(r"^\s*\d+[\.\)]\s*(.+?)\s*$")
+   252→_BULLET_LINE_RE = re.compile(r"^\s*[-*]\s*(.+?)\s*$")
+   253→_MD_INLINE_RE = re.compile(r"[*_`]+")
+   254→
+   255→
+   256→def _strip_md(text: str) -> str:
+   257→    s = _MD_INLINE_RE.sub("", text or "")
+   258→    s = re.sub(r"\s+", " ", s).strip()
+   259→    return s
+   260→
+   261→
+   262→def _short_label(text: str, max_len: int = 14) -> str:
+   263→    s = _strip_md(text)
+   264→    s = re.sub(r"^\d+[\.\)]\s*", "", s).strip()
+   265→    if len(s) > max_len:
+   266→        s = s[: max_len - 3].rstrip() + "..."
+   267→    return s or "行动"
+   268→
+   269→
+   270→def _extract_prescriptions(md: str) -> List[str]:
+   271→    lines = [ln.strip() for ln in (md or "").splitlines() if ln.strip()]
+   272→    start: Optional[int] = None
+   273→    for i, ln in enumerate(lines):
+   274→        if "处方" in ln and not _PRES_LINE_RE.match(ln):
+   275→            start = i + 1
+   276→            break
+   277→    if start is None:
+   278→        return []
+   279→    out: List[str] = []
+   280→    for ln in lines[start:]:
+   281→        if ln.startswith("#"):
+   282→            break
+   283→        m = _PRES_LINE_RE.match(ln) or _BULLET_LINE_RE.match(ln)
+   284→        if m:
+   285→            item = _strip_md(m.group(1))
+   286→            if item:
+   287→                out.append(item)
+   288→        if len(out) >= 3:
+   289→            break
+   290→    return out
+   291→
+   292→
+   293→def _insert_suggested_tasks(user_id: int, session_id: str, prescriptions: List[str]) -> List[Dict[str, Any]]:
+   294→    tasks: List[Dict[str, Any]] = []
+   295→    for p in prescriptions[:3]:
+   296→        title = _strip_md(p) or "行动"
+   297→        row = fortune_db.execute_returning_one(
+   298→            """
+   299→            INSERT INTO fortune_commitment (user_id, session_id, source, commitment_type, title, details, status)
+   300→            VALUES (%s, %s, 'chat', 'start_task', %s, '{}'::jsonb, 'suggested')
+   301→            RETURNING task_id
+   302→            """,
+   303→            (int(user_id), session_id, title[:200]),
+   304→        )
+   305→        if row and row.get("task_id"):
+   306→            tasks.append({"task_id": str(row["task_id"]), "title": title})
+   307→    return tasks
+   308→
+   309→
+   310→def _ensure_action_buttons(a2ui: Dict[str, Any], suggested_tasks: List[Dict[str, Any]]) -> None:
+   311→    buttons = []
+   312→    for t in suggested_tasks[:2]:
+   313→        title = _short_label(str(t.get("title") or ""))
+   314→        buttons.append({"label": f"开始：{title}", "action": {"type": "start_task", "task_id": str(t["task_id"])}})
+   315→    if suggested_tasks:
+   316→        buttons.append({"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": str(suggested_tasks[0]["task_id"])}})
+   317→    buttons.append({"label": "打开功能区", "action": {"type": "open_panel", "panel": "bento"}})
+   318→    buttons.append({"label": "先不需要", "action": {"type": "opt_out"}})
+   319→
+   320→    comps = a2ui.get("ui_components")
+   321→    if not isinstance(comps, list):
+   322→        a2ui["ui_components"] = comps = []
+   323→
+   324→    for c in comps:
+   325→        if isinstance(c, dict) and c.get("type") == "action_buttons":
+   326→            c["data"] = buttons
+   327→            return
+   328→
+   329→    comps.append({"type": "action_buttons", "title": "下一步", "data": buttons})
+   330→
+   331→
+   332→def _assistant_markdown(a2ui: Dict[str, Any]) -> str:
+   333→    comps = a2ui.get("ui_components") or []
+   334→    if isinstance(comps, list) and comps:
+   335→        first = comps[0] if isinstance(comps[0], dict) else None
+   336→        if first and isinstance(first.get("data"), str):
+   337→            return first["data"]
+   338→    return json.dumps(a2ui, ensure_ascii=False)
+   339→
+   340→
+   341→@router.post("/send")
+   342→def chat_send(req: ChatSendRequest, request: Request):
+   343→    """
+   344→    Send a chat message and get AI response.
+   345→
+   346→    Supports two backends based on user preference:
+   347→    - fastapi: Direct LLM call (default, current implementation)
+   348→    - agent_service: Vercel AI SDK orchestration (future)
+   349→
+   350→    Also writes audit log to fortune_agent_run for compliance.
+   351→    """
+   352→    import time as time_module
+   353→
+   354→    auth = require_auth(request)
+   355→    require_csrf(request, auth)
+   356→    user_id = int(auth["user_id"])
+   357→
+   358→    session_id = (req.session_id or "").strip()
+   359→    if session_id and not _UUID_RE.match(session_id):
+   360→        return _err(400, "invalid_request", "invalid_session_id")
+   361→
+   362→    if not session_id:
+   363→        s = chat_service.create_session(user_id, title="")
+   364→        session_id = s["session_id"]
+   365→    else:
+   366→        if not chat_service.get_session(user_id, session_id):
+   367→            return _err(404, "not_found", "session_not_found")
+   368→
+   369→    user_text = req.text.strip()
+   370→    if not user_text:
+   371→        return _err(400, "invalid_request", "empty_text")
+   372→
+   373→    model_name = (os.getenv("FORTUNE_AI_GLM_MODEL") or "glm-4.7").strip()
+   374→
+   375→    # Save user message
+   376→    chat_service.append_message(session_id=session_id, user_id=user_id, role="user", content=user_text, model=model_name)
+   377→    chat_service.set_title_if_empty(session_id, user_text[:24])
+   378→
+   379→    profile, prefs, snap = _load_user_context(user_id)
+   380→    if not snap or not snap.get("facts") or not snap.get("facts_hash"):
+   381→        snap = bazi_facts.ensure_snapshot_for_user(user_id)
+   382→
+   383→    # Check chat backend preference
+   384→    chat_backend = str(prefs.get("chat_backend") or "fastapi")
+   385→
+   386→    if chat_backend == "agent_service":
+   387→        # TODO: Implement Agent Service backend
+   388→        # For now, fall back to fastapi with a note
+   389→        # In future: call agent_service via HTTP/gRPC
+   390→        pass  # Fall through to fastapi implementation
+   391→
+   392→    # === FastAPI Direct LLM Implementation ===
+   393→    start_time = time_module.time()
+   394→
+   395→    persona_style = str(prefs.get("persona_style") or "warm")
+   396→    user_context_json = json.dumps({"profile": profile, "preferences": prefs}, ensure_ascii=False, default=str)
+   397→    facts_json = json.dumps(snap.get("facts") or {}, ensure_ascii=False)
+   398→    facts_obj = snap.get("facts") or {}
+   399→    facts_hash = str(snap.get("facts_hash") or "")
+   400→    rule_ids = []
+   401→    try:
+   402→        strength = facts_obj.get("bazi", {}).get("strength", {})
+   403→        if strength.get("rule_id"):
+   404→            rule_ids.append(str(strength["rule_id"]))
+   405→        for ss in facts_obj.get("bazi", {}).get("shensha", []) or []:
+   406→            if isinstance(ss, dict) and ss.get("rule_id"):
+   407→                rule_ids.append(str(ss["rule_id"]))
+   408→    except Exception:
+   409→        rule_ids = []
+   410→
+   411→    kb_hits = []
+   412→    kb_refs = []
+   413→    try:
+   414→        kb_hits = kb_service.search_bazi_kb(user_text, top_k=5)
+   415→        kb_refs = [h.get("kb_ref") for h in kb_hits if isinstance(h, dict) and h.get("kb_ref")]
+   416→    except Exception:
+   417→        kb_hits = []
+   418→        kb_refs = []
+   419→
+   420→    evidence_json = json.dumps(
+   421→        {
+   422→            "facts_hash": facts_hash,
+   423→            "kb_refs": kb_refs,
+   424→            "kb_snippets": [{"kb_ref": h["kb_ref"], "content": str(h.get("content") or "")[:600]} for h in kb_hits[:3] if h.get("kb_ref")],
+   425→            "rule_ids": rule_ids,
+   426→        },
+   427→        ensure_ascii=False,
+   428→    )
+   429→
+   430→    system = SYSTEM_PROMPT_TEMPLATE.safe_substitute(
+   431→        persona_style=persona_style,
+   432→        user_context_json=user_context_json,
+   433→        facts_json=facts_json,
+   434→        evidence_json=evidence_json,
+   435→    )
+   436→
+   437→    # Build LLM messages from DB (last 10 turns)
+   438→    hist = chat_service.get_recent_messages_for_llm(user_id, session_id, limit=10)
+   439→    llm_messages = [{"role": "system", "content": system}]
+   440→    for m in hist:
+   441→        role = "assistant" if m.get("role") == "assistant" else "user"
+   442→        llm_messages.append({"role": role, "content": str(m.get("content") or "")})
+   443→
+   444→    error_msg = None
+   445→    try:
+   446→        raw_text, raw = glm_client.call_chat_completions(messages=llm_messages)
+   447→    except glm_client.GlmError as e:
+   448→        error_msg = str(e)
+   449→        # Write audit log for failed request
+   450→        latency_ms = int((time_module.time() - start_time) * 1000)
+   451→        _write_agent_run_log(
+   452→            user_id=user_id,
+   453→            session_id=session_id,
+   454→            agent_name="coach",
+   455→            prompt_version="v1.0",
+   456→            facts_hash=facts_hash,
+   457→            input_data={"user_text": user_text, "kb_refs": kb_refs},
+   458→            output_data={},
+   459→            latency_ms=latency_ms,
+   460→            error=error_msg,
+   461→        )
+   462→        return _err(500, "glm_error", error_msg)
+   463→
+   464→    a2ui = _a2ui_from_text(raw_text)
+   465→    md = _assistant_markdown(a2ui)
+   466→    prescriptions = _extract_prescriptions(md)
+   467→    suggested_tasks = _insert_suggested_tasks(user_id, session_id, prescriptions)
+   468→    _ensure_action_buttons(a2ui, suggested_tasks)
+   469→
+   470→    usage = raw.get("usage") if isinstance(raw, dict) else {}
+   471→    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0) if isinstance(usage, dict) else 0
+   472→    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0) if isinstance(usage, dict) else 0
+   473→
+   474→    chat_service.append_message(
+   475→        session_id=session_id,
+   476→        user_id=user_id,
+   477→        role="assistant",
+   478→        content=md,
+   479→        a2ui=a2ui,
+   480→        model=str(raw.get("model") or model_name),
+   481→        prompt_tokens=prompt_tokens,
+   482→        completion_tokens=completion_tokens,
+   483→    )
+   484→
+   485→    # Write audit log for successful request
+   486→    latency_ms = int((time_module.time() - start_time) * 1000)
+   487→    _write_agent_run_log(
+   488→        user_id=user_id,
+   489→        session_id=session_id,
+   490→        agent_name="coach",
+   491→        prompt_version="v1.0",
+   492→        facts_hash=facts_hash,
+   493→        input_data={"user_text": user_text, "kb_refs": kb_refs},
+   494→        output_data={"a2ui_summary": a2ui.get("meta", {}).get("summary", ""), "suggested_tasks": len(suggested_tasks)},
+   495→        usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
+   496→        latency_ms=latency_ms,
+   497→    )
+   498→
+   499→    return _ok(
+   500→        {
+   501→            "session_id": session_id,
+   502→            "assistant_message": {"role": "assistant", "a2ui": a2ui},
+   503→            "suggested_tasks": suggested_tasks,
+   504→        }
+   505→    )
+   506→
+   507→
+   508→@router.post("/ask")
+   509→def chat_ask_alias(req: ChatSendRequest, request: Request):
+   510→    # Backward-compatible alias for /api/chat/send
+   511→    return chat_send(req, request)
+   512→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

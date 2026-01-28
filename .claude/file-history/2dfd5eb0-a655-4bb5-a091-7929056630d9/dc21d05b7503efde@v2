@@ -1,0 +1,567 @@
+"""
+Pairing Service - Business logic for privacy pairing system
+
+核心原则：
+1. 双方都必须同意才能合盘
+2. 合盘结果不展示任何原始出生数据
+3. 每人可单独删除自己的合盘记录
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+from uuid import UUID
+
+from stores.pairing_repo import PairingRepository
+from stores.unified_profile_repo import UnifiedProfileRepository
+from stores.user_repo import UserRepository
+from services.reminder.notification import NotificationService
+
+logger = logging.getLogger(__name__)
+
+# Rate limits
+MAX_DAILY_REQUESTS = 10
+MAX_DAILY_INVITES = 5
+
+
+class PairingService:
+    """
+    隐私配对服务
+
+    提供配对码流程和邀请链接流程的业务逻辑
+    """
+
+    # ─────────────────────────────────────────────────────────────────
+    # Vibe ID / Pairing Code
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_user_vibe_id(user_id: UUID) -> Optional[str]:
+        """
+        获取用户的 Vibe ID (配对码)
+
+        直接复用现有 Vibe ID，无需新建
+        """
+        user = await UserRepository.get_by_id(user_id)
+        return user.get("vibe_id") if user else None
+
+    @staticmethod
+    async def request_pairing(
+        requester_id: UUID,
+        target_vibe_id: str,
+        relationship_type: str,
+        message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        发起配对请求
+
+        Args:
+            requester_id: 发起请求的用户 ID
+            target_vibe_id: 目标用户的 Vibe ID
+            relationship_type: 关系类型
+            message: 可选消息
+
+        Returns:
+            请求结果
+        """
+        # 检查每日配对请求限制
+        daily_count = await PairingRepository.count_daily_requests(requester_id)
+        if daily_count >= MAX_DAILY_REQUESTS:
+            raise ValueError(f"今日配对请求已达上限 ({MAX_DAILY_REQUESTS} 次)")
+
+        # 不能给自己发配对请求
+        requester = await UserRepository.get_by_id(requester_id)
+        if requester and requester.get("vibe_id", "").upper() == target_vibe_id.upper():
+            raise ValueError("不能给自己发送配对请求")
+
+        # 检查目标用户是否存在
+        target_user = await UserRepository.get_by_vibe_id(target_vibe_id.upper())
+        if not target_user:
+            raise ValueError(f"找不到用户 {target_vibe_id}")
+
+        # 检查目标用户是否有出生信息
+        target_birth_info = await UnifiedProfileRepository.get_birth_info(target_user["id"])
+        if not target_birth_info or not target_birth_info.get("date"):
+            raise ValueError("对方还没有填写出生信息，无法进行合盘")
+
+        # 检查请求者是否有出生信息
+        requester_birth_info = await UnifiedProfileRepository.get_birth_info(requester_id)
+        if not requester_birth_info or not requester_birth_info.get("date"):
+            raise ValueError("请先完善你的出生信息")
+
+        # 创建配对请求
+        request = await PairingRepository.create_request(
+            requester_id=requester_id,
+            target_vibe_id=target_vibe_id.upper(),
+            relationship_type=relationship_type,
+            message=message,
+        )
+
+        # 发送通知给目标用户
+        requester_account = await UnifiedProfileRepository.get_account_full(requester_id)
+        requester_name = requester_account.get("display_name") or requester.get("vibe_id", "")
+
+        notification_service = NotificationService()
+        await notification_service.send_notification(
+            user_id=target_user["id"],
+            notification_type="pairing_request",
+            title="有人想和你合盘",
+            content={
+                "request_id": str(request["id"]),
+                "requester_name": requester_name,
+                "requester_vibe_id": requester.get("vibe_id", ""),
+                "relationship_type": relationship_type,
+                "message": message,
+            }
+        )
+
+        return {
+            "success": True,
+            "request_id": str(request["id"]),
+            "target_vibe_id": target_vibe_id.upper(),
+            "status": "pending",
+            "message": f"配对请求已发送给 {target_vibe_id}，等待对方同意"
+        }
+
+    @staticmethod
+    async def get_pending_requests(user_id: UUID) -> List[Dict[str, Any]]:
+        """
+        获取待处理的配对请求
+
+        返回发送给当前用户的待处理请求
+        """
+        requests = await PairingRepository.get_pending_requests_for_user(user_id)
+
+        formatted = []
+        for req in requests:
+            # 获取请求者的显示名称
+            requester_account = await UnifiedProfileRepository.get_account_full(req["requester_id"])
+            requester_name = requester_account.get("display_name") or req.get("requester_vibe_id", "")
+
+            formatted.append({
+                "id": str(req["id"]),
+                "requesterVibeId": req.get("requester_vibe_id"),
+                "requesterName": requester_name,
+                "relationshipType": req["relationship_type"],
+                "relationshipLabel": _get_relationship_label(req["relationship_type"]),
+                "message": req.get("message"),
+                "createdAt": req["created_at"].isoformat() if req.get("created_at") else None,
+                "expiresAt": req["expires_at"].isoformat() if req.get("expires_at") else None,
+            })
+
+        return formatted
+
+    @staticmethod
+    async def accept_pairing(request_id: UUID, user_id: UUID) -> Dict[str, Any]:
+        """
+        接受配对请求并计算合盘
+
+        Args:
+            request_id: 请求 ID
+            user_id: 接受请求的用户 ID (必须是 target)
+
+        Returns:
+            合盘结果 (不含原始出生数据)
+        """
+        # 获取请求
+        request = await PairingRepository.get_request_by_id(request_id)
+        if not request:
+            raise ValueError("配对请求不存在")
+
+        if request["target_user_id"] != user_id:
+            raise ValueError("只有请求的目标用户才能接受")
+
+        if request["status"] != "pending":
+            raise ValueError(f"请求状态无效: {request['status']}")
+
+        # 接受请求
+        updated = await PairingRepository.accept_request(request_id, user_id)
+        if not updated:
+            raise ValueError("接受请求失败")
+
+        # 计算合盘
+        result = await PairingService._calculate_privacy_synastry(
+            user1_id=request["requester_id"],
+            user2_id=user_id,
+            relationship_type=request["relationship_type"]
+        )
+
+        # 发送通知给请求者
+        target_account = await UnifiedProfileRepository.get_account_full(user_id)
+        target_name = target_account.get("display_name") or "对方"
+
+        notification_service = NotificationService()
+        await notification_service.send_notification(
+            user_id=request["requester_id"],
+            notification_type="pairing_accepted",
+            title="配对请求已被接受",
+            content={
+                "request_id": str(request_id),
+                "partner_name": target_name,
+                "overall_score": result["overallScore"],
+                "overall_label": result["overallLabel"],
+            }
+        )
+
+        return result
+
+    @staticmethod
+    async def reject_pairing(request_id: UUID, user_id: UUID) -> Dict[str, Any]:
+        """
+        拒绝配对请求
+
+        Args:
+            request_id: 请求 ID
+            user_id: 拒绝请求的用户 ID (必须是 target)
+
+        Returns:
+            操作结果
+        """
+        request = await PairingRepository.get_request_by_id(request_id)
+        if not request:
+            raise ValueError("配对请求不存在")
+
+        if request["target_user_id"] != user_id:
+            raise ValueError("只有请求的目标用户才能拒绝")
+
+        if request["status"] != "pending":
+            raise ValueError(f"请求状态无效: {request['status']}")
+
+        updated = await PairingRepository.reject_request(request_id, user_id)
+        if not updated:
+            raise ValueError("拒绝请求失败")
+
+        return {
+            "success": True,
+            "message": "已拒绝配对请求"
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # VibeLink Invite Links
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def generate_invite_link(
+        creator_id: UUID,
+        relationship_type: str,
+        message: Optional[str] = None,
+        base_url: str = "https://vibelife.app"
+    ) -> Dict[str, Any]:
+        """
+        生成邀请链接
+
+        Args:
+            creator_id: 创建者 ID
+            relationship_type: 关系类型
+            message: 邀请消息
+            base_url: 应用基础 URL
+
+        Returns:
+            邀请链接信息
+        """
+        # 检查每日邀请限制
+        daily_count = await PairingRepository.count_daily_invites(creator_id)
+        if daily_count >= MAX_DAILY_INVITES:
+            raise ValueError(f"今日邀请链接已达上限 ({MAX_DAILY_INVITES} 个)")
+
+        # 检查创建者是否有出生信息
+        creator_birth_info = await UnifiedProfileRepository.get_birth_info(creator_id)
+        if not creator_birth_info or not creator_birth_info.get("date"):
+            raise ValueError("请先完善你的出生信息")
+
+        # 创建邀请链接
+        invite = await PairingRepository.create_invite_link(
+            creator_id=creator_id,
+            relationship_type=relationship_type,
+            invite_message=message,
+        )
+
+        # 构建完整链接
+        token = invite["token"]
+        full_url = f"{base_url}/shared/invite/{token}"
+
+        return {
+            "success": True,
+            "token": token,
+            "url": full_url,
+            "relationshipType": relationship_type,
+            "relationshipLabel": _get_relationship_label(relationship_type),
+            "message": message,
+            "expiresAt": invite["expires_at"].isoformat() if invite.get("expires_at") else None,
+        }
+
+    @staticmethod
+    async def get_invite_info(token: str) -> Optional[Dict[str, Any]]:
+        """
+        获取邀请链接信息（公开端点）
+
+        Args:
+            token: 邀请 token
+
+        Returns:
+            邀请信息 (不含敏感数据)
+        """
+        invite = await PairingRepository.get_invite_by_token(token)
+        if not invite:
+            return None
+
+        # 检查是否过期或已使用
+        if invite["status"] != "active":
+            return {
+                "valid": False,
+                "status": invite["status"],
+                "message": "此邀请链接已失效"
+            }
+
+        if invite["expires_at"] < datetime.now(timezone.utc):
+            return {
+                "valid": False,
+                "status": "expired",
+                "message": "此邀请链接已过期"
+            }
+
+        return {
+            "valid": True,
+            "token": token,
+            "creatorName": invite.get("creator_name") or "神秘人",
+            "relationshipType": invite["relationship_type"],
+            "relationshipLabel": _get_relationship_label(invite["relationship_type"]),
+            "message": invite.get("invite_message"),
+            "expiresAt": invite["expires_at"].isoformat() if invite.get("expires_at") else None,
+        }
+
+    @staticmethod
+    async def accept_invite(token: str, user_id: UUID) -> Dict[str, Any]:
+        """
+        接受邀请链接并计算合盘
+
+        Args:
+            token: 邀请 token
+            user_id: 接受邀请的用户 ID
+
+        Returns:
+            合盘结果
+        """
+        invite = await PairingRepository.get_invite_by_token(token)
+        if not invite:
+            raise ValueError("邀请链接不存在")
+
+        if invite["status"] != "active":
+            raise ValueError("邀请链接已失效")
+
+        if invite["expires_at"] < datetime.now(timezone.utc):
+            raise ValueError("邀请链接已过期")
+
+        # 不能使用自己的邀请链接
+        if invite["creator_id"] == user_id:
+            raise ValueError("不能使用自己的邀请链接")
+
+        # 检查用户是否有出生信息
+        user_birth_info = await UnifiedProfileRepository.get_birth_info(user_id)
+        if not user_birth_info or not user_birth_info.get("date"):
+            raise ValueError("请先完善你的出生信息")
+
+        # 标记邀请为已使用
+        updated = await PairingRepository.use_invite_link(token, user_id)
+        if not updated:
+            raise ValueError("邀请链接使用失败")
+
+        # 计算合盘
+        result = await PairingService._calculate_privacy_synastry(
+            user1_id=invite["creator_id"],
+            user2_id=user_id,
+            relationship_type=invite["relationship_type"]
+        )
+
+        # 发送通知给创建者
+        user_account = await UnifiedProfileRepository.get_account_full(user_id)
+        user_name = user_account.get("display_name") or "新用户"
+
+        notification_service = NotificationService()
+        await notification_service.send_notification(
+            user_id=invite["creator_id"],
+            notification_type="invite_accepted",
+            title="有人通过你的邀请链接加入了",
+            content={
+                "partner_name": user_name,
+                "relationship_type": invite["relationship_type"],
+                "overall_score": result["overallScore"],
+                "overall_label": result["overallLabel"],
+            }
+        )
+
+        return result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Synastry Results
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_synastry_results(user_id: UUID) -> List[Dict[str, Any]]:
+        """获取用户的所有合盘结果"""
+        results = await PairingRepository.get_user_synastry_results(user_id)
+
+        formatted = []
+        for result in results:
+            formatted.append({
+                "id": str(result["id"]),
+                "partnerId": str(result["partner_id"]),
+                "partnerVibeId": result.get("partner_vibe_id"),
+                "partnerName": result.get("partner_display_name", ""),
+                "relationshipType": result["relationship_type"],
+                "relationshipLabel": _get_relationship_label(result["relationship_type"]),
+                "overallScore": result["overall_score"],
+                "overallLabel": result.get("overall_label"),
+                "dimensions": result.get("dimensions", []),
+                "strengths": result.get("strengths", []),
+                "challenges": result.get("challenges", []),
+                "advice": result.get("advice", []),
+                "calculatedAt": result["calculated_at"].isoformat() if result.get("calculated_at") else None,
+            })
+
+        return formatted
+
+    @staticmethod
+    async def delete_synastry_result(user_id: UUID, partner_id: UUID) -> Dict[str, Any]:
+        """删除合盘结果（只删除自己的记录）"""
+        deleted = await PairingRepository.delete_synastry_result(user_id, partner_id)
+        if not deleted:
+            raise ValueError("合盘记录不存在")
+
+        return {
+            "success": True,
+            "message": "合盘记录已删除"
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Private Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _calculate_privacy_synastry(
+        user1_id: UUID,
+        user2_id: UUID,
+        relationship_type: str
+    ) -> Dict[str, Any]:
+        """
+        计算隐私安全的合盘
+
+        1. 获取双方出生信息
+        2. 调用合盘引擎计算
+        3. 保存结果到双方记录（不含原始出生数据）
+        4. 返回隐私安全的结果
+        """
+        from skills.synastry.services.synastry_engine import SynastryEngine
+
+        # 获取出生信息
+        user1_birth = await UnifiedProfileRepository.get_birth_info(user1_id)
+        user2_birth = await UnifiedProfileRepository.get_birth_info(user2_id)
+
+        if not user1_birth or not user1_birth.get("date"):
+            raise ValueError("用户1缺少出生信息")
+        if not user2_birth or not user2_birth.get("date"):
+            raise ValueError("用户2缺少出生信息")
+
+        # 获取用户显示名称
+        user1_account = await UnifiedProfileRepository.get_account_full(user1_id)
+        user2_account = await UnifiedProfileRepository.get_account_full(user2_id)
+
+        user1_name = user1_account.get("display_name") or "用户1"
+        user2_name = user2_account.get("display_name") or "用户2"
+
+        # 计算合盘
+        engine = SynastryEngine()
+        result = await engine.calculate(
+            user_birth_info=user1_birth,
+            partner_birth_info=user2_birth,
+            relationship_type=relationship_type,
+            subscribed_skills=["zodiac"]  # MVP: 只用星座
+        )
+
+        # 转换维度格式
+        dimensions = [
+            {
+                "skill": dim.skill_id,
+                "name": _get_skill_name(dim.skill_id),
+                "icon": _get_skill_icon(dim.skill_id),
+                "score": dim.score,
+                "summary": dim.summary,
+            }
+            for dim in result.dimensions
+        ]
+
+        overall_label = engine.get_score_label(result.overall_score)
+
+        # 保存到双方记录
+        for owner_id, partner_id, partner_name in [
+            (user1_id, user2_id, user2_name),
+            (user2_id, user1_id, user1_name),
+        ]:
+            await PairingRepository.save_synastry_result(
+                owner_id=owner_id,
+                partner_id=partner_id,
+                relationship_type=relationship_type,
+                partner_display_name=partner_name,
+                overall_score=result.overall_score,
+                overall_label=overall_label,
+                dimensions=dimensions,
+                strengths=result.strengths,
+                challenges=result.challenges,
+                advice=[result.advice] if result.advice else [],
+            )
+
+        # 返回隐私安全的结果（不含出生数据）
+        return {
+            "success": True,
+            "person1": {
+                "name": user1_name,
+            },
+            "person2": {
+                "name": user2_name,
+            },
+            "relationshipType": relationship_type,
+            "relationshipLabel": _get_relationship_label(relationship_type),
+            "overallScore": result.overall_score,
+            "overallLabel": overall_label,
+            "dimensions": dimensions,
+            "strengths": result.strengths,
+            "challenges": result.challenges,
+            "advice": [result.advice] if result.advice else [],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_relationship_label(rel_type: str) -> str:
+    """获取关系类型的显示标签"""
+    labels = {
+        "romantic": "恋人",
+        "spouse": "伴侣",
+        "parent_child": "亲子",
+        "sibling": "兄弟姐妹",
+        "business": "合伙人",
+        "friend": "朋友"
+    }
+    return labels.get(rel_type, rel_type)
+
+
+def _get_skill_name(skill_id: str) -> str:
+    """获取 Skill 的显示名称"""
+    names = {
+        "zodiac": "星座契合",
+        "bazi": "八字配对",
+        "jungastro": "心理契合"
+    }
+    return names.get(skill_id, skill_id)
+
+
+def _get_skill_icon(skill_id: str) -> str:
+    """获取 Skill 的图标"""
+    icons = {
+        "zodiac": "star",
+        "bazi": "yin-yang",
+        "jungastro": "brain"
+    }
+    return icons.get(skill_id, "sparkles")

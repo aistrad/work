@@ -1,0 +1,319 @@
+"""
+Model Router - Quota Manager
+Handles quota checking, tracking, and enforcement
+"""
+import logging
+from typing import Optional, List, Tuple
+from datetime import datetime
+
+from .models import (
+    ModelContext, QuotaRule, QuotaUsage, QuotaCheckResult,
+    QuotaScope, ExceedAction
+)
+from .repository import get_repository
+from .cache import get_cache
+
+logger = logging.getLogger(__name__)
+
+
+class QuotaManager:
+    """
+    配额管理器
+
+    职责：
+    - 检查配额是否超限
+    - 记录使用量
+    - 确定超限后的处理策略
+    """
+
+    def __init__(self):
+        self._repo = get_repository()
+        self._cache = get_cache()
+
+    async def check_quota(
+        self,
+        context: ModelContext,
+        model_id: str
+    ) -> QuotaCheckResult:
+        """
+        检查配额是否允许调用
+
+        Args:
+            context: 请求上下文
+            model_id: 要检查的模型 ID
+
+        Returns:
+            QuotaCheckResult 包含是否允许、剩余额度、超限策略等
+        """
+        # 获取适用的配额规则
+        rules = await self._get_applicable_rules(context, model_id)
+
+        if not rules:
+            # 没有配额限制
+            return QuotaCheckResult(allowed=True)
+
+        # 检查每条规则
+        for rule in rules:
+            result = await self._check_single_rule(rule, context)
+            if not result.allowed:
+                return result
+
+        # 所有规则都通过
+        return QuotaCheckResult(allowed=True)
+
+    async def record_usage(
+        self,
+        context: ModelContext,
+        model_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost: float = 0.0
+    ) -> None:
+        """
+        记录模型使用量
+
+        Args:
+            context: 请求上下文
+            model_id: 使用的模型 ID
+            input_tokens: 输入 token 数
+            output_tokens: 输出 token 数
+            cost: 估算成本
+        """
+        rules = await self._get_applicable_rules(context, model_id)
+
+        for rule in rules:
+            try:
+                # 确定用户 ID（用户级配额才需要）
+                user_id = context.user_id if rule.scope == QuotaScope.USER.value else None
+
+                await self._repo.increment_quota_usage(
+                    rule_id=rule.id,
+                    user_id=user_id,
+                    calls=1,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost
+                )
+            except Exception as e:
+                logger.error(f"Failed to record quota usage for rule {rule.id}: {e}")
+
+    async def get_remaining_quota(
+        self,
+        context: ModelContext,
+        model_id: str
+    ) -> Optional[int]:
+        """
+        获取剩余配额（调用次数）
+
+        Returns:
+            剩余调用次数，None 表示无限制
+        """
+        rules = await self._get_applicable_rules(context, model_id)
+
+        if not rules:
+            return None
+
+        min_remaining = None
+        for rule in rules:
+            if rule.max_calls is None:
+                continue
+
+            usage = await self._get_usage_for_rule(rule, context)
+            remaining = rule.max_calls - usage.call_count if usage else rule.max_calls
+
+            if min_remaining is None or remaining < min_remaining:
+                min_remaining = remaining
+
+        return min_remaining
+
+    async def get_quota_status(
+        self,
+        context: ModelContext,
+        model_id: str
+    ) -> List[dict]:
+        """
+        获取所有适用配额的状态
+
+        Returns:
+            配额状态列表，包含名称、使用量、限制等
+        """
+        rules = await self._get_applicable_rules(context, model_id)
+        status_list = []
+
+        for rule in rules:
+            usage = await self._get_usage_for_rule(rule, context)
+
+            status = {
+                "rule_id": rule.id,
+                "name": rule.name,
+                "scope": rule.scope,
+                "period": rule.period,
+                "limits": {
+                    "max_calls": rule.max_calls,
+                    "max_input_tokens": rule.max_input_tokens,
+                    "max_output_tokens": rule.max_output_tokens,
+                    "max_cost": rule.max_cost
+                },
+                "usage": {
+                    "call_count": usage.call_count if usage else 0,
+                    "input_tokens": usage.input_tokens if usage else 0,
+                    "output_tokens": usage.output_tokens if usage else 0,
+                    "estimated_cost": float(usage.estimated_cost) if usage else 0.0
+                },
+                "remaining": {
+                    "calls": (rule.max_calls - usage.call_count) if (rule.max_calls and usage) else None
+                },
+                "on_exceed": rule.on_exceed,
+                "downgrade_to": rule.downgrade_to_model
+            }
+            status_list.append(status)
+
+        return status_list
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Private Methods
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _get_applicable_rules(
+        self,
+        context: ModelContext,
+        model_id: str
+    ) -> List[QuotaRule]:
+        """获取适用的配额规则"""
+        # 先尝试从缓存获取所有规则
+        all_rules = await self._cache.get_quota_rules()
+        if all_rules is None:
+            all_rules = await self._repo.get_all_quota_rules()
+            await self._cache.set_quota_rules(all_rules)
+
+        # 过滤适用的规则
+        provider_id = model_id.split(":")[0] if ":" in model_id else None
+        applicable = []
+
+        for rule in all_rules:
+            if self._rule_applies(rule, context, model_id, provider_id):
+                applicable.append(rule)
+
+        return applicable
+
+    def _rule_applies(
+        self,
+        rule: QuotaRule,
+        context: ModelContext,
+        model_id: str,
+        provider_id: str
+    ) -> bool:
+        """检查规则是否适用"""
+        scope = rule.scope
+
+        if scope == QuotaScope.GLOBAL.value:
+            return True
+
+        if scope == QuotaScope.PROVIDER.value:
+            return rule.scope_provider_id == provider_id
+
+        if scope == QuotaScope.MODEL.value:
+            return rule.scope_model_id == model_id
+
+        if scope == QuotaScope.USER.value:
+            return context.user_id is not None
+
+        if scope == QuotaScope.TIER.value:
+            return rule.scope_user_tier == context.user_tier
+
+        if scope == QuotaScope.TASK.value:
+            return rule.scope_task == context.task
+
+        return False
+
+    async def _check_single_rule(
+        self,
+        rule: QuotaRule,
+        context: ModelContext
+    ) -> QuotaCheckResult:
+        """检查单条配额规则"""
+        usage = await self._get_usage_for_rule(rule, context)
+
+        # 检查调用次数限制
+        if rule.max_calls is not None:
+            current = usage.call_count if usage else 0
+            if current >= rule.max_calls:
+                return QuotaCheckResult(
+                    allowed=False,
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    current_usage=current,
+                    max_allowed=rule.max_calls,
+                    remaining=0,
+                    exceed_action=rule.on_exceed,
+                    downgrade_to=rule.downgrade_to_model,
+                    message=rule.exceed_message or f"已达到{rule.name}限制"
+                )
+
+        # 检查 token 限制
+        if rule.max_input_tokens is not None:
+            current = usage.input_tokens if usage else 0
+            if current >= rule.max_input_tokens:
+                return QuotaCheckResult(
+                    allowed=False,
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    current_usage=current,
+                    max_allowed=rule.max_input_tokens,
+                    remaining=0,
+                    exceed_action=rule.on_exceed,
+                    downgrade_to=rule.downgrade_to_model,
+                    message=rule.exceed_message or f"已达到{rule.name} Token 限制"
+                )
+
+        # 检查成本限制
+        if rule.max_cost is not None:
+            current = float(usage.estimated_cost) if usage else 0.0
+            if current >= rule.max_cost:
+                return QuotaCheckResult(
+                    allowed=False,
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    current_usage=int(current * 100),  # 转为分
+                    max_allowed=int(rule.max_cost * 100),
+                    remaining=0,
+                    exceed_action=rule.on_exceed,
+                    downgrade_to=rule.downgrade_to_model,
+                    message=rule.exceed_message or f"已达到{rule.name}成本限制"
+                )
+
+        # 规则通过
+        remaining = (rule.max_calls - (usage.call_count if usage else 0)) if rule.max_calls else 0
+        return QuotaCheckResult(
+            allowed=True,
+            rule_id=rule.id,
+            rule_name=rule.name,
+            current_usage=usage.call_count if usage else 0,
+            max_allowed=rule.max_calls or 0,
+            remaining=remaining
+        )
+
+    async def _get_usage_for_rule(
+        self,
+        rule: QuotaRule,
+        context: ModelContext
+    ) -> Optional[QuotaUsage]:
+        """获取规则的使用量"""
+        user_id = context.user_id if rule.scope == QuotaScope.USER.value else None
+        return await self._repo.get_quota_usage(
+            rule_id=rule.id,
+            user_id=user_id,
+            period=rule.period
+        )
+
+
+# 全局实例
+_quota_manager: Optional[QuotaManager] = None
+
+
+def get_quota_manager() -> QuotaManager:
+    """获取配额管理器实例"""
+    global _quota_manager
+    if _quota_manager is None:
+        _quota_manager = QuotaManager()
+    return _quota_manager

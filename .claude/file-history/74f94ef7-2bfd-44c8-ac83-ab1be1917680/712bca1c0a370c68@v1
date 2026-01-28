@@ -1,0 +1,228 @@
+"""
+提醒服务测试
+"""
+
+import pytest
+from datetime import date, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+from services.reminder.calendar import FortuneCalendar, EventType, FortuneEvent
+from services.reminder.scheduler import ReminderScheduler, ReminderType
+from services.reminder.generator import ContentGenerator
+from services.reminder.notification import NotificationService
+
+
+class TestFortuneCalendar:
+    """运势日历测试"""
+
+    @pytest.mark.asyncio
+    async def test_get_upcoming_events(self, mock_db_pool):
+        """测试获取即将到来的事件"""
+        # 设置模拟返回数据
+        mock_db_pool.fetch.return_value = [
+            {
+                "id": "event-1",
+                "event_type": "solar_term",
+                "name": "节气·立春",
+                "start_date": date.today() + timedelta(days=3),
+                "end_date": None,
+                "event_data": {"solar_term": "立春"}
+            }
+        ]
+
+        calendar = FortuneCalendar(mock_db_pool)
+        events = await calendar.get_upcoming_events(days_ahead=7)
+
+        assert len(events) == 1
+        assert events[0].event_type == EventType.SOLAR_TERM
+        assert "立春" in events[0].name
+
+    @pytest.mark.asyncio
+    async def test_is_mercury_retrograde(self, mock_db_pool):
+        """测试水逆检查"""
+        # 不在水逆期间
+        mock_db_pool.fetchrow.return_value = None
+
+        calendar = FortuneCalendar(mock_db_pool)
+        is_retro, details = await calendar.is_mercury_retrograde()
+
+        assert is_retro is False
+        assert details is None
+
+    @pytest.mark.asyncio
+    async def test_is_mercury_retrograde_active(self, mock_db_pool):
+        """测试水逆期间"""
+        mock_db_pool.fetchrow.return_value = {
+            "name": "2026年第一次水逆",
+            "start_date": date.today() - timedelta(days=5),
+            "end_date": date.today() + timedelta(days=10),
+            "event_data": {"sign": "水瓶座"}
+        }
+
+        calendar = FortuneCalendar(mock_db_pool)
+        is_retro, details = await calendar.is_mercury_retrograde()
+
+        assert is_retro is True
+        assert details is not None
+        assert "水瓶座" in str(details)
+
+
+class TestReminderScheduler:
+    """提醒调度器测试"""
+
+    @pytest.mark.asyncio
+    async def test_get_user_settings_default(self, mock_db_pool):
+        """测试获取默认设置"""
+        mock_db_pool.fetchrow.return_value = None
+
+        scheduler = ReminderScheduler(mock_db_pool)
+        settings = await scheduler.get_user_settings("user-123")
+
+        assert settings.user_id == "user-123"
+        assert settings.bazi_month_enabled is True
+        assert settings.mercury_retrograde_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_get_user_settings_custom(self, mock_db_pool):
+        """测试获取自定义设置"""
+        mock_db_pool.fetchrow.return_value = {
+            "bazi_month_enabled": False,
+            "bazi_month_advance_days": 5,
+            "bazi_year_enabled": True,
+            "bazi_year_advance_days": 7,
+            "mercury_retrograde_enabled": True,
+            "mercury_retrograde_advance_days": 3,
+            "weekly_fortune_enabled": True,
+            "weekly_fortune_time": "09:00",
+            "quiet_start_time": "23:00",
+            "quiet_end_time": "07:00",
+            "in_app_enabled": True,
+            "push_enabled": False,
+            "wechat_enabled": False
+        }
+
+        scheduler = ReminderScheduler(mock_db_pool)
+        settings = await scheduler.get_user_settings("user-123")
+
+        assert settings.bazi_month_enabled is False
+        assert settings.bazi_month_advance_days == 5
+        assert settings.weekly_fortune_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings(self, mock_db_pool):
+        """测试更新用户设置"""
+        from services.reminder.scheduler import ReminderSettings
+
+        scheduler = ReminderScheduler(mock_db_pool)
+
+        settings = ReminderSettings(
+            user_id="user-123",
+            bazi_month_enabled=False,
+            mercury_retrograde_advance_days=5
+        )
+
+        result = await scheduler.update_user_settings(settings)
+        assert result is True
+        mock_db_pool.execute.assert_called_once()
+
+
+class TestContentGenerator:
+    """内容生成器测试"""
+
+    @pytest.mark.asyncio
+    async def test_generate_reminder_content(self, mock_db_pool, mock_llm):
+        """测试生成提醒内容"""
+        from services.reminder.scheduler import ReminderTask
+
+        mock_db_pool.fetchrow.return_value = {
+            "display_name": "测试用户",
+            "birth_datetime": datetime(1990, 5, 15),
+            "timezone": "Asia/Shanghai"
+        }
+
+        generator = ContentGenerator(mock_db_pool, mock_llm)
+
+        task = ReminderTask(
+            user_id="user-123",
+            reminder_type=ReminderType.BAZI_MONTH,
+            event_name="月运交接·丙寅月",
+            event_date=date.today() + timedelta(days=2),
+            scheduled_at=datetime.now()
+        )
+
+        content = await generator.generate_reminder_content(task, use_llm=False)
+
+        assert content.title == "月运交接提醒"
+        assert "丙寅月" in content.content
+        assert "测试用户" in content.content
+
+    @pytest.mark.asyncio
+    async def test_generate_mercury_retrograde_content(self, mock_db_pool):
+        """测试生成水逆提醒内容"""
+        from services.reminder.scheduler import ReminderTask
+
+        mock_db_pool.fetchrow.return_value = {
+            "display_name": "星星",
+            "birth_datetime": None,
+            "timezone": "Asia/Shanghai"
+        }
+
+        generator = ContentGenerator(mock_db_pool)
+
+        task = ReminderTask(
+            user_id="user-123",
+            reminder_type=ReminderType.MERCURY_RETROGRADE,
+            event_name="2026年第一次水逆",
+            event_date=date.today() + timedelta(days=3),
+            scheduled_at=datetime.now()
+        )
+
+        content = await generator.generate_reminder_content(task, use_llm=False)
+
+        assert content.title == "水逆提醒"
+        assert "水星逆行" in content.content
+
+
+class TestNotificationService:
+    """通知服务测试"""
+
+    @pytest.mark.asyncio
+    async def test_get_user_notifications(self, mock_db_pool):
+        """测试获取用户通知"""
+        mock_db_pool.fetch.return_value = [
+            {
+                "id": "notif-1",
+                "user_id": "user-123",
+                "notification_type": "bazi_month",
+                "title": "月运交接提醒",
+                "content": "明天将迎来新的月运",
+                "read": False,
+                "created_at": datetime.now()
+            }
+        ]
+
+        service = NotificationService(mock_db_pool)
+        notifications = await service.get_user_notifications("user-123")
+
+        assert len(notifications) == 1
+        assert notifications[0].title == "月运交接提醒"
+
+    @pytest.mark.asyncio
+    async def test_get_unread_count(self, mock_db_pool):
+        """测试获取未读数量"""
+        mock_db_pool.fetchval.return_value = 5
+
+        service = NotificationService(mock_db_pool)
+        count = await service.get_unread_count("user-123")
+
+        assert count == 5
+
+    @pytest.mark.asyncio
+    async def test_mark_as_read(self, mock_db_pool):
+        """测试标记已读"""
+        mock_db_pool.execute.return_value = "UPDATE 1"
+
+        service = NotificationService(mock_db_pool)
+        result = await service.mark_as_read("notif-1", "user-123")
+
+        assert result is True

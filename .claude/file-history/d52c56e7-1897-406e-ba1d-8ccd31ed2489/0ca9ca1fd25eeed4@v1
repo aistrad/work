@@ -1,0 +1,301 @@
+"""
+UsageService - 统一用量服务 (支持计费)
+v2.0: 支持 LLM/Skill/Tool 精确计费
+"""
+from datetime import date, datetime, timedelta
+from typing import Optional, List
+from uuid import UUID
+import logging
+
+from stores.db import get_db_pool
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 模型定价表 (每 1M tokens, USD)
+# ═══════════════════════════════════════════════════════════════
+
+MODEL_PRICING = {
+    # Zhipu GLM
+    "glm-4-flash": {"input": 0.1, "output": 0.1},
+    "glm-4": {"input": 0.5, "output": 0.5},
+    "glm-4-plus": {"input": 1.0, "output": 1.0},
+    # DeepSeek
+    "deepseek-chat": {"input": 0.14, "output": 0.28},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+    # Gemini
+    "gemini-flash": {"input": 0.075, "output": 0.3},
+    "gemini-2.0-flash": {"input": 0.075, "output": 0.3},
+    "gemini-pro": {"input": 0.5, "output": 1.5},
+    # Claude
+    "claude-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-opus": {"input": 15.0, "output": 75.0},
+    # OpenAI
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    # Default
+    "default": {"input": 0.1, "output": 0.1},
+}
+
+
+class UsageService:
+    """统一用量服务 - 支持计费"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # 记录方法
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def record_llm_call(
+        user_id: UUID,
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        skill_id: str = None,
+        conversation_id: UUID = None,
+        metadata: dict = None
+    ) -> None:
+        """记录 LLM 调用 (带成本估算)"""
+        cost = UsageService._estimate_cost(model, input_tokens, output_tokens)
+
+        pool = await get_db_pool()
+        try:
+            await pool.execute("""
+                INSERT INTO usage_events
+                (user_id, event_type, model, input_tokens, output_tokens,
+                 estimated_cost, skill_id, conversation_id, metadata)
+                VALUES ($1, 'llm_call', $2, $3, $4, $5, $6, $7, $8)
+            """, user_id, model, input_tokens, output_tokens,
+                cost, skill_id, conversation_id, metadata)
+        except Exception as e:
+            logger.error(f"Failed to record LLM call: {e}")
+
+    @staticmethod
+    async def record_skill_use(
+        user_id: UUID,
+        skill_id: str,
+        conversation_id: UUID = None
+    ) -> None:
+        """记录 Skill 使用"""
+        pool = await get_db_pool()
+        try:
+            await pool.execute("""
+                INSERT INTO usage_events
+                (user_id, event_type, skill_id, conversation_id)
+                VALUES ($1, 'skill_use', $2, $3)
+            """, user_id, skill_id, conversation_id)
+        except Exception as e:
+            logger.error(f"Failed to record skill use: {e}")
+
+    @staticmethod
+    async def record_tool_call(
+        user_id: UUID,
+        tool_name: str,
+        skill_id: str = None,
+        conversation_id: UUID = None
+    ) -> None:
+        """记录 Tool 调用"""
+        pool = await get_db_pool()
+        try:
+            await pool.execute("""
+                INSERT INTO usage_events
+                (user_id, event_type, tool_name, skill_id, conversation_id)
+                VALUES ($1, 'tool_call', $2, $3, $4)
+            """, user_id, tool_name, skill_id, conversation_id)
+        except Exception as e:
+            logger.error(f"Failed to record tool call: {e}")
+
+    @staticmethod
+    async def record_conversation(
+        user_id: UUID,
+        skill_id: str = None,
+        conversation_id: UUID = None
+    ) -> None:
+        """记录对话 (向后兼容)"""
+        pool = await get_db_pool()
+        try:
+            await pool.execute("""
+                INSERT INTO usage_events
+                (user_id, event_type, skill_id, conversation_id)
+                VALUES ($1, 'conversation', $2, $3)
+            """, user_id, skill_id, conversation_id)
+        except Exception as e:
+            logger.error(f"Failed to record conversation: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 查询方法 - 计费
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_billing_summary(
+        user_id: UUID,
+        start_date: date,
+        end_date: date
+    ) -> dict:
+        """获取计费汇总"""
+        pool = await get_db_pool()
+
+        result = await pool.fetchrow("""
+            SELECT
+                COUNT(*) FILTER (WHERE event_type = 'llm_call') as llm_calls,
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                COALESCE(SUM(estimated_cost), 0) as total_cost,
+                COUNT(*) FILTER (WHERE event_type = 'skill_use') as skill_uses,
+                COUNT(*) FILTER (WHERE event_type = 'tool_call') as tool_calls,
+                COUNT(*) FILTER (WHERE event_type = 'conversation') as conversations
+            FROM usage_events
+            WHERE user_id = $1
+              AND created_at >= $2
+              AND created_at < $3
+        """, user_id, start_date, end_date)
+
+        return {
+            "llm_calls": result["llm_calls"],
+            "total_input_tokens": result["total_input_tokens"],
+            "total_output_tokens": result["total_output_tokens"],
+            "total_tokens": result["total_input_tokens"] + result["total_output_tokens"],
+            "total_cost": float(result["total_cost"]),
+            "skill_uses": result["skill_uses"],
+            "tool_calls": result["tool_calls"],
+            "conversations": result["conversations"],
+        }
+
+    @staticmethod
+    async def get_usage_by_skill(user_id: UUID, month: date) -> List[dict]:
+        """按 Skill 统计用量"""
+        pool = await get_db_pool()
+
+        rows = await pool.fetch("""
+            SELECT
+                skill_id,
+                COUNT(*) FILTER (WHERE event_type = 'llm_call') as llm_calls,
+                COUNT(*) FILTER (WHERE event_type = 'skill_use') as skill_uses,
+                COUNT(*) FILTER (WHERE event_type = 'tool_call') as tool_calls,
+                COALESCE(SUM(input_tokens + output_tokens), 0) as tokens,
+                COALESCE(SUM(estimated_cost), 0) as cost
+            FROM usage_events
+            WHERE user_id = $1
+              AND created_at >= DATE_TRUNC('month', $2::date)
+              AND created_at < DATE_TRUNC('month', $2::date) + INTERVAL '1 month'
+              AND skill_id IS NOT NULL
+            GROUP BY skill_id
+            ORDER BY cost DESC
+        """, user_id, month)
+
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    async def get_usage_by_model(user_id: UUID, month: date) -> List[dict]:
+        """按模型统计用量"""
+        pool = await get_db_pool()
+
+        rows = await pool.fetch("""
+            SELECT
+                model,
+                COUNT(*) as calls,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(estimated_cost), 0) as cost
+            FROM usage_events
+            WHERE user_id = $1
+              AND event_type = 'llm_call'
+              AND created_at >= DATE_TRUNC('month', $2::date)
+              AND created_at < DATE_TRUNC('month', $2::date) + INTERVAL '1 month'
+              AND model IS NOT NULL
+            GROUP BY model
+            ORDER BY cost DESC
+        """, user_id, month)
+
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    async def get_daily_usage(user_id: UUID) -> dict:
+        """获取今日用量"""
+        pool = await get_db_pool()
+
+        result = await pool.fetchrow("""
+            SELECT
+                COUNT(*) FILTER (WHERE event_type = 'llm_call') as llm_calls,
+                COUNT(*) FILTER (WHERE event_type = 'conversation') as conversations,
+                COALESCE(SUM(input_tokens + output_tokens), 0) as tokens,
+                COALESCE(SUM(estimated_cost), 0) as cost
+            FROM usage_events
+            WHERE user_id = $1
+              AND created_at >= CURRENT_DATE
+        """, user_id)
+
+        return {
+            "llm_calls": result["llm_calls"],
+            "conversations": result["conversations"],
+            "tokens": result["tokens"],
+            "cost": float(result["cost"]),
+        }
+
+    @staticmethod
+    async def get_monthly_usage(user_id: UUID) -> dict:
+        """获取本月用量"""
+        pool = await get_db_pool()
+
+        result = await pool.fetchrow("""
+            SELECT
+                COUNT(*) FILTER (WHERE event_type = 'llm_call') as llm_calls,
+                COUNT(*) FILTER (WHERE event_type = 'conversation') as conversations,
+                COALESCE(SUM(input_tokens + output_tokens), 0) as tokens,
+                COALESCE(SUM(estimated_cost), 0) as cost
+            FROM usage_events
+            WHERE user_id = $1
+              AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+        """, user_id)
+
+        return {
+            "llm_calls": result["llm_calls"],
+            "conversations": result["conversations"],
+            "tokens": result["tokens"],
+            "cost": float(result["cost"]),
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # 向后兼容方法
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def record_usage(
+        user_id: UUID,
+        usage_type: str,
+        metadata: Optional[dict] = None
+    ) -> None:
+        """向后兼容: 记录简单用量事件"""
+        pool = await get_db_pool()
+
+        skill_id = metadata.get("skill") if metadata else None
+
+        try:
+            await pool.execute("""
+                INSERT INTO usage_events
+                (user_id, event_type, skill_id, metadata)
+                VALUES ($1, $2, $3, $4)
+            """, user_id, usage_type, skill_id, metadata)
+        except Exception as e:
+            logger.error(f"Failed to record usage: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 私有方法
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+        """估算成本 (USD)"""
+        pricing = MODEL_PRICING.get("default")
+
+        for key, p in MODEL_PRICING.items():
+            if key in model.lower():
+                pricing = p
+                break
+
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+
+        return input_cost + output_cost

@@ -1,0 +1,686 @@
+"""
+CoreAgent + Core Skill 用户场景测试
+
+测试场景覆盖：
+1. 用户数据工具 (read/write/query/delete)
+2. 触发器工具 (create/list/cancel)
+3. 展示工具 (show_card)
+4. 收集工具 (ask_user_question, request_info)
+5. 乐观锁版本控制
+6. 条件触发器自动检查
+"""
+
+import pytest
+import json
+import os
+from uuid import uuid4
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from services.agent.tool_registry import ToolRegistry, ToolContext
+from skills.core.services import (
+    TriggerService, CardService, CardTypes, UserData
+)
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Database Fixtures (for real DB testing)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+async def reset_db_pool():
+    """Reset database pool before each test to avoid event loop issues"""
+    import stores.db as db_module
+    # Close existing pool if any
+    if db_module._pool is not None:
+        try:
+            await db_module._pool.close()
+        except Exception:
+            pass
+        db_module._pool = None
+    yield
+    # Cleanup after test
+    if db_module._pool is not None:
+        try:
+            await db_module._pool.close()
+        except Exception:
+            pass
+        db_module._pool = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 使用固定的测试用户 ID（需要在数据库中存在）
+TEST_USER_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+@pytest.fixture
+def user_id():
+    """测试用户 ID - 使用固定 ID 以便数据库外键约束"""
+    return TEST_USER_ID
+
+
+@pytest.fixture
+def tool_context(user_id):
+    """工具执行上下文"""
+    return ToolContext(
+        user_id=user_id,
+        user_tier="premium",
+        profile={"name": "测试用户", "birth_info": {"year": 1990, "month": 5, "day": 15}},
+        skill_data={},
+        skill_id="core",
+        scenario_id="goal_tracking"
+    )
+
+
+@pytest.fixture
+def unified_profile_repo():
+    """UnifiedProfileRepository 单例"""
+    return UnifiedProfileRepository
+
+
+@pytest.fixture
+def trigger_service():
+    """TriggerService 实例"""
+    return TriggerService()
+
+
+@pytest.fixture
+def card_service():
+    """CardService 实例"""
+    return CardService()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 1: 目标设定与追踪
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGoalTrackingScenario:
+    """
+    用户场景：设定年度目标并追踪进度
+
+    用户故事：
+    - 用户想设定 2026 年的年度目标
+    - 用户想查看自己的目标列表
+    - 用户想更新目标进度
+    - 用户想设置每日打卡提醒
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_1_1_create_year_goal(self, tool_context):
+        """场景 1.1: 用户设定年度目标"""
+        # 初始化工具注册表
+        ToolRegistry.initialize()
+
+        # 模拟用户说："我想设定今年的目标，学会弹吉他"
+        args = {
+            "path": "goals/2026/year",
+            "content": {
+                "title": "2026年度目标",
+                "status": "active",
+                "items": [
+                    {
+                        "id": "goal-1",
+                        "title": "学会弹吉他",
+                        "description": "能够弹奏 5 首完整的歌曲",
+                        "deadline": "2026-12-31",
+                        "progress": 0,
+                        "status": "active"
+                    }
+                ]
+            }
+        }
+
+        result = await ToolRegistry.execute("write_user_data", args, tool_context)
+
+        assert result["status"] == "success"
+        assert result["version"] == 1
+        print(f"✅ 场景 1.1 通过: 创建年度目标成功, version={result['version']}")
+
+    @pytest.mark.asyncio
+    async def test_scenario_1_2_read_goals(self, tool_context):
+        """场景 1.2: 用户查看目标列表"""
+        ToolRegistry.initialize()
+
+        # 先创建目标
+        await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/year",
+            "content": {"title": "2026目标", "items": [{"id": "1", "title": "学吉他"}]}
+        }, tool_context)
+
+        # 模拟用户说："我的目标有哪些？"
+        result = await ToolRegistry.execute("read_user_data", {
+            "path": "goals/2026/year"
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["data"] is not None
+        print(f"✅ 场景 1.2 通过: 读取目标成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_1_3_update_goal_progress(self, tool_context):
+        """场景 1.3: 用户更新目标进度（乐观锁测试）"""
+        ToolRegistry.initialize()
+
+        # 创建初始目标
+        create_result = await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/guitar",
+            "content": {"title": "学吉他", "progress": 0, "status": "active"}
+        }, tool_context)
+
+        initial_version = create_result["version"]
+
+        # 模拟用户说："我已经学会了第一首歌，更新进度到 20%"
+        update_result = await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/guitar",
+            "content": {"title": "学吉他", "progress": 20, "status": "active"},
+            "expected_version": initial_version
+        }, tool_context)
+
+        assert update_result["status"] == "success"
+        assert update_result["version"] == initial_version + 1
+        print(f"✅ 场景 1.3 通过: 乐观锁更新成功, version={update_result['version']}")
+
+    @pytest.mark.asyncio
+    async def test_scenario_1_4_version_conflict(self, tool_context):
+        """场景 1.4: 并发更新导致版本冲突"""
+        ToolRegistry.initialize()
+
+        # 创建初始目标
+        await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/conflict_test",
+            "content": {"title": "冲突测试", "value": 1}
+        }, tool_context)
+
+        # 模拟另一个客户端已经更新了数据（version 变成 2）
+        await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/conflict_test",
+            "content": {"title": "冲突测试", "value": 2}
+        }, tool_context)
+
+        # 当前客户端尝试用旧版本更新
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/conflict_test",
+            "content": {"title": "冲突测试", "value": 3},
+            "expected_version": 1  # 旧版本
+        }, tool_context)
+
+        assert result["status"] == "conflict"
+        print(f"✅ 场景 1.4 通过: 版本冲突正确检测")
+
+    @pytest.mark.asyncio
+    async def test_scenario_1_5_create_daily_reminder(self, tool_context):
+        """场景 1.5: 用户设置每日打卡提醒"""
+        ToolRegistry.initialize()
+
+        # 模拟用户说："帮我设置每天晚上 9 点的打卡提醒"
+        result = await ToolRegistry.execute("create_trigger", {
+            "trigger_type": "reminder",
+            "title": "每日打卡提醒",
+            "schedule": "21:00",
+            "schedule_type": "daily",
+            "trigger_subtype": "goal_checkin",
+            "action": {
+                "type": "notify",
+                "payload": {"title": "打卡时间到", "body": "记得完成今天的目标打卡哦！"}
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        # trigger_id 在 result["trigger"]["id"] 中
+        assert "trigger" in result
+        trigger_id = result["trigger"]["id"]
+        print(f"✅ 场景 1.5 通过: 创建每日提醒成功, trigger_id={trigger_id}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 2: 每日计划与打卡
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDailyPlanScenario:
+    """
+    用户场景：制定每日计划并打卡
+
+    用户故事：
+    - 用户想制定今天的计划
+    - 用户想查看今天的任务
+    - 用户想完成任务并打卡
+    - 用户想查看打卡记录
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_2_1_create_daily_plan(self, tool_context):
+        """场景 2.1: 用户制定今日计划"""
+        ToolRegistry.initialize()
+
+        # 模拟用户说："帮我制定今天的计划"
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "plans/daily/2026-01-18",
+            "content": {
+                "date": "2026-01-18",
+                "status": "active",
+                "tasks": [
+                    {"id": "t1", "title": "练习吉他 30 分钟", "done": False},
+                    {"id": "t2", "title": "阅读 20 页书", "done": False},
+                    {"id": "t3", "title": "运动 15 分钟", "done": False}
+                ]
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 2.1 通过: 创建每日计划成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_2_2_show_daily_tasks(self, tool_context):
+        """场景 2.2: 展示今日任务列表"""
+        ToolRegistry.initialize()
+
+        # 先创建计划
+        await ToolRegistry.execute("write_user_data", {
+            "path": "plans/daily/2026-01-18",
+            "content": {
+                "tasks": [
+                    {"id": "t1", "title": "练习吉他", "done": False},
+                    {"id": "t2", "title": "阅读", "done": True}
+                ]
+            }
+        }, tool_context)
+
+        # 模拟用户说："展示我今天的任务"
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "list",
+            "data_source": {
+                "type": "path",
+                "path": "plans/daily/2026-01-18"
+            },
+            "options": {
+                "emptyText": "今天还没有计划哦",
+                "showIndex": True
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "list"
+        print(f"✅ 场景 2.2 通过: 展示任务列表成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_2_3_checkin(self, tool_context):
+        """场景 2.3: 用户打卡"""
+        ToolRegistry.initialize()
+
+        # 模拟用户说："我完成了今天的吉他练习，帮我打卡"
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "checkins/2026-01-18",
+            "content": {
+                "date": "2026-01-18",
+                "items": [
+                    {
+                        "goal_id": "guitar",
+                        "task": "练习吉他 30 分钟",
+                        "completed": True,
+                        "notes": "今天练习了《小星星》",
+                        "mood": "happy"
+                    }
+                ],
+                "summary": "完成 1 项任务"
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 2.3 通过: 打卡记录成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_2_4_query_checkin_history(self, tool_context):
+        """场景 2.4: 查询打卡历史"""
+        ToolRegistry.initialize()
+
+        # 创建多天打卡记录
+        for day in range(15, 19):
+            await ToolRegistry.execute("write_user_data", {
+                "path": f"checkins/2026-01-{day:02d}",
+                "content": {"date": f"2026-01-{day:02d}", "completed": True}
+            }, tool_context)
+
+        # 模拟用户说："查看我这周的打卡记录"
+        result = await ToolRegistry.execute("query_user_data", {
+            "path_prefix": "checkins/2026-01",
+            "sort_by": "created_at",
+            "limit": 7
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["count"] >= 1
+        print(f"✅ 场景 2.4 通过: 查询打卡历史成功, count={result['count']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 3: 条件触发器
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestConditionTriggerScenario:
+    """
+    用户场景：设置条件触发器
+
+    用户故事：
+    - 用户想在目标完成时收到通知
+    - 用户想在连续打卡 7 天时收到庆祝
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_3_1_goal_completion_trigger(self, tool_context):
+        """场景 3.1: 目标完成时触发通知"""
+        ToolRegistry.initialize()
+
+        # 模拟用户说："当我的吉他目标完成时，提醒我庆祝"
+        result = await ToolRegistry.execute("create_trigger", {
+            "trigger_type": "condition",
+            "title": "目标完成庆祝",
+            "source_path": "goals/2026/guitar",
+            "condition": {
+                "field": "progress",
+                "operator": "gte",
+                "value": 100
+            },
+            "action": {
+                "type": "notify",
+                "payload": {
+                    "title": "🎉 恭喜！",
+                    "body": "你的吉他学习目标已完成！"
+                }
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 3.1 通过: 创建条件触发器成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_3_2_list_triggers(self, tool_context):
+        """场景 3.2: 查看所有触发器"""
+        ToolRegistry.initialize()
+
+        # 先创建一些触发器
+        await ToolRegistry.execute("create_trigger", {
+            "trigger_type": "reminder",
+            "title": "测试提醒",
+            "schedule": "08:00",
+            "schedule_type": "daily"
+        }, tool_context)
+
+        # 模拟用户说："我有哪些提醒？"
+        result = await ToolRegistry.execute("list_triggers", {
+            "status": "active"
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 3.2 通过: 列出触发器成功, count={result['count']}")
+
+    @pytest.mark.asyncio
+    async def test_scenario_3_3_cancel_trigger(self, tool_context):
+        """场景 3.3: 取消触发器"""
+        ToolRegistry.initialize()
+
+        # 先创建触发器
+        create_result = await ToolRegistry.execute("create_trigger", {
+            "trigger_type": "reminder",
+            "title": "要取消的提醒",
+            "schedule": "10:00",
+            "schedule_type": "daily"
+        }, tool_context)
+
+        trigger_id = create_result.get("trigger_id")
+
+        # 模拟用户说："取消这个提醒"
+        result = await ToolRegistry.execute("cancel_trigger", {
+            "trigger_id": trigger_id
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 3.3 通过: 取消触发器成功")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 4: 展示卡片
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestShowCardScenario:
+    """
+    用户场景：各种卡片展示
+
+    测试所有 11 种通用视图类型
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_1_show_tree(self, tool_context):
+        """场景 4.1: 展示目标树"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "tree",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "id": "root",
+                    "title": "2026 年度目标",
+                    "children": [
+                        {
+                            "id": "health",
+                            "title": "健康",
+                            "progress": 30,
+                            "children": [
+                                {"id": "h1", "title": "每周运动 3 次", "progress": 50},
+                                {"id": "h2", "title": "早睡早起", "progress": 10}
+                            ]
+                        },
+                        {
+                            "id": "skill",
+                            "title": "技能",
+                            "progress": 20,
+                            "children": [
+                                {"id": "s1", "title": "学吉他", "progress": 20}
+                            ]
+                        }
+                    ]
+                }
+            },
+            "options": {"expandLevel": 2, "showProgress": True}
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "tree"
+        print(f"✅ 场景 4.1 通过: 展示目标树成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_2_show_progress(self, tool_context):
+        """场景 4.2: 展示进度条"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "progress",
+            "data_source": {
+                "type": "inline",
+                "data": {"value": 65, "max": 100, "label": "年度目标完成度"}
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "progress"
+        print(f"✅ 场景 4.2 通过: 展示进度条成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_3_show_chart(self, tool_context):
+        """场景 4.3: 展示图表"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "chart",
+            "data_source": {
+                "type": "inline",
+                "data": [
+                    {"month": "1月", "完成": 5, "目标": 10},
+                    {"month": "2月", "完成": 8, "目标": 10},
+                    {"month": "3月", "完成": 12, "目标": 10}
+                ]
+            },
+            "options": {
+                "chartType": "bar",
+                "xAxis": {"dataKey": "month"}
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "chart"
+        print(f"✅ 场景 4.3 通过: 展示图表成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_4_show_form(self, tool_context):
+        """场景 4.4: 展示打卡表单"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "form",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "fields": [
+                        {"name": "task", "label": "完成的任务", "type": "text", "required": True},
+                        {"name": "duration", "label": "用时(分钟)", "type": "number"},
+                        {"name": "mood", "label": "心情", "type": "select", "options": ["开心", "一般", "疲惫"]},
+                        {"name": "notes", "label": "备注", "type": "textarea"}
+                    ],
+                    "submitLabel": "提交打卡"
+                }
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "form"
+        print(f"✅ 场景 4.4 通过: 展示表单成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_5_show_timeline(self, tool_context):
+        """场景 4.5: 展示时间线"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "timeline",
+            "data_source": {
+                "type": "inline",
+                "data": [
+                    {"date": "2026-01-15", "title": "开始学吉他", "description": "购买了吉他"},
+                    {"date": "2026-01-16", "title": "第一次练习", "description": "学会了基本和弦"},
+                    {"date": "2026-01-17", "title": "练习《小星星》", "description": "能弹完整首歌了"}
+                ]
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "timeline"
+        print(f"✅ 场景 4.5 通过: 展示时间线成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_6_show_toast(self, tool_context):
+        """场景 4.6: 展示轻提示"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "toast",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "message": "打卡成功！继续加油！",
+                    "type": "success",
+                    "duration": 3000
+                }
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "toast"
+        print(f"✅ 场景 4.6 通过: 展示轻提示成功")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 5: 收集信息
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCollectInfoScenario:
+    """
+    用户场景：收集用户信息
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_5_1_ask_question(self, tool_context):
+        """场景 5.1: 向用户提问"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("ask_user_question", {
+            "question": "你想先设定哪个领域的目标？",
+            "options": ["健康", "事业", "学习", "感情"]
+        }, tool_context)
+
+        assert result["status"] == "asking"
+        assert result["cardType"] == "question_card"
+        print(f"✅ 场景 5.1 通过: 提问成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_5_2_request_birth_info(self, tool_context):
+        """场景 5.2: 请求出生信息"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("request_info", {
+            "info_type": "birth",
+            "question": "为了给你更准确的分析，请告诉我��的出生信息"
+        }, tool_context)
+
+        assert result["status"] == "collecting"
+        assert "fields" in result
+        print(f"✅ 场景 5.2 通过: 请求出生信息成功")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 6: 删除数据
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDeleteDataScenario:
+    """
+    用户场景：删除数据
+    """
+
+    @pytest.mark.asyncio
+    async def test_scenario_6_1_delete_goal(self, tool_context):
+        """场景 6.1: 删除目标"""
+        ToolRegistry.initialize()
+
+        # 先创建目标
+        await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/to_delete",
+            "content": {"title": "要删除的目标"}
+        }, tool_context)
+
+        # 模拟用户说："删除这个目标"
+        result = await ToolRegistry.execute("delete_user_data", {
+            "path": "goals/2026/to_delete"
+        }, tool_context)
+
+        assert result["status"] == "success"
+        print(f"✅ 场景 6.1 通过: 删除目标成功")
+
+    @pytest.mark.asyncio
+    async def test_scenario_6_2_delete_nonexistent(self, tool_context):
+        """场景 6.2: 删除不存在的数据"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("delete_user_data", {
+            "path": "goals/nonexistent/path"
+        }, tool_context)
+
+        assert result["status"] == "not_found"
+        print(f"✅ 场景 6.2 通过: 正确处理不存在的数据")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 运行测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s", "--tb=short"])

@@ -1,0 +1,224 @@
+"""
+Unified Skill Gateway - 统一 Skill API 入口
+
+所有 Skill 数据服务通过此路由访问:
+- POST /api/v1/skills/{skill_id}/{action}
+- GET /api/v1/skills/{skill_id}/services
+- GET /api/v1/skills
+
+示例:
+- POST /api/v1/skills/bazi/chart
+- POST /api/v1/skills/zodiac/fortune
+- POST /api/v1/skills/tarot/draw
+"""
+import logging
+from typing import Optional, Dict, Any
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Header
+from pydantic import BaseModel, Field
+
+from services.identity import get_optional_user, CurrentUser
+from services.agent.skill_service_registry import (
+    SkillServiceRegistry, ServiceContext
+)
+from stores.profile_cache import get_cached_profile_with_skill
+
+router = APIRouter(prefix="/skills", tags=["Skills"])
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SkillRequest(BaseModel):
+    """通用 Skill 请求"""
+    args: Dict[str, Any] = Field(default_factory=dict, description="服务参数")
+
+
+class SkillResponse(BaseModel):
+    """通用 Skill 响应"""
+    status: str = "success"
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class ServiceInfo(BaseModel):
+    """服务信息"""
+    skill_id: str
+    action: str
+    description: str = ""
+    auth_required: bool = True
+    entitlement: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def build_service_context(
+    user_id: Optional[UUID],
+    skill_id: str,
+    user_tier: str = "free"
+) -> ServiceContext:
+    """构建服务上下文"""
+    profile = {}
+    skill_data = {}
+
+    if user_id:
+        try:
+            result = await get_cached_profile_with_skill(user_id, skill_id)
+            profile = result.get("profile", {})
+            skill_data = result.get("skill_data", {})
+        except Exception as e:
+            logger.warning(f"Failed to get user context: {e}")
+
+    return ServiceContext(
+        user_id=str(user_id) if user_id else None,
+        user_tier=user_tier,
+        profile=profile,
+        skill_data=skill_data
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("")
+async def list_skills():
+    """
+    列出所有可用的 Skill
+
+    Returns:
+        skills: 可用的 Skill ID 列表
+    """
+    skills = SkillServiceRegistry.list_skills()
+    return {"skills": skills}
+
+
+@router.get("/{skill_id}/services")
+async def list_skill_services(skill_id: str):
+    """
+    列出 Skill 的所有服务
+
+    Args:
+        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+
+    Returns:
+        services: 服务列表
+    """
+    services = SkillServiceRegistry.list_services(skill_id)
+    if not services:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No services found for skill: {skill_id}"
+        )
+    return {"skill_id": skill_id, "services": services}
+
+
+@router.post("/{skill_id}/{action}")
+async def execute_skill_service(
+    skill_id: str,
+    action: str,
+    request: SkillRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+    x_test_tier: Optional[str] = Header(None, alias="x-test-tier")
+):
+    """
+    执行 Skill 服务
+
+    Args:
+        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+        action: 服务动作 (chart, fortune, draw, etc.)
+        request: 请求参数
+
+    Returns:
+        服务执行结果
+
+    Examples:
+        POST /api/v1/skills/bazi/chart
+        {"args": {"birth_date": "1990-01-01", "birth_time": "12:00"}}
+
+        POST /api/v1/skills/zodiac/fortune
+        {"args": {"date": "2026-01-15"}}
+    """
+    # 检查服务是否存在
+    if not SkillServiceRegistry.has_service(skill_id, action):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service not found: {skill_id}/{action}"
+        )
+
+    # 获取服务定义
+    service_def = SkillServiceRegistry.get_service(skill_id, action)
+
+    # 检查认证要求
+    if service_def.auth_required and not current_user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+
+    # 确定用户等级
+    user_id = current_user.user_id if current_user else None
+    user_tier = "free"
+
+    # 测试模式: 允许通过 header 覆盖 tier
+    if x_test_tier and x_test_tier in ("free", "paid", "vip", "guest"):
+        user_tier = x_test_tier
+        logger.info(f"Test mode: using tier={x_test_tier}")
+    elif user_id:
+        try:
+            from services.entitlement import EntitlementService
+            entitlements = await EntitlementService.get_entitlements(user_id)
+            user_tier = entitlements.get("tier", "free")
+        except Exception as e:
+            logger.warning(f"Failed to get entitlements: {e}")
+
+    # 检查权益要求
+    if service_def.entitlement:
+        # TODO: 实现权益检查
+        pass
+
+    # 构建上下文
+    context = await build_service_context(user_id, skill_id, user_tier)
+
+    # 执行服务
+    result = await SkillServiceRegistry.execute(skill_id, action, request.args, context)
+
+    # 检查错误
+    if "error" in result and result.get("status") in ("error", "not_found"):
+        status_code = 404 if result.get("status") == "not_found" else 400
+        raise HTTPException(status_code=status_code, detail=result["error"])
+
+    return result
+
+
+@router.get("/{skill_id}/{action}")
+async def get_skill_service_info(skill_id: str, action: str):
+    """
+    获取服务信息
+
+    Args:
+        skill_id: Skill 标识
+        action: 服务动作
+
+    Returns:
+        服务定义信息
+    """
+    service_def = SkillServiceRegistry.get_service(skill_id, action)
+    if not service_def:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service not found: {skill_id}/{action}"
+        )
+
+    return {
+        "skill_id": service_def.skill_id,
+        "action": service_def.action,
+        "description": service_def.description,
+        "auth_required": service_def.auth_required,
+        "entitlement": service_def.entitlement
+    }

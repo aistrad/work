@@ -1,0 +1,466 @@
+# VibeLife v10.2 实施总结
+
+> 修复上下文丢失问题 - 从历史消息提取出生信息 + 用户确认保存
+> 实施日期：2026-01-21
+
+---
+
+## 实施内容
+
+### ✅ 方案 1：修复 SOP 状态检查（核心修复）
+
+**文件**：`apps/api/services/agent/core.py`
+
+**修改内容**：
+
+#### 1. 新增 `_extract_birth_info_from_history` 方法
+
+**位置**：line 1045-1099
+
+**功能**：从历史对话中提取出生信息
+
+**支持的格式**：
+- 日期：`1980-02-11`, `1980/02/11`, `1980.02.11`
+- 时间：`14:30`
+- 地点：`beijing`, `北京`, `上海` 等
+- 性别：`male`, `female`, `男`, `女`
+
+**返回值**：
+```python
+{
+    "birth_date": "1980-02-11",
+    "birth_time": "14:30",
+    "place": "beijing",
+    "gender": "male"
+}
+```
+
+---
+
+#### 2. 更新 `_compute_sop_status` 方法
+
+**位置**：line 502-556
+
+**新增逻辑**：
+```python
+# v10.2: 如果数据库没有，尝试从历史消息提取
+extracted_from_history = None
+if not has_birth and context.history:
+    extracted_from_history = self._extract_birth_info_from_history(context.history)
+    has_birth = bool(extracted_from_history and extracted_from_history.get("birth_date"))
+    if has_birth:
+        logger.info(f"[SOP] Found birth_info in history: {extracted_from_history}")
+```
+
+**返回值增强**：
+```python
+result = {
+    ...
+    "has_birth_info": has_birth,  # 现在会检查历史
+    ...
+}
+
+# 如果从历史提取到了信息，附加到结果中
+if extracted_from_history:
+    result["extracted_from_history"] = extracted_from_history
+```
+
+---
+
+### ✅ 方案 2：优化 Phase 1 Prompt（配合修复 + 用户确认）
+
+**文件**：`apps/api/skills/core/config/routing.yaml`
+
+**修改内容**：
+
+#### 增加"提供出生信息"的处理规则
+
+**位置**：line 8-75
+
+**新增内容**：
+
+##### 1. 核心规则表格增加新行
+
+```yaml
+| 用户说 | 你的行动 |
+|-------|---------|
+| **提供出生信息（1990-01-01...）** | **先询问是否保存 → 激活相关 skill** |
+```
+
+##### 2. 详细处理流程
+
+```yaml
+## 重要：处理出生信息（v10.2 新增）
+
+### Step 1：询问用户是否保存
+
+先调用 ask_user_question 工具：
+  question="我注意到您提供了出生信息，是否保存为您的个人档案？"
+  options=["保存到档案", "这次先不保存", "这不是我的信息"]
+
+### Step 2：根据用户选择
+
+- 用户选"保存到档案"：
+  1. 调用 save_birth_info(...)
+  2. 调用 activate_skill
+
+- 用户选"这次先不保存"：
+  1. 不调用 save_birth_info
+  2. 直接调用 activate_skill（临时使用）
+
+- 用户选"这不是我的信息"：
+  1. 不调用 save_birth_info
+  2. 不激活技能
+  3. 简短说明
+```
+
+---
+
+## 工作流程
+
+### 场景 1：用户提供信息后激活 Skill
+
+#### 修复前（v10.1）
+
+```
+轮次 1：用户说"1980-02-11 14:30, beijing, male"
+  → Core Skill：文字回复，没调用 save_birth_info
+  → 数据库：无数据
+
+轮次 2：用户说"八字"
+  → activate_skill(bazi)
+  → 从数据库加载 profile：无 birth_info
+  → SOP 状态：has_birth_info = False
+  → SOP Prompt："已提供：否" + "推荐工具：collect_bazi_info"
+  → ❌ LLM 调用表单工具，用户困惑
+```
+
+#### 修复后（v10.2）
+
+```
+轮次 1：用户说"1980-02-11 14:30, beijing, male"
+  → Core Skill（Phase 1）：
+     ✅ 识别出生信息
+     ✅ 调用 ask_user_question："是否保存为档案？"
+     ✅ 用户选择"保存到档案"
+     ✅ 调用 save_birth_info
+     ✅ 调用 activate_skill(bazi)
+  → 数据库：已保存 birth_info
+
+轮次 2：进入 Bazi Skill
+  → 从数据库加载 profile：有 birth_info
+  → SOP 状态：has_birth_info = True
+  → SOP Prompt："已提供：是" + "需要计算"
+  → ✅ LLM 调用 calculate_bazi，流程正常
+```
+
+---
+
+### 场景 2：用户在 Phase 1 提供信息但选择"不保存"
+
+```
+轮次 1：用户说"1980-02-11 14:30, beijing, male"
+  → ask_user_question："是否保存？"
+  → 用户选择"这次先不保存"
+
+轮次 2：用户说"八字"
+  → activate_skill(bazi)
+  → 从数据库加载 profile：无 birth_info
+  → ✅ _compute_sop_status：检查历史消息
+  → ✅ extracted_from_history = {birth_date: "1980-02-11", ...}
+  → ✅ SOP 状态：has_birth_info = True（从历史提取）
+  → SOP Prompt："已提供：是" + "需要计算"
+  → ✅ LLM 调用 calculate_bazi，使用历史中的参数
+```
+
+**关键改进**：
+- ✅ 即使用户不保存，系统也能从历史恢复信息
+- ✅ 双重保障：优先数据库，备用历史提取
+
+---
+
+## 用户确认机制
+
+### 使用的工具：`ask_user_question`
+
+**工具定义**：`apps/api/skills/core/tools/tools.yaml:41-61`
+
+**调用示例**：
+```python
+ask_user_question(
+    question="我注意到您提供了出生信息，是否保存为您的个人档案？",
+    options=["保存到档案", "这次先不保存", "这不是我的信息"]
+)
+```
+
+**返回格式**：
+```json
+{
+  "status": "asking",
+  "cardType": "question_card",
+  "question": "我注意到您提供了出生信息，是否保存为您的个人档案？",
+  "options": ["保存到档案", "这次先不保存", "这不是我的信息"]
+}
+```
+
+**前端渲染**：
+- 展示问题
+- 渲染 3 个选项按钮
+- 用户点击后，选择结果作为下一轮消息返回
+
+---
+
+## 关键特性
+
+### 1. 双重保障
+
+```
+方案 1（SOP 历史检查）        方案 2（Phase 1 主动保存）
+      ↓                               ↓
+从历史提取出生信息          →    Phase 1 主动询问并保存
+      ↓                               ↓
+即使数据库没有，也能恢复    +    提供持久化数据
+      ↓                               ↓
+        容错性强，用户体验流畅
+```
+
+### 2. 用户确认
+
+**为什么需要确认**：
+- ✅ 尊重用户隐私：不会未经同意保存敏感信息
+- ✅ 支持代问场景：用户可能在帮朋友问
+- ✅ 灵活选择：临时使用 vs 长期保存
+
+**3 个选项的含义**：
+
+| 选项 | 行为 | 适用场景 |
+|------|------|---------|
+| "保存到档案" | 调用 `save_birth_info` + `activate_skill` | 用户自己的信息，希望保存 |
+| "这次先不保存" | 不保存，直接 `activate_skill`（临时使用） | 用户不确定，或暂时不想保存 |
+| "这不是我的信息" | 不保存，不激活 | 帮朋友问，或提供错了 |
+
+### 3. 历史提取容错
+
+**支持的输入格式**：
+
+| 类型 | 支持格式 | 示例 |
+|------|---------|------|
+| 日期 | YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD | `1980-02-11`, `1980/2/11` |
+| 时间 | HH:MM | `14:30`, `02:30` |
+| 地点 | 英文/中文城市名 | `beijing`, `北京`, `上海` |
+| 性别 | male/female, 男/女 | `male`, `男` |
+
+**提取逻辑**：
+- 正则表达式匹配
+- 只看最近 5 轮对话
+- 至少要有日期才返回
+
+---
+
+## 测试场景
+
+### 场景 1：用户分批提供信息（保存）
+
+```
+用户："我的生日"
+系统：request_info（表单）
+
+用户：填写表单 → 1980-02-11 14:30, beijing, male
+系统：ask_user_question："是否保存？"
+
+用户：点击"保存到档案"
+系统：save_birth_info + activate_skill(bazi) → "好的，让我来看看你的八字～"
+
+✅ 预期：直接进入排盘，不重复收集
+```
+
+---
+
+### 场景 2：用户一次性提供信息（不保存）
+
+```
+用户："1980-02-11 14:30, beijing, male, 帮我算命"
+系统：ask_user_question："是否保存？"
+
+用户：点击"这次先不保存"
+系统：activate_skill(bazi)（不调用 save_birth_info）
+
+✅ 预期：直接进入排盘，使用临时数据
+```
+
+---
+
+### 场景 3：用户提供信息后选择 Skill（保存）
+
+```
+用户："1980-02-11 14:30, beijing, male"
+系统：ask_user_question："是否保存？"
+
+用户：点击"保存到档案"
+系统：save_birth_info + recommend_skills
+
+用户："八字"
+系统：activate_skill(bazi) → 从数据库加载 → 有 birth_info → 直接排盘
+
+✅ 预期：不重复收集信息
+```
+
+---
+
+### 场景 4：用户提供信息后选择 Skill（不保存，依赖历史提取）
+
+```
+用户："1980-02-11 14:30, beijing, male"
+系统：ask_user_question："是否保存？"
+
+用户：点击"这次先不保存"
+系统：recommend_skills（不调用 save_birth_info）
+
+用户："八字"
+系统：
+  1. activate_skill(bazi)
+  2. 从数据库加载 → 无 birth_info
+  3. _compute_sop_status → 检查历史 → 提取到 birth_info
+  4. SOP 状态：has_birth_info = True
+  5. 直接调用 calculate_bazi（使用历史参数）
+
+✅ 预期：不重复收集信息，从历史恢复
+```
+
+---
+
+### 场景 5：帮朋友算命
+
+```
+用户："1980-02-11 14:30, beijing, male"
+系统：ask_user_question："是否保存？"
+
+用户：点击"这不是我的信息"
+系统：简短说明："好的，如果需要帮您或朋友看看，随时告诉我～"
+
+✅ 预期：不保存，不激活 Skill
+```
+
+---
+
+## 日志检查
+
+### 关键日志
+
+**1. 历史提取成功**：
+```
+[SOP] Found birth_info in history: {'birth_date': '1980-02-11', 'birth_time': '14:30', 'place': 'beijing', 'gender': 'male'}
+```
+
+**2. SOP 状态计算**：
+```
+[PERF Agent] Prompt built: XXms, len=XXXX, phase=phase2
+```
+
+**3. 工具调用**：
+```
+[PERF Agent] Tool ask_user_question: XXms
+[PERF Agent] Tool save_birth_info: XXms
+```
+
+---
+
+## 影响评估
+
+### 用户体验
+
+- ✅ 避免重复填写，提升流畅度
+- ✅ 尊重用户隐私，提供选择权
+- ✅ 支持代问场景，不误存数据
+- ✅ 对话更自然，符合预期
+
+### 系统稳定性
+
+- ✅ 数据持久化，不依赖对话历史
+- ✅ Phase 1 → Phase 2 切换更可靠
+- ✅ 双重保障，容错性强
+- ✅ SOP 状态准确，不误导 LLM
+
+### 代码复杂度
+
+- ⚠️ 增加了历史提取逻辑（约 50 行代码）
+- ⚠️ 正则提取可能不准确（需要充分测试）
+- ✅ 配置文件修改，易于维护
+- ✅ 日志完善，便于调试
+
+---
+
+## 待办事项
+
+- [ ] 测试场景 1-5
+- [ ] 检查日志输出
+- [ ] 验证前端 `question_card` 渲染
+- [ ] 边界情况测试（如日期格式多样、中文地名等）
+- [ ] 性能测试（历史提取的性能影响）
+
+---
+
+## 后续优化
+
+### 可选优化 1：增强历史提取
+
+**当前**：正则表达式匹配
+
+**未来**：LLM 提取
+```python
+# 调用 LLM 从历史中提取结构化信息
+prompt = """从以下对话中提取出生信息：
+对话历史：{history}
+
+返回 JSON：
+{
+  "birth_date": "YYYY-MM-DD",
+  "birth_time": "HH:MM",
+  "place": "...",
+  "gender": "male/female"
+}
+"""
+```
+
+**优点**：
+- 更准确
+- 支持更多格式（如"我是80后"、"90年生人"）
+
+**缺点**：
+- 增加 LLM 调用成本
+- 延长响应时间
+
+---
+
+### 可选优化 2：前端直接展示确认对话框
+
+**当前**：LLM 调用 `ask_user_question` 工具 → 前端渲染
+
+**未来**：前端拦截出生信息输入 → 直接展示确认对话框
+
+**优点**：
+- 更快响应
+- 减少 LLM 调用
+
+**缺点**：
+- 前端逻辑复杂
+- 需要前端识别出生信息格式
+
+---
+
+## 版本信息
+
+- **版本**：v10.2
+- **实施日期**：2026-01-21
+- **修改文件**：
+  - `apps/api/services/agent/core.py`（+56 行）
+  - `apps/api/skills/core/config/routing.yaml`（+43 行）
+- **关联文档**：
+  - `CONTEXT_LOSS_ANALYSIS.md`（问题分析）
+  - `SOP_MECHANISM_GUIDE.md`（SOP 机制详解）
+
+---
+
+**实施完成时间**：2026-01-21
+**实施者**：Claude Sonnet 4.5
+**状态**：✅ 代码修改完成，待测试验证

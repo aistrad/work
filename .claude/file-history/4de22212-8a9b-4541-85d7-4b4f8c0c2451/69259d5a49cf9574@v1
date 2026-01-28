@@ -1,0 +1,401 @@
+# Proactive 模块设计规范 v1.0
+
+## 概述
+
+Proactive 模块负责主动触达用户，通过推送通知增强用户粘性和业务转化。本模块与 Skill Management 深度集成，实现订阅感知的精准推送。
+
+## 核心原则
+
+| 原则 | 说明 |
+|-----|------|
+| 订阅感知 | 根据 Skill 订阅状态决定是否推送 |
+| 配置独立 | reminders.yaml 独立于 SKILL.md，便于运营调整 |
+| Skill 级开关 | 用户通过 Skill 总开关控制推送，简化设置 |
+| 对话引导 | 每条推送提供一键开始对话入口 |
+
+## 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Proactive 架构                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
+│  │  Scheduler  │───▶│   Engine    │───▶│  Delivery   │        │
+│  │  (Cron)     │    │             │    │  (Push)     │        │
+│  └─────────────┘    └──────┬──────┘    └─────────────┘        │
+│                            │                                   │
+│           ┌────────────────┼────────────────┐                  │
+│           │                │                │                  │
+│           ▼                ▼                ▼                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+│  │  Trigger    │  │  Content    │  │ Subscription │            │
+│  │  Detector   │  │  Generator  │  │   Checker    │            │
+│  └─────────────┘  └─────────────┘  └─────────────┘            │
+│         │                │                │                    │
+│         │                │                │                    │
+│         ▼                ▼                ▼                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+│  │ reminders   │  │   rules/    │  │ user_skill  │            │
+│  │   .yaml     │  │   *.md      │  │ subscriptions│           │
+│  └─────────────┘  └─────────────┘  └─────────────┘            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 配置模型
+
+### reminders.yaml 结构
+
+reminders.yaml 独立存放于 `apps/api/skills/{skill_id}/reminders.yaml`，与 SKILL.md 通过 skill_id 关联。
+
+```yaml
+# apps/api/skills/bazi/reminders.yaml
+skill_id: bazi
+enabled: true
+
+reminders:
+  - id: daily_fortune
+    name: 每日运势
+    trigger:
+      type: time_based
+      schedule: "0 4 * * *"  # 每天早上4点
+    content:
+      generator: rules/daily-fortune.md  # 复用 rules/ 架构
+      card_type: DailyFortuneCard
+      # 对话引导配置
+      suggested_prompt: "想了解今天的运势详情？"
+      quick_actions:
+        - label: "今日宜忌"
+          prompt: "今天适合做什么？有什么需要注意的？"
+        - label: "开运建议"
+          prompt: "今天如何提升运势？"
+    priority: medium
+
+  - id: dayun_transition
+    name: 大运交接
+    trigger:
+      type: event_based
+      event: dayun_change
+      advance_days: [30, 7, 0]  # 提前30天、7天、当天提醒
+    content:
+      generator: rules/dayun-transition.md
+      card_type: InsightCard
+      suggested_prompt: "想了解新大运的详细分析？"
+      quick_actions:
+        - label: "大运解读"
+          prompt: "请详细分析我即将进入的新大运"
+        - label: "机遇与挑战"
+          prompt: "新大运会带来哪些机遇和挑战？"
+    priority: high
+
+  - id: fortune_alert
+    name: 运势预警
+    trigger:
+      type: threshold_based
+      metric: daily_fortune_score
+      condition: "<"
+      threshold: 40
+      cooldown_days: 7  # 7天内不重复提醒
+    content:
+      generator: rules/fortune-alert.md
+      suggested_prompt: "想了解如何化解？"
+      quick_actions:
+        - label: "化解方法"
+          prompt: "请告诉我如何化解当前的不利因素"
+    priority: medium
+```
+
+### 触发器类型
+
+| 类型 | 说明 | 参数 |
+|-----|------|------|
+| time_based | 定时触发 | schedule (cron) |
+| event_based | 事件触发 | event, advance_days |
+| threshold_based | 阈值触发 | metric, condition, threshold, cooldown_days |
+
+## Subscription 集成
+
+### 推送决策逻辑
+
+```python
+async def _should_send_to_user(
+    self,
+    user_id: UUID,
+    skill_id: str,
+) -> bool:
+    """
+    检查是否应该发送推送
+    - 粒度: Skill 级别总开关
+    """
+    # 1. 获取 Skill 元数据
+    skill_meta = self._skill_metadata.get(skill_id, {})
+    category = skill_meta.get("category", "professional")
+
+    # 2. Core Skill 始终发送
+    if category == "core":
+        return True
+
+    # 3. 获取用户订阅状态
+    subscription = await SkillSubscriptionRepo.get(user_id, skill_id)
+
+    # 4. Default Skill: 检查是否取消订阅或关闭推送
+    if category == "default":
+        if subscription and subscription.status == "unsubscribed":
+            return False
+        if subscription and not subscription.push_enabled:
+            return False
+        return True
+
+    # 5. Professional Skill: 需要有效订阅且开启推送
+    if not subscription or subscription.status != "subscribed":
+        return False
+
+    return subscription.push_enabled
+```
+
+### 订阅状态与推送关系
+
+| Skill 类别 | 订阅状态 | push_enabled | 是否推送 |
+|-----------|---------|--------------|---------|
+| core | - | - | ✅ 始终推送 |
+| default | 无/subscribed | true (默认) | ✅ 推送 |
+| default | unsubscribed | - | ❌ 不推送 |
+| default | subscribed | false | ❌ 不推送 |
+| professional | subscribed | true | ✅ 推送 |
+| professional | 无/unsubscribed | - | ❌ 不推送 |
+| professional | subscribed | false | ❌ 不推送 |
+
+## ContentGenerator 设计
+
+### 复用 Rules 架构
+
+```python
+class ContentGenerator:
+    """复用 Skill Rules 的内容生成器"""
+
+    async def generate(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """
+        流程:
+        1. 加载 content.generator 指定的 rule 文件
+        2. 使用 rule 中的分析要点和检索 Query
+        3. 调用 LLM 生成个性化内容
+        4. 附加对话引导信息
+        """
+        skill_id = task.skill_id
+        generator_path = config.get("content", {}).get("generator", "")
+
+        # 如果指定了 rule 文件，加载并使用
+        if generator_path.startswith("rules/"):
+            rule_content = await self._load_rule(skill_id, generator_path)
+            content = await self._generate_from_rule(
+                task=task,
+                profile=profile,
+                rule=rule_content,
+                card_type=config.get("content", {}).get("card_type"),
+            )
+        else:
+            # 降级到默认生成器
+            content = await self._generate_default(task, profile, config)
+
+        # 附加对话引导
+        content.suggested_prompt = config.get("content", {}).get("suggested_prompt")
+        content.quick_actions = config.get("content", {}).get("quick_actions", [])
+
+        return content
+```
+
+## 通知数据结构
+
+### ProactiveNotification
+
+```typescript
+interface ProactiveNotification {
+  id: string;
+  skill_id: string;
+  reminder_type: string;
+  title: string;
+  content: {
+    body: string;
+    fortune_hint?: string;
+    action_tip?: string;
+    // 对话引导 (必须)
+    suggested_prompt: string;
+    quick_actions: Array<{
+      label: string;
+      prompt: string;  // 点击后发送的消息
+    }>;
+  };
+  card_type?: string;
+  created_at: string;
+  read_at?: string;
+}
+```
+
+## 前端对话引导
+
+### 通知卡片组件
+
+```tsx
+function NotificationCard({ notification }: { notification: ProactiveNotification }) {
+  const router = useRouter();
+
+  const handleStartChat = (prompt: string) => {
+    // 1. 跳转到聊天页面
+    // 2. 传递 skill_id 和初始消息
+    router.push({
+      pathname: '/chat',
+      query: {
+        skill: notification.skill_id,
+        prompt: encodeURIComponent(prompt),
+      },
+    });
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <SkillIcon skillId={notification.skill_id} />
+        <span>{notification.title}</span>
+      </CardHeader>
+      <CardBody>
+        <p>{notification.content.body}</p>
+
+        {/* 一键开始对话 */}
+        <div className="mt-4 flex gap-2">
+          {notification.content.quick_actions.map(action => (
+            <Button
+              key={action.label}
+              variant="outline"
+              onClick={() => handleStartChat(action.prompt)}
+            >
+              {action.label}
+            </Button>
+          ))}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+```
+
+### 聊天页面接收
+
+```tsx
+// apps/web/src/app/chat/page.tsx
+export default function ChatPage() {
+  const searchParams = useSearchParams();
+  const skillParam = searchParams.get('skill');
+  const promptParam = searchParams.get('prompt');
+
+  const { sendMessage, switchSkill } = useVibeChat();
+
+  useEffect(() => {
+    if (skillParam) {
+      // 切换到指定 Skill
+      switchSkill(skillParam);
+    }
+    if (promptParam) {
+      // 自动发送预设消息
+      const decodedPrompt = decodeURIComponent(promptParam);
+      sendMessage(decodedPrompt);
+    }
+  }, [skillParam, promptParam]);
+
+  // ...
+}
+```
+
+## 目录结构
+
+```
+apps/api/
+├── skills/{skill_id}/
+│   ├── SKILL.md
+│   ├── reminders.yaml        # Proactive 配置 (独立文件)
+│   ├── rules/
+│   │   ├── daily-fortune.md  # 复用为推送内容生成
+│   │   └── ...
+│   └── tools/
+│
+├── services/
+│   └── proactive/
+│       ├── engine.py         # 集成 Subscription 检查
+│       ├── trigger_detector.py
+│       ├── content_generator.py  # 复用 rules/ 架构
+│       └── scheduler.py
+│
+└── workers/
+    └── proactive_worker.py
+
+apps/web/
+├── components/
+│   ├── notification/
+│   │   └── NotificationCard.tsx  # 支持对话引导
+│   └── skill/
+│       └── SkillPushToggle.tsx   # Skill 级推送开关
+│
+└── app/
+    ├── chat/
+    │   └── page.tsx              # 支持 skill/prompt 参数
+    └── settings/
+        └── page.tsx              # Skill 管理入口
+```
+
+## 实施优先级
+
+| 优先级 | 任务 | 复杂度 | 价值 |
+|-------|------|-------|------|
+| P0 | Subscription 检查集成 | 低 | 高 |
+| P1 | 推送→对话引导实现 | 中 | 高 |
+| P2 | ContentGenerator 复用 rules/ | 中 | 中 |
+| P3 | 设置页 Skill 推送开关 | 低 | 高 |
+
+## API 接口
+
+### 获取推送通知列表
+
+```
+GET /api/notifications
+```
+
+Response:
+```json
+{
+  "notifications": [
+    {
+      "id": "uuid",
+      "skill_id": "bazi",
+      "reminder_type": "daily_fortune",
+      "title": "今日运势",
+      "content": {
+        "body": "甲木日主，今日戊土当令...",
+        "suggested_prompt": "想了解今天的运势详情？",
+        "quick_actions": [
+          {"label": "今日宜忌", "prompt": "今天适合做什么？"},
+          {"label": "开运建议", "prompt": "今天如何提升运势？"}
+        ]
+      },
+      "created_at": "2025-01-19T04:00:00Z"
+    }
+  ]
+}
+```
+
+### 更新 Skill 推送开关
+
+```
+PUT /api/skills/{skill_id}/subscription
+```
+
+Request:
+```json
+{
+  "push_enabled": false
+}
+```

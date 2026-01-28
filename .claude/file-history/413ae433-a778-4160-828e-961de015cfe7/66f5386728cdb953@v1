@@ -1,0 +1,244 @@
+"""
+Vibe ID Authentication Routes
+"""
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel, EmailStr
+import jwt
+from passlib.context import CryptContext
+
+from stores.db import fetchrow, execute
+
+
+router = APIRouter()
+
+# ─────────────────────────────────────────────────────────────────
+# Security Config
+# ─────────────────────────────────────────────────────────────────
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+JWT_SECRET = os.getenv("VIBELIFE_JWT_SECRET", "dev-secret-key")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("VIBELIFE_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("VIBELIFE_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def generate_vibe_id() -> str:
+    """Generate unique Vibe ID like vibe_2xK9mN4pLq8"""
+    import secrets
+    import string
+    chars = string.ascii_letters + string.digits
+    suffix = ''.join(secrets.choice(chars) for _ in range(11))
+    return f"vibe_{suffix}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user_id: str
+    vibe_id: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+# ─────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/register", response_model=TokenResponse)
+async def register(request: RegisterRequest):
+    """Register a new user with Vibe ID"""
+
+    # Check if email exists
+    existing = await fetchrow(
+        "SELECT id FROM vibe_users WHERE id IN (SELECT user_id FROM vibe_user_auth WHERE auth_identifier = $1)",
+        request.email
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+
+    # Create user
+    user_id = str(uuid.uuid4())
+    vibe_id = generate_vibe_id()
+    password_hash = hash_password(request.password)
+
+    # Insert user
+    await execute(
+        """
+        INSERT INTO vibe_users (id, vibe_id, display_name, status, created_at, updated_at)
+        VALUES ($1, $2, $3, 'active', NOW(), NOW())
+        """,
+        user_id, vibe_id, request.display_name or request.email.split("@")[0]
+    )
+
+    # Insert auth
+    await execute(
+        """
+        INSERT INTO vibe_user_auth (id, user_id, auth_type, auth_identifier, auth_credential, created_at)
+        VALUES ($1, $2, 'email', $3, $4, NOW())
+        """,
+        str(uuid.uuid4()), user_id, request.email, password_hash
+    )
+
+    # Generate tokens
+    access_token = create_access_token({"sub": user_id, "vibe_id": vibe_id})
+    refresh_token = create_refresh_token({"sub": user_id, "vibe_id": vibe_id})
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        user_id=user_id,
+        vibe_id=vibe_id
+    )
+
+
+@router.post("/login", response_model=TokenResponse)
+async def login(request: LoginRequest):
+    """Login with email and password"""
+
+    # Find user by email
+    auth_row = await fetchrow(
+        """
+        SELECT ua.user_id, ua.auth_credential, vu.vibe_id
+        FROM vibe_user_auth ua
+        JOIN vibe_users vu ON ua.user_id = vu.id
+        WHERE ua.auth_type = 'email' AND ua.auth_identifier = $1 AND vu.status = 'active'
+        """,
+        request.email
+    )
+
+    if not auth_row:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    if not verify_password(request.password, auth_row["auth_credential"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    user_id = str(auth_row["user_id"])
+    vibe_id = auth_row["vibe_id"]
+
+    # Generate tokens
+    access_token = create_access_token({"sub": user_id, "vibe_id": vibe_id})
+    refresh_token = create_refresh_token({"sub": user_id, "vibe_id": vibe_id})
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        user_id=user_id,
+        vibe_id=vibe_id
+    )
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(request: RefreshRequest):
+    """Refresh access token"""
+
+    try:
+        payload = jwt.decode(request.refresh_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type"
+            )
+
+        user_id = payload.get("sub")
+        vibe_id = payload.get("vibe_id")
+
+        if not user_id or not vibe_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+
+        # Verify user still exists and is active
+        user = await fetchrow(
+            "SELECT id FROM vibe_users WHERE id = $1 AND status = 'active'",
+            user_id
+        )
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found"
+            )
+
+        # Generate new tokens
+        access_token = create_access_token({"sub": user_id, "vibe_id": vibe_id})
+        new_refresh_token = create_refresh_token({"sub": user_id, "vibe_id": vibe_id})
+
+        return TokenResponse(
+            access_token=access_token,
+            refresh_token=new_refresh_token,
+            user_id=user_id,
+            vibe_id=vibe_id
+        )
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+
+@router.get("/me")
+async def get_current_user():
+    """Get current user info (placeholder - needs auth middleware)"""
+    # TODO: Implement with proper auth dependency
+    return {"message": "Auth middleware needed"}

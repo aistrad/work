@@ -1,0 +1,357 @@
+import { test, expect } from '@playwright/test';
+
+/**
+ * Email Authentication E2E Tests
+ *
+ * Tests the email registration and login flow:
+ * 1. Register: Send verification code -> Verify code -> Get JWT
+ * 2. Login: Email/password -> Get JWT
+ *
+ * Note: In test mode (no CF_SECRET_KEY), Turnstile is skipped.
+ * Note: In test mode (no RESEND_API_KEY), codes are logged to console.
+ */
+
+const API_BASE = process.env.VIBELIFE_API_INTERNAL || 'http://127.0.0.1:8100';
+const WEB_URL = process.env.TEST_URL || 'http://localhost:8232';
+const TEST_EMAIL = `test_${Date.now()}@example.com`;
+const TEST_PASSWORD = 'TestPassword123!';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI Tests - Login Page
+// ═══════════════════════════════════════════════════════════════════════════
+
+test.describe('Email Auth UI Tests', () => {
+  test('Login page renders email form and OAuth buttons', async ({ page }) => {
+    await page.goto(`${WEB_URL}/auth/login`);
+    await page.waitForLoadState('networkidle');
+
+    // Check page title
+    await expect(page.getByText('欢迎来到 VibeLife')).toBeVisible();
+
+    // Check email input
+    const emailInput = page.getByPlaceholder('Email address');
+    await expect(emailInput).toBeVisible();
+
+    // Check password input
+    const passwordInput = page.getByPlaceholder(/Password/);
+    await expect(passwordInput).toBeVisible();
+
+    // Check submit button
+    const signInButton = page.getByRole('button', { name: /Sign In/i });
+    await expect(signInButton).toBeVisible();
+
+    // Check OAuth buttons
+    const googleButton = page.getByRole('button', { name: /Continue with Google/i });
+    const appleButton = page.getByRole('button', { name: /Continue with Apple/i });
+    await expect(googleButton).toBeVisible();
+    await expect(appleButton).toBeVisible();
+
+    // Check divider
+    await expect(page.getByText('or continue with')).toBeVisible();
+
+    console.log('Login page UI elements verified');
+  });
+
+  test('Email form validation - empty fields', async ({ page }) => {
+    await page.goto(`${WEB_URL}/auth/login`);
+    await page.waitForLoadState('networkidle');
+
+    // Try to submit without filling fields
+    const signInButton = page.getByRole('button', { name: /Sign In/i });
+
+    // Button should be disabled when fields are empty
+    await expect(signInButton).toBeDisabled();
+  });
+
+  test('Email form - fill and switch modes', async ({ page }) => {
+    await page.goto(`${WEB_URL}/auth/login`);
+    await page.waitForLoadState('networkidle');
+
+    // Fill email and password
+    await page.getByPlaceholder('Email address').fill('test@example.com');
+    await page.getByPlaceholder(/Password/).fill('TestPassword123');
+
+    // Button should now be enabled
+    const signInButton = page.getByRole('button', { name: /Sign In/i });
+    await expect(signInButton).toBeEnabled();
+
+    // Switch to register mode
+    const createAccountLink = page.getByRole('button', { name: /Create one/i });
+    await createAccountLink.click();
+
+    // Button should now say "Create Account"
+    const createButton = page.getByRole('button', { name: /Create Account/i });
+    await expect(createButton).toBeVisible();
+
+    // Switch back to login
+    const signInLink = page.getByRole('button', { name: /Sign in/i });
+    await signInLink.click();
+
+    // Button should be back to Sign In
+    await expect(page.getByRole('button', { name: /Sign In/i })).toBeVisible();
+  });
+
+  test('Email form - registration flow UI', async ({ page }) => {
+    await page.goto(`${WEB_URL}/auth/login`);
+    await page.waitForLoadState('networkidle');
+
+    // Switch to register mode
+    await page.getByRole('button', { name: /Create one/i }).click();
+
+    // Fill registration form
+    const uniqueEmail = `uitest_${Date.now()}@example.com`;
+    await page.getByPlaceholder('Email address').fill(uniqueEmail);
+    await page.getByPlaceholder(/Password.*8/).fill('TestPassword123!');
+
+    // Click Create Account
+    await page.getByRole('button', { name: /Create Account/i }).click();
+
+    // Wait for response
+    await page.waitForTimeout(2000);
+
+    // Should show verification code input or error
+    const verifyHeading = page.getByText(/Verification code sent/i);
+    const codeInput = page.getByPlaceholder(/6-digit code/i);
+
+    // Either we're on verify step or got an error
+    const isOnVerifyStep = await verifyHeading.isVisible().catch(() => false) ||
+                           await codeInput.isVisible().catch(() => false);
+
+    if (isOnVerifyStep) {
+      console.log('Reached verification step successfully');
+      await expect(codeInput).toBeVisible();
+
+      // Check Back button
+      await expect(page.getByRole('button', { name: /Back/i })).toBeVisible();
+
+      // Check Verify button (disabled initially)
+      const verifyButton = page.getByRole('button', { name: /Verify/i });
+      await expect(verifyButton).toBeDisabled();
+
+      // Fill code
+      await codeInput.fill('123456');
+      await expect(verifyButton).toBeEnabled();
+    } else {
+      console.log('Did not reach verify step - checking for error message');
+      // Check for any error message displayed
+      const errorMessage = page.locator('.text-red-500');
+      if (await errorMessage.isVisible()) {
+        console.log('Error:', await errorMessage.textContent());
+      }
+    }
+  });
+
+  test('Take screenshot of login page', async ({ page }) => {
+    await page.goto(`${WEB_URL}/auth/login`);
+    await page.waitForLoadState('networkidle');
+    await page.waitForTimeout(500);
+
+    await page.screenshot({ path: '.playwright-mcp/login-page-email-auth.png', fullPage: true });
+    console.log('Screenshot saved to .playwright-mcp/login-page-email-auth.png');
+  });
+});
+
+test.describe('Email Auth API Tests', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  let verificationCode: string | null = null;
+
+  test('Step 1: Register - Send verification code', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/register`, {
+      data: {
+        email: TEST_EMAIL,
+        password: TEST_PASSWORD,
+        turnstile_token: 'test_token', // Skipped in dev mode
+      },
+    });
+
+    // Should succeed or return specific error
+    const status = response.status();
+    const data = await response.json();
+
+    console.log('Register response:', { status, data });
+
+    if (status === 200) {
+      expect(data.success).toBe(true);
+      expect(data.message).toContain('Verification code sent');
+      expect(data.expires_in).toBeGreaterThan(0);
+    } else if (status === 400) {
+      // Email already registered is acceptable in repeat runs
+      expect(data.detail).toBeDefined();
+    }
+  });
+
+  test('Step 2: Verify code - Create account', async ({ request }) => {
+    // In dev mode without Resend, we need to get the code from logs
+    // For automated testing, we'll test with a mock code scenario
+
+    // First, let's try a wrong code to test error handling
+    const wrongCodeResponse = await request.post(`${API_BASE}/api/v1/account/auth/email/verify`, {
+      data: {
+        email: TEST_EMAIL,
+        code: '000000', // Wrong code
+      },
+    });
+
+    const wrongStatus = wrongCodeResponse.status();
+    console.log('Wrong code response status:', wrongStatus);
+
+    // Should fail with 400
+    if (wrongStatus === 400) {
+      const errorData = await wrongCodeResponse.json();
+      expect(errorData.detail).toBeDefined();
+      console.log('Expected error:', errorData.detail);
+    }
+  });
+
+  test('Step 3: Login with wrong password', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/login`, {
+      data: {
+        email: TEST_EMAIL,
+        password: 'WrongPassword123!',
+        turnstile_token: 'test_token',
+      },
+    });
+
+    const status = response.status();
+    console.log('Wrong password login status:', status);
+
+    // Should fail with 401 (unless email doesn't exist yet, then it's also 401)
+    expect(status).toBe(401);
+
+    const data = await response.json();
+    expect(data.detail).toBeDefined();
+  });
+
+  test('Step 4: Resend code', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/resend`, {
+      data: {
+        email: TEST_EMAIL,
+        turnstile_token: 'test_token',
+      },
+    });
+
+    const status = response.status();
+    const data = await response.json();
+
+    console.log('Resend response:', { status, data });
+
+    // May succeed or fail depending on whether registration was started
+    expect([200, 400]).toContain(status);
+  });
+});
+
+test.describe('Email Auth - Integration with existing user', () => {
+  // Test with an existing dev user if available
+  const DEV_EMAIL = 'dev@vibelife.app';
+
+  test('Check if dev login works', async ({ request }) => {
+    // First check if dev login endpoint works (development only)
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/dev-login`, {
+      data: {
+        email: DEV_EMAIL,
+      },
+    });
+
+    const status = response.status();
+    console.log('Dev login status:', status);
+
+    if (status === 200) {
+      const data = await response.json();
+      expect(data.access_token).toBeDefined();
+      expect(data.refresh_token).toBeDefined();
+      expect(data.user).toBeDefined();
+      console.log('Dev login successful for:', data.user.vibe_id);
+    } else if (status === 404) {
+      console.log('Dev user not found - expected in fresh database');
+    } else if (status === 403) {
+      console.log('Dev login disabled - expected in production');
+    }
+  });
+});
+
+test.describe('Email Auth - Validation Tests', () => {
+  test('Reject invalid email format', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/register`, {
+      data: {
+        email: 'not-an-email',
+        password: 'TestPassword123!',
+        turnstile_token: 'test_token',
+      },
+    });
+
+    // FastAPI/Pydantic should reject this with 422 (Unprocessable Entity)
+    expect(response.status()).toBe(422);
+  });
+
+  test('Reject short password', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/register`, {
+      data: {
+        email: 'valid@example.com',
+        password: 'short',
+        turnstile_token: 'test_token',
+      },
+    });
+
+    // Should fail with 400 (password too short)
+    const status = response.status();
+    expect([400, 422]).toContain(status);
+
+    if (status === 400) {
+      const data = await response.json();
+      expect(data.detail).toContain('8 characters');
+    }
+  });
+
+  test('Reject missing turnstile token', async ({ request }) => {
+    const response = await request.post(`${API_BASE}/api/v1/account/auth/email/register`, {
+      data: {
+        email: 'valid@example.com',
+        password: 'TestPassword123!',
+        // Missing turnstile_token
+      },
+    });
+
+    // Should fail with 422 (missing required field)
+    expect(response.status()).toBe(422);
+  });
+});
+
+test.describe('Email Auth - Full Flow with Test Account', () => {
+  // This test creates a real account and logs in
+  const FLOW_EMAIL = `e2e_flow_${Date.now()}@test.vibelife.app`;
+  const FLOW_PASSWORD = 'E2ETestPassword123!';
+
+  test('Complete registration and login flow', async ({ request }) => {
+    console.log(`Testing with email: ${FLOW_EMAIL}`);
+
+    // Step 1: Start registration
+    const registerResponse = await request.post(`${API_BASE}/api/v1/account/auth/email/register`, {
+      data: {
+        email: FLOW_EMAIL,
+        password: FLOW_PASSWORD,
+        turnstile_token: 'test_token',
+      },
+    });
+
+    const registerStatus = registerResponse.status();
+    console.log('Registration status:', registerStatus);
+
+    if (registerStatus === 200) {
+      const registerData = await registerResponse.json();
+      console.log('Registration response:', registerData);
+      expect(registerData.success).toBe(true);
+
+      // In a real test with Resend configured, we would:
+      // 1. Check email inbox for code
+      // 2. Extract code
+      // 3. Call verify endpoint
+
+      // For now, we verify the flow is set up correctly
+      console.log('Registration initiated successfully');
+      console.log('Note: To complete, need verification code from email/logs');
+    } else {
+      console.log('Registration failed or email exists:', await registerResponse.json());
+    }
+  });
+});

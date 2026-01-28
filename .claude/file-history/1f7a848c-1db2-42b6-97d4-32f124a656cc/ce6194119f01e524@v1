@@ -1,0 +1,627 @@
+# Skill Store 平台化架构设计
+
+> 从平台自建 Skill → 用户创建 Skill → Skill Store 生态
+
+## 一、愿景
+
+```
+Phase 1: 用户私有 Skill（个人助手定制）
+    ↓
+Phase 2: Skill Store（创作者发布，用户订阅）
+    ↓
+Phase 3: Skill 生态（API 开放，第三方集成）
+```
+
+---
+
+## 二、当前架构 vs 平台化需求
+
+| 维度 | 当前架构 | 平台化需求 | Gap |
+|------|----------|------------|-----|
+| **存储** | 文件系统 (`skills/`) | 数据库 + 对象存储 | 重构 |
+| **发现** | 目录扫描 | 注册表查询 | 重构 |
+| **所有权** | 平台单一 | 多租户（用户/创作者） | 新增 |
+| **版本** | Git | 版本控制系统 | 新增 |
+| **运行时** | 直接执行 | 沙箱隔离 | 新增 |
+| **分发** | 无 | Store + 安装 | 新增 |
+| **计费** | Skill 订阅 | 创作者分成 | 扩展 |
+| **审核** | 无 | 代码审核 + 内容审核 | 新增 |
+
+---
+
+## 三、核心架构设计
+
+### 3.1 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Skill Platform Architecture                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                           Skill Registry (核心)                          │ │
+│  │                                                                          │ │
+│  │   skills 表                    skill_versions 表                         │ │
+│  │   ├── id (UUID)               ├── id                                    │ │
+│  │   ├── owner_id                ├── skill_id                              │ │
+│  │   ├── owner_type (user/org)   ├── version (semver)                      │ │
+│  │   ├── slug (唯一标识)          ├── config (JSONB)                        │ │
+│  │   ├── visibility              │   ├── name, triggers, category          │ │
+│  │   │   (private/public/paid)   │   ├── requires_birth_info, etc.         │ │
+│  │   ├── category                │   └── skill_data, includes              │ │
+│  │   ├── status                  ├── prompt_content (专家身份等)            │ │
+│  │   │   (draft/review/active)   ├── rules (JSONB)                         │ │
+│  │   ├── pricing                 ├── tools (JSONB)                         │ │
+│  │   │   (free/monthly/one-time) ├── handlers_url (对象存储)               │ │
+│  │   └── stats                   ├── status (draft/active/deprecated)      │ │
+│  │       (installs, rating)      └── created_at                            │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                        │                                      │
+│            ┌───────────────────────────┼───────────────────────────┐         │
+│            ▼                           ▼                           ▼         │
+│  ┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────┐    │
+│  │  Skill Studio   │     │   Runtime Engine    │     │   Skill Store   │    │
+│  │  (创作者工具)    │     │   (执行引擎)         │     │   (发现分发)     │    │
+│  │                 │     │                     │     │                 │    │
+│  │  - 在线编辑器   │     │  - Skill Loader     │     │  - 分类浏览     │    │
+│  │  - 版本管理     │     │  - Sandbox Executor │     │  - 搜索排序     │    │
+│  │  - 测试沙箱     │     │  - Tool Registry    │     │  - 评分评论     │    │
+│  │  - 发布审核     │     │  - Data Isolation   │     │  - 安装管理     │    │
+│  └─────────────────┘     └─────────────────────┘     └─────────────────┘    │
+│                                        │                                      │
+│  ┌─────────────────────────────────────┴─────────────────────────────────┐   │
+│  │                         Supporting Services                             │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │   │
+│  │  │  Review  │  │ Billing  │  │ Analytics│  │  Search  │  │  CDN/    │ │   │
+│  │  │  System  │  │  Split   │  │  Stats   │  │  Index   │  │  Storage │ │   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘ │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 数据模型
+
+```sql
+-- Skill 主表
+CREATE TABLE skills (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug VARCHAR(100) UNIQUE NOT NULL,  -- e.g., "my-career-advisor"
+
+    -- 所有权
+    owner_id UUID NOT NULL,
+    owner_type VARCHAR(20) NOT NULL,  -- 'user' | 'org' | 'platform'
+
+    -- 元信息
+    display_name VARCHAR(200) NOT NULL,
+    short_desc TEXT,
+    icon_url VARCHAR(500),
+    category VARCHAR(50),
+    tags TEXT[],
+
+    -- 可见性和状态
+    visibility VARCHAR(20) DEFAULT 'private',  -- 'private' | 'public' | 'unlisted'
+    status VARCHAR(20) DEFAULT 'draft',  -- 'draft' | 'review' | 'active' | 'suspended'
+
+    -- 定价（公开 Skill）
+    pricing_type VARCHAR(20),  -- 'free' | 'monthly' | 'one_time'
+    price_cents INT,
+
+    -- 统计
+    install_count INT DEFAULT 0,
+    rating_avg DECIMAL(2,1),
+    rating_count INT DEFAULT 0,
+
+    -- 当前活跃版本
+    active_version_id UUID,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Skill 版本表
+CREATE TABLE skill_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    skill_id UUID REFERENCES skills(id),
+    version VARCHAR(20) NOT NULL,  -- semver: "1.0.0"
+
+    -- 配置（原 routing.yaml 内容）
+    config JSONB NOT NULL,
+    -- {
+    --   "name": "职场时机",
+    --   "triggers": ["职场时机", "跳槽"],
+    --   "requires_birth_info": true,
+    --   "skill_data": ["bazi", "zodiac"],
+    --   "includes": ["bazi", "zodiac"]
+    -- }
+
+    -- Prompt 内容（原 SKILL.md body）
+    prompt_content TEXT,
+
+    -- 规则文件（原 rules/*.md）
+    rules JSONB,  -- {"basic-reading": "...", "career": "..."}
+
+    -- 工具定义（原 tools/tools.yaml）
+    tools JSONB,
+
+    -- Handler 代码（对象存储 URL）
+    handlers_url VARCHAR(500),
+    handlers_hash VARCHAR(64),  -- 代码 hash，用于验证
+
+    -- 状态
+    status VARCHAR(20) DEFAULT 'draft',  -- 'draft' | 'active' | 'deprecated'
+    review_status VARCHAR(20),  -- 'pending' | 'approved' | 'rejected'
+    review_notes TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(skill_id, version)
+);
+
+-- 用户安装的 Skill
+CREATE TABLE user_skill_installs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    skill_id UUID REFERENCES skills(id),
+    version_id UUID REFERENCES skill_versions(id),
+
+    -- 状态
+    status VARCHAR(20) DEFAULT 'active',  -- 'active' | 'disabled'
+
+    -- 自定义配置（用户可覆盖的部分）
+    custom_config JSONB,
+
+    -- 订阅信息（付费 Skill）
+    subscription_id UUID,
+    expires_at TIMESTAMPTZ,
+
+    installed_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(user_id, skill_id)
+);
+
+-- Skill 评价
+CREATE TABLE skill_reviews (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    skill_id UUID REFERENCES skills(id),
+    user_id UUID NOT NULL,
+    rating INT CHECK (rating >= 1 AND rating <= 5),
+    content TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(skill_id, user_id)
+);
+```
+
+### 3.3 Skill 标识符设计
+
+```
+平台 Skill:   platform:bazi
+用户私有:     user:{user_id}:{slug}
+公开 Skill:   store:{creator_slug}/{skill_slug}
+
+示例:
+- platform:bazi                    # 平台八字 Skill
+- user:abc123:my-career-advisor    # 用户私有
+- store:master-li/fortune-teller   # Store 公开
+
+在对话中使用:
+- activate_skill(skill="platform:bazi")
+- activate_skill(skill="store:master-li/fortune-teller")
+```
+
+---
+
+## 四、routing.yaml 升级方案
+
+### 4.1 从文件配置到数据库配置
+
+**当前**：`routing.yaml` 是静态文件
+
+**升级**：routing.yaml 只定义平台 Skill，用户/Store Skill 存数据库
+
+```yaml
+# routing.yaml - 只保留平台 Skill
+skills:
+  bazi:
+    type: platform  # 标记为平台 Skill
+    name: 八字命理
+    # ... 配置不变
+```
+
+### 4.2 Skill Loader 升级
+
+```python
+class SkillLoader:
+    """统一 Skill 加载器，支持多来源"""
+
+    async def load_skill(self, skill_ref: str, user_id: UUID) -> SkillConfig:
+        """
+        加载 Skill 配置
+
+        skill_ref 格式:
+        - "bazi" → 兼容旧格式，等同于 "platform:bazi"
+        - "platform:bazi" → 平台 Skill
+        - "user:abc123:my-skill" → 用户私有 Skill
+        - "store:creator/skill" → Store Skill
+        """
+        source, identifier = self._parse_skill_ref(skill_ref)
+
+        if source == "platform":
+            return self._load_from_routing_yaml(identifier)
+
+        elif source == "user":
+            user_id, slug = identifier.split(":", 1)
+            return await self._load_from_db(
+                owner_type="user",
+                owner_id=user_id,
+                slug=slug
+            )
+
+        elif source == "store":
+            creator, slug = identifier.split("/", 1)
+            return await self._load_from_db(
+                owner_type="creator",
+                creator_slug=creator,
+                slug=slug
+            )
+
+    async def _load_from_db(self, **filters) -> SkillConfig:
+        """从数据库加载 Skill 配置"""
+        skill = await db.fetch_one("""
+            SELECT s.*, v.config, v.prompt_content, v.rules, v.tools, v.handlers_url
+            FROM skills s
+            JOIN skill_versions v ON s.active_version_id = v.id
+            WHERE ...
+        """)
+
+        return SkillConfig(
+            id=skill["slug"],
+            name=skill["config"]["name"],
+            triggers=skill["config"].get("triggers", []),
+            requires_birth_info=skill["config"].get("requires_birth_info", False),
+            skill_data=skill["config"].get("skill_data", []),
+            includes=skill["config"].get("includes", []),
+            prompt_content=skill["prompt_content"],
+            rules=skill["rules"],
+            tools=skill["tools"],
+            handlers_url=skill["handlers_url"],
+        )
+```
+
+### 4.3 Tool Registry 升级
+
+```python
+class ToolRegistry:
+    """支持动态工具加载"""
+
+    async def load_skill_tools(self, skill_ref: str, user_id: UUID):
+        """加载 Skill 的工具"""
+        skill = await skill_loader.load_skill(skill_ref, user_id)
+
+        # 平台 Skill：从文件系统加载 handler
+        if skill.source == "platform":
+            return self._load_from_filesystem(skill.id)
+
+        # 用户/Store Skill：从对象存储加载 handler
+        else:
+            return await self._load_from_storage(
+                skill.handlers_url,
+                skill.tools
+            )
+
+    async def _load_from_storage(self, handlers_url: str, tool_defs: dict):
+        """
+        从对象存储加载 handler 代码
+        在沙箱中执行
+        """
+        code = await object_storage.download(handlers_url)
+
+        # 沙箱执行（RestrictedPython 或 Docker）
+        sandbox = Sandbox()
+        handlers = sandbox.execute(code)
+
+        return handlers
+```
+
+---
+
+## 五、Skill Studio（创作者工具）
+
+### 5.1 Web 编辑器
+
+```typescript
+// 创作者编辑界面
+interface SkillEditor {
+  // 基础配置
+  config: {
+    name: string;
+    shortDesc: string;
+    triggers: string[];
+    category: string;
+
+    // SOP 配置
+    requiresBirthInfo: boolean;
+    requiresCompute: boolean;
+    computeTool: string;
+
+    // 依赖配置
+    skillData: string[];
+    includes: string[];
+  };
+
+  // Prompt 内容
+  promptContent: string;  // Markdown 编辑器
+
+  // Rules 文件
+  rules: Record<string, string>;  // 多文件编辑器
+
+  // 工具定义
+  tools: ToolDefinition[];  // YAML/可视化编辑器
+
+  // Handler 代码
+  handlers: string;  // Python 代码编辑器
+}
+```
+
+### 5.2 测试沙箱
+
+```python
+class SkillTestSandbox:
+    """Skill 测试环境"""
+
+    async def test_conversation(
+        self,
+        skill_config: SkillConfig,
+        test_messages: List[Dict],
+        mock_user: MockUser
+    ) -> TestResult:
+        """
+        在隔离环境中测试 Skill
+        - 使用 mock 用户数据
+        - 不影响真实数据
+        - 记录所有工具调用
+        """
+        pass
+```
+
+### 5.3 发布流程
+
+```
+创作 → 测试 → 提交审核 → 审核通过 → 上架
+  │       │        │           │          │
+  │       │        │           │          └─ 可在 Store 搜索到
+  │       │        │           └─ 自动化 + 人工审核
+  │       │        └─ 触发审核流程
+  │       └─ 沙箱测试通过
+  └─ 在 Studio 中编辑
+```
+
+---
+
+## 六、Runtime 安全隔离
+
+### 6.1 Handler 沙箱执行
+
+```python
+class SecureSandbox:
+    """
+    安全沙箱，限制用户代码能力
+
+    允许:
+    - 数据转换和计算
+    - 调用白名单 API
+    - 读取 context 数据
+
+    禁止:
+    - 文件系统访问
+    - 网络请求（除白名单）
+    - 系统调用
+    - 导入危险模块
+    """
+
+    ALLOWED_MODULES = {
+        'json', 'datetime', 'math', 're', 'collections',
+        'typing', 'dataclasses', 'enum'
+    }
+
+    ALLOWED_APIS = {
+        'search_db',      # 知识检索
+        'get_profile',    # 获取用户 profile（只读）
+        'get_skill_data', # 获取 skill_data（只读）
+        'show_card',      # 展示卡片
+    }
+
+    def execute(self, code: str, context: ToolContext) -> Any:
+        """在沙箱中执行代码"""
+        # 使用 RestrictedPython 或 Docker 容器
+        pass
+```
+
+### 6.2 数据隔离
+
+```python
+class IsolatedContext:
+    """
+    隔离的执行上下文
+    - 用户 Skill 只能访问自己声明的数据
+    - 不能访问其他用户数据
+    - 不能修改平台 Skill 数据
+    """
+
+    def __init__(self, skill: SkillConfig, user_id: UUID):
+        self.skill = skill
+        self.user_id = user_id
+
+        # 只加载声明的 skill_data
+        self.allowed_skill_data = skill.skill_data
+
+    async def get_skill_data(self, skill_id: str) -> Dict:
+        if skill_id not in self.allowed_skill_data:
+            raise PermissionError(f"Skill {self.skill.id} cannot access {skill_id} data")
+        return await load_skill_data(self.user_id, skill_id)
+```
+
+---
+
+## 七、计费与分成
+
+### 7.1 收入分成模型
+
+```
+用户支付 100 元订阅 Store Skill
+    │
+    ├─ 平台抽成 30%: 30 元
+    │   ├─ 运营成本
+    │   ├─ 审核成本
+    │   └─ 基础设施
+    │
+    └─ 创作者收入 70%: 70 元
+        └─ 如果 Skill 使用了平台 Skill (includes: [bazi])
+           └─ 平台 Skill 使用费: 按调用量计算（可选）
+```
+
+### 7.2 计费表
+
+```sql
+CREATE TABLE creator_earnings (
+    id UUID PRIMARY KEY,
+    creator_id UUID NOT NULL,
+    skill_id UUID REFERENCES skills(id),
+
+    -- 期间
+    period_start DATE,
+    period_end DATE,
+
+    -- 收入
+    gross_revenue DECIMAL(10,2),
+    platform_fee DECIMAL(10,2),
+    net_revenue DECIMAL(10,2),
+
+    -- 状态
+    status VARCHAR(20),  -- 'pending' | 'paid'
+    paid_at TIMESTAMPTZ
+);
+```
+
+---
+
+## 八、实施路线图
+
+### Phase 1: 用户私有 Skill（MVP）
+
+**目标**：用户可以创建自己的私有 Skill
+
+**范围**：
+- [ ] Skill 数据库存储
+- [ ] 基础 Skill Studio（Web 编辑器）
+- [ ] 纯配置型 Skill（无自定义 handler）
+- [ ] 用户 Skill 列表管理
+
+**不包含**：
+- Store 功能
+- 付费功能
+- 自定义 handler
+- 审核系统
+
+### Phase 2: Skill Store（公开分发）
+
+**目标**：创作者可以发布 Skill 供其他用户使用
+
+**范围**：
+- [ ] Store 浏览和搜索
+- [ ] 安装和卸载
+- [ ] 评分评论
+- [ ] 免费 Skill 发布
+- [ ] 基础审核流程
+
+### Phase 3: 付费 Skill + Handler
+
+**目标**：完整的商业化能力
+
+**范围**：
+- [ ] 付费 Skill 订阅
+- [ ] 创作者分成结算
+- [ ] 自定义 handler（沙箱执行）
+- [ ] 完整审核系统（代码审核）
+
+---
+
+## 九、routing.yaml 兼容升级
+
+### 当前格式
+
+```yaml
+skills:
+  bazi:
+    name: 八字命理
+    triggers: [八字, 命理]
+    # ...
+```
+
+### 升级后格式
+
+```yaml
+# 标记平台 Skill
+platform_skills:
+  bazi:
+    name: 八字命理
+    triggers: [八字, 命理]
+    # ... 配置不变
+
+# 动态 Skill 来源配置
+skill_sources:
+  - type: database
+    filter:
+      visibility: public
+      status: active
+```
+
+### 兼容逻辑
+
+```python
+def get_available_skills(user_id: UUID) -> List[SkillConfig]:
+    """获取用户可用的所有 Skill"""
+    skills = []
+
+    # 1. 平台 Skill（从 routing.yaml）
+    skills.extend(load_platform_skills())
+
+    # 2. 用户私有 Skill（从数据库）
+    skills.extend(await load_user_skills(user_id))
+
+    # 3. 用户安装的 Store Skill（从数据库）
+    skills.extend(await load_installed_skills(user_id))
+
+    return skills
+```
+
+---
+
+## 十、安全考虑
+
+| 风险 | 缓解措施 |
+|------|----------|
+| 恶意代码 | 沙箱执行 + 代码审核 |
+| 数据泄露 | 数据隔离 + 权限控制 |
+| 滥用 API | 速率限制 + 用量监控 |
+| 内容违规 | 内容审核 + 举报机制 |
+| 知识产权 | 原创声明 + 侵权处理 |
+
+---
+
+## 十一、总结
+
+### 核心改动
+
+1. **Skill 存储**：文件系统 → 数据库 + 对象存储
+2. **Skill Loader**：静态加载 → 多来源动态加载
+3. **Tool Registry**：静态注册 → 支持沙箱执行
+4. **routing.yaml**：全部配置 → 只定义平台 Skill
+
+### 保持不变
+
+1. **配置驱动**：skill_data + includes 模型
+2. **LLM 路由**：activate_skill 工具
+3. **工具机制**：@tool_handler 模式
+4. **数据模型**：unified_profiles 结构

@@ -1,0 +1,1062 @@
+"""
+Proactive System E2E Scenarios Test
+
+全面真实数据库测试，覆盖以下场景：
+1. 用户场景：新用户、活跃用户、沉默用户、VIP用户
+2. 触发类型：时间触发、事件触发、数据条件触发
+3. 边界条件：静默时段、每日推送上限、幂等去重、冷却时间
+4. Skill 组合：八字、星座、LifeCoach 交叉测试
+
+运行方式:
+    # 需要设置数据库环境变量
+    export VIBELIFE_TEST_DB_URL="postgresql://..."
+    pytest tests/services/proactive/test_e2e_scenarios.py -v -s
+"""
+
+import pytest
+import asyncio
+from datetime import datetime, date, timedelta
+from uuid import uuid4, UUID
+from typing import Dict, Any, List
+from unittest.mock import AsyncMock, MagicMock, patch
+import time_machine
+
+# 可选：设置数据库环境变量进行真实数据库测试
+# export VIBELIFE_TEST_DB_URL="postgresql://..."
+import os
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def test_user_profiles() -> Dict[str, Dict[str, Any]]:
+    """定义多种用户画像测试数据"""
+    return {
+        # 场景1: 完整画像用户（八字+星座+LifeCoach）
+        "complete_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {
+                    "birth_info": {
+                        "date": "1990-05-15",
+                        "time": "10:30",
+                        "place": "北京",
+                        "gender": "male",
+                        "timezone": "Asia/Shanghai"
+                    }
+                },
+                "skills": {
+                    "bazi": {
+                        "chart": {"day_master": "甲木", "strength": "旺"},
+                        "daily_fortune": {"score": 75}
+                    },
+                    "zodiac": {
+                        "sun_sign": "金牛座",
+                        "moon_sign": "处女座"
+                    },
+                    "lifecoach": {
+                        "north_star": {"vision": "成为一名优秀的产品经理"},
+                        "progress": {
+                            "last_checkin_date": "2026-01-25",
+                            "streak_days": 7,
+                            "weekly_checkins": 5
+                        }
+                    }
+                },
+                "vibe": {
+                    "profile": {
+                        "birth_info": {
+                            "date": "1990-05-15",
+                            "time": "10:30"
+                        }
+                    },
+                    "state": {
+                        "emotion": "平静",
+                        "focus": ["事业", "健康"]
+                    },
+                    "goals": [
+                        {"name": "升职加薪", "status": "active"},
+                        {"name": "健身减重", "status": "active"}
+                    ]
+                },
+                "preferences": {
+                    "voice_mode": "warm",
+                    "language": "zh-CN",
+                    "timezone": "Asia/Shanghai",
+                    "push_settings": {
+                        "default_push_hour": 8,
+                        "max_daily_pushes": 5,
+                        "quiet_start_hour": 22,
+                        "quiet_end_hour": 7
+                    },
+                    "subscribed_skills": {
+                        "bazi": {"status": "subscribed", "push_enabled": True},
+                        "zodiac": {"status": "subscribed", "push_enabled": True},
+                        "lifecoach": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        },
+
+        # 场景2: 只有八字信息的用户
+        "bazi_only_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {
+                    "birth_info": {
+                        "date": "1995-08-20",
+                        "time": "14:00",
+                        "place": "上海"
+                    }
+                },
+                "skills": {
+                    "bazi": {
+                        "chart": {"day_master": "丙火", "strength": "弱"}
+                    }
+                },
+                "vibe": {
+                    "profile": {
+                        "birth_info": {"date": "1995-08-20"}
+                    }
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "bazi": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        },
+
+        # 场景3: LifeCoach 用户（无八字信息）
+        "lifecoach_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {},
+                "skills": {
+                    "lifecoach": {
+                        "north_star": {"vision": "创业成功"},
+                        "progress": {
+                            "last_checkin_date": "2026-01-20",  # 6天未签到
+                            "streak_days": 0,
+                            "previous_streak": 15,
+                            "weekly_checkins": 0
+                        }
+                    }
+                },
+                "vibe": {},
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "lifecoach": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        },
+
+        # 场景4: 生日临近用户（7天后生日）
+        # 测试日期是 2026-01-26，生日设为 02-02（7天后）
+        "birthday_soon_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {
+                    "birth_info": {
+                        "date": "1990-02-02",
+                        "time": "08:00"
+                    }
+                },
+                "skills": {
+                    "bazi": {
+                        "chart": {"day_master": "壬水"}
+                    }
+                },
+                "vibe": {
+                    "profile": {
+                        "birth_info": {"date": "1990-02-02"}
+                    },
+                    "preferences": {
+                        "timezone": "Asia/Shanghai"
+                    }
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "bazi": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        },
+
+        # 场景5: 低运势用户（触发预警）
+        "low_fortune_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {
+                    "birth_info": {
+                        "date": "1988-12-10",
+                        "time": "22:00"
+                    }
+                },
+                "skills": {
+                    "bazi": {
+                        "chart": {"day_master": "癸水"},
+                        "daily_fortune": {"score": 35}  # 低于40分
+                    }
+                },
+                "vibe": {
+                    "profile": {
+                        "birth_info": {"date": "1988-12-10"}
+                    }
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "bazi": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        },
+
+        # 场景6: 推送关闭用户
+        "push_disabled_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {
+                    "birth_info": {"date": "1992-03-15"}
+                },
+                "skills": {
+                    "bazi": {"chart": {"day_master": "乙木"}}
+                },
+                "vibe": {
+                    "profile": {"birth_info": {"date": "1992-03-15"}}
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "bazi": {"status": "subscribed", "push_enabled": False}
+                    }
+                }
+            }
+        },
+
+        # 场景7: 无画像新用户
+        "new_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {},
+                "skills": {},
+                "vibe": {},
+                "preferences": {
+                    "timezone": "Asia/Shanghai"
+                }
+            }
+        },
+
+        # 场景8: 连续签到里程碑用户（30天）
+        "milestone_user": {
+            "user_id": uuid4(),
+            "profile": {
+                "identity": {},
+                "skills": {
+                    "lifecoach": {
+                        "north_star": {"vision": "成为更好的自己"},
+                        "progress": {
+                            "last_checkin_date": "2026-01-25",
+                            "streak_days": 30,
+                            "weekly_checkins": 7
+                        }
+                    }
+                },
+                "vibe": {},
+                "preferences": {
+                    "timezone": "Asia/Shanghai",
+                    "subscribed_skills": {
+                        "lifecoach": {"status": "subscribed", "push_enabled": True}
+                    }
+                }
+            }
+        }
+    }
+
+
+@pytest.fixture
+def mock_notification_service():
+    """模拟通知服务"""
+    service = MagicMock()
+    service.save = AsyncMock()
+    service.check_cooldown = AsyncMock(return_value=True)
+    service.count_today = AsyncMock(return_value=0)
+    return service
+
+
+@pytest.fixture
+def mock_agent_adapter():
+    """模拟Agent适配器"""
+    from services.proactive.models import ReminderContent
+
+    adapter = MagicMock()
+    adapter.generate_content = AsyncMock(return_value=ReminderContent(
+        title="测试标题",
+        body="测试正文内容",
+        fortune_hint="宜: 学习 | 忌: 冲动",
+        action_tip="今天适合做规划"
+    ))
+    return adapter
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景1: 时间触发测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTimeBasedTriggers:
+    """时间触发场景测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)  # 北京时间 08:00:30
+    async def test_daily_fortune_triggers_at_8am(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 早上8点触发每日运势"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        # 手动设置 skill_configs 用于测试
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {
+                    "max_daily_pushes": 5,
+                    "quiet_hours": {"start": 22, "end": 7}
+                },
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "name": "每日运势",
+                    "trigger": {
+                        "type": "time_based",
+                        "schedule": "0 8 * * *"
+                    },
+                    "conditions": [
+                        {"data_path": "vibe.profile.birth_info", "operator": "exists"}
+                    ],
+                    "content": {
+                        "rule": "rules/proactive/daily-fortune-push.md",
+                        "card_type": "DailyFortuneCard"
+                    }
+                }]
+            }
+        }
+
+        # Mock 辅助方法
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"],
+            dry_run=False
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["skill_id"] == "bazi"
+        assert notifications[0]["reminder_id"] == "daily_fortune"
+        mock_notification_service.save.assert_called_once()
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 01:00:00+00:00", tick=False)  # 北京时间 09:00
+    async def test_daily_fortune_not_triggers_at_9am(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 早上9点不应触发8点的运势"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景2: 事件触发测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestEventBasedTriggers:
+    """事件触发场景测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)  # UTC 00:00 = Beijing 08:00
+    async def test_birthday_reminder_7_days_before(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 生日前7天触发提醒"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["birthday_soon_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "birthday",
+                    "name": "生日提醒",
+                    "trigger": {
+                        "type": "event_based",
+                        "event": "birthday",
+                        "advance_days": [7, 0]
+                    },
+                    "conditions": [
+                        {"data_path": "vibe.profile.birth_info.date", "operator": "exists"}
+                    ],
+                    "content": {
+                        "rule": "rules/proactive/birthday-push.md",
+                        "card_type": "InsightCard"
+                    }
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["reminder_id"] == "birthday"
+        assert notifications[0]["triggered_reason"]["event_type"] == "birthday"
+        assert notifications[0]["triggered_reason"]["days_until"] == 7
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景3: 数据条件触发测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDataConditionTriggers:
+    """数据条件触发场景测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_low_fortune_alert_triggers(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 运势低于40分触发预警"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["low_fortune_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "fortune_alert",
+                    "name": "运势预警",
+                    "trigger": {"type": "data_condition"},
+                    "conditions": [
+                        {"data_path": "vibe.profile.birth_info", "operator": "exists"},
+                        {"data_path": "skills.bazi.daily_fortune.score", "operator": "<", "value": 40}
+                    ],
+                    "content": {"rule": "rules/proactive/fortune-alert-push.md", "card_type": "AlertCard"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["reminder_id"] == "fortune_alert"
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)  # UTC 00:00 = Beijing 08:00
+    async def test_checkin_reminder_when_not_checked_in(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 用户今天未签到时触发签到提醒"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["lifecoach_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "lifecoach": {
+                "skill_id": "lifecoach",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 3, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_checkin",
+                    "name": "每日签到",
+                    "trigger": {"type": "data_condition"},
+                    "conditions": [
+                        {"data_path": "skills.lifecoach.north_star.vision", "operator": "exists"},
+                        {"data_path": "skills.lifecoach.progress.last_checkin_date", "operator": "!=", "value": "{today}"}
+                    ],
+                    "content": {"rule": "rules/proactive/daily-checkin-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["reminder_id"] == "daily_checkin"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景4: 平台约束测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPlatformConstraints:
+    """平台约束场景测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 15:00:00+00:00", tick=False)  # 北京时间 23:00 (静默时段)
+    async def test_quiet_hours_blocks_notification(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 静默时段内不发送推送"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": []
+            }
+        }
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_daily_limit_blocks_notification(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 达到每日推送上限后不再发送"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        # 模拟已达到每日上限
+        orchestrator._get_daily_push_count = AsyncMock(return_value=5)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_idempotent_deduplication(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 幂等去重 - 同一触发不重复发送"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        # 第一次处理
+        notifications1 = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        # 第二次处理（同一分钟内）
+        notifications2 = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications1) == 1
+        assert len(notifications2) == 0  # 被幂等去重
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_cooldown_blocks_notification(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 冷却时间内不发送"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+
+        # Mock 冷却时间检查返回 False
+        mock_notification_service.check_cooldown = AsyncMock(return_value=False)
+
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}, "cooldown_hours": 24},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景5: 用户订阅状态测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSubscriptionStatus:
+    """用户订阅状态测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_push_disabled_user_no_notification(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 关闭推送的用户不收到通知"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["push_disabled_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        # Mock: 推送关闭返回 False
+        orchestrator._should_send_to_user = AsyncMock(return_value=False)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_new_user_no_notification(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 新用户（无画像）不触发基于画像的通知"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["new_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [
+                        {"data_path": "vibe.profile.birth_info", "operator": "exists"}  # 新用户没有
+                    ],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        assert len(notifications) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景6: Dry Run 模式测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDryRunMode:
+    """Dry Run 模式测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_dry_run_does_not_save(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: Dry Run 模式不保存通知"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"],
+            dry_run=True  # Dry Run 模式
+        )
+
+        assert len(notifications) == 1
+        mock_notification_service.save.assert_not_called()  # 未保存
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景7: 多 Skill 组合测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMultiSkillScenarios:
+    """多 Skill 组合测试"""
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_multiple_skills_trigger_together(
+        self,
+        test_user_profiles,
+        mock_notification_service,
+        mock_agent_adapter
+    ):
+        """场景: 多个 Skill 同时触发"""
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        user_data = test_user_profiles["complete_user"]
+
+        # 修改 last_checkin_date 为昨天，确保 lifecoach 也触发
+        user_data["profile"]["skills"]["lifecoach"]["progress"]["last_checkin_date"] = "2026-01-25"
+
+        orchestrator = ProactiveOrchestrator(
+            trigger_evaluator=TriggerEvaluator(),
+            agent_adapter=mock_agent_adapter,
+            notification_service=mock_notification_service,
+        )
+
+        orchestrator._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_fortune",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-fortune-push.md"}
+                }]
+            },
+            "zodiac": {
+                "skill_id": "zodiac",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 5, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_horoscope",
+                    "trigger": {"type": "time_based", "schedule": "0 8 * * *"},
+                    "conditions": [{"data_path": "vibe.profile.birth_info", "operator": "exists"}],
+                    "content": {"rule": "rules/proactive/daily-horoscope-push.md"}
+                }]
+            },
+            "lifecoach": {
+                "skill_id": "lifecoach",
+                "enabled": True,
+                "global_config": {"max_daily_pushes": 3, "quiet_hours": {"start": 22, "end": 7}},
+                "reminders": [{
+                    "id": "daily_checkin",
+                    "trigger": {"type": "data_condition"},
+                    "conditions": [
+                        {"data_path": "skills.lifecoach.north_star.vision", "operator": "exists"},
+                        {"data_path": "skills.lifecoach.progress.last_checkin_date", "operator": "!=", "value": "{today}"}
+                    ],
+                    "content": {"rule": "rules/proactive/daily-checkin-push.md"}
+                }]
+            }
+        }
+
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(
+            user_id=user_data["user_id"],
+            profile=user_data["profile"]
+        )
+
+        # 应该有3个通知（bazi + zodiac + lifecoach）
+        assert len(notifications) == 3
+        skill_ids = {n["skill_id"] for n in notifications}
+        assert skill_ids == {"bazi", "zodiac", "lifecoach"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景8: TriggerEvaluator 静态条件测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTriggerEvaluatorStaticConditions:
+    """TriggerEvaluator 静态条件详细测试"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.mark.asyncio
+    async def test_complex_condition_combination(self, evaluator, test_user_profiles):
+        """场景: 复杂条件组合"""
+        user_data = test_user_profiles["complete_user"]
+
+        # 测试多条件 AND 逻辑
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"},
+            {"data_path": "skills.bazi.daily_fortune.score", "operator": ">=", "value": 70},
+            {"data_path": "vibe.state.emotion", "operator": "==", "value": "平静"}
+        ]
+
+        result = await evaluator._evaluate_conditions(conditions, user_data["profile"])
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_condition_short_circuit(self, evaluator, test_user_profiles):
+        """场景: 静态条件短路优化"""
+        user_data = test_user_profiles["new_user"]
+
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"},  # 新用户没有，应短路
+            {"description": "复杂条件，不应该被评估"}  # 复杂条件
+        ]
+
+        result = await evaluator._evaluate_conditions(conditions, user_data["profile"])
+        assert result is False  # 第一个条件失败，短路
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 运行测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

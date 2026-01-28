@@ -1,0 +1,378 @@
+"""
+Goal Service - 目标设定模块
+
+基于 os_design_claude_mvp v1.md §3 设计：
+- 支持年/季/月/周目标层级
+- 包含 Outcome/Lead/Checkpoint 结构
+- 与 Commitment 关联实现目标-任务闭环
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from stores import fortune_db
+
+
+def create_goal(
+    user_id: int,
+    title: str,
+    goal_type: str,
+    *,
+    parent_goal_id: Optional[str] = None,
+    outcome_measure: Optional[str] = None,
+    lead_measures: Optional[List[str]] = None,
+    assumptions: Optional[List[str]] = None,
+    dimension: str = "mixed",
+    checkpoints: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    创建目标
+
+    Args:
+        user_id: 用户ID
+        title: 目标标题
+        goal_type: 目标类型 (annual/quarterly/monthly/weekly)
+        parent_goal_id: 父目标ID（可选）
+        outcome_measure: 结果指标
+        lead_measures: 行为指标列表
+        assumptions: 假设前提列表
+        dimension: 维度 (cognition/time/capital/mixed)
+        checkpoints: 检查点列表
+
+    Returns:
+        创建的目标对象
+    """
+    if goal_type not in ("annual", "quarterly", "monthly", "weekly"):
+        raise ValueError(f"Invalid goal type: {goal_type}")
+
+    if dimension not in ("cognition", "time", "capital", "mixed"):
+        dimension = "mixed"
+
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO fortune_goal (
+                user_id, parent_goal_id, type, title,
+                outcome_measure, lead_measures, assumptions,
+                dimension, checkpoints, status
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, 'active'
+            )
+            RETURNING goal_id, user_id, parent_goal_id, type, title,
+                      outcome_measure, lead_measures, assumptions,
+                      dimension, checkpoints, status, created_at, updated_at
+            """,
+            (
+                user_id,
+                parent_goal_id,
+                goal_type,
+                title,
+                outcome_measure,
+                json.dumps(lead_measures or []),
+                json.dumps(assumptions or []),
+                dimension,
+                json.dumps(checkpoints or []),
+            ),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else {}
+
+
+def get_goal(goal_id: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """获取单个目标"""
+    if user_id:
+        row = fortune_db.fetch_one(
+            """
+            SELECT goal_id, user_id, parent_goal_id, type, title,
+                   outcome_measure, lead_measures, assumptions,
+                   dimension, checkpoints, status, created_at, updated_at
+            FROM fortune_goal
+            WHERE goal_id = %s AND user_id = %s
+            """,
+            (goal_id, user_id),
+        )
+    else:
+        row = fortune_db.fetch_one(
+            """
+            SELECT goal_id, user_id, parent_goal_id, type, title,
+                   outcome_measure, lead_measures, assumptions,
+                   dimension, checkpoints, status, created_at, updated_at
+            FROM fortune_goal
+            WHERE goal_id = %s
+            """,
+            (goal_id,),
+        )
+    return dict(row) if row else None
+
+
+def list_goals(
+    user_id: int,
+    *,
+    goal_type: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    获取用户目标列表
+
+    Args:
+        user_id: 用户ID
+        goal_type: 过滤目标类型 (可选)
+        status: 过滤状态 (可选)
+        limit: 返回数量限制
+        offset: 偏移量
+
+    Returns:
+        目标列表
+    """
+    conditions = ["user_id = %s"]
+    params: List[Any] = [user_id]
+
+    if goal_type:
+        conditions.append("type = %s")
+        params.append(goal_type)
+
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+
+    where_clause = " AND ".join(conditions)
+    params.extend([limit, offset])
+
+    rows = fortune_db.fetch_all(
+        f"""
+        SELECT goal_id, user_id, parent_goal_id, type, title,
+               outcome_measure, lead_measures, assumptions,
+               dimension, checkpoints, status, created_at, updated_at
+        FROM fortune_goal
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params),
+    )
+    return [dict(r) for r in rows]
+
+
+def get_active_goals(user_id: int) -> List[Dict[str, Any]]:
+    """获取用户当前活跃的目标"""
+    return list_goals(user_id, status="active")
+
+
+def update_goal(
+    goal_id: str,
+    user_id: int,
+    *,
+    title: Optional[str] = None,
+    outcome_measure: Optional[str] = None,
+    lead_measures: Optional[List[str]] = None,
+    assumptions: Optional[List[str]] = None,
+    dimension: Optional[str] = None,
+    checkpoints: Optional[List[Dict[str, Any]]] = None,
+    status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    更新目标
+
+    Args:
+        goal_id: 目标ID
+        user_id: 用户ID (验证所有权)
+        其他参数: 要更新的字段
+
+    Returns:
+        更新后的目标对象
+    """
+    updates = []
+    params: List[Any] = []
+
+    if title is not None:
+        updates.append("title = %s")
+        params.append(title)
+
+    if outcome_measure is not None:
+        updates.append("outcome_measure = %s")
+        params.append(outcome_measure)
+
+    if lead_measures is not None:
+        updates.append("lead_measures = %s")
+        params.append(json.dumps(lead_measures))
+
+    if assumptions is not None:
+        updates.append("assumptions = %s")
+        params.append(json.dumps(assumptions))
+
+    if dimension is not None:
+        if dimension in ("cognition", "time", "capital", "mixed"):
+            updates.append("dimension = %s")
+            params.append(dimension)
+
+    if checkpoints is not None:
+        updates.append("checkpoints = %s")
+        params.append(json.dumps(checkpoints))
+
+    if status is not None:
+        if status in ("active", "achieved", "abandoned", "revised"):
+            updates.append("status = %s")
+            params.append(status)
+
+    if not updates:
+        return get_goal(goal_id, user_id)
+
+    updates.append("updated_at = NOW()")
+    params.extend([goal_id, user_id])
+
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            f"""
+            UPDATE fortune_goal
+            SET {", ".join(updates)}
+            WHERE goal_id = %s AND user_id = %s
+            RETURNING goal_id, user_id, parent_goal_id, type, title,
+                      outcome_measure, lead_measures, assumptions,
+                      dimension, checkpoints, status, created_at, updated_at
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def link_commitment_to_goal(
+    goal_id: str,
+    task_id: str,
+    user_id: int,
+) -> bool:
+    """
+    将任务关联到目标
+
+    Args:
+        goal_id: 目标ID
+        task_id: 任务ID
+        user_id: 用户ID (验证所有权)
+
+    Returns:
+        是否成功
+    """
+    goal = get_goal(goal_id, user_id)
+    if not goal:
+        return False
+
+    with fortune_db.db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE fortune_commitment
+            SET goal_id = %s
+            WHERE task_id = %s AND user_id = %s
+            """,
+            (goal_id, task_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def record_checkpoint(
+    goal_id: str,
+    user_id: int,
+    checkpoint_date: str,
+    description: str,
+    progress: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    记录检查点进展
+
+    Args:
+        goal_id: 目标ID
+        user_id: 用户ID
+        checkpoint_date: 检查点日期
+        description: 进展描述
+        progress: 进展状态
+
+    Returns:
+        更新后的目标对象
+    """
+    goal = get_goal(goal_id, user_id)
+    if not goal:
+        return None
+
+    checkpoints = goal.get("checkpoints") or []
+    if isinstance(checkpoints, str):
+        checkpoints = json.loads(checkpoints)
+
+    new_checkpoint = {
+        "date": checkpoint_date,
+        "description": description,
+        "progress": progress,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    found = False
+    for i, cp in enumerate(checkpoints):
+        if cp.get("date") == checkpoint_date:
+            checkpoints[i] = new_checkpoint
+            found = True
+            break
+
+    if not found:
+        checkpoints.append(new_checkpoint)
+
+    return update_goal(goal_id, user_id, checkpoints=checkpoints)
+
+
+def get_goal_progress(goal_id: str, user_id: int) -> Dict[str, Any]:
+    """
+    获取目标进度
+
+    Args:
+        goal_id: 目标ID
+        user_id: 用户ID
+
+    Returns:
+        目标进度信息
+    """
+    goal = get_goal(goal_id, user_id)
+    if not goal:
+        return {"error": "goal_not_found"}
+
+    tasks = fortune_db.fetch_all(
+        """
+        SELECT task_id, title, status, created_at, accepted_at, done_at
+        FROM fortune_commitment
+        WHERE goal_id = %s AND user_id = %s
+        ORDER BY created_at DESC
+        """,
+        (goal_id, user_id),
+    )
+
+    total_tasks = len(tasks)
+    done_tasks = sum(1 for t in tasks if t.get("status") == "done")
+    active_tasks = sum(1 for t in tasks if t.get("status") == "active")
+
+    checkpoints = goal.get("checkpoints") or []
+    if isinstance(checkpoints, str):
+        checkpoints = json.loads(checkpoints)
+    completed_checkpoints = sum(
+        1 for cp in checkpoints if cp.get("progress") == "completed"
+    )
+
+    return {
+        "goal_id": str(goal.get("goal_id")),
+        "title": goal.get("title"),
+        "status": goal.get("status"),
+        "tasks": {
+            "total": total_tasks,
+            "done": done_tasks,
+            "active": active_tasks,
+            "completion_rate": (done_tasks / total_tasks * 100) if total_tasks > 0 else 0,
+        },
+        "checkpoints": {
+            "total": len(checkpoints),
+            "completed": completed_checkpoints,
+        },
+        "recent_tasks": [dict(t) for t in tasks[:5]],
+    }

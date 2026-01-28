@@ -1,0 +1,283 @@
+"""
+Skill Contract Schema v1.0 - Provider/Consumer 双向契约数据结构
+
+跨技能调用规范的核心数据结构定义。
+
+Provider（被调用方）通过 exports 声明可供其他 Skill 调用的工具。
+Consumer（调用方）通过 imports 声明需要从其他 Skill 引用的工具。
+
+框架职责：
+1. 启动时校验 imports ⊆ exports
+2. 运行时访问控制（订阅/配额）
+3. 构建 LLM 工具集时尊重契约
+"""
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExportedToolSchema:
+    """导出工具的入参/出参 Schema"""
+    type: str = "object"
+    required: List[str] = field(default_factory=list)
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ExportedTool:
+    """Provider 导出的工具定义"""
+    name: str
+    description: str
+    input_schema: Optional[ExportedToolSchema] = None
+    output_schema: Optional[ExportedToolSchema] = None
+
+
+@dataclass
+class ExportAccess:
+    """访问控制配置"""
+    requires_subscription: bool = False
+    free_tools: List[str] = field(default_factory=list)
+    rate_limit: Dict[str, str] = field(default_factory=dict)  # tool_name -> "50/day" or "unlimited"
+
+
+@dataclass
+class DeprecatedTool:
+    """弃用工具声明"""
+    tool: str
+    removal_date: str  # ISO date: "2026-06-01"
+    replacement: Optional[str] = None
+
+
+@dataclass
+class SkillExports:
+    """Provider 导出声明
+
+    Example YAML:
+    ```yaml
+    exports:
+      api_version: "1.0"
+      tools:
+        - name: calculate_zodiac
+          description: 计算星盘
+          input_schema: {...}
+          output_schema: {...}
+      access:
+        requires_subscription: true
+        free_tools: [get_chart_snapshot]
+        rate_limit:
+          calculate_zodiac: 50/day
+      deprecated:
+        - tool: old_calculate_chart
+          removal_date: "2026-06-01"
+          replacement: calculate_zodiac
+    ```
+    """
+    api_version: str = "1.0"
+    tools: List[ExportedTool] = field(default_factory=list)
+    access: ExportAccess = field(default_factory=ExportAccess)
+    deprecated: List[DeprecatedTool] = field(default_factory=list)
+
+    def get_tool_names(self) -> List[str]:
+        """获取所有导出工具名"""
+        return [t.name for t in self.tools]
+
+    def has_tool(self, tool_name: str) -> bool:
+        """检查是否导出了某个工具"""
+        return tool_name in self.get_tool_names()
+
+    def is_free_tool(self, tool_name: str) -> bool:
+        """检查工具是否免费"""
+        if not self.access.requires_subscription:
+            return True
+        return tool_name in self.access.free_tools
+
+    def get_rate_limit(self, tool_name: str) -> Optional[str]:
+        """获取工具的速率限制"""
+        return self.access.rate_limit.get(tool_name)
+
+
+@dataclass
+class SkillImport:
+    """Consumer 从单个 Skill 引用的工具
+
+    Example YAML:
+    ```yaml
+    imports:
+      - from: zodiac
+        tools:
+          - calculate_zodiac
+          - get_chart_snapshot
+        min_version: "1.0"
+    ```
+    """
+    from_skill: str  # Provider Skill ID
+    tools: List[str] = field(default_factory=list)
+    min_version: Optional[str] = None  # 最低 API 版本要求
+
+
+@dataclass
+class SkillContract:
+    """完整的 Skill 契约（exports + imports）"""
+    skill_id: str
+    exports: Optional[SkillExports] = None
+    imports: List[SkillImport] = field(default_factory=list)
+
+    def get_imported_tools(self) -> Dict[str, List[str]]:
+        """获取所有导入的工具，按 provider skill 分组
+
+        Returns:
+            {provider_skill_id: [tool_name, ...]}
+        """
+        result = {}
+        for imp in self.imports:
+            result[imp.from_skill] = imp.tools
+        return result
+
+    def get_all_imported_tool_names(self) -> List[str]:
+        """获取所有导入的工具名（扁平化）"""
+        tools = []
+        for imp in self.imports:
+            tools.extend(imp.tools)
+        return tools
+
+    def imports_from(self, provider_skill_id: str) -> Optional[SkillImport]:
+        """获取从某个 Provider 的导入声明"""
+        for imp in self.imports:
+            if imp.from_skill == provider_skill_id:
+                return imp
+        return None
+
+
+def parse_exports_from_frontmatter(data: Dict[str, Any]) -> Optional[SkillExports]:
+    """从 SKILL.md frontmatter 解析 exports
+
+    Args:
+        data: frontmatter 字典
+
+    Returns:
+        SkillExports 对象，如果没有 exports 则返回 None
+    """
+    exports_data = data.get("exports")
+    if not exports_data:
+        return None
+
+    # 解析 tools
+    tools = []
+    for tool_data in exports_data.get("tools", []):
+        if isinstance(tool_data, dict):
+            # 验证必需字段
+            name = tool_data.get("name", "")
+            if not name:
+                logger.warning("Skipping exported tool with missing name")
+                continue
+
+            # 解析 input_schema
+            input_schema = None
+            if tool_data.get("input_schema"):
+                schema_data = tool_data["input_schema"]
+                input_schema = ExportedToolSchema(
+                    type=schema_data.get("type", "object"),
+                    required=schema_data.get("required", []),
+                    properties=schema_data.get("properties", {}),
+                )
+
+            # 解析 output_schema
+            output_schema = None
+            if tool_data.get("output_schema"):
+                schema_data = tool_data["output_schema"]
+                output_schema = ExportedToolSchema(
+                    type=schema_data.get("type", "object"),
+                    required=schema_data.get("required", []),
+                    properties=schema_data.get("properties", {}),
+                )
+
+            tools.append(ExportedTool(
+                name=name,
+                description=tool_data.get("description", ""),
+                input_schema=input_schema,
+                output_schema=output_schema,
+            ))
+
+    # 解析 access
+    access_data = exports_data.get("access", {})
+    access = ExportAccess(
+        requires_subscription=access_data.get("requires_subscription", False),
+        free_tools=access_data.get("free_tools", []),
+        rate_limit=access_data.get("rate_limit", {}),
+    )
+
+    # 解析 deprecated
+    deprecated = []
+    for dep_data in exports_data.get("deprecated", []):
+        if isinstance(dep_data, dict):
+            deprecated.append(DeprecatedTool(
+                tool=dep_data.get("tool", ""),
+                removal_date=dep_data.get("removal_date", ""),
+                replacement=dep_data.get("replacement"),
+            ))
+
+    return SkillExports(
+        api_version=exports_data.get("api_version", "1.0"),
+        tools=tools,
+        access=access,
+        deprecated=deprecated,
+    )
+
+
+def parse_imports_from_frontmatter(data: Dict[str, Any]) -> List[SkillImport]:
+    """从 SKILL.md frontmatter 解析 imports
+
+    Args:
+        data: frontmatter 字典
+
+    Returns:
+        SkillImport 列表
+    """
+    imports_data = data.get("imports", [])
+
+    # 兼容旧版 external_tools 格式
+    if not imports_data and data.get("external_tools"):
+        # 转换为新格式（无法确定 from_skill，标记为 unknown）
+        # 这种情况会在校验时产生警告
+        return []
+
+    imports = []
+    for imp_data in imports_data:
+        if isinstance(imp_data, dict):
+            from_skill = imp_data.get("from", "")
+            if not from_skill:
+                logger.warning("Skipping import with missing 'from' field")
+                continue
+
+            tools = imp_data.get("tools", [])
+            if not tools:
+                logger.warning(f"Skipping import from {from_skill} with empty tools list")
+                continue
+
+            imports.append(SkillImport(
+                from_skill=from_skill,
+                tools=tools,
+                min_version=imp_data.get("min_version"),
+            ))
+
+    return imports
+
+
+def parse_skill_contract(skill_id: str, frontmatter: Dict[str, Any]) -> SkillContract:
+    """从 SKILL.md frontmatter 解析完整契约
+
+    Args:
+        skill_id: Skill ID
+        frontmatter: frontmatter 字典
+
+    Returns:
+        SkillContract 对象
+    """
+    return SkillContract(
+        skill_id=skill_id,
+        exports=parse_exports_from_frontmatter(frontmatter),
+        imports=parse_imports_from_frontmatter(frontmatter),
+    )

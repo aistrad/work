@@ -1,0 +1,616 @@
+"""
+Model Router Service 测试
+测试模型路由器的核心功能
+
+覆盖场景:
+- 模型选择与路由匹配
+- 配额检查与降级策略
+- A/B 测试分流
+- Fallback 链处理
+- 配置加载与缓存
+"""
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from dataclasses import dataclass
+
+pytestmark = pytest.mark.asyncio
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def mock_model_context():
+    """创建测试用的 ModelContext"""
+    from services.model_router.models import ModelContext
+    return ModelContext(
+        user_id="user_123",
+        user_tier="free",
+        skill="bazi",
+        task="chat",
+        session_id="session_456"
+    )
+
+
+@pytest.fixture
+def mock_quota_result_allowed():
+    """允许的配额检查结果"""
+    from services.model_router.models import QuotaCheckResult
+    return QuotaCheckResult(
+        allowed=True,
+        remaining=100,
+        current_usage=0,
+        max_allowed=100
+    )
+
+
+@pytest.fixture
+def mock_quota_result_exceeded():
+    """超额的配额检查结果"""
+    from services.model_router.models import QuotaCheckResult
+    return QuotaCheckResult(
+        allowed=False,
+        remaining=0,
+        current_usage=100,
+        max_allowed=100,
+        exceed_action="downgrade",
+        downgrade_to="glm:glm-4-flash",
+        message="Daily quota exceeded"
+    )
+
+
+@pytest.fixture
+def mock_model():
+    """模拟模型定义"""
+    from services.model_router.models import Model
+    return Model(
+        id="deepseek:deepseek-v3",
+        provider_id="deepseek",
+        model_name="deepseek-chat",
+        capabilities=["chat", "analysis", "tools"],
+        max_tokens=4096
+    )
+
+
+@pytest.fixture
+def mock_route():
+    """模拟路由规则"""
+    from services.model_router.models import ModelRoute
+    return ModelRoute(
+        id=1,
+        name="default_route",
+        model_id="deepseek:deepseek-v3",
+        priority=100,
+        match_user_tier="free",
+        fallback_chain=["glm:glm-4.7", "glm:glm-4-flash"]
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ModelConfig Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestModelConfig:
+    """模型配置测试"""
+
+    def test_load_config_success(self):
+        """测试成功加载配置"""
+        from services.model_router.config import load_model_config
+
+        config = load_model_config(force_reload=True)
+
+        assert config is not None
+        assert len(config.providers) > 0
+        assert len(config.models) > 0
+        assert config.global_fallback is not None
+
+    def test_get_model_definition(self):
+        """测试获取模型定义"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+
+        # 检查配置中是否有模型
+        if config.models:
+            model_id = next(iter(config.models.keys()))
+            model = config.get_model(model_id)
+            assert model is not None
+            assert model.provider is not None
+
+    def test_get_provider_config(self):
+        """测试获取提供商配置"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+
+        # 检查配置中是否有提供商
+        if config.providers:
+            provider_id = next(iter(config.providers.keys()))
+            provider = config.get_provider(provider_id)
+            assert provider is not None
+            assert provider.name is not None
+
+    def test_get_default_route(self):
+        """测试获取默认路由"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+        route = config.get_default_route("chat")
+
+        assert route is not None
+        assert route.primary is not None
+
+    def test_get_fallback_chain(self):
+        """测试获取 fallback 链"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+        chain = config.get_fallback_chain("chat")
+
+        assert chain is not None
+        assert len(chain) > 0
+        # 确保 global_fallback 在链中
+        assert config.global_fallback in chain
+
+    def test_tier_override_route(self):
+        """测试用户层级覆盖路由"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+
+        # 测试 free 用户路由
+        free_route = config.get_default_route("chat", user_tier="free")
+        assert free_route is not None
+
+        # 测试 vip 用户路由（如果有覆盖）
+        vip_route = config.get_default_route("chat", user_tier="vip")
+        assert vip_route is not None
+
+    def test_env_var_substitution(self):
+        """测试环境变量替换"""
+        from services.model_router.config import _substitute_env_vars
+        import os
+
+        os.environ["TEST_VAR"] = "test_value"
+
+        result = _substitute_env_vars("${TEST_VAR}")
+        assert result == "test_value"
+
+        # 测试带默认值
+        result_with_default = _substitute_env_vars("${NONEXISTENT:default}")
+        assert result_with_default == "default"
+
+        del os.environ["TEST_VAR"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ModelRouter Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestModelRouter:
+    """模型路由器测试"""
+
+    async def test_resolve_returns_selection(self, mock_model_context):
+        """测试 resolve 返回有效的模型选择"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import ModelSelection
+
+        with patch.object(ModelRouter, '_ensure_config_loaded', new_callable=AsyncMock), \
+             patch.object(ModelRouter, '_get_matching_routes', new_callable=AsyncMock) as mock_routes, \
+             patch.object(ModelRouter, '_get_default_selection', new_callable=AsyncMock) as mock_default:
+
+            mock_routes.return_value = []
+            mock_default.return_value = ModelSelection(
+                provider="deepseek",
+                model="deepseek-chat",
+                model_id="deepseek:deepseek-v3"
+            )
+
+            router = ModelRouter()
+            selection = await router.resolve(mock_model_context)
+
+            assert selection is not None
+            assert selection.provider == "deepseek"
+            assert selection.model_id == "deepseek:deepseek-v3"
+
+    async def test_resolve_with_capability_filter(self, mock_model_context):
+        """测试带能力要求的模型选择"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import ModelSelection
+
+        with patch.object(ModelRouter, '_ensure_config_loaded', new_callable=AsyncMock), \
+             patch.object(ModelRouter, '_get_matching_routes', new_callable=AsyncMock) as mock_routes, \
+             patch.object(ModelRouter, '_get_default_selection', new_callable=AsyncMock) as mock_default:
+
+            mock_routes.return_value = []
+            mock_default.return_value = ModelSelection(
+                provider="deepseek",
+                model="deepseek-chat",
+                model_id="deepseek:deepseek-v3"
+            )
+
+            router = ModelRouter()
+            selection = await router.resolve(mock_model_context, required_capability="tools")
+
+            assert selection is not None
+
+    async def test_resolve_fallback_on_error(self, mock_model_context):
+        """测试错误时的 fallback"""
+        from services.model_router.router import ModelRouter
+
+        with patch.object(ModelRouter, '_ensure_config_loaded', new_callable=AsyncMock) as mock_load:
+            mock_load.side_effect = Exception("Config load failed")
+
+            router = ModelRouter()
+            selection = await router.resolve(mock_model_context)
+
+            # 应该返回 fallback 选择
+            assert selection is not None
+            assert selection.provider is not None
+
+    async def test_route_matching_by_tier(self, mock_model_context, mock_route):
+        """测试按用户层级匹配路由"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+
+        # 测试匹配
+        mock_model_context.user_tier = "free"
+        mock_route.match_user_tier = "free"
+        assert router._route_matches(mock_route, mock_model_context) is True
+
+        # 测试不匹配
+        mock_model_context.user_tier = "vip"
+        assert router._route_matches(mock_route, mock_model_context) is False
+
+    async def test_route_matching_by_skill(self, mock_model_context, mock_route):
+        """测试按 Skill 匹配路由"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        mock_route.match_user_tier = None  # 不限制 tier
+        mock_route.match_skill = "bazi"
+
+        # 测试匹配
+        mock_model_context.skill = "bazi"
+        assert router._route_matches(mock_route, mock_model_context) is True
+
+        # 测试不匹配
+        mock_model_context.skill = "zodiac"
+        assert router._route_matches(mock_route, mock_model_context) is False
+
+    async def test_route_matching_wildcard(self, mock_model_context, mock_route):
+        """测试通配符匹配（NULL 条件）"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        mock_route.match_user_tier = None
+        mock_route.match_skill = None
+        mock_route.match_task = None
+        mock_route.match_user_id = None
+
+        # 所有条件为 NULL 应该匹配任何上下文
+        assert router._route_matches(mock_route, mock_model_context) is True
+
+    async def test_ab_test_consistent_bucketing(self, mock_model_context, mock_route):
+        """测试 A/B 测试分桶一致性"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        mock_route.ab_test_group = "experiment_1"
+        mock_route.ab_test_percentage = 50
+
+        # 同一用户应该得到一致的结果
+        result1 = router._ab_test_matches(mock_route, mock_model_context)
+        result2 = router._ab_test_matches(mock_route, mock_model_context)
+
+        assert result1 == result2
+
+    async def test_ab_test_no_user_id(self, mock_model_context, mock_route):
+        """测试无用户 ID 时 A/B 测试返回 False"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        mock_route.ab_test_group = "experiment_1"
+        mock_route.ab_test_percentage = 50
+        mock_model_context.user_id = None
+
+        assert router._ab_test_matches(mock_route, mock_model_context) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Quota Handling Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestQuotaHandling:
+    """配额处理测试"""
+
+    async def test_quota_allowed(self, mock_model_context, mock_route, mock_quota_result_allowed):
+        """测试配额允许时正常返回"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import ModelSelection
+
+        router = ModelRouter()
+        router._models_map = {"deepseek:deepseek-v3": MagicMock(capabilities=["chat"])}
+        router._providers_map = {"deepseek": MagicMock(base_url="https://api.deepseek.com")}
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(return_value=mock_quota_result_allowed)
+
+            selection = await router._try_route(mock_route, mock_model_context)
+
+            assert selection is not None
+            assert selection.was_downgraded is False
+
+    async def test_quota_exceeded_downgrade(self, mock_model_context, mock_route, mock_quota_result_exceeded):
+        """测试配额超限时降级"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        router._models_map = {
+            "deepseek:deepseek-v3": MagicMock(capabilities=["chat"]),
+            "glm:glm-4-flash": MagicMock(capabilities=["chat"])
+        }
+        router._providers_map = {
+            "deepseek": MagicMock(base_url="https://api.deepseek.com"),
+            "glm": MagicMock(base_url="https://open.bigmodel.cn")
+        }
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(return_value=mock_quota_result_exceeded)
+
+            selection = await router._try_route(mock_route, mock_model_context)
+
+            assert selection is not None
+            assert selection.was_downgraded is True
+            assert selection.downgrade_reason == "Daily quota exceeded"
+
+    async def test_quota_exceeded_reject(self, mock_model_context, mock_route):
+        """测试配额超限且策略为拒绝"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import QuotaCheckResult, ExceedAction
+
+        router = ModelRouter()
+        router._models_map = {"deepseek:deepseek-v3": MagicMock(capabilities=["chat"])}
+
+        reject_result = QuotaCheckResult(
+            allowed=False,
+            exceed_action=ExceedAction.REJECT.value,
+            message="Quota exceeded, request rejected"
+        )
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(return_value=reject_result)
+
+            selection = await router._try_route(mock_route, mock_model_context)
+
+            # 拒绝策略应该返回 None
+            assert selection is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fallback Chain Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFallbackChain:
+    """Fallback 链测试"""
+
+    async def test_fallback_chain_execution(self, mock_model_context, mock_route, mock_quota_result_allowed):
+        """测试 fallback 链执行"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import QuotaCheckResult
+
+        router = ModelRouter()
+        router._models_map = {
+            "deepseek:deepseek-v3": MagicMock(capabilities=["chat"]),
+            "glm:glm-4.7": MagicMock(capabilities=["chat"]),
+            "glm:glm-4-flash": MagicMock(capabilities=["chat"])
+        }
+        router._providers_map = {
+            "deepseek": MagicMock(base_url="https://api.deepseek.com"),
+            "glm": MagicMock(base_url="https://open.bigmodel.cn")
+        }
+
+        # 主模型配额超限，fallback 模型可用
+        exceeded = QuotaCheckResult(allowed=False, exceed_action="downgrade")
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(side_effect=[exceeded, mock_quota_result_allowed])
+
+            selection = await router._try_fallback(
+                mock_route, mock_model_context, reason="Primary model unavailable"
+            )
+
+            assert selection is not None
+            assert selection.was_downgraded is True
+            assert "glm" in selection.model_id
+
+    async def test_fallback_chain_all_exhausted(self, mock_model_context, mock_route):
+        """测试 fallback 链全部耗尽"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import QuotaCheckResult
+
+        router = ModelRouter()
+        router._models_map = {
+            "glm:glm-4.7": MagicMock(capabilities=["chat"]),
+            "glm:glm-4-flash": MagicMock(capabilities=["chat"])
+        }
+
+        # 所有 fallback 都超限
+        exceeded = QuotaCheckResult(allowed=False, exceed_action="downgrade")
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(return_value=exceeded)
+
+            selection = await router._try_fallback(
+                mock_route, mock_model_context, reason="All models unavailable"
+            )
+
+            # 所有 fallback 都不可用应该返回 None
+            assert selection is None
+
+    async def test_fallback_with_capability_filter(self, mock_model_context, mock_route, mock_quota_result_allowed):
+        """测试带能力过滤的 fallback"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        router._models_map = {
+            "glm:glm-4.7": MagicMock(capabilities=["chat"]),  # 不支持 vision
+            "glm:glm-4-flash": MagicMock(capabilities=["chat", "vision"])  # 支持 vision
+        }
+        router._providers_map = {"glm": MagicMock(base_url="https://open.bigmodel.cn")}
+
+        with patch.object(router, '_quota') as mock_quota:
+            mock_quota.check_quota = AsyncMock(return_value=mock_quota_result_allowed)
+
+            # 需要 vision 能力
+            selection = await router._try_fallback(
+                mock_route, mock_model_context,
+                required_capability="vision",
+                reason="Need vision capability"
+            )
+
+            if selection:
+                assert "glm-4-flash" in selection.model_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cost Calculation Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCostCalculation:
+    """成本计算测试"""
+
+    async def test_calculate_cost_with_tokens(self):
+        """测试基于 token 的成本计算"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import Model
+
+        router = ModelRouter()
+        router._models_map = {
+            "test:model": Model(
+                id="test:model",
+                provider_id="test",
+                model_name="test-model",
+                cost_per_1k_input=0.001,
+                cost_per_1k_output=0.002
+            )
+        }
+
+        cost = await router._calculate_cost("test:model", 1000, 500)
+
+        # 1000 input tokens * 0.001 + 500 output tokens * 0.002 = 0.001 + 0.001 = 0.002
+        assert cost == pytest.approx(0.002, rel=1e-3)
+
+    async def test_calculate_cost_unknown_model(self):
+        """测试未知模型返回 0 成本"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        router._models_map = {}
+
+        cost = await router._calculate_cost("unknown:model", 1000, 500)
+
+        assert cost == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Logging Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestModelCallLogging:
+    """模型调用日志测试"""
+
+    async def test_resolve_with_logging(self, mock_model_context):
+        """测试带日志的 resolve"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import ModelSelection
+
+        router = ModelRouter()
+
+        with patch.object(router, 'resolve', new_callable=AsyncMock) as mock_resolve, \
+             patch.object(router, '_repo') as mock_repo:
+
+            mock_resolve.return_value = ModelSelection(
+                provider="deepseek",
+                model="deepseek-chat",
+                model_id="deepseek:deepseek-v3"
+            )
+            mock_repo.log_model_call = AsyncMock()
+
+            selection = await router.resolve_with_logging(mock_model_context)
+
+            assert selection is not None
+            # 验证日志被记录
+            mock_repo.log_model_call.assert_called_once()
+
+    async def test_record_completion(self, mock_model_context):
+        """测试记录调用完成"""
+        from services.model_router.router import ModelRouter
+        from services.model_router.models import ModelSelection
+
+        router = ModelRouter()
+        router._models_map = {}
+
+        selection = ModelSelection(
+            provider="deepseek",
+            model="deepseek-chat",
+            model_id="deepseek:deepseek-v3"
+        )
+
+        with patch.object(router, '_quota') as mock_quota, \
+             patch.object(router, '_repo') as mock_repo:
+
+            mock_quota.record_usage = AsyncMock()
+            mock_repo.log_model_call = AsyncMock()
+
+            await router.record_completion(
+                selection, mock_model_context,
+                input_tokens=100, output_tokens=50,
+                status="success", latency_ms=200
+            )
+
+            # 验证用量被记录
+            mock_quota.record_usage.assert_called_once()
+            mock_repo.log_model_call.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cache Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRouterCache:
+    """路由器缓存测试"""
+
+    async def test_invalidate_cache(self):
+        """测试缓存失效"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+        router._models_map = {"test": "data"}
+        router._providers_map = {"test": "data"}
+
+        with patch.object(router, '_cache') as mock_cache:
+            mock_cache.invalidate_all = AsyncMock()
+
+            await router.invalidate_cache()
+
+            mock_cache.invalidate_all.assert_called_once()
+            assert len(router._models_map) == 0
+            assert len(router._providers_map) == 0
+
+    def test_get_cache_stats(self):
+        """测试获取缓存统计"""
+        from services.model_router.router import ModelRouter
+
+        router = ModelRouter()
+
+        with patch.object(router, '_cache') as mock_cache:
+            mock_cache.get_stats.return_value = {"hits": 100, "misses": 10}
+
+            stats = router.get_cache_stats()
+
+            assert stats["hits"] == 100
+            assert stats["misses"] == 10

@@ -1,0 +1,1173 @@
+"""
+Unified Extractor - Stage 4 of Knowledge Building Pipeline
+
+Extracts both Cases and Scenarios from MD files in a single LLM call.
+Supports incremental processing via MD5 hash tracking.
+
+Features:
+- Reads directly from MD source files (not DB chunks)
+- Single LLM call extracts both Case and Scenario
+- Incremental processing via extraction_log.json
+- Large files split by sections (< 30K tokens per call)
+- Output: Cases → DB, Scenarios → files
+"""
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Base directories
+DATA_DIR = Path("/data/vibelife")
+
+# Skill-specific configurations
+SKILL_CONFIGS = {
+    "bazi": {
+        "thinking_frameworks": """
+主体思维架构：身强/身弱判定
+客体思维架构：十神分析
+五行思维架构：五行分布特征
+柱位思维架构：四柱位置含义
+冲合思维架构：冲合关系解读
+时运思维架构：大运流年分析
+正偏思维架构：正偏十神转换
+""",
+        "core_data_schema": """
+- year: 年柱 (如: 甲子)
+- month: 月柱
+- day: 日柱
+- hour: 时柱
+- gender: 性别 (男/女)
+""",
+        "features_schema": """
+- daymaster: 日主 (如: 甲木)
+- strength: 身强/身弱
+- pattern: 格局 (如: 正官格)
+- key_gods: 关键十神 (数组)
+""",
+    },
+    "zodiac": {
+        "thinking_frameworks": """
+元素思维架构：火/土/风/水元素分析
+模式思维架构：基本/固定/变动模式分析
+相位思维架构：行星相位解读
+宫位思维架构：十二宫位分析
+行运思维架构：行运推进分析
+""",
+        "core_data_schema": """
+- sun_sign: 太阳星座
+- moon_sign: 月亮星座
+- rising_sign: 上升星座
+- birth_chart: 星盘配置摘要
+""",
+        "features_schema": """
+- dominant_element: 主导元素
+- dominant_modality: 主导模式
+- key_aspects: 关键相位
+- stellium: 星群 (如有)
+""",
+    },
+    "tarot": {
+        "thinking_frameworks": """
+大小牌思维架构：大牌vs小牌分析
+花色思维架构：权杖/圣杯/宝剑/钱币
+数字思维架构：牌号数字含义
+叙事思维架构：牌阵故事整合
+元素尊严架构：元素强弱分析
+""",
+        "core_data_schema": """
+- spread_type: 牌阵类型
+- cards: 抽到的牌 (数组)
+- question: 问题类型
+""",
+        "features_schema": """
+- major_count: 大牌数量
+- dominant_suit: 主导花色
+- reversed_count: 逆位数量
+- key_cards: 关键牌
+""",
+    },
+    "career": {
+        "thinking_frameworks": """
+职业锚思维架构：核心职业动机分析
+霍兰德思维架构：职业兴趣类型分析
+MBTI思维架构：性格类型分析
+技能矩阵架构：技能组合分析
+发展阶段架构：职业周期分析
+""",
+        "core_data_schema": """
+- background: 职业背景
+- current_role: 当前职位
+- challenge: 面临挑战
+""",
+        "features_schema": """
+- industry: 行业
+- career_stage: 职业阶段
+- key_skills: 核心技能
+- goals: 职业目标
+""",
+    },
+}
+
+UNIFIED_EXTRACTION_PROMPT = """你是一个专业的知识抽取专家。请从以下文本中同时识别：
+1. **案例 (Case)**：具体的分析实例，包含完整的推理过程
+2. **场景 (Scenario)**：可服务用户的服务流程定义
+
+## Skill 类型
+{skill_id}
+
+## 该 Skill 的思维架构体系
+{thinking_frameworks}
+
+## 源文件信息
+- 文件: {source_file}
+- 章节: {source_section}
+
+## 案例数据结构
+
+### core_data (核心数据)
+{core_data_schema}
+
+### features (特征数据)
+{features_schema}
+
+## 待分析文本
+
+{text}
+
+## 输出格式
+
+以 JSON 格式输出，结构如下：
+
+{{
+  "cases": [
+    {{
+      "name": "案例名称",
+      "core_data": {{}},
+      "features": {{}},
+      "thinking_frameworks_used": ["架构1"],
+      "reasoning_chain": [
+        {{"step": 1, "framework": "...", "observation": "...", "analysis": "...", "conclusion": "..."}}
+      ],
+      "guidance_patterns": [
+        {{"pattern_name": "...", "condition": "...", "advice": "...", "source": "..."}}
+      ],
+      "tags": [],
+      "scenario_ids": []
+    }}
+  ],
+  "scenarios": [
+    {{
+      "scenario_id": "英文ID",
+      "name": "中文名称",
+      "level": "entry|standard|professional",
+      "billing": "free|basic|premium",
+      "description": "服务描述",
+      "primary_triggers": ["触发词1"],
+      "secondary_triggers": [],
+      "sop_phases": [
+        {{"phase": 1, "name": "阶段名", "type": "required", "description": "...", "tools": [], "knowledge_queries": []}}
+      ]
+    }}
+  ],
+  "extraction_notes": ""
+}}
+
+如果文本不包含案例，cases 返回空数组 []。
+如果文本不包含场景定义，scenarios 返回空数组 []。
+请直接输出 JSON，不要添加其他说明。
+"""
+
+
+@dataclass
+class ExtractedCase:
+    """Extracted case data structure"""
+    name: str
+    skill_id: str
+    core_data: dict
+    features: dict
+    thinking_frameworks_used: list[str]
+    reasoning_chain: list[dict]
+    guidance_patterns: list[dict]
+    tags: list[str]
+    scenario_ids: list[str]
+    source_file: str
+    source_section: str
+    quality_score: float = 0.0
+    status: str = "pending"
+
+
+@dataclass
+class ExtractedScenario:
+    """Extracted scenario data structure"""
+    scenario_id: str
+    skill_id: str
+    name: str
+    level: str
+    billing: str
+    description: str
+    primary_triggers: list[str]
+    secondary_triggers: list[str]
+    sop_phases: list[dict]
+    source_file: str
+
+
+class UnifiedExtractor:
+    """
+    Stage 4: Unified Case & Scenario Extraction from MD Files
+
+    Features:
+    - Reads directly from MD source files (not DB chunks)
+    - Single LLM call extracts both Case and Scenario
+    - Incremental processing via extraction_log.json
+    - Large files split by sections (< 30K tokens per call)
+    - Output: Cases → DB, Scenarios → files
+    """
+
+    # Approximate tokens per character (conservative estimate)
+    CHARS_PER_TOKEN = 2.5
+    MAX_TOKENS = 30000
+
+    def __init__(self, skill_id: str):
+        self.skill_id = skill_id
+        self.converted_dir = DATA_DIR / "knowledge" / skill_id / "converted"
+        self.extracted_dir = DATA_DIR / "knowledge" / skill_id / "extracted"
+        self.log_path = self.extracted_dir / "extraction_log.json"
+        self.config = SKILL_CONFIGS.get(skill_id, SKILL_CONFIGS["bazi"])
+
+    def _ensure_directories(self):
+        """Create necessary directories if they don't exist"""
+        (self.extracted_dir / "cases").mkdir(parents=True, exist_ok=True)
+        (self.extracted_dir / "scenarios").mkdir(parents=True, exist_ok=True)
+
+    def _load_extraction_log(self) -> dict:
+        """Load or initialize extraction log"""
+        if self.log_path.exists():
+            try:
+                return json.loads(self.log_path.read_text())
+            except json.JSONDecodeError:
+                logger.warning("Corrupted extraction log, reinitializing")
+
+        return {
+            "skill_id": self.skill_id,
+            "prompt_version": 1,
+            "last_run": None,
+            "files": {},
+        }
+
+    def _save_extraction_log(self, log: dict):
+        """Save extraction log to file"""
+        self._ensure_directories()
+        log["last_run"] = datetime.now().isoformat()
+        self.log_path.write_text(json.dumps(log, indent=2, ensure_ascii=False))
+
+    def _compute_md5(self, file_path: Path) -> str:
+        """Compute MD5 hash of file content"""
+        content = file_path.read_bytes()
+        return hashlib.md5(content).hexdigest()
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count from text"""
+        return int(len(text) / self.CHARS_PER_TOKEN)
+
+    def _split_by_sections(self, content: str, max_tokens: int = None) -> list[dict]:
+        """
+        Split large MD file by sections (headers).
+
+        Returns list of dicts with 'name' and 'content' keys.
+        """
+        max_tokens = max_tokens or self.MAX_TOKENS
+
+        # Find all headers (## or ### level)
+        header_pattern = r'^(#{1,3})\s+(.+)$'
+        lines = content.split('\n')
+
+        sections = []
+        current_section = {"name": "开头", "content": [], "start_line": 0}
+
+        for i, line in enumerate(lines):
+            match = re.match(header_pattern, line)
+            if match:
+                # Save previous section if it has content
+                if current_section["content"]:
+                    current_section["content"] = '\n'.join(current_section["content"])
+                    sections.append(current_section)
+
+                # Start new section
+                current_section = {
+                    "name": match.group(2).strip(),
+                    "content": [line],
+                    "start_line": i,
+                }
+            else:
+                current_section["content"].append(line)
+
+        # Don't forget the last section
+        if current_section["content"]:
+            current_section["content"] = '\n'.join(current_section["content"])
+            sections.append(current_section)
+
+        # Merge small sections and split large ones
+        result = []
+        buffer = {"name": "", "content": ""}
+
+        for section in sections:
+            section_tokens = self._estimate_tokens(section["content"])
+
+            if section_tokens > max_tokens:
+                # Section too large, need to split further
+                # Save buffer first
+                if buffer["content"]:
+                    result.append(buffer)
+                    buffer = {"name": "", "content": ""}
+
+                # Split large section by paragraphs
+                paragraphs = section["content"].split('\n\n')
+                chunk = {"name": section["name"], "content": ""}
+
+                for para in paragraphs:
+                    if self._estimate_tokens(chunk["content"] + para) > max_tokens:
+                        if chunk["content"]:
+                            result.append(chunk)
+                        chunk = {"name": f"{section['name']} (续)", "content": para}
+                    else:
+                        chunk["content"] += ('\n\n' if chunk["content"] else '') + para
+
+                if chunk["content"]:
+                    result.append(chunk)
+
+            elif self._estimate_tokens(buffer["content"] + section["content"]) > max_tokens:
+                # Buffer would be too large, flush it
+                if buffer["content"]:
+                    result.append(buffer)
+                buffer = section
+
+            else:
+                # Merge with buffer
+                if buffer["content"]:
+                    buffer["name"] = f"{buffer['name']} + {section['name']}"
+                    buffer["content"] += '\n\n' + section["content"]
+                else:
+                    buffer = section
+
+        # Don't forget the buffer
+        if buffer["content"]:
+            result.append(buffer)
+
+        return result
+
+    async def _call_llm(self, text: str, source_file: str, source_section: str) -> dict:
+        """Call LLM with unified extraction prompt"""
+        from services.model_router import chat
+
+        prompt = UNIFIED_EXTRACTION_PROMPT.format(
+            skill_id=self.skill_id,
+            thinking_frameworks=self.config["thinking_frameworks"],
+            core_data_schema=self.config["core_data_schema"],
+            features_schema=self.config["features_schema"],
+            source_file=source_file,
+            source_section=source_section,
+            text=text,
+        )
+
+        try:
+            response = await chat(
+                messages=[{"role": "user", "content": prompt}],
+                capability="analysis",
+            )
+
+            content = response.content if hasattr(response, 'content') else str(response)
+
+            # Extract JSON from response
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            data = json.loads(content.strip())
+            return data
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse LLM response: {e}")
+            return {"cases": [], "scenarios": [], "extraction_notes": f"Parse error: {e}"}
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return {"cases": [], "scenarios": [], "extraction_notes": f"LLM error: {e}"}
+
+    def _calculate_case_quality_score(self, case: dict) -> tuple[float, list[str]]:
+        """
+        Calculate quality score for a case (0-1).
+
+        Scoring criteria (v2 - simplified):
+        - reasoning_chain: 50% (must have)
+        - guidance_patterns: 50% (must have)
+
+        Returns:
+            tuple of (score, rejection_reasons)
+        """
+        score = 0.0
+        rejection_reasons = []
+
+        # Reasoning chain (50%)
+        reasoning = case.get("reasoning_chain", [])
+        if not reasoning:
+            rejection_reasons.append("缺少 reasoning_chain（推理链条）")
+        elif len(reasoning) >= 3:
+            score += 0.50
+        elif len(reasoning) >= 2:
+            score += 0.40
+        elif len(reasoning) >= 1:
+            score += 0.25
+
+        # Guidance patterns (50%)
+        patterns = case.get("guidance_patterns", [])
+        if not patterns:
+            rejection_reasons.append("缺少 guidance_patterns（指导模式）")
+        elif len(patterns) >= 2:
+            score += 0.50
+        elif len(patterns) >= 1:
+            score += 0.35
+
+        return min(score, 1.0), rejection_reasons
+
+    def _calculate_scenario_quality_score(self, scenario: dict) -> tuple[float, list[str]]:
+        """
+        Calculate quality score for a scenario (0-1).
+
+        Scoring criteria:
+        - scenario_id valid: 15%
+        - name present: 10%
+        - primary_triggers (at least 1): 25%
+        - sop_phases (at least 2): 35%
+        - description present: 15%
+
+        Returns:
+            tuple of (score, rejection_reasons)
+        """
+        score = 0.0
+        rejection_reasons = []
+
+        # scenario_id (15%)
+        scenario_id = scenario.get("scenario_id", "")
+        if not scenario_id:
+            rejection_reasons.append("缺少 scenario_id")
+        elif not scenario_id.replace("_", "").isalnum():
+            rejection_reasons.append("scenario_id 格式无效（应为 snake_case）")
+        else:
+            score += 0.15
+
+        # name (10%)
+        name = scenario.get("name", "")
+        if not name:
+            rejection_reasons.append("缺少 name")
+        else:
+            score += 0.10
+
+        # primary_triggers (25%)
+        triggers = scenario.get("primary_triggers", [])
+        if not triggers:
+            rejection_reasons.append("缺少 primary_triggers")
+        elif len(triggers) >= 2:
+            score += 0.25
+        elif len(triggers) >= 1:
+            score += 0.20
+
+        # sop_phases (35%)
+        phases = scenario.get("sop_phases", [])
+        if not phases or len(phases) < 2:
+            rejection_reasons.append("sop_phases 至少需要 2 个阶段")
+        elif len(phases) >= 4:
+            score += 0.35
+        elif len(phases) >= 3:
+            score += 0.30
+        elif len(phases) >= 2:
+            score += 0.25
+
+        # description (15%)
+        description = scenario.get("description", "")
+        if description:
+            score += 0.15
+
+        return min(score, 1.0), rejection_reasons
+
+    def _calculate_scenario_similarity(self, new_scenario: dict, existing_scenario: dict) -> float:
+        """
+        Calculate similarity between two scenarios (0-1).
+
+        Based on:
+        - Trigger word overlap (60%)
+        - Name similarity (20%)
+        - SOP phase similarity (20%)
+        """
+        similarity = 0.0
+
+        # Trigger word overlap (60%)
+        new_triggers = set(new_scenario.get("primary_triggers", []) +
+                          new_scenario.get("secondary_triggers", []))
+        existing_triggers = set(existing_scenario.get("primary_triggers", []) +
+                               existing_scenario.get("secondary_triggers", []))
+
+        if new_triggers and existing_triggers:
+            overlap = len(new_triggers & existing_triggers)
+            total = len(new_triggers | existing_triggers)
+            if total > 0:
+                similarity += 0.60 * (overlap / total)
+
+        # Name similarity (20%) - simple character overlap
+        new_name = new_scenario.get("name", "")
+        existing_name = existing_scenario.get("name", "")
+        if new_name and existing_name:
+            new_chars = set(new_name)
+            existing_chars = set(existing_name)
+            if new_chars and existing_chars:
+                char_overlap = len(new_chars & existing_chars)
+                char_total = len(new_chars | existing_chars)
+                if char_total > 0:
+                    similarity += 0.20 * (char_overlap / char_total)
+
+        # SOP phase name similarity (20%)
+        new_phases = [p.get("name", "") for p in new_scenario.get("sop_phases", [])]
+        existing_phases = [p.get("name", "") for p in existing_scenario.get("sop_phases", [])]
+        if new_phases and existing_phases:
+            phase_overlap = len(set(new_phases) & set(existing_phases))
+            phase_total = len(set(new_phases) | set(existing_phases))
+            if phase_total > 0:
+                similarity += 0.20 * (phase_overlap / phase_total)
+
+        return min(similarity, 1.0)
+
+    def _load_existing_scenarios(self) -> list[dict]:
+        """Load all existing scenarios from skills/{skill}/scenarios/ directory"""
+        import yaml
+
+        scenarios_dir = Path(__file__).parent.parent / "skills" / self.skill_id / "scenarios"
+        existing = []
+
+        if not scenarios_dir.exists():
+            return existing
+
+        for md_file in scenarios_dir.glob("*.md"):
+            try:
+                content = md_file.read_text(encoding='utf-8')
+                # Parse YAML frontmatter
+                if content.startswith("---"):
+                    parts = content.split("---", 2)
+                    if len(parts) >= 3:
+                        frontmatter = yaml.safe_load(parts[1])
+                        if frontmatter:
+                            # Extract triggers from markdown body
+                            body = parts[2]
+                            primary_triggers = []
+                            secondary_triggers = []
+
+                            # Simple extraction from markdown
+                            if "主要触发词" in body:
+                                line = [l for l in body.split('\n') if "主要触发词" in l]
+                                if line:
+                                    triggers_str = line[0].split(":", 1)[-1].strip()
+                                    primary_triggers = [t.strip() for t in triggers_str.split(",") if t.strip()]
+
+                            if "次要触发词" in body:
+                                line = [l for l in body.split('\n') if "次要触发词" in l]
+                                if line:
+                                    triggers_str = line[0].split(":", 1)[-1].strip()
+                                    secondary_triggers = [t.strip() for t in triggers_str.split(",") if t.strip()]
+
+                            existing.append({
+                                "scenario_id": frontmatter.get("id", md_file.stem),
+                                "name": frontmatter.get("name", ""),
+                                "primary_triggers": primary_triggers,
+                                "secondary_triggers": secondary_triggers,
+                                "sop_phases": [],  # Not needed for similarity check
+                                "file_path": str(md_file),
+                            })
+            except Exception as e:
+                logger.warning(f"Failed to parse scenario {md_file}: {e}")
+
+        return existing
+
+    async def extract_from_file(self, file_path: Path) -> dict:
+        """
+        Extract Cases and Scenarios from a single MD file.
+        For large files, split by sections.
+
+        Returns:
+            dict with 'cases' and 'scenarios' lists
+        """
+        content = file_path.read_text(encoding='utf-8')
+        rel_path = str(file_path.relative_to(self.converted_dir))
+
+        token_estimate = self._estimate_tokens(content)
+        logger.info(f"Processing {rel_path} (~{token_estimate} tokens)")
+
+        results = {"cases": [], "scenarios": []}
+
+        if token_estimate > self.MAX_TOKENS:
+            # Large file - split by sections
+            sections = self._split_by_sections(content)
+            logger.info(f"  Split into {len(sections)} sections")
+
+            for i, section in enumerate(sections):
+                logger.info(f"  Processing section {i+1}/{len(sections)}: {section['name']}")
+                section_result = await self._call_llm(
+                    section["content"],
+                    rel_path,
+                    section["name"],
+                )
+
+                # Add source info to cases
+                for case in section_result.get("cases", []):
+                    case["source_file"] = rel_path
+                    case["source_section"] = section["name"]
+                    score, reasons = self._calculate_case_quality_score(case)
+                    case["quality_score"] = score
+                    case["rejection_reasons"] = reasons
+                    results["cases"].append(case)
+
+                # Add source info to scenarios
+                for scenario in section_result.get("scenarios", []):
+                    scenario["source_file"] = rel_path
+                    results["scenarios"].append(scenario)
+        else:
+            # Small file - process as whole
+            extraction = await self._call_llm(content, rel_path, "全文")
+
+            for case in extraction.get("cases", []):
+                case["source_file"] = rel_path
+                case["source_section"] = "全文"
+                score, reasons = self._calculate_case_quality_score(case)
+                case["quality_score"] = score
+                case["rejection_reasons"] = reasons
+                results["cases"].append(case)
+
+            for scenario in extraction.get("scenarios", []):
+                scenario["source_file"] = rel_path
+                results["scenarios"].append(scenario)
+
+        logger.info(f"  Extracted {len(results['cases'])} cases, {len(results['scenarios'])} scenarios")
+        return results
+
+    async def process_pending_files(self, force_reextract: bool = False) -> dict:
+        """
+        Incremental processing:
+        - Check MD5 hash for file changes
+        - Only process changed/new files
+        - Update extraction_log.json
+
+        Args:
+            force_reextract: If True, reprocess all files regardless of status
+
+        Returns:
+            dict with counts: cases_count, scenarios_count, files_processed
+        """
+        self._ensure_directories()
+        log = self._load_extraction_log()
+        md_files = list(self.converted_dir.rglob("*.md"))
+
+        results = {
+            "cases_count": 0,
+            "scenarios_count": 0,
+            "files_processed": 0,
+            "files_skipped": 0,
+        }
+
+        for md_file in md_files:
+            rel_path = str(md_file.relative_to(self.converted_dir))
+            current_md5 = self._compute_md5(md_file)
+
+            # Check if file needs processing
+            if not force_reextract and rel_path in log["files"]:
+                file_entry = log["files"][rel_path]
+                if file_entry.get("md5") == current_md5:
+                    logger.debug(f"Skipping {rel_path} (unchanged)")
+                    results["files_skipped"] += 1
+                    continue
+
+            logger.info(f"Processing: {rel_path}")
+
+            try:
+                # Extract
+                extraction = await self.extract_from_file(md_file)
+
+                # Save Cases to DB
+                saved_cases = await self._save_cases_to_db(extraction["cases"])
+
+                # Save Scenarios to files
+                saved_scenarios = await self._save_scenarios_to_files(extraction["scenarios"])
+
+                # Also save to YAML for review
+                self._save_cases_to_yaml(extraction["cases"], rel_path)
+
+                # Update log
+                log["files"][rel_path] = {
+                    "status": "extracted",
+                    "md5": current_md5,
+                    "extracted_at": datetime.now().isoformat(),
+                    "cases_count": len(extraction["cases"]),
+                    "scenarios_count": len(extraction["scenarios"]),
+                }
+
+                results["cases_count"] += saved_cases
+                results["scenarios_count"] += saved_scenarios
+                results["files_processed"] += 1
+
+            except Exception as e:
+                logger.error(f"Failed to process {rel_path}: {e}")
+                log["files"][rel_path] = {
+                    "status": "error",
+                    "md5": current_md5,
+                    "error": str(e),
+                    "extracted_at": datetime.now().isoformat(),
+                }
+
+        self._save_extraction_log(log)
+
+        logger.info(
+            f"Extraction complete: {results['files_processed']} files processed, "
+            f"{results['files_skipped']} skipped, "
+            f"{results['cases_count']} cases, {results['scenarios_count']} scenarios"
+        )
+
+        return results
+
+    async def _save_cases_to_db(self, cases: list[dict]) -> int:
+        """
+        Insert approved cases to PostgreSQL.
+
+        Auto-approval criteria:
+        - Must have reasoning_chain (not empty)
+        - Must have guidance_patterns (not empty)
+        - quality_score >= 0.6
+
+        Returns number of cases saved.
+        """
+        if not cases:
+            return 0
+
+        from stores.db import get_connection
+
+        saved = 0
+        async with get_connection() as conn:
+            for case in cases:
+                # Auto-approval check
+                reasoning = case.get("reasoning_chain", [])
+                patterns = case.get("guidance_patterns", [])
+                score = case.get("quality_score", 0.0)
+
+                # Must have both and score >= 0.6
+                if not reasoning or not patterns or score < 0.6:
+                    case["status"] = "rejected"
+                    logger.info(f"  Case rejected: {case.get('name')} (score={score:.2f})")
+                    continue
+
+                case["status"] = "approved"
+                case_id = f"CASE_{self.skill_id}_{uuid.uuid4().hex[:8]}"
+                case["db_id"] = case_id
+
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO cases (
+                            id, skill_id, scenario_ids, name,
+                            core_data, features, tags,
+                            thinking_frameworks_used,
+                            reasoning_chain, guidance_patterns,
+                            source_file, source_section,
+                            quality_score, status,
+                            analysis, conclusion, authority
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            $11, $12, $13, $14, $15, $16, $17
+                        )
+                        ON CONFLICT (id) DO UPDATE SET
+                            core_data = EXCLUDED.core_data,
+                            features = EXCLUDED.features,
+                            reasoning_chain = EXCLUDED.reasoning_chain,
+                            guidance_patterns = EXCLUDED.guidance_patterns,
+                            quality_score = EXCLUDED.quality_score,
+                            status = EXCLUDED.status
+                        """,
+                        case_id,
+                        self.skill_id,
+                        case.get("scenario_ids", ["basic_reading"]),
+                        case.get("name", "未命名案例"),
+                        json.dumps(case.get("core_data", {})),
+                        json.dumps(case.get("features", {})),
+                        case.get("tags", []),
+                        case.get("thinking_frameworks_used", []),
+                        json.dumps(case.get("reasoning_chain", [])),
+                        json.dumps(case.get("guidance_patterns", [])),
+                        case.get("source_file", ""),
+                        case.get("source_section", ""),
+                        score,
+                        "approved",  # Auto-approved
+                        json.dumps({"key_points": []}),  # Legacy field
+                        json.dumps({"summary": "", "advice": ""}),  # Legacy field
+                        "medium",
+                    )
+                    saved += 1
+                    logger.info(f"  Case approved: {case.get('name')} (score={score:.2f}, id={case_id})")
+                except Exception as e:
+                    logger.error(f"Failed to save case {case.get('name')}: {e}")
+
+        return saved
+
+    def _save_cases_to_yaml(self, cases: list[dict], source_file: str):
+        """
+        Save cases to YAML file with auto-review status annotation.
+
+        Format:
+        - source_file: str
+        - extraction_time: str
+        - summary: {total, approved, rejected}
+        - cases: [{name, status, quality_score, db_id?, rejection_reasons?, ...}]
+        """
+        if not cases:
+            return
+
+        import yaml
+
+        # Calculate summary
+        approved_count = sum(1 for c in cases if c.get("status") == "approved")
+        rejected_count = sum(1 for c in cases if c.get("status") == "rejected")
+
+        # Prepare output data
+        output_data = {
+            "source_file": source_file,
+            "extraction_time": datetime.now().isoformat(),
+            "summary": {
+                "total": len(cases),
+                "approved": approved_count,
+                "rejected": rejected_count,
+            },
+            "cases": []
+        }
+
+        for case in cases:
+            case_entry = {
+                "name": case.get("name", "未命名"),
+                "status": case.get("status", "unknown"),
+                "quality_score": round(case.get("quality_score", 0.0), 2),
+            }
+
+            # Add db_id if approved
+            if case.get("db_id"):
+                case_entry["db_id"] = case["db_id"]
+
+            # Add rejection reasons if rejected
+            if case.get("rejection_reasons"):
+                case_entry["rejection_reasons"] = case["rejection_reasons"]
+
+            # Include key data for review
+            case_entry["source_section"] = case.get("source_section", "")
+            case_entry["reasoning_chain_count"] = len(case.get("reasoning_chain", []))
+            case_entry["guidance_patterns_count"] = len(case.get("guidance_patterns", []))
+
+            output_data["cases"].append(case_entry)
+
+        # Create filename from source file
+        file_stem = Path(source_file).stem.replace('.converted', '')
+        output_path = self.extracted_dir / "cases" / f"{file_stem}.cases.yaml"
+
+        yaml_content = yaml.dump(
+            output_data,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+
+        output_path.write_text(yaml_content, encoding='utf-8')
+        logger.info(f"  Cases YAML saved: {output_path} ({approved_count} approved, {rejected_count} rejected)")
+
+    async def _save_scenarios_to_files(self, scenarios: list[dict]) -> int:
+        """
+        Auto-review and save scenarios.
+
+        Logic:
+        1. Calculate quality score for each scenario
+        2. Check similarity with existing scenarios
+        3. Decision matrix:
+           - quality >= 0.6 AND all similarities < 0.5 → New scenario, publish to skills/{skill}/scenarios/
+           - quality >= 0.7 AND max similarity >= 0.5 → Merge into existing scenario
+           - Otherwise → Save to extracted/scenarios/ as candidate (not published)
+
+        Returns number of scenarios published (new + merged).
+        """
+        if not scenarios:
+            return 0
+
+        # Load existing scenarios for similarity check
+        existing_scenarios = self._load_existing_scenarios()
+
+        published = 0
+        for scenario in scenarios:
+            # Calculate quality score
+            quality, rejection_reasons = self._calculate_scenario_quality_score(scenario)
+            scenario["quality_score"] = quality
+            scenario["rejection_reasons"] = rejection_reasons
+
+            # Check similarity with existing scenarios
+            max_similarity = 0.0
+            most_similar = None
+            for existing in existing_scenarios:
+                sim = self._calculate_scenario_similarity(scenario, existing)
+                if sim > max_similarity:
+                    max_similarity = sim
+                    most_similar = existing
+
+            scenario["max_similarity"] = max_similarity
+            scenario["most_similar_id"] = most_similar["scenario_id"] if most_similar else None
+
+            scenario_id = scenario.get("scenario_id", f"scenario_{uuid.uuid4().hex[:8]}")
+
+            # Decision: New scenario (publish)
+            if quality >= 0.6 and max_similarity < 0.5:
+                scenario["status"] = "approved_new"
+                # Publish to skills/{skill}/scenarios/
+                published_path = self._publish_scenario(scenario)
+                if published_path:
+                    published += 1
+                    logger.info(f"  Scenario NEW published: {scenario_id} (quality={quality:.2f}, similarity={max_similarity:.2f})")
+                    # Also save to extracted for record
+                    self._save_scenario_candidate(scenario, "published_new")
+
+            # Decision: Merge into existing (quality >= 0.7)
+            elif quality >= 0.7 and max_similarity >= 0.5:
+                scenario["status"] = "approved_merge"
+                # Create merge file
+                merged = self._merge_scenario(scenario, most_similar)
+                if merged:
+                    published += 1
+                    logger.info(f"  Scenario MERGED into {most_similar['scenario_id']}: {scenario_id} (quality={quality:.2f}, similarity={max_similarity:.2f})")
+                    self._save_scenario_candidate(scenario, "merged")
+
+            # Decision: Reject (save as candidate only)
+            else:
+                if quality < 0.6:
+                    scenario["status"] = "rejected_quality"
+                    reason = f"质量分数不足 ({quality:.2f} < 0.6)"
+                elif max_similarity >= 0.5 and quality < 0.7:
+                    scenario["status"] = "rejected_similarity"
+                    reason = f"与现有场景 '{most_similar['scenario_id']}' 相似度高 ({max_similarity:.2f}) 但质量不足 ({quality:.2f} < 0.7)"
+                else:
+                    scenario["status"] = "rejected"
+                    reason = "不满足入库条件"
+
+                scenario["rejection_reason"] = reason
+                self._save_scenario_candidate(scenario, "rejected")
+                logger.info(f"  Scenario rejected: {scenario_id} - {reason}")
+
+        return published
+
+    def _publish_scenario(self, scenario: dict) -> Optional[Path]:
+        """Publish scenario to skills/{skill}/scenarios/ directory"""
+        scenarios_dir = Path(__file__).parent.parent / "skills" / self.skill_id / "scenarios"
+        scenarios_dir.mkdir(parents=True, exist_ok=True)
+
+        scenario_id = scenario.get("scenario_id", "")
+        if not scenario_id:
+            return None
+
+        output_path = scenarios_dir / f"{scenario_id}.md"
+
+        # Check if file already exists
+        if output_path.exists():
+            logger.warning(f"Scenario file already exists: {output_path}")
+            return None
+
+        md_content = self._render_published_scenario_md(scenario)
+        output_path.write_text(md_content, encoding='utf-8')
+        return output_path
+
+    def _merge_scenario(self, new_scenario: dict, existing_scenario: dict) -> bool:
+        """
+        Merge new scenario content into existing scenario file.
+
+        Strategy:
+        - Add new triggers that don't exist
+        - Add new SOP phases if significantly different
+        """
+        if not existing_scenario.get("file_path"):
+            return False
+
+        existing_path = Path(existing_scenario["file_path"])
+        if not existing_path.exists():
+            return False
+
+        try:
+            content = existing_path.read_text(encoding='utf-8')
+
+            # Extract new triggers to add
+            new_triggers = set(new_scenario.get("primary_triggers", []))
+            existing_triggers = set(existing_scenario.get("primary_triggers", []))
+            triggers_to_add = new_triggers - existing_triggers
+
+            if not triggers_to_add:
+                logger.info(f"    No new triggers to merge for {existing_scenario['scenario_id']}")
+                return False
+
+            # Simple merge: append new triggers to the triggers line
+            if triggers_to_add and "主要触发词" in content:
+                # Find and update the triggers line
+                lines = content.split('\n')
+                for i, line in enumerate(lines):
+                    if "主要触发词" in line and ":" in line:
+                        existing_part = line.split(":", 1)[1].strip()
+                        new_triggers_str = ", ".join(triggers_to_add)
+                        if existing_part:
+                            lines[i] = f"**主要触发词**: {existing_part}, {new_triggers_str}"
+                        else:
+                            lines[i] = f"**主要触发词**: {new_triggers_str}"
+                        break
+
+                content = '\n'.join(lines)
+                existing_path.write_text(content, encoding='utf-8')
+                logger.info(f"    Merged {len(triggers_to_add)} new triggers into {existing_scenario['scenario_id']}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to merge scenario: {e}")
+
+        return False
+
+    def _save_scenario_candidate(self, scenario: dict, status_tag: str):
+        """Save scenario to extracted/scenarios/ with status annotation"""
+        scenario_id = scenario.get("scenario_id", f"scenario_{uuid.uuid4().hex[:8]}")
+        output_path = self.extracted_dir / "scenarios" / f"{scenario_id}.{status_tag}.md"
+
+        md_content = self._render_scenario_md(scenario)
+        output_path.write_text(md_content, encoding='utf-8')
+
+    def _render_published_scenario_md(self, scenario: dict) -> str:
+        """Render scenario as publishable Markdown file (with YAML frontmatter)"""
+        sop_phases = scenario.get("sop_phases", [])
+        phases_md = ""
+
+        for phase in sop_phases:
+            tools_str = ", ".join(phase.get("tools", [])) or "无"
+            queries_str = ", ".join(phase.get("knowledge_queries", [])) or "无"
+
+            phases_md += f"""
+### Phase {phase.get('phase', '?')}: {phase.get('name', '未命名')}
+
+**类型**: {phase.get('type', 'required')}
+
+{phase.get('description', '')}
+
+**工具**: {tools_str}
+**知识查询**: {queries_str}
+"""
+
+        return f"""---
+id: {scenario.get('scenario_id', '')}
+name: {scenario.get('name', '')}
+level: {scenario.get('level', 'entry')}
+billing: {scenario.get('billing', 'free')}
+description: {scenario.get('description', '')}
+---
+
+# {scenario.get('name', '未命名场景')}
+
+## 元数据
+
+- **ID**: {scenario.get('scenario_id', '')}
+- **名称**: {scenario.get('name', '')}
+- **级别**: {scenario.get('level', 'entry')}
+- **计费**: {scenario.get('billing', 'free')}
+- **描述**: {scenario.get('description', '')}
+
+## 触发条件
+
+**主要触发词**: {', '.join(scenario.get('primary_triggers', []))}
+
+**次要触发词**: {', '.join(scenario.get('secondary_triggers', []))}
+
+## 服务流程 (SOP)
+
+{phases_md}
+"""
+
+    def _render_scenario_md(self, scenario: dict) -> str:
+        """Render scenario as Markdown file"""
+        sop_phases = scenario.get("sop_phases", [])
+        phases_md = ""
+
+        for phase in sop_phases:
+            tools_str = ", ".join(phase.get("tools", [])) or "无"
+            queries_str = ", ".join(phase.get("knowledge_queries", [])) or "无"
+
+            phases_md += f"""
+### Phase {phase.get('phase', '?')}: {phase.get('name', '未命名')}
+
+**类型**: {phase.get('type', 'required')}
+
+{phase.get('description', '')}
+
+**工具**: {tools_str}
+**知识查询**: {queries_str}
+"""
+
+        return f"""# {scenario.get('name', '未命名场景')}
+
+> 自动生成的场景候选，需人工审核后发布。
+> 来源文件: {scenario.get('source_file', '未知')}
+
+## 元数据
+
+| 属性 | 值 |
+|------|-----|
+| ID | `{scenario.get('scenario_id', '')}` |
+| Skill | {self.skill_id} |
+| 级别 | {scenario.get('level', 'entry')} |
+| 计费 | {scenario.get('billing', 'free')} |
+
+## 描述
+
+{scenario.get('description', '')}
+
+## 触发条件
+
+**主要触发词**: {', '.join(scenario.get('primary_triggers', []))}
+
+**次要触发词**: {', '.join(scenario.get('secondary_triggers', []))}
+
+## SOP 流程
+
+{phases_md}
+
+---
+
+*生成时间: {datetime.now().isoformat()}*
+"""
+
+
+# CLI entry point
+async def unified_extract_cli(skill_id: str, force: bool = False):
+    """CLI entry point for unified extraction"""
+    extractor = UnifiedExtractor(skill_id)
+    results = await extractor.process_pending_files(force_reextract=force)
+
+    print(f"\n{'='*60}")
+    print(f"Unified Extraction Complete - {skill_id}")
+    print(f"{'='*60}")
+    print(f"Files processed: {results['files_processed']}")
+    print(f"Files skipped:   {results['files_skipped']}")
+    print(f"Cases extracted: {results['cases_count']}")
+    print(f"Scenarios extracted: {results['scenarios_count']}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    skill = sys.argv[1] if len(sys.argv) > 1 else "bazi"
+    force = "--force" in sys.argv or "-f" in sys.argv
+
+    asyncio.run(unified_extract_cli(skill, force))

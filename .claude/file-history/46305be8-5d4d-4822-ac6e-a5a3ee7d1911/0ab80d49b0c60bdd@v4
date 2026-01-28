@@ -1,0 +1,277 @@
+# VibeProfile - 用户画像数据层
+
+> Version: 2.0 | 极简设计
+
+---
+
+## 1. 概述
+
+VibeProfile 是 VibeLife 的 **核心用户数据层**，基于现有 `unified_profiles` 表扩展。
+
+### 设计原则
+
+- **Single Table** - 主数据存在 unified_profiles.profile (JSONB)
+- **Lazy Compute** - 不预计算，按需获取
+- **Simple Cache** - 内存缓存，5分钟 TTL
+- **Daily Proactive** - 每天凌晨扫描一次
+
+---
+
+## 2. 数据结构
+
+### 2.1 Profile Schema
+
+```yaml
+profile:
+  # 账户 (来源: vibe_users)
+  account:
+    vibe_id: "VB-A1B2C3D4"
+    display_name: "用户昵称"
+    email: "user@example.com"
+    tier: "free"                 # free | premium
+    status: "active"
+
+  # 身份
+  identity:
+    birth_info:
+      date: "1990-05-15"
+      time: "14:30"
+      place: "北京"
+      timezone: "Asia/Shanghai"
+      gender: "male"
+
+  # 状态
+  state:
+    emotion: "neutral"           # anxious | sad | neutral | content | excited
+    focus: ["career"]            # 当前关注的话题
+    life_stage: "career_growth"
+
+  # 偏好
+  preferences:
+    voice_mode: "warm"
+    language: "zh-CN"
+    push_enabled: true
+    push_hour: 8                 # 推送时间 (0-23)
+    subscribed_skills: ["core", "bazi", "zodiac"]
+
+  # Skill 数据 (各 Skill 独立存储)
+  skill_data:
+    bazi: { chart, features, daymaster, current_dayun, current_liunian }
+    zodiac: { chart, planets, houses, current_transits }
+    tarot: { last_reading }
+    career: { assessment }
+
+  # 从对话抽取
+  extracted:
+    facts: ["在互联网公司工作", "有升职压力"]
+    goals: ["年底升职"]
+    concerns: ["工作压力"]
+
+  # 生活上下文
+  life_context:
+    occupation: { title, industry }
+    focus_areas: ["career", "health"]
+```
+
+### 2.2 Cold Layer (独立表)
+
+```sql
+-- 洞察 (低频写入)
+CREATE TABLE vibe_profile_insights (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    insight_type VARCHAR(50),  -- discovery | pattern | timing | growth
+    skill_id VARCHAR(50),
+    content TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- 时间线 (低频写入)
+CREATE TABLE vibe_profile_timeline (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    event_type VARCHAR(50),    -- dayun_change | milestone
+    event_date DATE,
+    title VARCHAR(200),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+---
+
+## 3. 数据访问
+
+### 3.1 Repository
+
+```python
+class VibeProfileRepository:
+    """极简数据访问层"""
+
+    # 读取
+    @staticmethod
+    async def get_profile(user_id: UUID) -> Dict:
+        """获取完整 Profile"""
+
+    @staticmethod
+    async def get_identity(user_id: UUID) -> Dict:
+        """获取身份信息 (birth_info)"""
+
+    @staticmethod
+    async def get_skill_data(user_id: UUID, skill: str) -> Dict:
+        """获取 Skill 数据"""
+
+    # 写入
+    @staticmethod
+    async def update_birth_info(user_id: UUID, birth_info: Dict) -> None:
+        """更新出生信息"""
+
+    @staticmethod
+    async def update_skill_data(user_id: UUID, skill: str, data: Dict) -> None:
+        """更新 Skill 数据"""
+
+    @staticmethod
+    async def update_state(user_id: UUID, state: Dict) -> None:
+        """更新状态"""
+
+    @staticmethod
+    async def update_extracted(user_id: UUID, extracted: Dict) -> None:
+        """更新抽取信息"""
+
+    # Proactive 支持
+    @staticmethod
+    async def get_users_for_push(push_hour: int) -> List[Dict]:
+        """获取指定推送时间的用户"""
+```
+
+### 3.2 缓存
+
+```python
+# 简单内存缓存，5分钟 TTL
+_cache: Dict[UUID, CacheEntry] = {}
+TTL = 300  # 5分钟
+
+async def get_cached_profile(user_id: UUID) -> Dict:
+    if user_id in _cache and not _cache[user_id].expired:
+        return _cache[user_id].data
+    profile = await VibeProfileRepository.get_profile(user_id)
+    _cache[user_id] = CacheEntry(data=profile, expires_at=now() + TTL)
+    return profile
+```
+
+---
+
+## 4. Skill 访问规则
+
+| Skill | 可读 | 可写 |
+|-------|------|------|
+| **Core Layer** | | |
+| core | 全部 | state, extracted |
+| lifecoach | 全部 | state, extracted, life_context |
+| mindfulness | 全部 | state |
+| **Professional Layer** | | |
+| bazi | identity, state | skill_data.bazi |
+| zodiac | identity, state | skill_data.zodiac |
+| tarot | identity, state | skill_data.tarot |
+| career | identity, state, life_context | skill_data.career |
+
+> 约定优于配置，通过代码 Review 保证，不需要强制访问控制层。
+
+---
+
+## 5. Proactive 集成
+
+### 每日推送流程
+
+```
+每天 04:00 (凌晨)
+    │
+    ▼
+┌─────────────────────────────┐
+│  ProactiveWorker.daily_scan │
+│                             │
+│  1. 获取所有 push_enabled   │
+│     用户                    │
+│                             │
+│  2. 按 push_hour 分组       │
+│                             │
+│  3. 为每个用户生成今日推送  │
+│     内容，存入通知表        │
+│                             │
+│  4. 按用户 push_hour 时间   │
+│     投递通知                │
+└─────────────────────────────┘
+```
+
+### 触发条件
+
+| 类型 | 检测时机 | 示例 |
+|------|---------|------|
+| 每日运势 | 每天凌晨 | 八字每日运势 |
+| 事件触发 | 每天凌晨 | 大运交接、流年变化 |
+| 状态触发 | 对话结束时 | 情绪低落时触发 mindfulness |
+
+---
+
+## 6. 迁移
+
+### 从现有表迁移
+
+```sql
+-- 1. 合并 user_skill_subscriptions 到 profile.preferences.subscribed_skills
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{preferences,subscribed_skills}',
+    (SELECT jsonb_agg(skill_id)
+     FROM user_skill_subscriptions
+     WHERE user_id = up.user_id AND status = 'subscribed')
+);
+
+-- 2. 合并 user_push_preferences 到 profile.preferences
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{preferences,push_hour}',
+    to_jsonb(COALESCE(
+        (SELECT default_push_hour FROM user_push_preferences WHERE user_id = up.user_id),
+        8
+    ))
+);
+```
+
+### 兼容期
+
+迁移后保留旧表 30 天，期间双写，确认无问题后删除。
+
+---
+
+## 7. API
+
+### 内部 Python API
+
+```python
+# 读取
+profile = await VibeProfileRepository.get_profile(user_id)
+bazi_data = await VibeProfileRepository.get_skill_data(user_id, "bazi")
+
+# 写入
+await VibeProfileRepository.update_birth_info(user_id, {"date": "1990-05-15"})
+await VibeProfileRepository.update_state(user_id, {"emotion": "content"})
+```
+
+### HTTP API
+
+```
+GET  /api/v1/profile/summary    # 用户查看 AI 对自己的认知摘要
+PUT  /api/v1/profile/preferences # 更新偏好
+```
+
+---
+
+## 附录：极简原则
+
+1. **不预计算** - Proactive 每天凌晨扫描一次，不需要 pending_triggers
+2. **不做访问控制层** - 通过 Code Review 保证 Skill 只访问该访问的数据
+3. **不做事件去抖** - 状态更新频率不高，无需 Debounce
+4. **不做 Redis** - 内存缓存足够，单机部署先不考虑多实例
+5. **不做复杂 compact** - facts/checkins 通过业务逻辑控制增长

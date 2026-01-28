@@ -1,0 +1,207 @@
+"""
+Tool Schema v6 - 统一工具定义系统
+
+从 YAML 文件加载工具定义，自动生成：
+- Python OpenAI 格式工具定义
+- TypeScript 类型定义（可选）
+
+V6.1 更新：
+- 移除 GLOBAL_TOOLS 硬编码
+- 全局工具从 skills/core/tools/tools.yaml 加载
+"""
+import yaml
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
+
+SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+
+
+@dataclass
+class ToolParam:
+    """工具参数"""
+    name: str
+    type: str
+    required: bool = False
+    description: str = ""
+    default: Any = None
+    enum: Optional[List[str]] = None
+
+
+@dataclass
+class ToolDef:
+    """工具定义"""
+    name: str
+    description: str
+    tool_type: str  # collect, compute, display, search
+    parameters: List[ToolParam] = field(default_factory=list)
+    card_type: Optional[str] = None
+    fallback_type: Optional[str] = None  # V7.1: 无专用卡片时的降级类型
+    card_props: Optional[Dict] = None
+    when_to_call: Optional[str] = None
+    implementation: Optional[str] = None
+    skill_id: Optional[str] = None  # 所属 Skill ID
+    is_global: bool = False  # 是否为全局工具
+    phase1: bool = False  # v12: Phase 1 可用（Skill 选择阶段）
+
+    def to_openai_format(self) -> Dict[str, Any]:
+        """转换为 OpenAI 工具格式"""
+        properties = {}
+        required = []
+
+        for param in self.parameters:
+            # Handle special types that aren't valid JSON Schema types
+            if param.type == "any":
+                # "any" type: use empty schema to accept any value
+                prop = {"description": param.description}
+            else:
+                prop = {"type": param.type, "description": param.description}
+            if param.enum:
+                prop["enum"] = param.enum
+            if param.default is not None:
+                prop["default"] = param.default
+            properties[param.name] = prop
+            if param.required:
+                required.append(param.name)
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                }
+            },
+            "_metadata": {
+                "tool_type": self.tool_type,
+                "card_type": self.card_type,
+                "fallback_type": self.fallback_type,  # V7.1
+                "when_to_call": self.when_to_call
+            }
+        }
+
+
+def _parse_yaml_tool(tool_data: Dict, tool_type: str) -> ToolDef:
+    """解析 YAML 工具定义"""
+    params = []
+    for p in tool_data.get("parameters", []):
+        params.append(ToolParam(
+            name=p["name"],
+            type=p.get("type", "string"),
+            required=p.get("required", False),
+            description=p.get("description", ""),
+            default=p.get("default"),
+            enum=p.get("enum")
+        ))
+
+    return ToolDef(
+        name=tool_data["name"],
+        description=tool_data.get("description", ""),
+        tool_type=tool_type,
+        parameters=params,
+        card_type=tool_data.get("card_type"),
+        fallback_type=tool_data.get("fallback_type"),  # V7.1
+        card_props=tool_data.get("card_props"),
+        when_to_call=tool_data.get("when_to_call"),
+        implementation=tool_data.get("implementation"),
+        phase1=tool_data.get("phase1", False)  # v12: Phase 1 可用
+    )
+
+
+@lru_cache(maxsize=16)
+def load_skill_tools(skill_id: str) -> List[ToolDef]:
+    """从 YAML 加载 Skill 工具定义
+
+    支持两种格式：
+    1. 旧格式：按类型分组 (collect, compute, display, search, action)
+    2. 新格式：tools 列表，每个工具有 type 字段
+    """
+    tools_file = SKILLS_DIR / skill_id / "tools" / "tools.yaml"
+    if not tools_file.exists():
+        logger.debug(f"Tools file not found: {tools_file}")
+        return []
+
+    try:
+        with open(tools_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        tools = []
+
+        # 新格式：tools 列表
+        if "tools" in data and isinstance(data["tools"], list):
+            for tool_data in data["tools"]:
+                tool_type = tool_data.get("type", "display")
+                tool = _parse_yaml_tool(tool_data, tool_type)
+                tool.skill_id = skill_id
+                tool.is_global = (skill_id == "core")
+                tools.append(tool)
+        else:
+            # 旧格式：按类型分组
+            # v12: 添加 routing 和 trigger 分组
+            for tool_type in ["routing", "collect", "compute", "display", "search", "action", "data", "trigger"]:
+                for tool_data in data.get(tool_type, []):
+                    tool = _parse_yaml_tool(tool_data, tool_type)
+                    tool.skill_id = skill_id
+                    tool.is_global = (skill_id == "core")
+                    tools.append(tool)
+
+        logger.debug(f"Loaded {len(tools)} tools for skill: {skill_id}")
+        return tools
+    except Exception as e:
+        logger.error(f"Failed to load tools for {skill_id}: {e}")
+        return []
+
+
+@lru_cache(maxsize=1)
+def get_global_tools() -> List[ToolDef]:
+    """获取全局工具（从 core skill 加载）"""
+    return load_skill_tools("core")
+
+
+def get_skill_tools_openai(skill_id: str) -> List[Dict[str, Any]]:
+    """获取 Skill 工具的 OpenAI 格式"""
+    tools = load_skill_tools(skill_id)
+    return [t.to_openai_format() for t in tools]
+
+
+def get_global_tools_openai() -> List[Dict[str, Any]]:
+    """获取全局工具的 OpenAI 格式"""
+    return [t.to_openai_format() for t in get_global_tools()]
+
+
+def get_all_tools_for_skill(skill_id: str) -> List[Dict[str, Any]]:
+    """获取 Skill 的所有工具（全局 + Skill 专属）"""
+    tools = get_global_tools_openai()
+    if skill_id != "core":
+        tools.extend(get_skill_tools_openai(skill_id))
+    return tools
+
+
+def get_tool_card_type(tool_name: str, skill_id: Optional[str] = None) -> Optional[str]:
+    """获取工具对应的卡片类型"""
+    # 先查全局工具
+    for tool in get_global_tools():
+        if tool.name == tool_name:
+            return tool.card_type
+
+    # 再查 Skill 工具
+    if skill_id:
+        for tool in load_skill_tools(skill_id):
+            if tool.name == tool_name:
+                return tool.card_type
+
+    return None
+
+
+def clear_tool_cache():
+    """清除工具缓存"""
+    load_skill_tools.cache_clear()
+    get_global_tools.cache_clear()
+    logger.info("Tool cache cleared")

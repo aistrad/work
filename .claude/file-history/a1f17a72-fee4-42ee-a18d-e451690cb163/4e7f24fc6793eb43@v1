@@ -1,0 +1,1772 @@
+# Fortune AI 最终 MVP 系统设计（Web 可落地 / PostgreSQL / GLM）
+
+**文档类型**：Final MVP System Design  
+**产品代号**：`Fortune AI`  
+**版本**：Final MVP v1.1（rev_20260101，Spec ↔ Code 对齐版）  
+**日期**：2026-01-01  
+**核心定位**：AI 驱动的“人生导航 / 陪伴 / 提升系统”（有效而极简）  
+**硬约束**：纯 AI（不引入真人服务）/ 不做“公开社区 feed”（仅做隐私社交）/ Web 端可落地 / **Fortune AI 业务数据 SSOT 使用 PostgreSQL（DB=fortune_ai）**；深度报告支持 `backend=cli|gemini`：`gemini` 仅在调用 gemini 报告链路时连接 `DB=gemini`（`gemini_job/gemini_task`），`cli` 仅调用 `cli_worker` 的执行与状态查询（业务 SSOT 仍写入 `fortune_ai`）  
+**LLM**：**GLM（Z.AI / /api/paas/v4/chat/completions）**  
+**入口**：`/new`（Next.js 双栏：Zone A=对话 / Zone B=Dashboard Tabs；未登录跳转 `/new/login`；`/main`/`/login`/`/register` 为兼容跳转）  
+
+---
+
+## 更新说明（rev_20260101：对齐当前代码）
+
+### A. 实现基线（当前代码已存在）
+
+- 前端：Next.js（`fortune_ai/web-app`），`basePath="/new"`，入口 `http://<host>:8231/new`  
+- 后端：FastAPI（`fortune_ai/api/main.py`）+ routers（`fortune_ai/api/*_routes.py`），对外统一 `/api/*`  
+- 认证：Cookie `fortune_session` + `fortune_csrf`；写操作必须带 `X-CSRF-Token`（见 `fortune_ai/api/deps.py`、`fortune_ai/api/auth_routes.py`）  
+- Chat：`POST /api/chat/send`（A2UI JSON）+ `GET /api/chat/stream`（SSE：`delta`/`final`/`[DONE]`）  
+- Dashboard（Zone B）：`/api/dashboard/*`（`overview/status/trends/tasks/relations/explore/kline`）  
+- 深度报告：`/api/report/bazi/submit`（`cli|gemini` 异步）+ `GET /api/report/bazi/{job_id}`；`/api/report/bazi/deep/submit`（GLM 同步）  
+- 海报：`POST /api/poster/generate` + `GET /api/poster/{poster_id}`（注意状态查询是 `poster_id`，不是 `job_id`）  
+- 目标/复盘：`/api/goal/*`、`/api/reflection/*`  
+- 隐私社交引擎：`/api/social/*`（好友/能量加油/好运接龙/分享卡片；无公开广场）  
+
+### B. 与原 v1.0 的关键差异（需要在产品/运维层明确）
+
+- 入口从 `/main`（旧页）迁移为 `/new`（Next.js）；后端 `/`、`/main`、`/login`、`/register` 在 `fortune_ai/api/main.py` 做 `307` 跳转到 `/new*`。如果前后端分端口部署（8230/8231），需要反向代理或改为绝对 URL。  
+- 旧的无鉴权接口 `/api/calculate`、`/api/v2/*`、`/api/system-prompts`、`/api/files/*` 已在 `fortune_ai/api/main.py` 统一返回 `410 deprecated_use_new_api`。  
+- Session Cookie 当前实现为 **30 天**（`fortune_ai/api/auth_routes.py:_set_session_cookies`），与部分旧 spec 的 **7 天**不一致（建议后续做成可配置并统一口径）。  
+
+### C. SSOT 约束（本轮需重点治理）
+
+- 目标：业务 SSOT 只在 PostgreSQL。当前 `fortune_ai/services/task_service.py` 仍写入 `fortune_ai/services/conversation_store.py`（本地文件）作为外部任务 prompt/output 的日志，建议迁移到 `fortune_external_job` 或独立审计表后移除文件落盘。
+
+---
+
+## ★ 三图对比：Spec设计 vs 当前实现 vs 最优方案
+
+### 1. 整体架构对比
+
+#### 1.1 Spec设计（原规划）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Fortune AI Architecture                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  Client (/new)                                                       │
+│     │                                                                │
+│     ▼                                                                │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ API Gateway (FastAPI :8230)                                  │    │
+│  │ ├── Auth (Cookie Session + CSRF)                             │    │
+│  │ ├── Chat (/api/chat/*)                                       │    │
+│  │ ├── Dashboard (/api/dashboard/*)                             │    │
+│  │ ├── Bento (/api/bento/*)                                     │    │
+│  │ ├── Report (/api/report/*)                                   │    │
+│  │ └── Push (/api/push/*)                                       │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│           │                │                  │                      │
+│           ▼                ▼                  ▼                      │
+│  ┌────────────┐   ┌────────────┐    ┌────────────────────┐          │
+│  │ 数学脑      │   │ 知识脑      │    │ 语言脑              │          │
+│  │ (八字计算)  │   │ (PG FTS)   │    │ (GLM)              │          │
+│  │ - facts    │   │ - kb_refs  │    │ - A2UI输出          │          │
+│  │ - hash     │   │ - rule_ids │    │ - Guidance Card    │          │
+│  └────────────┘   └────────────┘    └────────────────────┘          │
+│           │                │                  │                      │
+│           └────────────────┼──────────────────┘                      │
+│                            ▼                                         │
+│                  ┌──────────────────┐                                │
+│                  │ PostgreSQL SSOT  │                                │
+│                  │ (fortune_ai DB)  │                                │
+│                  └──────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.2 当前实现（实际代码）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Current Implementation                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  Next.js (:8231/new)              FastAPI (:8230/api/*)              │
+│     │                                   │                            │
+│     │ ◄─── CSRF Token (Cookie) ───►    │ ✓ 已实现                   │
+│     │                                   │                            │
+│     ▼                                   ▼                            │
+│  ┌─────────────┐                 ┌─────────────────────┐            │
+│  │ Zone A      │                 │ Routers             │            │
+│  │ (Chat)      │ ───────────────►│ ✓ auth_routes      │            │
+│  │ - SSE流式   │                 │ ✓ chat_routes      │            │
+│  │ - A2UI渲染  │                 │ ✓ dashboard_routes │            │
+│  └─────────────┘                 │ ✓ bento_routes     │            │
+│                                  │ ✓ report_routes    │            │
+│  ┌─────────────┐                 │ ○ poster_routes    │ ← 部分实现  │
+│  │ Zone B      │                 │ ✓ goal_routes      │            │
+│  │ (Dashboard) │                 │ ✓ reflection_routes│            │
+│  │ - 6 Tabs    │                 └─────────────────────┘            │
+│  │ - Bento卡片 │                          │                         │
+│  └─────────────┘                          ▼                         │
+│                                  ┌─────────────────────┐            │
+│                                  │ Services            │            │
+│  ┌─────────────┐                 │ ✓ soul_os          │            │
+│  │ app-store   │                 │ ✓ bazi_facts       │            │
+│  │ (Zustand)   │                 │ ✓ kb_service       │            │
+│  │ ✓ CSRF传递  │                 │ ✓ glm_client       │            │
+│  │ ✓ A2UI转换  │                 │ ✓ chat_service     │            │
+│  └─────────────┘                 │ ○ poster_service   │ ← 未完成    │
+│                                  └─────────────────────┘            │
+│                                           │                         │
+│                                           ▼                         │
+│                                  ┌─────────────────────┐            │
+│                                  │ PostgreSQL          │            │
+│                                  │ ✓ 核心表已创建      │            │
+│                                  │ ✗ fortune_kline_daily│ ← 缺失   │
+│                                  └─────────────────────┘            │
+└─────────────────────────────────────────────────────────────────────┘
+
+图例: ✓ 已实现  ○ 部分实现  ✗ 未实现
+```
+
+#### 1.3 最优方案（综合建议）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Optimal Architecture                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ 统一入口层                                                     │   │
+│  │ Nginx/Caddy (:80/:443)                                        │   │
+│  │ ├── /new/* → Next.js :8231 (SSR + Static)                    │   │
+│  │ ├── /api/* → FastAPI :8230 (API Gateway)                     │   │
+│  │ └── WebSocket/SSE 长连接支持                                  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ API Layer (FastAPI)                                           │   │
+│  │ ┌────────────┬────────────┬─────────────┬──────────────┐     │   │
+│  │ │ AuthGuard  │ CSRFGuard  │ RateLimiter │ Correlation  │     │   │
+│  │ │ (中间件)   │ (中间件)    │ (中间件)    │ ID追踪       │     │   │
+│  │ └────────────┴────────────┴─────────────┴──────────────┘     │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│           │                                                          │
+│           ├──────────────┬──────────────┬──────────────┐            │
+│           ▼              ▼              ▼              ▼            │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐       │
+│  │ L0 数学脑  │ │ L1 心理脑  │ │ L2 知识脑  │ │ L3 语言脑  │       │
+│  │            │ │            │ │            │ │            │       │
+│  │ bazi_facts │ │ soul_os    │ │ kb_service │ │ glm_client │       │
+│  │ ↓          │ │ ↓          │ │ ↓          │ │ ↓          │       │
+│  │ facts      │ │ PERMA      │ │ kb_refs    │ │ A2UI       │       │
+│  │ facts_hash │ │ StateScore │ │ rule_ids   │ │ Guidance   │       │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘       │
+│           │              │              │              │            │
+│           └──────────────┴──────────────┴──────────────┘            │
+│                                  │                                   │
+│                                  ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ PostgreSQL (fortune_ai)                                       │   │
+│  │ ├── 用户层: fortune_user, fortune_user_session                │   │
+│  │ ├── 会话层: fortune_conversation_*, fortune_commitment       │   │
+│  │ ├── 计算层: fortune_bazi_snapshot, fortune_kline_daily       │   │
+│  │ ├── 知识层: bazi_kb_document, bazi_kb_chunk (FTS+trgm)       │   │
+│  │ └── 审计层: fortune_agent_run, fortune_push_event            │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. 认证流程对比
+
+#### 2.1 Spec设计
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Auth Flow (Spec)                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  User ─────► POST /api/auth/register                          │
+│              │                                                │
+│              ▼                                                │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ 1. 创建 fortune_user                         │             │
+│  │ 2. 创建 fortune_user_preferences             │             │
+│  │ 3. 计算 fortune_bazi_snapshot               │             │
+│  │ 4. 创建 fortune_user_session                │             │
+│  │ 5. 下发 Cookie (fortune_session + csrf)     │             │
+│  └─────────────────────────────────────────────┘             │
+│              │                                                │
+│              ▼                                                │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ Session有效期: 7天 (spec原定)               │             │
+│  │ CSRF验证: 所有 POST/PUT/DELETE              │             │
+│  └─────────────────────────────────────────────┘             │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 2.2 当前实现
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  Auth Flow (Implemented)                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  User ─────► POST /api/auth/register                          │
+│              │                                                │
+│              ▼                                                │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ auth_routes.py:register()                    │             │
+│  │ 1. ✓ 创建 fortune_user                       │             │
+│  │ 2. ✓ upsert fortune_user_preferences         │             │
+│  │ 3. ✓ 计算 fortune_bazi_snapshot (TTS)       │             │
+│  │ 4. ✓ 创建 fortune_user_session              │             │
+│  │ 5. ✓ _set_session_cookies()                 │             │
+│  └─────────────────────────────────────────────┘             │
+│              │                                                │
+│              ▼                                                │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ Session有效期: 30天 (当前实现)  ⚠️ 与spec不一致 │             │
+│  │ CSRF验证: ✓ require_csrf(request, auth)     │             │
+│  │                                              │             │
+│  │ 前端 CSRF 传递:                              │             │
+│  │ ✓ api.ts:csrfHeaders() (lines 17-20)        │             │
+│  │ ✓ blocks/index.tsx:csrfHeaders() (21-24)    │             │
+│  └─────────────────────────────────────────────┘             │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 2.3 最优方案
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  Auth Flow (Optimal)                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ 配置化 Session 有效期                        │             │
+│  │ AUTH_SESSION_DAYS=30 (env可配置)            │             │
+│  └─────────────────────────────────────────────┘             │
+│                                                               │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ 统一 CSRF Helper 模块                        │             │
+│  │ web-app/src/lib/csrf.ts                     │             │
+│  │ - getCsrfToken()                            │             │
+│  │ - csrfHeaders()                             │             │
+│  │ → 消除 api.ts 与 blocks/index.tsx 重复代码  │             │
+│  └─────────────────────────────────────────────┘             │
+│                                                               │
+│  ┌─────────────────────────────────────────────┐             │
+│  │ 增加 Refresh Token 机制 (可选)               │             │
+│  │ - Access Token: 15min                       │             │
+│  │ - Refresh Token: 30day                      │             │
+│  │ → 提高安全性                                 │             │
+│  └─────────────────────────────────────────────┘             │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 3. Chat对话流程对比
+
+#### 3.1 Spec设计
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                      Chat Flow (Spec)                              │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  User Input ──► POST /api/chat/send                                │
+│                      │                                             │
+│       ┌──────────────┼──────────────┐                              │
+│       ▼              ▼              ▼                              │
+│  ┌─────────┐   ┌─────────┐   ┌─────────┐                          │
+│  │ L0 Facts│   │ L2 KB   │   │ History │                          │
+│  │ (八字)  │   │ (检索)  │   │ (会话)  │                          │
+│  └────┬────┘   └────┬────┘   └────┬────┘                          │
+│       │             │             │                                │
+│       └─────────────┼─────────────┘                                │
+│                     ▼                                              │
+│            ┌────────────────┐                                      │
+│            │ GLM 调用       │                                      │
+│            │ System Prompt: │                                      │
+│            │ - persona_style│                                      │
+│            │ - facts_json   │                                      │
+│            │ - evidence_json│                                      │
+│            └────────┬───────┘                                      │
+│                     │                                              │
+│                     ▼                                              │
+│            ┌────────────────┐                                      │
+│            │ A2UI Output    │                                      │
+│            │ - markdown_text│                                      │
+│            │ - action_buttons│                                     │
+│            └────────┬───────┘                                      │
+│                     │                                              │
+│       ┌─────────────┼─────────────┐                                │
+│       ▼             ▼             ▼                                │
+│  ┌─────────┐  ┌──────────┐  ┌──────────┐                          │
+│  │保存消息 │  │提取处方   │  │生成承诺   │                          │
+│  │(DB)    │  │(3条)     │  │(suggested)│                          │
+│  └─────────┘  └──────────┘  └──────────┘                          │
+│                                                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2 当前实现
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    Chat Flow (Implemented)                         │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  User Input                                                        │
+│      │                                                             │
+│      ├──► POST /api/chat/send (同步)                               │
+│      │          │                                                  │
+│      │          ▼                                                  │
+│      │    chat_routes.py:chat_send()                               │
+│      │          │                                                  │
+│      │    ┌─────┴─────┐                                            │
+│      │    ▼           ▼                                            │
+│      │ ┌──────┐ ┌──────────────┐                                   │
+│      │ │yunshi│ │anti_dependency│ ← 反依赖检查                     │
+│      │ │意图  │ │检查          │                                   │
+│      │ └──┬───┘ └──────┬───────┘                                   │
+│      │    │            │                                           │
+│      │    ▼            ▼                                           │
+│      │ ┌──────────────────────────────┐                            │
+│      │ │ soul_os.get_full_context()   │                            │
+│      │ │ ✓ L0 facts                   │                            │
+│      │ │ ✓ L1 PERMA                   │                            │
+│      │ │ ✓ L2 evidence (kb_refs)      │                            │
+│      │ │ ✓ system_prompt              │                            │
+│      │ └──────────────┬───────────────┘                            │
+│      │                ▼                                            │
+│      │ ┌──────────────────────────────┐                            │
+│      │ │ glm_client.call_chat()       │                            │
+│      │ │ → A2UI JSON                  │                            │
+│      │ └──────────────┬───────────────┘                            │
+│      │                ▼                                            │
+│      │ ┌──────────────────────────────┐                            │
+│      │ │ _ensure_action_buttons()     │ ← 确保有按钮               │
+│      │ │ _insert_suggested_tasks()    │ ← 生成承诺                 │
+│      │ │ _write_agent_run_log()       │ ← 审计日志                 │
+│      │ └──────────────────────────────┘                            │
+│      │                                                             │
+│      └──► GET /api/chat/stream (SSE)                               │
+│                 │                                                  │
+│                 ▼                                                  │
+│           StreamingResponse                                        │
+│           - data: {"type":"delta","delta":"..."}                   │
+│           - data: {"type":"final","data":{...}}                    │
+│           - data: [DONE]                                           │
+│                                                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.3 最优方案
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                      Chat Flow (Optimal)                           │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  User Input                                                        │
+│      │                                                             │
+│      ▼                                                             │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │ 意图路由层 (Intent Router)                                  │   │
+│  │ ┌────────┬────────┬────────┬────────┬────────┐             │   │
+│  │ │ yunshi │ report │ poster │ goal   │ general│             │   │
+│  │ │ 今日运势│ 深度报告│ 海报   │ 目标   │ 通用对话│             │   │
+│  │ └────┬───┴────┬───┴────┬───┴────┬───┴────┬───┘             │   │
+│  │      │        │        │        │        │                  │   │
+│  │      ▼        ▼        ▼        ▼        ▼                  │   │
+│  │ [专用处理器] → 统一返回 A2UI 格式                           │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                      │                                             │
+│                      ▼                                             │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │ 上下文增强层 (Context Enricher)                             │   │
+│  │ ├── soul_os.get_full_context()                             │   │
+│  │ ├── anti_dependency.check() + exempt_phrases               │   │
+│  │ └── kb_service.search() with correlation_id                │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                      │                                             │
+│                      ▼                                             │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │ 统一 SSE 输出层                                              │   │
+│  │ - 默认使用 stream，同步接口内部调用 stream                   │   │
+│  │ - 前端统一使用 streamChatMessage()                          │   │
+│  │ - 错误时自动降级到非流式                                     │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                      │                                             │
+│                      ▼                                             │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │ 后处理层 (Post-processor)                                   │   │
+│  │ ├── A2UI 规范化 (_normalize_a2ui)                          │   │
+│  │ ├── 处方提取 (_extract_prescriptions)                       │   │
+│  │ ├── 承诺生成 (_insert_suggested_tasks)                      │   │
+│  │ └── 审计日志 (_write_agent_run_log with correlation_id)    │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                                                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4. API 实现状态矩阵
+
+| 模块 | Spec端点 | 实现状态 | 关键文件 | 备注 |
+|------|----------|----------|----------|------|
+| Auth | `/api/auth/register` | ✓ 完成 | `auth_routes.py:56` | |
+| Auth | `/api/auth/login` | ✓ 完成 | `auth_routes.py:107` | |
+| Auth | `/api/auth/logout` | ✓ 完成 | `auth_routes.py:145` | |
+| Auth | `/api/auth/me` | ✓ 完成 | `auth_routes.py:162` | |
+| Auth | `/api/auth/validation-points` | ✗ 未实现 | - | P1 待开发 |
+| Chat | `/api/chat/send` | ✓ 完成 | `chat_routes.py:504` | |
+| Chat | `/api/chat/stream` | ✓ 完成 | `chat_routes.py:786` | SSE |
+| Dashboard | `/api/dashboard/overview` | ✓ 完成 | `dashboard_routes.py:72` | |
+| Dashboard | `/api/dashboard/status` | ✓ 完成 | `dashboard_routes.py:144` | |
+| Dashboard | `/api/dashboard/trends` | ✓ 完成 | `dashboard_routes.py:191` | |
+| Dashboard | `/api/dashboard/kline` | ✓ 完成 | `dashboard_routes.py:572` | 需建表 |
+| Dashboard | `/api/dashboard/tasks` | ✓ 完成 | `dashboard_routes.py:295` | |
+| Dashboard | `/api/dashboard/task/accept` | ✓ 完成 | `dashboard_routes.py:319` | |
+| Dashboard | `/api/dashboard/task/done` | ✓ 完成 | `dashboard_routes.py:374` | |
+| Dashboard | `/api/dashboard/checkin` | ✓ 完成 | `dashboard_routes.py:473` | |
+| Report | `/api/report/bazi/submit` | ✓ 完成 | `bento_routes.py` | cli/gemini |
+| Poster | `/api/poster/generate` | ○ 部分 | `poster_routes.py` | 需完善 |
+| Goal | `/api/goal/*` | ✓ 完成 | `goal_routes.py` | |
+| Reflection | `/api/reflection/*` | ✓ 完成 | `reflection_routes.py` | |
+
+---
+
+### 5. 已知问题清单 (按优先级)
+
+#### P0 (阻塞核心功能)
+
+| # | 问题 | 位置 | 修复建议 |
+|---|------|------|----------|
+| 1 | fortune_kline_daily 表未创建 | DB schema | 添加 DDL 到 migrations |
+| 2 | MarkdownTextBlock.content 映射 | app-store.ts | 确认 data→content 转换正确 |
+
+#### P1 (影响用户体验)
+
+| # | 问题 | 位置 | 修复建议 |
+|---|------|------|----------|
+| 3 | validation-points API 缺失 | auth_routes.py | 实现"那就是我"验证点 |
+| 4 | poster 前端集成未完成 | web-app | 添加海报预览组件 |
+| 5 | Session 有效期与 spec 不一致 | auth_routes.py | 改为可配置 |
+| 6 | 反依赖无豁免机制 | soul_os.py | 添加 exempt_phrases |
+
+#### P2 (后续优化)
+
+| # | 问题 | 位置 | 修复建议 |
+|---|------|------|----------|
+| 7 | 无 correlation_id 追踪 | chat_routes.py | 添加 X-Request-ID |
+| 8 | CSRF helpers 重复定义 | api.ts, blocks/index.tsx | 抽取到 lib/csrf.ts |
+| 9 | K-line 前端蜡烛图未实现 | trends-tab.tsx | 替换为 K-line 组件 |
+| 10 | Settings Tab UI 不完整 | web-app | 完善设置页面 |
+
+---
+
+## 0. 一页结论（给产品 & 开发）
+
+### 0.1 MVP 交付目标
+
+在 Web 端跑通一个可重复、可度量、可追溯的“陪跑闭环”：
+
+`Clarify → Insight → Prescription → Commitment → Action → Reflection → Memory Update`
+
+并用最小交互承载三大价值：
+- **导航**：把问题结构化成 `Options / Constraints / Risk Boundary / Next Experiment`
+- **陪伴**：以积极心理学 / Performance Coach 话术承接情绪（不恐吓、不宿命）
+- **提升**：把输出收敛为可执行行动与能力训练轨道（30 天计划 + 复盘）
+
+### 0.2 北极星指标（统一口径）
+
+`WCG`（Weekly Closed-loop Guidance）  
+定义：用户在一周内完成 ≥1 次“触发 → 指引 → 行动 → 反馈”闭环。
+
+### 0.3 最终合并决策（Codex MVP × Claude MVP）
+
+| 决策点 | 最终方案（Final MVP） | 取舍理由 |
+|---|---|---|
+| 闭环核心 | 引入 `Commitment`（4 类承诺） | 没有承诺就没有闭环；与“提升”一致 |
+| 交互效率 | “三点击原则”作为验收标准 | 可验收、可迭代、可控复杂度 |
+| 布局 | **两栏**（对话 + 功能区；会话历史为抽屉/弹层） | 保持极简与高效；多会话仍可用但不占常驻空间 |
+| Bento | 卡片为内容 + Tab 为容器 | 卡片可复用、Tab 可组织复杂度 |
+| 计划 | 4 个预设计划开箱即用 + 30 天轨道统一口径 | 降低选择成本，同时保证“提升”可度量 |
+| 知识库 | **PostgreSQL FTS + pg_trgm**（不引入其他 DB） | 可真实落地、可运维、可追溯 |
+| LLM | GLM（Z.AI / ChatGLM-4） | 统一对话与文本生成后端，便于治理 |
+
+---
+
+## 1. 产品原则（硬规则，可验收）
+
+### 1.1 三点击原则
+
+任何核心价值都必须在 ≤3 次点击内完成：
+- 打开 `/new` → 看今日指引 → 选择一个行动（Commitment）
+- 点“情绪打卡” → 选情绪/强度 → 获得一个调节动作并开始
+- 点“决策模板” → 选问题类型 → 生成下一步实验并加入待办
+
+### 1.2 每次交互必落到 Commitment
+
+`commitment_type`（仅 4 类）：
+- `start_task`：立刻开始（≤5 分钟优先）
+- `schedule_task`：加入今日/本周并设提醒
+- `ask_followup`：选择一个澄清问题继续（减少开放式追问）
+- `opt_out`：暂停/关闭（推送与反依赖的必要出口）
+
+### 1.3 反依赖机制（防玄学依赖）
+
+| 触发条件 | 系统响应（默认温和） |
+|---|---|
+| 连续 3 次问同一问题 | 强制给“现实行动实验”（5–15 分钟）后再继续；提供“我愿意执行/稍后/不再提示” |
+| 当日咨询 > 5 次 | 提示“信息足够，先行动”；给 1 个最小任务并结束回合 |
+| 轨道达标毕业 | 主动降频推送；强调自我掌控；引导进入维护期或换轨道 |
+
+### 1.4 Agent 角色优先级（不可逆）
+
+`Coach > Teaching Assistant > Customer Support > Sales`
+
+销售规则：**先交付价值，再给升级路径**；禁止恐吓式转化。
+
+---
+
+## 2. 前端交互（Web /new：双栏 + Tabs，Next.js）
+
+### 2.1 登录与用户管理（无游客模式）
+
+- 未登录访问 `/new` 时，前端在调用受保护 API（如 `GET /api/dashboard/overview`）返回 `401/403` 后跳转 `/new/login`（当前实现见 `fortune_ai/web-app/src/lib/api.ts`）。  
+- `/new/login`：登录 / 注册二合一（左侧表单 + 右侧命盘预览 + 验证点）  
+- `/new/register`：完整注册页（基础 Profile）  
+- 兼容入口：后端 `/login`、`/register`、`/main` 仅做重定向（`fortune_ai/api/main.py`）  
+- `设置` Tab 必须包含：
+  - 修改密码
+  - 退出登录
+  - 注销账户（软删除，清空会话）
+
+### 2.2 页面结构
+
+`/new` 双栏布局（Zone A / Zone B）：
+- 左：对话线程（Chat Thread，SSOT）+ 顶部会话切换；会话历史以**抽屉/弹层**呈现（不常驻）
+- 右：功能区（Bento/Workbench，承载所有非语言交互）
+
+**ASCII（桌面端 /new 结构）**
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Fortune AI | 会话 ▼ | 风格: warm | 设置 | 退出                              │
+├───────────────────────────────┬──────────────────────────────────────────┤
+│ Chat Thread (SSOT)             │ Bento / Workbench                         │
+│ ─────────────────────────────  │ Tabs: [Bento] [工具] [设置]               │
+│ · 会话历史（抽屉/弹层，按需开） │                                           │
+│ · 消息流（用户/教练）          │ 6 张核心卡片（1 tap 启动）                 │
+│ · 输入框 + 快捷动作            │ + 工具：八字报告/校准/铁板                 │
+│                                │ + 设置：push/静默/隐私/语言风格           │
+└───────────────────────────────┴──────────────────────────────────────────┘
+```
+
+### 2.3 右侧 Bento（Tab 作为容器，卡片为内容）
+
+右侧固定 3 个 Tab：
+- `Bento`（默认）：6 张核心卡片
+- `工具`：八字报告 / 出生校准 / 铁板神算
+- `设置`：语言风格 / 推送与静默时段 / 隐私与数据管理
+
+**Bento 6 张核心卡片（全部 1 tap 启动）**
+1) `今日指引`：结论 + 1 个动作（按钮）  
+2) `行动处方`：最多 3 个进行中任务（完成/跳过/复盘）  
+3) `情绪打卡`：情绪 + 强度（0–10）→ 归因 + 1 个调节动作  
+4) `成长计划`：预设计划（4 个）+ 30 天游程轨道（统一进度口径）  
+5) `决策模板`：Decision Brief（Options/Constraints/Risks/Next Experiment）  
+6) `话术生成`：场景 → 可复制模板（沟通/边界/拒绝/谈判）  
+
+### 2.4 语言风格（表达层）
+
+`persona_style`：
+- `standard`：清晰、中性、专业
+- `warm`：共情、支持性（默认）
+- `roast`：轻毒舌但不羞辱、不做人身定性
+
+---
+
+## 3. Chat Agent（GLM）设计
+
+### 3.1 “后端专业分析”到“教练表达”的翻译规则
+
+后端产出两类输入给 LLM：
+- `facts`：确定性事实（八字计算、用户偏好、计划进度、历史反馈）
+- `evidence`：证据（规则 ID + 知识库引用 + `facts_hash`）
+
+LLM 只做三件事：
+1) 共情承接（积极心理学）
+2) 结构化解释（把问题拆成可控/不可控/需澄清）
+3) 生成行动处方 + 承诺邀请（≤3 条处方）
+
+LLM 禁止做：
+- 自行推断八字事实、编造经典出处、输出确定性宿命论断言
+
+### 3.2 统一对话结构（6 步）
+
+1) 情绪确认  
+2) 结构解释（导航）  
+3) 行动处方（≤3）  
+4) 时间窗口（默认干预窗口）  
+5) 风险边界（医疗/法律/投资等）  
+6) 承诺邀请（Commitment）  
+
+### 3.3 GLM 接入方式（Z.AI OpenAI-compat）
+
+配置来源：`/home/aiscend/work/docs/apikey.md`
+
+**必须环境变量（不在文档中写明密钥值）**
+- `GLM_BASE_URL=https://api.z.ai/api/paas/v4`
+- `GLM_API_KEY=$ZAI_GLM_KEY`
+- `FORTUNE_AI_GLM_MODEL=glm-4.7`
+- `FORTUNE_AI_GLM_THINKING=disabled`（`enabled|disabled`）
+
+**请求协议（Chat Completions）**
+- `POST ${GLM_BASE_URL}/chat/completions`
+- Header：
+  - `Content-Type: application/json`
+  - `Authorization: Bearer ${GLM_API_KEY}`
+- Body：`model`, `messages`, `max_tokens`, `temperature`, `thinking.type`, `stream`
+
+**请求示例（非流式）**
+
+```bash
+curl -sS "$GLM_BASE_URL/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GLM_API_KEY" \
+  -d '{
+    "model": "'"$FORTUNE_AI_GLM_MODEL"'",
+    "max_tokens": 1200,
+    "temperature": 0.6,
+    "stream": false,
+    "thinking": {"type":"disabled"},
+    "messages": [
+      {"role":"system","content":"你是 Fortune AI 的 Performance Coach。请严格仅输出 A2UI JSON（不要代码块/不要多余文本）。"},
+      {"role":"user","content":"我最近很焦虑，工作要不要换？"}
+    ]
+  }'
+```
+
+**注意**
+- 若设置 `thinking.type=enabled`，Z.AI 可能仅返回 `reasoning_content` 且 `content` 为空。
+- 后端会在检测到 `content` 为空时自动降级重试（`thinking=disabled`）以保证有可展示输出。
+
+**输出格式要求（强制）**
+- 返回 **A2UI JSON**，首组件必须为 `markdown_text`，确保前端可渲染。
+
+### 3.4 GLM System Prompt（最终模板，直接用于实现）
+
+> 目标：把“命理/知识库/规则”的专业分析，翻译成“积极心理学/绩效教练”的行动闭环输出；并强制结构化与可追溯。
+
+```text
+你是 Fortune AI 的对话 Agent，角色是积极心理学教练（Performance Coach）。
+
+【产品定位】
+人生导航 / 陪伴 / 提升。系统和交互保持“有效而极简”。
+
+【你的优先级（不可逆）】
+Coach > Teaching Assistant > Customer Support > Sales
+
+【硬性规则（必须遵守）】
+1) 禁止恐吓、羞辱、宿命论断言；负面信息必须紧接“你可以做什么”的行动处方。
+2) 禁止自行计算八字事实；只能基于提供的 facts + evidence 输出。
+3) 每次输出必须包含：结论(conclusion) + 依据(why) + ≤3条处方(prescriptions) + 承诺邀请(commitment_ask)。
+4) 时间窗口默认只给干预窗口（intervention）；forecast 只能条件句+低置信度。
+5) 输出必须是 A2UI JSON，且第一组件必须是 markdown_text。
+6) 必须给出可点击 actions（start_task / schedule_task / open_panel / opt_out）。
+
+【语言风格 persona_style】
+standard：清晰、中性、专业
+warm：共情、支持性（默认）
+roast：轻毒舌但不羞辱、不对人格做负面定性
+
+【输入】
+- persona_style 取值：standard / warm / roast
+- user_context：用户基础信息与偏好（来自 PostgreSQL）
+- facts：八字确定性事实 + 计划进度 + 历史反馈（来自 PostgreSQL）
+- evidence：rule_ids + kb_refs + facts_hash（来自 PostgreSQL）
+- user_message：用户本轮输入（来自对话）
+
+【输出（A2UI JSON）】
+- meta.summary：一句话摘要
+- ui_components[0]：markdown_text（必须，包含：结论要点/依据/处方/时间窗口/边界/承诺邀请）
+- ui_components[1]：action_buttons（必须，包含：开始行动/加入计划/查看Bento等按钮）
+```
+
+---
+
+## 4. 交付契约（Guidance Card + A2UI）
+
+### 4.1 Guidance Card（服务端 SSOT）
+
+```json
+{
+  "card_id": "b3a28c14-7a04-4b6c-8a37-8f4b0bb4c0f3",
+  "type": "daily_guidance",
+  "conclusion": "≤50字结论",
+  "why": "依据（用心理学/教练语言重构）",
+  "prescriptions": [
+    {"task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1", "content": "行动1", "estimated_minutes": 5},
+    {"task_id": "d1d6b1f3-1c1a-4d0f-9a64-2e4a91bfe5d2", "content": "行动2", "estimated_minutes": 10}
+  ],
+  "time_window": {
+    "type": "intervention",
+    "value": "7天试行",
+    "confidence": "high",
+    "checkpoint_date": "2026-01-05"
+  },
+  "risk_boundary": "不替代医疗/法律/投资建议",
+  "commitment_ask": "你愿意先做哪一个？",
+  "actions": [
+    {"type": "start_task", "task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1", "label": "开始行动1"},
+    {"type": "schedule_task", "task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1", "label": "加入今日计划"}
+  ],
+  "evidence": {
+    "plugin": "bazi",
+    "rule_ids": ["RULE-TS-001", "RULE-PATTERN-004"],
+    "kb_refs": ["kb:doc:2:page:45:chunk:3"],
+    "facts_hash": "sha256:3b9e8b9a1ad0b2f92b2d4e8c5a2d9b4c1f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c"
+  },
+  "created_at": "2025-12-29T10:00:00Z"
+}
+```
+
+### 4.2 A2UI（前端渲染）
+
+```json
+{
+  "meta": {"summary": "一句话摘要"},
+  "ui_components": [
+    {"type": "markdown_text", "title": "输出", "data": "### 结论要点\n- 你现在的焦虑主要来自不确定性与信息过载。\n\n### 行动处方（≤3条）\n1) 用决策模板写清选项/约束（10分钟）\n2) 48小时内做一次最小验证（找1位同行聊15分钟）\n3) 情绪峰值先做3分钟降噪再决策\n\n### 承诺\n你愿意先做哪一个？"},
+    {"type": "action_buttons", "title": "下一步", "data": [{"label": "开始行动1", "action": {"type": "start_task", "task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1"}}]}
+  ]
+}
+```
+
+---
+
+## 5. 后端架构（数学脑 / 知识脑 / 语言脑）
+
+```
+Client (/new)
+  → API (FastAPI)
+      → [数学脑] 八字确定性计算（facts + facts_hash）
+      → [知识脑] PostgreSQL FTS 检索知识库（kb_refs）
+      → [语言脑] GLM 生成 A2UI + Guidance Card
+      → PostgreSQL SSOT（用户/会话/计划/承诺/反馈/推送/知识库）
+```
+
+### 5.1 数学脑：八字确定性计算（真太阳时，直接实现）
+
+**输入（来自用户 Profile）**
+- `birthday_local`: `YYYY-MM-DD HH:MM:SS`（用户当地标准时间）
+- `tz_offset_hours`: 例如 `8.0`
+- `location`: `{ "name": "北京", "longitude": 116.4074, "latitude": 39.9042 }`
+
+**真太阳时校正（用于时柱/跨日边界）**
+
+1) 时区中央经线：`tz_meridian_deg = tz_offset_hours * 15`
+2) 经度校正（分钟）：`lon_corr_min = (longitude - tz_meridian_deg) * 4`
+3) 均时差（Equation of Time，分钟）：
+   - `birthday_utc = birthday_local - tz_offset_hours`
+   - `jd_ut = swisseph.julday(birthday_utc.year, birthday_utc.month, birthday_utc.day, hour_decimal_utc)`
+   - `e_days = swisseph.time_equ(jd_ut)`（返回“真太阳时 - 平太阳时”，单位天）
+   - `eot_min = e_days * 1440`
+4) 真太阳时（本地）：`true_solar_time_local = birthday_local + lon_corr_min + eot_min`
+
+**排盘（lunar_python）**
+
+以 `true_solar_time_local` 为排盘时间：
+- `Solar.fromYmdHms(Y,M,D,hh,mm,ss) -> Lunar -> EightChar`
+- 四柱：
+  - `EightChar.getYear()/getMonth()/getDay()/getTime()`
+- 十神（天干 + 地支）：
+  - `getYearShiShenGan/getMonthShiShenGan/getDayShiShenGan/getTimeShiShenGan`
+  - `getYearShiShenZhi/getMonthShiShenZhi/getDayShiShenZhi/getTimeShiShenZhi`
+- 纳音：`getYearNaYin/getMonthNaYin/getDayNaYin/getTimeNaYin`
+- 地势：`getYearDiShi/getMonthDiShi/getDayDiShi/getTimeDiShi`
+- 大运/流年：
+  - `yun = EightChar.getYun(gender_code)`（`男=1`，`女=0`）
+  - `da_yun_list = yun.getDaYun(10)`（取 10 步大运；过滤 `getGanZhi()==''` 的条目）
+  - 每步大运：`getStartAge/getEndAge/getStartYear/getEndYear/getGanZhi/getXun/getXunKong`
+  - 流年：`DaYun.getLiuNian()`（取当年与未来 5 年用于 MVP）
+
+### 5.2 `facts`（LLM 唯一事实输入，固定字段）
+
+`facts` 写入 `fortune_bazi_snapshot.facts`，并作为 GLM 生成的唯一事实来源。
+
+示例（北京，1990-05-12 14:00，男）：
+
+```json
+{
+  "profile": {
+    "name": "张三",
+    "gender": "男",
+    "birthday_local": "1990-05-12 14:00:00",
+    "tz_offset_hours": 8.0,
+    "location": {"name": "北京", "longitude": 116.4074, "latitude": 39.9042}
+  },
+  "solar_time": {
+    "tz_meridian_deg": 120.0,
+    "lon_corr_min": -14.3704,
+    "eot_min": 3.6845,
+    "true_solar_time_local": "1990-05-12 13:49:19"
+  },
+  "bazi": {
+    "pillars": {"year": "庚午", "month": "辛巳", "day": "丁丑", "hour": "丁未"},
+    "day_master": {"gan": "丁", "element": "火"},
+    "wuxing_count": {"金": 2, "木": 0, "水": 0, "火": 4, "土": 2},
+    "shi_shen_gan": {"year": "正财", "month": "偏财", "day": "日主", "hour": "比肩"},
+    "shi_shen_zhi": {
+      "year": ["比肩", "食神"],
+      "month": ["劫财", "正财", "伤官"],
+      "day": ["食神", "七杀", "偏财"],
+      "hour": ["食神", "比肩", "偏印"]
+    },
+    "na_yin": {"year": "路旁土", "month": "白蜡金", "day": "涧下水", "hour": "天河水"},
+    "di_shi": {"year": "临官", "month": "帝旺", "day": "墓", "hour": "冠带"},
+    "luck": {
+      "forward": true,
+      "start_age_year": 8,
+      "da_yun": [
+        {"index": 1, "start_age": 9, "end_age": 18, "start_year": 1998, "end_year": 2007, "gan_zhi": "壬午", "xun": "甲申", "xun_kong": "戌亥"},
+        {"index": 2, "start_age": 19, "end_age": 28, "start_year": 2008, "end_year": 2017, "gan_zhi": "癸未", "xun": "乙酉", "xun_kong": "戌亥"}
+      ],
+      "liu_nian_next5": [
+        {"year": 2026, "gan_zhi": "丙午"},
+        {"year": 2027, "gan_zhi": "丁未"},
+        {"year": 2028, "gan_zhi": "戊申"},
+        {"year": 2029, "gan_zhi": "己酉"},
+        {"year": 2030, "gan_zhi": "庚戌"}
+      ]
+    },
+    "shensha": [
+      {"name": "桃花", "hit": true, "note": "以日支/年支推咸池"},
+      {"name": "驿马", "hit": false, "note": "以日支/年支推驿马"},
+      {"name": "天乙贵人", "hit": true, "note": "以日干推贵人"}
+    ]
+  },
+  "version": {
+    "compute_version": "bazi-tts-v1",
+    "facts_hash": "sha256:9a59e0f36b8f4c8b0b0e0e7b1c3c0d9610e14aa0f0e2d1d6b1f31c1a4d0f9a64"
+  }
+}
+```
+
+### 5.3 旺衰与喜用（MVP 确定性算法，输出可解释）
+
+**日主五行映射（按日干）**
+- 甲乙=木；丙丁=火；戊己=土；庚辛=金；壬癸=水
+
+**月令季节五行（按月支）**
+- 寅卯辰=木（春）；巳午未=火（夏）；申酉戌=金（秋）；亥子丑=水（冬）
+
+**强弱评分（score）**
+- `support = count(day_master) + count(generator_of_day_master)`
+- `drain = count(produced_by_day_master) + count(controller_of_day_master)`
+- `score = support - drain + season_bonus`
+- `season_bonus`：
+  - 月令同五行：`+2`
+  - 月令生日主：`+1`
+  - 月令克日主：`-1`
+  - 月令被日主克：`-1`
+
+**判定**
+- `score >= 2` → `strong`
+- `score <= -2` → `weak`
+- 其余 → `neutral`
+
+**喜用输出**
+- `weak`：喜 `日主五行 + 生扶五行`
+- `strong`：喜 `泄耗五行 + 财五行 + 官杀五行`
+- `neutral`：优先补“最少的五行”
+
+### 5.4 神煞（MVP 固定计算范围与规则）
+
+固定计算：`桃花(咸池)`、`驿马`、`华盖`、`天乙贵人`、`文昌`
+
+**三合局分组（以年支/日支所属局为准）**
+- 申子辰局 → 桃花=酉，驿马=寅，华盖=辰
+- 亥卯未局 → 桃花=子，驿马=巳，华盖=未
+- 寅午戌局 → 桃花=卯，驿马=申，华盖=戌
+- 巳酉丑局 → 桃花=午，驿马=亥，华盖=丑
+
+**天乙贵人（按日干）**
+- 甲/戊/庚：丑、未
+- 乙/己：子、申
+- 丙/丁：亥、酉
+- 辛：寅、午
+- 壬/癸：卯、巳
+
+**文昌（按日干）**
+- 甲乙：巳、午
+- 丙丁：申、酉
+- 戊己：申、酉
+- 庚辛：亥、子
+- 壬癸：寅、卯
+
+命中判定：若四柱地支出现对应地支，则 `hit=true`。
+
+---
+
+## 6. 数据库设计（PostgreSQL / DB=fortune_ai，全部可执行）
+
+> 说明：本节为最终 schema（不使用任何其他数据库）。连接凭据参考 `docs/apikey.md`，将 DB 名替换为 `fortune_ai`。
+
+**决策（回答 DB 名称冲突）**
+- 在同一 PostgreSQL 实例中新建数据库 `fortune_ai`，Fortune AI 所有业务表只创建在该库内。
+- 深度报告支持 `backend=cli|gemini`：`gemini` 数据库保持原样，仅在 `backend=gemini` 时作为报告引擎的 job/task 存储（读写 `gemini_job/gemini_task`）；`backend=cli` 通过 `cli_worker` 的执行链路提交与轮询（不访问 `gemini` DB）。
+
+**运行时连接（必须）**
+- Fortune AI 业务库（DB=fortune_ai）：使用 `FORTUNE_DB_HOST/FORTUNE_DB_PORT/FORTUNE_DB_NAME/FORTUNE_DB_USER/FORTUNE_DB_PASSWORD`（与现有代码一致，`FORTUNE_DB_NAME=fortune_ai`）；也可用单一连接串 `FORTUNE_AI_DB_URL`（libpq URL 形式）。
+- `backend=gemini`：Gemini 报告服务库使用 `.env.example` 同名变量 `GEMINI_DB_HOST/GEMINI_DB_PORT/GEMINI_DB_NAME/GEMINI_DB_USER/GEMINI_DB_PASSWORD` 连接 `gemini`；**仅** `integrations/gemini_repo.py`（以及其依赖的 gemini_tool）允许访问该库，用于创建与轮询 `gemini_job/gemini_task`。
+- `backend=cli`：CLI Worker 使用 `CLI_WORKER_DB_URL`（或本地 sqlite fallback）查询任务状态；任务提交通过 `cli_worker` 项目接口执行（由 `integrations/cli_worker_repo.py` 封装）。
+
+### 6.1 初始化（数据库与扩展）
+
+```sql
+CREATE DATABASE fortune_ai;
+
+\\c fortune_ai;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+### 6.2 用户与偏好
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_user (
+  user_id BIGSERIAL PRIMARY KEY,
+  email TEXT NOT NULL,
+  password_hash TEXT NOT NULL,          -- bcrypt
+  name TEXT NOT NULL,                   -- 昵称/显示名
+  gender TEXT NOT NULL CHECK (gender IN ('男','女')),
+  birthday_local TIMESTAMP NOT NULL,    -- 用户当地标准时间（不含时区）
+  birthday_utc TIMESTAMPTZ NOT NULL,    -- 统一存 UTC 时间（由 birthday_local + tz_offset_hours 推导）
+  tz_offset_hours NUMERIC(4,1) NOT NULL DEFAULT 8.0,
+  location JSONB NOT NULL,              -- {name, longitude, latitude}
+  bazi_digest TEXT,
+  last_login_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fortune_user_email_lower ON fortune_user ((lower(email))) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fortune_user_name ON fortune_user (name) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS fortune_user_preferences (
+  user_id BIGINT PRIMARY KEY REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  persona_style TEXT NOT NULL DEFAULT 'warm' CHECK (persona_style IN ('standard','warm','roast')),
+  push_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  push_time TIME NOT NULL DEFAULT '08:00:00',
+  push_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+  quiet_hours_start TIME NOT NULL DEFAULT '22:00:00',
+  quiet_hours_end TIME NOT NULL DEFAULT '07:00:00',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS fortune_user_session (
+  session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,             -- sha256(base64url_token)
+  csrf_token_hash TEXT NOT NULL,        -- sha256(csrf_token)
+  ip TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,      -- now() + interval '30 days'
+  revoked_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_session_token_hash ON fortune_user_session (token_hash);
+CREATE INDEX IF NOT EXISTS idx_user_session_user_active ON fortune_user_session (user_id, expires_at DESC) WHERE revoked_at IS NULL;
+```
+
+### 6.3 会话与消息（SSOT，不落本地文件）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_conversation_session (
+  session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_conv_session_user_updated ON fortune_conversation_session (user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_conversation_message (
+  message_id BIGSERIAL PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES fortune_conversation_session(session_id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+  content TEXT NOT NULL,
+  a2ui JSONB,                            -- assistant 输出（可空）
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_conv_msg_session_time ON fortune_conversation_message (session_id, created_at);
+```
+
+### 6.4 八字事实快照（可追溯一致性）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_bazi_snapshot (
+  snapshot_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  compute_version TEXT NOT NULL,
+  facts JSONB NOT NULL,
+  facts_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, compute_version, facts_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_bazi_snapshot_user_time ON fortune_bazi_snapshot (user_id, created_at DESC);
+```
+
+### 6.5 承诺与行动（闭环核心）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_commitment (
+  task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  session_id UUID REFERENCES fortune_conversation_session(session_id) ON DELETE SET NULL,
+  card_id UUID,                         -- 生成该建议的交付卡 ID（可空）
+  source TEXT NOT NULL CHECK (source IN ('chat','bento','push')),
+  commitment_type TEXT NOT NULL CHECK (commitment_type IN ('start_task','schedule_task','ask_followup','opt_out')),
+  title TEXT NOT NULL,
+  details JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'suggested' CHECK (status IN ('suggested','active','done','skipped','canceled')),
+  accepted_at TIMESTAMPTZ,              -- 用户确认承诺的时间（commitment_made 以此判定）
+  due_at TIMESTAMPTZ,
+  done_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_commitment_user_status ON fortune_commitment (user_id, status, created_at DESC);
+```
+
+### 6.6 情绪打卡与复盘（反馈闭环）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_checkin (
+  checkin_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  mood TEXT NOT NULL,                    -- 例：焦虑/低落/平静/兴奋
+  intensity INTEGER NOT NULL CHECK (intensity BETWEEN 0 AND 10),
+  note TEXT NOT NULL DEFAULT '',
+  recommended_action TEXT NOT NULL,      -- 系统给出的 1 个动作（可执行）
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_user_time ON fortune_checkin (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_reflection (
+  reflection_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  period TEXT NOT NULL CHECK (period IN ('daily','weekly')),
+  reflection_date DATE NOT NULL,
+  input JSONB NOT NULL,                 -- 用户回答（结构化）
+  output_card JSONB NOT NULL,           -- Guidance Card
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, period, reflection_date)
+);
+```
+
+### 6.7 成长计划（4 个预设 + 用户进度）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_plan (
+  plan_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  duration_days INTEGER NOT NULL CHECK (duration_days > 0),
+  theory TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_day (
+  plan_id TEXT NOT NULL REFERENCES fortune_plan(plan_id) ON DELETE CASCADE,
+  day_no INTEGER NOT NULL CHECK (day_no > 0),
+  title TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  PRIMARY KEY (plan_id, day_no)
+);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_enrollment (
+  enrollment_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL REFERENCES fortune_plan(plan_id) ON DELETE RESTRICT,
+  start_date DATE NOT NULL,
+  current_day INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','completed','abandoned')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, plan_id, start_date)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_enroll_user_status ON fortune_plan_enrollment (user_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_record (
+  record_id BIGSERIAL PRIMARY KEY,
+  enrollment_id BIGINT NOT NULL REFERENCES fortune_plan_enrollment(enrollment_id) ON DELETE CASCADE,
+  day_no INTEGER NOT NULL,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (enrollment_id, day_no)
+);
+```
+
+**预设计划固定为 4 个（开箱即用，写入 DB）**
+
+```sql
+INSERT INTO fortune_plan (plan_id, name, duration_days, theory) VALUES
+  ('gratitude_21', '21天感恩练习', 21, '积极心理学'),
+  ('mindfulness_7', '7天正念入门', 7, '正念冥想'),
+  ('habit_30', '30天习惯养成挑战', 30, '行为科学/原子习惯'),
+  ('strength_14', '14天优势发现之旅', 14, 'VIA优势理论')
+ON CONFLICT (plan_id) DO NOTHING;
+```
+
+**预设计划任务（`fortune_plan_day`，固定内容，直接写入 DB）**
+
+```sql
+-- 21天感恩练习
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('gratitude_21', 1, '启动：三件好事', '写下今天发生的3件值得感恩/欣赏的小事；每件用1句话写清“发生了什么”和“我为什么感激”。'),
+('gratitude_21', 2, '细化：把好事写具体', '从昨天的3件好事里任选1件，补充3个细节（人/地点/动作/感受），让它更可回忆。'),
+('gratitude_21', 3, '人际：感谢一个人', '给一个人发一条感谢信息（不需长），明确说出：对方做了什么→对你产生了什么影响。'),
+('gratitude_21', 4, '逆境：找出一个转折', '回想最近一个不顺，写下：最难的点是什么？我从中学到的一件事是什么？'),
+('gratitude_21', 5, '身体：感谢身体', '写下今天身体为你做好的3件事（例如呼吸、走路、恢复），并做一次1分钟伸展。'),
+('gratitude_21', 6, '环境：感谢一处空间', '选一个你常待的空间（工位/卧室），写下它带给你的1个好处，并整理1个小角落。'),
+('gratitude_21', 7, '一周复盘：我更容易看见什么', '写下这一周你更容易注意到的“好”是什么（人/事/能力/资源），以及下周你想继续强化的1点。'),
+('gratitude_21', 8, '行为：把感谢变成行动', '选择一个你感激的人或资源，做一个5分钟的小行动来回馈（例如主动帮一次忙）。'),
+('gratitude_21', 9, '优势：感谢自己的一个优点', '写下你最近做对的一件事，并标注它体现了你哪种能力/品质（例如专注、勇气、耐心）。'),
+('gratitude_21', 10, '情绪：感谢一次情绪提醒', '回想今天一次负面情绪，写下：它提醒了我什么需求？我能用一个健康方式满足它是什么？'),
+('gratitude_21', 11, '关系：修复一个小摩擦', '选择一个小摩擦场景，写下你能做的一个小修复动作（例如道歉、解释、感谢）。'),
+('gratitude_21', 12, '时间：感谢一次坚持', '写下你最近坚持了3天以上的一件事，并说明它让你得到的一个好处。'),
+('gratitude_21', 13, '工作：感谢一个机会', '写下你当前工作/学习里一个可利用的机会或资源，并写下你明天会做的一个最小利用动作。'),
+('gratitude_21', 14, '两周复盘：我的变化', '用0-10分给“情绪稳定/行动一致/关系满意”各打分，并写下各自提升/下降的原因。'),
+('gratitude_21', 15, '表达：把感谢说出口', '当面或语音对一个人表达感谢（30秒即可）：具体行为→影响→你的感受。'),
+('gratitude_21', 16, '愿景：感谢未来的自己', '写一段给30天后的自己的话：你希望他/她保持什么？你感谢他/她会做到什么？'),
+('gratitude_21', 17, '学习：感谢一次输入', '选一段你今天学到的内容（文章/视频/对话），写下1句可执行的收获（明天怎么用）。'),
+('gratitude_21', 18, '金钱：感谢一笔支出', '挑一笔你最近的支出，写下它解决了什么问题/带来了什么价值；避免自责式语言。'),
+('gratitude_21', 19, '勇气：感谢一次不完美行动', '写下你做过的一次“虽然不完美但仍然去做”的行动；标注它体现的勇气。'),
+('gratitude_21', 20, '整合：我的感谢清单', '把前19天里你最想保留的5条感谢整理成清单，并写下你将如何持续（每周一次）。'),
+('gratitude_21', 21, '毕业：把感谢变成习惯', '写下：这21天最有效的一个做法；以及你未来4周的最小维持频率（例如每周3天）。')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 7天正念入门
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('mindfulness_7', 1, '呼吸锚点（3分钟）', '计时3分钟：只关注呼吸的进出；走神时温和拉回；结束后给自己一句鼓励。'),
+('mindfulness_7', 2, '身体扫描（5分钟）', '从头到脚扫描身体感受；只描述“紧/松/热/冷”，不评判好坏。'),
+('mindfulness_7', 3, '情绪命名（2分钟）', '当下情绪用一个词命名（例如焦虑/烦躁）；再用一句话描述它在身体的感觉。'),
+('mindfulness_7', 4, '正念进食（5分钟）', '选一小口食物：观察颜色/气味/口感；放慢咀嚼；注意冲动与满足的变化。'),
+('mindfulness_7', 5, '正念行走（5分钟）', '走5分钟：注意脚掌触地、身体重心移动；不听信息流。'),
+('mindfulness_7', 6, '3分钟降噪协议', '遇到强情绪时执行：1分钟呼吸→1分钟身体感受→1分钟选择下一步（一个小动作）。'),
+('mindfulness_7', 7, '毕业复盘', '写下：本周最有效的练习是哪一个？你准备在未来两周以什么频率继续？')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 30天习惯养成挑战
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('habit_30', 1, '定义一个最小习惯', '选择一个你想养成的习惯，把它缩小到“2分钟版本”（例如做5个俯卧撑/写50字）。'),
+('habit_30', 2, '设置触发器', '为习惯选择一个固定触发器（起床后/刷牙后/下班到家后），写成一句话，例如：“当我刷牙后，我就做2分钟版本”。'),
+('habit_30', 3, '准备环境', '把执行习惯需要的物品/环境准备好（例如把瑜伽垫放出来）；让开始成本≤30秒。'),
+('habit_30', 4, '记录一次完成', '今天完成一次2分钟版本，并记录：我在什么时刻做的？完成后感觉如何（0-10）？'),
+('habit_30', 5, '加入一个奖励', '为完成后加一个小奖励（1分钟伸展/一杯热水/听一首歌），强化闭环。'),
+('habit_30', 6, '识别阻碍', '写下你今天最可能失败的原因（时间/情绪/环境），并给一个应对预案。'),
+('habit_30', 7, '一周复盘', '统计本周完成天数；写下最有效的触发器与最大阻碍；调整一次触发器或时间。'),
+('habit_30', 8, '提高可见性', '把习惯放到更可见的位置（便签/桌面/日历），让你更容易想起它。'),
+('habit_30', 9, '缩短启动时间', '把“开始动作”进一步缩短（例如只做1个俯卧撑也算开始），确保今天不会零。'),
+('habit_30', 10, '提高一致性', '把习惯固定到同一时间段；如果做不到，就固定“同一触发器”。'),
+('habit_30', 11, '建立替代方案', '准备一个“低能量版本”（例如累时做30秒），保证情绪低谷也能完成。'),
+('habit_30', 12, '消除一个摩擦', '找到一个让你不想做的摩擦点（准备麻烦/太远），今天把它消掉。'),
+('habit_30', 13, '把习惯和身份绑定', '写一句身份宣言：我是谁→我会做什么（例如“我是重视健康的人，所以我每天动2分钟”）。'),
+('habit_30', 14, '两周复盘', '统计14天完成率；写下你最常见的失败场景，并更新一个更现实的预案。'),
+('habit_30', 15, '提升一点难度', '把2分钟版本提升10%-20%（仍然很小），例如从写50字到写60字。'),
+('habit_30', 16, '让它更有趣', '给习惯加一点乐趣（音乐/计时挑战/打卡视觉化），让你更愿意开始。'),
+('habit_30', 17, '建立“如果-那么”计划', '写下两条：如果我加班→那么我做低能量版本；如果我忘了→那么我睡前补一次。'),
+('habit_30', 18, '加入社交承诺', '找一个朋友或对话里做一个承诺：我将坚持到第30天；并写下你希望被如何提醒。'),
+('habit_30', 19, '连续3天挑战', '目标：连续3天不间断完成（允许低能量版本）。'),
+('habit_30', 20, '复盘奖励机制', '写下奖励是否有效；如果无效，换一个更适合你的奖励（不靠刷短视频）。'),
+('habit_30', 21, '三周复盘', '统计21天完成率；写下你完成最多的时间段；把习惯固定到那个时间段。'),
+('habit_30', 22, '减少自责', '写下：我失败时常说的自责句；把它改写成教练句（例如“下一次我做更小”）。'),
+('habit_30', 23, '优化提醒', '设置一个具体提醒（闹钟/日历），并写上行动文案（不是“别忘了”，而是“现在做2分钟版本”）。'),
+('habit_30', 24, '把习惯连到目标', '写下：这个习惯最终服务什么目标？它让你更接近目标的证据是什么？'),
+('habit_30', 25, '应对突发', '假设明天有突发事件，写下你仍能完成的最小动作是什么，并承诺执行。'),
+('habit_30', 26, '连续7天维护', '目标：连续7天都完成（允许低能量版本）；只追求“不断”。'),
+('habit_30', 27, '整理成果', '写下本月你累计完成了多少次；你感觉最大的变化是什么（哪怕很小）。'),
+('habit_30', 28, '建立复盘仪式', '选择一个每周固定的复盘时刻（例如周日20:00），写下你将检查的3个问题。'),
+('habit_30', 29, '准备长期版本', '为下个月定义一个可持续版本（不比现在更难），并确定触发器与提醒方式。'),
+('habit_30', 30, '毕业：写一封给自己的信', '写下：我靠什么坚持了30天？我下个月继续的最小频率是多少？')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 14天优势发现之旅
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('strength_14', 1, '列出5次高光时刻', '写下你过去1-2年里5次“做得很顺/很投入”的时刻；每次写清场景与结果。'),
+('strength_14', 2, '提炼3个优势', '从高光时刻里提炼3个反复出现的优势（例如组织、表达、洞察、执行），并各写一句证据。'),
+('strength_14', 3, '优势命名', '给每个优势起一个你喜欢的名字（更个人化），并写下它在你身上的表现。'),
+('strength_14', 4, '优势应用：工作', '选择一个工作/学习任务，刻意用一个优势完成它；记录结果与感受。'),
+('strength_14', 5, '优势应用：关系', '选择一个关系场景，用一个优势改善沟通（例如倾听/表达/边界），并记录反馈。'),
+('strength_14', 6, '识别优势的阴影面', '为每个优势写下它的“过度使用”会带来的问题（例如过度负责、过度挑剔）。'),
+('strength_14', 7, '一周复盘：优势最有用的时刻', '写下本周优势最有帮助的一次经历；以及下一周你想在哪个场景继续用它。'),
+('strength_14', 8, '优势组合', '挑两个优势做组合：它们如何互补？写下一个你想尝试的组合行动。'),
+('strength_14', 9, '优势补短', '选一个你经常卡住的弱项，写下用哪个优势可以“绕过去”（例如用结构化代替拖延）。'),
+('strength_14', 10, '优势与目标对齐', '写下你当前一个目标；把它拆成3步，并标注每步使用哪个优势最省力。'),
+('strength_14', 11, '请求支持', '找一个人描述你的一个优势，并请对方给一个你可以更好发挥的建议。'),
+('strength_14', 12, '优势表达为价值', '写一段30秒自我介绍：我擅长什么→能为别人带来什么价值（避免空话）。'),
+('strength_14', 13, '优势在压力下的使用', '回想一次压力情境，写下你可以如何用优势稳定自己，并设计一个下次的应对句。'),
+('strength_14', 14, '毕业：优势使用计划', '写下未来4周你要刻意使用的1个优势；设定每周至少2次的应用场景。')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+```
+
+### 6.8 每日指引（今日卡 SSOT）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_daily_guidance (
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  guidance_date DATE NOT NULL,
+  card JSONB NOT NULL,                    -- Guidance Card
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, guidance_date)
+);
+```
+
+### 6.9 推送调度与发送记录（可审计）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_push_event (
+  push_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  push_type TEXT NOT NULL CHECK (push_type IN ('plan_daily','weekly_reflection','milestone')),
+  scheduled_at TIMESTAMPTZ NOT NULL,
+  sent_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','sent','skipped','failed')),
+  payload JSONB NOT NULL,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_push_user_scheduled ON fortune_push_event (user_id, scheduled_at DESC);
+```
+
+### 6.10 八字知识库（PDF 入库 → PostgreSQL 检索）
+
+```sql
+CREATE TABLE IF NOT EXISTS bazi_kb_document (
+  doc_id BIGSERIAL PRIMARY KEY,
+  file_name TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (sha256)
+);
+
+CREATE TABLE IF NOT EXISTS bazi_kb_chunk (
+  chunk_id BIGSERIAL PRIMARY KEY,
+  doc_id BIGINT NOT NULL REFERENCES bazi_kb_document(doc_id) ON DELETE CASCADE,
+  page_no INTEGER NOT NULL CHECK (page_no > 0),
+  chunk_no INTEGER NOT NULL CHECK (chunk_no > 0),
+  content TEXT NOT NULL,
+  content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (doc_id, page_no, chunk_no)
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_tsv ON bazi_kb_chunk USING GIN (content_tsv);
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_trgm ON bazi_kb_chunk USING GIN (content gin_trgm_ops);
+```
+
+检索（用于 Structured RAG）：
+```sql
+-- 关键词检索（FTS）
+SELECT c.chunk_id, c.doc_id, c.page_no, c.chunk_no,
+       ts_rank(c.content_tsv, plainto_tsquery('simple', :q)) AS rank,
+       c.content
+FROM bazi_kb_chunk c
+WHERE c.content_tsv @@ plainto_tsquery('simple', :q)
+ORDER BY rank DESC
+LIMIT 12;
+
+-- 中文场景补充：trgm 相似度
+SELECT c.chunk_id, c.doc_id, c.page_no, c.chunk_no,
+       similarity(c.content, :q) AS sim,
+       c.content
+FROM bazi_kb_chunk c
+WHERE c.content % :q
+ORDER BY sim DESC
+LIMIT 12;
+```
+
+### 6.10.1 知识库入库流程（PDF → 文本 → chunk → PostgreSQL）
+
+**输入目录**
+- `fortune_ai/knowledge/bazi/*.pdf`
+
+**依赖（Python）**
+- `pypdf`（用于 PDF 文本抽取）
+
+**入库规则（固定）**
+- `bazi_kb_document.sha256` 唯一，保证幂等：同一 PDF 重复导入不会产生重复文档。
+- chunk 参数固定：
+  - `chunk_size_chars = 800`
+  - `chunk_overlap_chars = 120`
+- `kb_ref` 统一格式：`kb:doc:{doc_id}:page:{page_no}:chunk:{chunk_no}`
+
+**入库步骤（脚本执行顺序）**
+1) 遍历 PDF：计算文件 `sha256`，写入/复用 `bazi_kb_document`。
+2) 逐页抽取文本：保留 `page_no`；清理多余空白与重复换行。
+3) 分段切分：
+   - 先按段落（空行）拆分
+   - 再按字符数合并成 chunk（800 字），相邻 chunk 120 字重叠
+4) 写入 `bazi_kb_chunk`（`doc_id + page_no + chunk_no` 唯一）
+
+### 6.11 规则库（`rule_ids` SSOT，可追溯）
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_rule (
+  rule_id TEXT PRIMARY KEY,
+  category TEXT NOT NULL,
+  name TEXT NOT NULL,
+  body JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rule_category ON fortune_rule (category);
+```
+
+写入 MVP 必备规则（与 §5.3/§5.4 保持一致）：
+
+```sql
+INSERT INTO fortune_rule (rule_id, category, name, body) VALUES
+('RULE-STRENGTH-SCORE-V1', 'bazi_strength', '旺衰评分算法', '{
+  "season_map": {"寅":"木","卯":"木","辰":"木","巳":"火","午":"火","未":"火","申":"金","酉":"金","戌":"金","亥":"水","子":"水","丑":"水"},
+  "day_master_map": {"甲":"木","乙":"木","丙":"火","丁":"火","戊":"土","己":"土","庚":"金","辛":"金","壬":"水","癸":"水"},
+  "threshold": {"strong": 2, "weak": -2}
+}'::jsonb),
+('RULE-SHENSHA-TAOHUA-V1', 'bazi_shensha', '桃花（咸池）', '{
+  "group_map": {"申子辰":"酉","亥卯未":"子","寅午戌":"卯","巳酉丑":"午"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-YIMA-V1', 'bazi_shensha', '驿马', '{
+  "group_map": {"申子辰":"寅","亥卯未":"巳","寅午戌":"申","巳酉丑":"亥"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-HUAGAI-V1', 'bazi_shensha', '华盖', '{
+  "group_map": {"申子辰":"辰","亥卯未":"未","寅午戌":"戌","巳酉丑":"丑"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-TIANYI-V1', 'bazi_shensha', '天乙贵人', '{
+  "day_gan_map": {"甲":["丑","未"],"戊":["丑","未"],"庚":["丑","未"],"乙":["子","申"],"己":["子","申"],"丙":["亥","酉"],"丁":["亥","酉"],"辛":["寅","午"],"壬":["卯","巳"],"癸":["卯","巳"]}
+}'::jsonb),
+('RULE-SHENSHA-WENCHANG-V1', 'bazi_shensha', '文昌', '{
+  "day_gan_map": {"甲":["巳","午"],"乙":["巳","午"],"丙":["申","酉"],"丁":["申","酉"],"戊":["申","酉"],"己":["申","酉"],"庚":["亥","子"],"辛":["亥","子"],"壬":["寅","卯"],"癸":["寅","卯"]}
+}'::jsonb)
+ON CONFLICT (rule_id) DO UPDATE SET
+  category = EXCLUDED.category,
+  name = EXCLUDED.name,
+  body = EXCLUDED.body,
+  updated_at = now();
+```
+
+### 6.12 外部任务映射（报告 Job：backend=cli|gemini）
+
+目标：Fortune AI 的业务闭环与权限在 `fortune_ai` 库内完成；报告生成的执行与状态可来自 `backend=cli|gemini`，本表负责在两者之间建立“用户 ↔ provider_job_id”的可审计映射。
+
+```sql
+CREATE TABLE IF NOT EXISTS fortune_external_job (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  session_id UUID REFERENCES fortune_conversation_session(session_id) ON DELETE SET NULL,
+  provider TEXT NOT NULL CHECK (provider IN ('cli','gemini')),
+  job_type TEXT NOT NULL CHECK (job_type IN ('bazi_report')),
+  provider_job_id BIGINT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('processing','completed','error')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_polled_at TIMESTAMPTZ,
+  output_url TEXT NOT NULL DEFAULT '',
+  output_a2ui JSONB,
+  error TEXT NOT NULL DEFAULT '',
+  UNIQUE (provider, provider_job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_external_job_user_time ON fortune_external_job (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_job_status ON fortune_external_job (status, updated_at DESC);
+```
+
+---
+
+## 7. API 设计（统一命名，直接实现）
+
+### 7.0 认证与通用约定（必须）
+
+**无游客模式**
+- 只有以下接口不需要登录：
+  - `POST /api/auth/register`
+  - `POST /api/auth/login`
+- 其余所有接口都要求有效登录态，否则返回 `401`。
+
+**登录态（Cookie 会话）**
+- Cookie：
+  - `fortune_session`：`base64url` 随机 token（HttpOnly，`SameSite=Lax`，`Path=/`）
+  - `fortune_csrf`：随机 CSRF token（非 HttpOnly，`SameSite=Lax`，`Path=/`）
+- 服务端校验：
+  - `fortune_session` → `sha256(token)` 匹配 `fortune_user_session.token_hash`，且 `revoked_at IS NULL AND expires_at > now()`
+  - 对所有 `POST/PUT/DELETE`：要求请求头 `X-CSRF-Token`，其 `sha256` 必须匹配 `fortune_user_session.csrf_token_hash`
+
+**统一响应结构**
+
+成功：
+```json
+{"ok": true, "data": {}}
+```
+
+失败：
+```json
+{"ok": false, "error": {"code": "invalid_request", "message": "missing_field: birthday_local", "detail": {"field": "birthday_local"}}}
+```
+
+### 7.1 认证与用户管理
+
+`POST /api/auth/register`（注册即登录）
+
+请求：
+```json
+{
+  "email": "zhangsan@example.com",
+  "password": "S3curePassw0rd!",
+  "name": "张三",
+  "gender": "男",
+  "birthday_local": "1990-05-12 14:00:00",
+  "tz_offset_hours": 8.0,
+  "location": {"name": "北京", "longitude": 116.4074, "latitude": 39.9042}
+}
+```
+
+行为：
+- 创建 `fortune_user`（`email` 统一转小写存储；`password_hash` 使用 bcrypt）
+- upsert `fortune_user_preferences`（默认 `persona_style=warm`）
+- 创建会话：插入 `fortune_user_session`，下发 `fortune_session` 与 `fortune_csrf` Cookie
+- 计算并写入 `fortune_bazi_snapshot`（`compute_version=bazi-tts-v1`）
+
+响应：
+```json
+{
+  "ok": true,
+  "data": {
+    "user_id": 123,
+    "email": "zhangsan@example.com",
+    "profile_summary": {"name": "张三", "gender": "男", "location_name": "北京"}
+  }
+}
+```
+
+`POST /api/auth/login`
+
+请求：
+```json
+{"email":"zhangsan@example.com","password":"S3curePassw0rd!"}
+```
+
+行为：
+- 校验密码（bcrypt）
+- 更新 `fortune_user.last_login_at`
+- 创建 `fortune_user_session` 并下发 Cookie
+
+响应：
+```json
+{"ok": true, "data": {"user_id": 123, "email": "zhangsan@example.com", "name": "张三"}}
+```
+
+`GET /api/auth/me`
+
+响应：
+```json
+{"ok": true, "data": {"user_id": 123, "email": "zhangsan@example.com", "name": "张三", "persona_style": "warm"}}
+```
+
+`POST /api/auth/logout`
+- 行为：将当前 `fortune_user_session.revoked_at = now()`，并清空 Cookie
+
+`GET /api/auth/sessions`
+响应：
+```json
+{
+  "ok": true,
+  "data": {
+    "sessions": [
+      {"session_id":"a9c55f2f-2d2b-4f02-9c35-7f5a0d6d9a1c","created_at":"2025-12-29T10:00:00Z","expires_at":"2026-01-28T10:00:00Z","ip":"106.37.170.238","user_agent":"Mozilla/5.0"}
+    ]
+  }
+}
+```
+
+`POST /api/auth/logout-all`
+- 行为：将该用户所有未过期 session 标记 `revoked_at = now()`，并清空当前 Cookie
+
+`PUT /api/auth/password`
+
+请求：
+```json
+{"old_password":"S3curePassw0rd!","new_password":"N3wS3curePassw0rd!"}
+```
+
+行为：
+- 校验旧密码 → 更新 `fortune_user.password_hash`
+- 退出所有登录态：`logout-all`
+
+`DELETE /api/auth/account`
+
+请求：
+```json
+{"password":"N3wS3curePassw0rd!"}
+```
+
+行为：
+- 校验密码 → `fortune_user.deleted_at = now()`
+- 退出所有登录态：`logout-all`
+
+### 7.2 用户资料（Profile）
+
+`GET /api/user/profile`
+
+响应：
+```json
+{
+  "ok": true,
+  "data": {
+    "profile": {
+      "name": "张三",
+      "gender": "男",
+      "birthday_local": "1990-05-12 14:00:00",
+      "tz_offset_hours": 8.0,
+      "location": {"name": "北京", "longitude": 116.4074, "latitude": 39.9042}
+    },
+    "preferences": {"persona_style":"warm","push_enabled":true,"push_time":"08:00:00","quiet_hours_start":"22:00:00","quiet_hours_end":"07:00:00"}
+  }
+}
+```
+
+`PUT /api/user/profile`（更新出生信息会触发重算）
+
+请求：
+```json
+{
+  "name": "张三",
+  "gender": "男",
+  "birthday_local": "1990-05-12 13:50:00",
+  "tz_offset_hours": 8.0,
+  "location": {"name": "北京", "longitude": 116.4074, "latitude": 39.9042}
+}
+```
+
+行为：
+- 更新 `fortune_user` 的 Profile 字段
+- 写入新的 `fortune_bazi_snapshot`（重算并生成新 `facts_hash`）
+
+### 7.3 会话
+
+`POST /api/session/new`
+```json
+{"title": "新对话"}
+```
+
+响应：
+```json
+{"ok": true, "data": {"session_id": "5bfa6d4f-2b4b-4f6f-8a5c-4f6d9a1e5a0d", "title": "新对话"}}
+```
+
+`GET /api/session/list`
+```json
+{"ok": true, "data": {"sessions": [{"session_id":"5bfa6d4f-2b4b-4f6f-8a5c-4f6d9a1e5a0d","title":"新对话","updated_at":"2025-12-29T10:00:00Z","preview":"我最近很焦虑，工作要不要换？"}]}}
+```
+
+`GET /api/session/{session_id}`
+```json
+{"ok": true, "data": {"messages": [{"role":"user","content":"我最近很焦虑，工作要不要换？"},{"role":"assistant","content":"（已用A2UI返回）","a2ui":{"meta":{"summary":"把问题写清并做最小验证"},"ui_components":[{"type":"markdown_text","title":"输出","data":"### 结论要点\\n- 你现在的焦虑主要来自不确定性与信息过载。\\n\\n### 行动处方（≤3条）\\n1) 用决策模板写清选项/约束（10分钟）\\n2) 48小时内做一次最小验证（找1位同行聊15分钟）\\n3) 情绪峰值先做3分钟降噪再决策\\n\\n### 承诺\\n你愿意先做哪一个？"}]}}}]}}
+```
+
+### 7.4 Chat（GLM，写入会话 + 生成“建议承诺”）
+
+`POST /api/chat/send`
+
+请求：
+```json
+{"session_id":"5bfa6d4f-2b4b-4f6f-8a5c-4f6d9a1e5a0d","text":"我最近很焦虑，工作要不要换？"}
+```
+
+行为：
+- 写入 `fortune_conversation_message(role=user)`
+- 读取最新 `fortune_bazi_snapshot` + `fortune_user_preferences` + 计划/承诺/打卡摘要
+- 检索知识库 `bazi_kb_chunk`（FTS + trgm，top-k=12）得到 `kb_refs`
+- 调用 GLM 输出 A2UI（必须含 actions）
+- 写入 `fortune_conversation_message(role=assistant, a2ui=GLM输出的A2UI JSON)`
+- 将 A2UI 中的处方写入 `fortune_commitment(status=suggested, source=chat, card_id=card.card_id)`
+
+响应：
+```json
+{"ok": true, "data": {"assistant_message": {"role":"assistant","a2ui":{"meta":{"summary":"先把问题写清，再做最小验证"},"ui_components":[{"type":"markdown_text","title":"输出","data":"### 结论要点\\n- 你现在的焦虑主要来自不确定性与信息过载。\\n\\n### 行动处方（≤3条）\\n1) 用决策模板写清选项/约束（10分钟）\\n2) 48小时内做一次最小验证（找1位同行聊15分钟）\\n3) 情绪峰值先做3分钟降噪再决策\\n\\n### 承诺\\n你愿意先做哪一个？"},{"type":"action_buttons","title":"下一步","data":[{"label":"生成决策模板","action":{"type":"open_panel","panel":"decision_brief"}},{"label":"开始行动1","action":{"type":"accept_task","task_id":"4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1"}}]}]}},"suggested_tasks":[{"task_id":"4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1","title":"用决策模板写清选项/约束（10分钟）"}]}}
+```
+
+### 7.5 Bento（非语言交互）
+
+`GET /api/bento/today`
+- 返回今日指引卡；并 upsert `fortune_daily_guidance(user_id, today)`
+
+`POST /api/bento/checkin`
+```json
+{"mood":"焦虑","intensity":7,"note":"总担心选错"}
+```
+- 写入 `fortune_checkin`
+- 返回一个“调节动作” + card（并带 actions 以便生成承诺）
+
+`POST /api/bento/commitment/accept`
+```json
+{"task_id":"4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1","due_at":"2025-12-29T13:00:00Z"}
+```
+- 将该 task 从 `suggested` 变为 `active`，写入 `accepted_at`
+
+`POST /api/bento/commitment/done`
+```json
+{"task_id":"4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1","note":"已完成，感觉更清晰了"}
+```
+- `status=done`，写 `done_at`
+
+`POST /api/bento/decision-brief`
+```json
+{"session_id":"5bfa6d4f-2b4b-4f6f-8a5c-4f6d9a1e5a0d","topic":"是否换工作","options":["留下","跳槽"],"constraints":["经济压力","学习成本"],"time_horizon_days":30}
+```
+
+`POST /api/bento/script`
+```json
+{"session_id":"5bfa6d4f-2b4b-4f6f-8a5c-4f6d9a1e5a0d","scenario":"和领导谈涨薪","tone":"professional","constraints":["不引战","清晰边界"],"length":"short"}
+```
+
+`POST /api/bento/reflect`
+```json
+{"period":"weekly","reflection_date":"2025-12-29","input":{"wins":["按计划完成了2分钟习惯"],"pain_points":["中途差点放弃"],"next_week_focus":["把触发器固定到刷牙后"]}}
+```
+
+### 7.6 计划（固定 4 个）
+
+`GET /api/plan/list`：返回 `fortune_plan`
+
+`POST /api/plan/join`
+```json
+{"plan_id":"habit_30","start_date":"2025-12-29"}
+```
+
+`POST /api/plan/record`
+```json
+{"plan_id":"habit_30","day_no":1,"completed":true,"note":"完成2分钟版本"}
+```
+
+### 7.7 偏好与推送
+
+`GET /api/user/preferences`：读取 `fortune_user_preferences`
+
+`PUT /api/user/preferences`
+```json
+{"persona_style":"warm","push_enabled":true,"push_time":"08:00:00","quiet_hours_start":"22:00:00","quiet_hours_end":"07:00:00"}
+```
+
+`POST /api/push/pause`
+```json
+{"push_enabled": false}
+```
+
+### 7.8 八字深度报告（backend=cli|gemini）
+
+定位：作为 `工具` Tab 的可选能力（长文报告、阅读模式），不影响主闭环（主闭环用 GLM）。
+
+**边界（DB 使用）**
+- Fortune AI 业务数据与权限控制：`fortune_ai`（本项目所有表）
+- `backend=cli`：调用 `cli_worker` 执行与状态查询（不访问 `gemini` DB）
+- `backend=gemini`：复用现有 gemini job/task 流程（仅此处会访问 `gemini` DB，见 `.env.example` 的 `GEMINI_DB_*`）
+
+**对外 API（绑定登录用户，权限可控）**
+
+`POST /api/report/bazi/submit`
+
+请求：
+```json
+{"backend":"cli","model":"deep_research","system_prompt":"你是一个八字大师，请以建设性、可执行的方式输出。"}
+```
+
+行为：
+- 从 `fortune_user` 读取该用户的出生信息（不允许前端随意覆盖）
+- 默认 `backend=cli`：调用 `cli_worker` 执行链路提交与轮询任务
+- 当 `backend=gemini`：调用现有报告引擎（内部仍走 `/api/v2/submit` 与 `task_service.submit_bazi_task_v2` 的逻辑）
+- 在 `fortune_ai` 写入 `fortune_external_job` 记录（user_id ↔ provider_job_id ↔ backend ↔ session_id 可选）
+
+响应：
+```json
+{"ok": true, "data": {"job_id": 101, "backend": "cli", "status": "processing"}}
+```
+
+`GET /api/report/bazi/{job_id}?backend=cli|gemini`
+
+响应（processing）：
+```json
+{"ok": true, "data": {"job_id": 101, "backend": "cli", "status": "processing"}}
+```
+
+响应（completed）：
+```json
+{"ok": true, "data": {"job_id": 101, "backend": "cli", "status": "completed", "a2ui": {"meta": {"summary": "八字深度报告"}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": "### 结论要点\\n- 你属于偏火土的结构，做事更适合先定节奏再推进。\\n\\n### 行动处方（≤3条）\\n1) 本周只做一个最小目标（写清楚并公开承诺）\\n2) 每天固定一个30分钟深度专注块\\n3) 情绪上头时先做3分钟降噪再沟通"}]}}}
+```
+
+**内部保留接口（不建议前端直接调用）**
+- `POST /api/v2/submit`
+- `GET /api/v2/report/{job_id}`
+
+---
+
+## 8. 主动服务（Push）实现（订阅制、可审计）
+
+### 8.1 触发与频控（固定）
+
+| push_type | 触发 | 频率上限 |
+|---|---|---:|
+| `plan_daily` | 用户加入任一计划后，每日到点 | 每日 1 次 |
+| `weekly_reflection` | 每周固定一天到点 | 每周 1 次 |
+| `milestone` | streak/毕业/关键里程碑 | 达成即推 |
+
+### 8.2 发送规则（执行时检查）
+
+发送前必须同时满足：
+- `fortune_user_preferences.push_enabled = true`
+- 不在静默时段
+- 同类 push 当日未发送过（以 `fortune_push_event` 去重）
+
+---
+
+## 9. 验收（可运行、可统计、可回放）
+
+### 9.1 事件口径（WCG）
+
+| 事件 | 写入表 | 判定 |
+|---|---|---|
+| trigger | `fortune_push_event` / `fortune_conversation_message` | 用户打开/点击/发起 |
+| guidance_shown | `fortune_daily_guidance` / message.a2ui | 已展示 card |
+| commitment_made | `fortune_commitment` | `accepted_at IS NOT NULL` |
+| action_done | `fortune_commitment.status='done'` | 完成 ≥1 |
+| feedback | `fortune_checkin` / `fortune_reflection` | 有打卡/复盘 |
+
+### 9.2 关键验收标准
+
+- 三点击路径全部可走通（今日指引/情绪打卡/决策模板/话术生成）
+- 每次 Chat 输出都有 `commitment_ask` 与可点击 `actions`
+- 任何负面提示都包含“你可以做什么”的行动处方
+- 所有输出可追溯：`facts_hash + kb_refs + rule_ids`
+
+---
+
+## 10. 4 周交付计划（Final MVP）
+
+1) Week 1：PostgreSQL schema（fortune_ai）+ 登录/会话（注册/登录/用户管理）+ 会话/消息 SSOT + `/new`/`/new/login`/`/new/register` 路由落地（`/login`/`/register`/`/main` 做兼容跳转）  
+2) Week 2：八字事实完整版（facts + facts_hash）+ 知识库入库脚本（PDF→chunk→PG）+ 检索接口  
+3) Week 3：GLM 对话 `/api/chat/send` + Guidance Card/A2UI 输出 + Bento 6 卡片 API  
+4) Week 4：计划（4 个预设）+ Push 调度器（写 `fortune_push_event`）+ WCG 指标统计与回放  

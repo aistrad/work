@@ -1,0 +1,145 @@
+Cloudflare Turnstile (前端无感验证) + 临时邮箱黑名单 (后端过滤) + Redis 限流。
+
+1. 核心防线：Cloudflare Turnstile (推荐)
+不要用 Google reCAPTCHA（国内访问慢/不通）。Cloudflare Turnstile 是目前体验最好的方案：
+
+免费。
+
+无感：绝大多数用户不需要点击“找出所有红绿灯”，只要在那停顿一下就自动过了。
+
+全球畅通：在国内和香港都能极速加载。
+
+实施步骤：
+A. 获取密钥
+
+去 Cloudflare Dashboard -> Turnstile。
+
+添加站点 (vibelife.ai)。
+
+获取 Site Key (前端用) 和 Secret Key (后端用)。
+
+B. 前端实现 (Next.js) 安装组件库：npm install @marsidev/react-turnstile
+
+TypeScript
+
+// components/auth/EmailLoginForm.tsx
+import { Turnstile } from '@marsidev/react-turnstile'
+import { useState } from 'react'
+
+export default function EmailLoginForm() {
+  const [token, setToken] = useState('')
+  const [email, setEmail] = useState('')
+
+  const handleSubmit = async () => {
+    if (!token) {
+      alert('请等待人机验证通过')
+      return
+    }
+
+    // 将 token 和 email 一起发给后端
+    const res = await fetch('/api/auth/signin-email', {
+      method: 'POST',
+      body: JSON.stringify({ email, cf_token: token }) // 关键
+    })
+  }
+
+  return (
+    <div className="space-y-4">
+      <input 
+        type="email" 
+        value={email} 
+        onChange={e => setEmail(e.target.value)} 
+        placeholder="name@example.com"
+      />
+      
+      {/* 验证码组件 */}
+      <Turnstile 
+        siteKey={process.env.NEXT_PUBLIC_CF_SITE_KEY} 
+        onSuccess={(token) => setToken(token)} 
+        options={{ theme: 'light' }}
+      />
+      
+      <button onClick={handleSubmit}>登录 / 注册</button>
+    </div>
+  )
+}
+C. 后端校验 (API Route) 在发送邮件之前，先问 Cloudflare 这个 token 对不对。
+
+TypeScript
+
+// app/api/auth/signin-email/route.ts
+import { NextResponse } from 'next/server'
+
+export async function POST(request: Request) {
+  const { email, cf_token } = await request.json()
+
+  // --- 1. 人机验证 (Turnstile) ---
+  const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      secret: process.env.CF_SECRET_KEY, // 你的后端密钥
+      response: cf_token,
+    }),
+  })
+
+  const verifyData = await verifyRes.json()
+  
+  if (!verifyData.success) {
+    return NextResponse.json({ error: '人机验证失败，请刷新重试' }, { status: 400 })
+  }
+
+  // --- 验证通过，继续后面的逻辑 ---
+  // 发送邮件...
+}
+2. 第二道防线：屏蔽“临时邮箱” (Disposable Email)
+很多机器人使用 10minutemail.com 这种一次性邮箱来薅羊毛。你需要把它们拒之门外。
+
+方法：使用开源的黑名单库。
+
+安装：npm install disposable-email-domains
+
+TypeScript
+
+// 在后端 API 中继续添加逻辑
+import disposableDomains from 'disposable-email-domains'
+
+const domain = email.split('@')[1]
+
+if (disposableDomains.includes(domain)) {
+  return NextResponse.json({ error: '不支持使用临时/一次性邮箱注册' }, { status: 400 })
+}
+3. 第三道防线：Redis 频率限制 (Rate Limiting)
+防止同一个 IP 在短时间内疯狂请求发送邮件接口，耗尽你的邮件额度。
+
+TypeScript
+
+import Redis from 'ioredis'
+const redis = new Redis(process.env.REDIS_URL)
+
+// 获取用户 IP (Next.js 中通常在 headers 里)
+const ip = request.headers.get('x-forwarded-for') || 'unknown'
+
+// 规则：同一个 IP，1小时内只能请求 5 次验证邮件
+const key = `rate_limit:email:${ip}`
+const currentCount = await redis.incr(key)
+
+if (currentCount === 1) {
+  await redis.expire(key, 3600) // 设置 1 小时过期
+}
+
+if (currentCount > 5) {
+  return NextResponse.json({ error: '操作太频繁，请稍后再试' }, { status: 429 })
+}
+总结：防御体系全貌
+当一个“用户”点击发送登录邮件时，VibeLife 的后台会经历以下三层过滤：
+
+Cloudflare Turnstile：拦住 99% 的脚本机器人。
+
+Redis 限流：拦住高频暴力请求的人类或漏网之鱼。
+
+临时邮箱库：拦住羊毛党和虚假账号。
+
+只有通过这三关，你的服务器才会调用 Resend/AWS SES 发出那封邮件。
+
+需要我帮你把这个逻辑整合到 NextAuth 的 signIn 回调中吗？（因为 NextAuth 默认逻辑很难插入验证码校验，需要一点特殊处理）。

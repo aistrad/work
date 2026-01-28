@@ -1,0 +1,382 @@
+"""
+VibeLife Reminder Routes
+提醒系统 API 路由
+"""
+
+from datetime import date
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from stores.db import get_db_pool
+from services.reminder import (
+    FortuneCalendar,
+    ReminderScheduler,
+    ContentGenerator,
+    NotificationService
+)
+from services.reminder.calendar import EventType, FortuneEvent
+from services.reminder.scheduler import ReminderSettings, ReminderType
+
+router = APIRouter(prefix="/reminders", tags=["reminders"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class ReminderSettingsUpdate(BaseModel):
+    bazi_month_enabled: Optional[bool] = None
+    bazi_month_advance_days: Optional[int] = None
+    bazi_year_enabled: Optional[bool] = None
+    bazi_year_advance_days: Optional[int] = None
+    mercury_retrograde_enabled: Optional[bool] = None
+    mercury_retrograde_advance_days: Optional[int] = None
+    weekly_fortune_enabled: Optional[bool] = None
+    weekly_fortune_time: Optional[str] = None
+    quiet_start_time: Optional[str] = None
+    quiet_end_time: Optional[str] = None
+    in_app_enabled: Optional[bool] = None
+    push_enabled: Optional[bool] = None
+    wechat_enabled: Optional[bool] = None
+
+
+class NotificationResponse(BaseModel):
+    id: str
+    notification_type: str
+    title: str
+    content: str
+    read: bool
+    created_at: str
+
+
+class EventResponse(BaseModel):
+    id: str
+    event_type: str
+    name: str
+    start_date: str
+    end_date: Optional[str] = None
+    event_data: dict = {}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Event Calendar Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/events/upcoming")
+async def get_upcoming_events(
+    days_ahead: int = Query(7, ge=1, le=90),
+    event_type: Optional[str] = None
+):
+    """获取即将到来的运势事件"""
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    event_types = None
+    if event_type:
+        try:
+            event_types = [EventType(event_type)]
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid event type: {event_type}")
+
+    events = await calendar.get_upcoming_events(days_ahead, event_types)
+
+    return {
+        "events": [
+            EventResponse(
+                id=e.id,
+                event_type=e.event_type.value,
+                name=e.name,
+                start_date=e.start_date.isoformat(),
+                end_date=e.end_date.isoformat() if e.end_date else None,
+                event_data=e.event_data
+            )
+            for e in events
+        ]
+    }
+
+
+@router.get("/events/date/{target_date}")
+async def get_events_for_date(target_date: str):
+    """获取指定日期的事件"""
+    try:
+        check_date = date.fromisoformat(target_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
+
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    events = await calendar.get_events_for_date(check_date)
+
+    return {
+        "date": target_date,
+        "events": [
+            EventResponse(
+                id=e.id,
+                event_type=e.event_type.value,
+                name=e.name,
+                start_date=e.start_date.isoformat(),
+                end_date=e.end_date.isoformat() if e.end_date else None,
+                event_data=e.event_data
+            )
+            for e in events
+        ]
+    }
+
+
+@router.get("/events/mercury-retrograde")
+async def check_mercury_retrograde(check_date: Optional[str] = None):
+    """检查是否在水逆期间"""
+    target_date = None
+    if check_date:
+        try:
+            target_date = date.fromisoformat(check_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    is_retro, details = await calendar.is_mercury_retrograde(target_date)
+
+    return {
+        "is_mercury_retrograde": is_retro,
+        "details": details
+    }
+
+
+@router.get("/events/next-solar-term")
+async def get_next_solar_term():
+    """获取下一个节气"""
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    event = await calendar.get_next_solar_term()
+    if not event:
+        return {"event": None}
+
+    return {
+        "event": EventResponse(
+            id=event.id,
+            event_type=event.event_type.value,
+            name=event.name,
+            start_date=event.start_date.isoformat(),
+            end_date=event.end_date.isoformat() if event.end_date else None,
+            event_data=event.event_data
+        )
+    }
+
+
+@router.get("/events/next-moon-phase")
+async def get_next_moon_phase(phase_type: Optional[str] = None):
+    """获取下一个月相 (new_moon/full_moon)"""
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    event = await calendar.get_next_moon_phase(phase_type)
+    if not event:
+        return {"event": None}
+
+    return {
+        "event": EventResponse(
+            id=event.id,
+            event_type=event.event_type.value,
+            name=event.name,
+            start_date=event.start_date.isoformat(),
+            end_date=event.end_date.isoformat() if event.end_date else None,
+            event_data=event.event_data
+        )
+    }
+
+
+@router.post("/events/initialize")
+async def initialize_events():
+    """初始化预计算的运势事件 (管理员接口)"""
+    pool = await get_db_pool()
+    calendar = FortuneCalendar(pool)
+
+    count = await calendar.initialize_events()
+
+    return {
+        "message": "Events initialized successfully",
+        "events_created": count
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Reminder Settings Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/settings/{user_id}")
+async def get_reminder_settings(user_id: str):
+    """获取用户提醒设置"""
+    pool = await get_db_pool()
+    scheduler = ReminderScheduler(pool)
+
+    settings = await scheduler.get_user_settings(user_id)
+
+    return {
+        "settings": settings.model_dump()
+    }
+
+
+@router.put("/settings/{user_id}")
+async def update_reminder_settings(user_id: str, updates: ReminderSettingsUpdate):
+    """更新用户提醒设置"""
+    pool = await get_db_pool()
+    scheduler = ReminderScheduler(pool)
+
+    # 获取当前设置
+    current = await scheduler.get_user_settings(user_id)
+
+    # 应用更新
+    update_data = updates.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        if value is not None:
+            setattr(current, key, value)
+
+    # 保存
+    await scheduler.update_user_settings(current)
+
+    return {
+        "message": "Settings updated",
+        "settings": current.model_dump()
+    }
+
+
+@router.get("/pending/{user_id}")
+async def get_pending_reminders(
+    user_id: str,
+    days_ahead: int = Query(7, ge=1, le=30)
+):
+    """获取用户未来的待发送提醒"""
+    pool = await get_db_pool()
+    scheduler = ReminderScheduler(pool)
+
+    tasks = await scheduler.get_pending_reminders_for_user(user_id, days_ahead)
+
+    return {
+        "reminders": [
+            {
+                "reminder_type": t.reminder_type.value,
+                "event_name": t.event_name,
+                "event_date": t.event_date.isoformat(),
+                "scheduled_at": t.scheduled_at.isoformat()
+            }
+            for t in tasks
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Notification Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/notifications/{user_id}")
+async def get_notifications(
+    user_id: str,
+    unread_only: bool = False,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """获取用户通知列表"""
+    pool = await get_db_pool()
+    service = NotificationService(pool)
+
+    notifications = await service.get_user_notifications(
+        user_id, unread_only, limit, offset
+    )
+
+    return {
+        "notifications": [
+            NotificationResponse(
+                id=n.id,
+                notification_type=n.notification_type,
+                title=n.title,
+                content=n.content,
+                read=n.status.value == "read",
+                created_at=n.created_at.isoformat() if n.created_at else ""
+            )
+            for n in notifications
+        ]
+    }
+
+
+@router.get("/notifications/{user_id}/unread-count")
+async def get_unread_count(user_id: str):
+    """获取未读通知数量"""
+    pool = await get_db_pool()
+    service = NotificationService(pool)
+
+    count = await service.get_unread_count(user_id)
+
+    return {"unread_count": count}
+
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, user_id: str):
+    """标记通知为已读"""
+    pool = await get_db_pool()
+    service = NotificationService(pool)
+
+    success = await service.mark_as_read(notification_id, user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Notification not found")
+
+    return {"message": "Marked as read"}
+
+
+@router.post("/notifications/{user_id}/read-all")
+async def mark_all_notifications_read(user_id: str):
+    """标记所有通知为已读"""
+    pool = await get_db_pool()
+    service = NotificationService(pool)
+
+    count = await service.mark_all_as_read(user_id)
+
+    return {"message": f"Marked {count} notifications as read"}
+
+
+@router.delete("/notifications/{notification_id}")
+async def delete_notification(notification_id: str, user_id: str):
+    """删除通知"""
+    pool = await get_db_pool()
+    service = NotificationService(pool)
+
+    success = await service.delete_notification(notification_id, user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Notification not found")
+
+    return {"message": "Notification deleted"}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Scheduler Trigger (Cron Job Endpoint)
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/scheduler/run")
+async def run_scheduler():
+    """
+    触发提醒调度任务
+    此接口应由 Cron Job 定时调用 (如每天早上8点)
+    """
+    pool = await get_db_pool()
+    scheduler = ReminderScheduler(pool)
+    generator = ContentGenerator(pool)
+    notification_service = NotificationService(pool, generator)
+
+    # 扫描并生成提醒任务
+    tasks = await scheduler.scan_and_schedule()
+
+    # 发送通知
+    sent_count = 0
+    for task in tasks:
+        notifications = await notification_service.send_reminder(task)
+        sent_count += len(notifications)
+
+    return {
+        "message": "Scheduler run complete",
+        "tasks_generated": len(tasks),
+        "notifications_sent": sent_count
+    }

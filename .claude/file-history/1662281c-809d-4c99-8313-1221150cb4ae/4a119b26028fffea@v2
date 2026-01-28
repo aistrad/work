@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""
+CoreAgent + Skills E2E 综合测试
+================================
+
+测试目标：
+1. 覆盖所有11个Skills的核心场景
+2. 验证Phase 1路由（Skill选择）
+3. 验证Phase 2执行（工具调用）
+4. 验证边界情况和错误处理
+5. 汇报系统实际返回结果
+
+运行方式:
+    cd apps/api && python scripts/test_e2e_comprehensive.py
+"""
+
+import asyncio
+import sys
+import os
+import json
+from datetime import datetime
+from uuid import UUID, uuid4
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from enum import Enum
+
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../../.env"))
+
+# 添加项目路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../"))
+
+from services.agent.core import CoreAgent, AgentContext
+from services.llm import get_llm_client
+from stores.unified_profile_repo import (
+    get_unified_profile,
+    UnifiedProfileRepository
+)
+from stores.conversation_repo import create_conversation
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 测试数据结构
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCategory(Enum):
+    ROUTING = "路由测试"
+    SKILL_CORE = "Core对话"
+    SKILL_BAZI = "八字命理"
+    SKILL_ZODIAC = "西方占星"
+    SKILL_TAROT = "塔罗占卜"
+    SKILL_CAREER = "职业规划"
+    SKILL_LIFECOACH = "人生教练"
+    SKILL_PSYCH = "心理探索"
+    SKILL_MINDFULNESS = "正念导师"
+    SKILL_VIBE_ID = "人格画像"
+    SKILL_SYNASTRY = "关系合盘"
+    SKILL_JUNGASTRO = "荣格占星"
+    EDGE_CASES = "边界测试"
+    MULTI_SKILL = "多技能切换"
+
+
+@dataclass
+class TestCase:
+    id: str
+    category: TestCategory
+    name: str
+    message: str
+    skill: Optional[str] = None  # 如果为None，测试Phase 1路由
+    expected_tool_calls: List[str] = field(default_factory=list)
+    expected_keywords: List[str] = field(default_factory=list)
+    requires_birth_info: bool = False
+    requires_chart: bool = False
+    description: str = ""
+
+
+@dataclass
+class TestResult:
+    test_id: str
+    success: bool
+    llm_reply: str
+    tool_calls: List[Dict[str, Any]]
+    tool_results: List[Dict[str, Any]]
+    iterations: int
+    error: Optional[str] = None
+    duration_ms: int = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 测试用例定义
+# ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASES = [
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1. Phase 1 路由测试（不指定skill，让LLM选择）
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="R1",
+        category=TestCategory.ROUTING,
+        name="路由到八字",
+        message="帮我算算命",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["八字", "命理"],
+        description="测试LLM是否能正确路由到八字skill"
+    ),
+    TestCase(
+        id="R2",
+        category=TestCategory.ROUTING,
+        name="路由到星盘",
+        message="我想看看我的星盘",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["星", "占星"],
+        description="测试LLM是否能正确路由到zodiac skill"
+    ),
+    TestCase(
+        id="R3",
+        category=TestCategory.ROUTING,
+        name="路由到塔罗",
+        message="帮我抽张塔罗牌",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["塔罗", "牌"],
+        description="测试LLM是否能正确路由到tarot skill"
+    ),
+    TestCase(
+        id="R4",
+        category=TestCategory.ROUTING,
+        name="路由到职业",
+        message="我不知道该选什么工作",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["职业", "工作"],
+        description="测试LLM是否能正确路由到career skill"
+    ),
+    TestCase(
+        id="R5",
+        category=TestCategory.ROUTING,
+        name="路由到心理",
+        message="最近感觉很焦虑",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["焦虑", "感受", "情绪"],
+        description="测试LLM是否能正确路由到psych skill"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2. Core Skill 对话测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="C1",
+        category=TestCategory.SKILL_CORE,
+        name="日常问候",
+        message="你好",
+        skill="core",
+        expected_keywords=["你好", "嗨"],
+        description="测试基础问候响应"
+    ),
+    TestCase(
+        id="C2",
+        category=TestCategory.SKILL_CORE,
+        name="情绪支持",
+        message="今天心情不太好",
+        skill="core",
+        expected_keywords=["心情", "怎么", "发生"],
+        description="测试情绪支持和共情"
+    ),
+    TestCase(
+        id="C3",
+        category=TestCategory.SKILL_CORE,
+        name="倾听理解",
+        message="我感觉生活没有方向",
+        skill="core",
+        expected_keywords=["方向", "感觉"],
+        description="测试倾听和引导探索"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3. 八字 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="B1",
+        category=TestCategory.SKILL_BAZI,
+        name="无出生信息排盘",
+        message="帮我排八字",
+        skill="bazi",
+        expected_tool_calls=["ask", "collect_bazi_info"],
+        expected_keywords=["出生", "生辰", "信息"],
+        description="没有出生信息时应收集"
+    ),
+    TestCase(
+        id="B2",
+        category=TestCategory.SKILL_BAZI,
+        name="有信息排盘",
+        message="我是1990年5月15日上午10点北京出生的，帮我排八字",
+        skill="bazi",
+        expected_tool_calls=["calculate_bazi", "show_bazi_chart"],
+        requires_birth_info=True,
+        description="有出生信息应直接计算"
+    ),
+    TestCase(
+        id="B3",
+        category=TestCategory.SKILL_BAZI,
+        name="事业分析",
+        message="从八字看我适合什么职业",
+        skill="bazi",
+        requires_chart=True,
+        expected_keywords=["事业", "职业", "工作"],
+        description="有命盘后的事业分析"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4. 星盘 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="Z1",
+        category=TestCategory.SKILL_ZODIAC,
+        name="无信息看星盘",
+        message="帮我看星盘",
+        skill="zodiac",
+        expected_tool_calls=["ask", "collect_zodiac_info"],
+        expected_keywords=["出生", "信息"],
+        description="没有出生信息时应收集"
+    ),
+    TestCase(
+        id="Z2",
+        category=TestCategory.SKILL_ZODIAC,
+        name="有信息计算星盘",
+        message="我是1995年8月23日早上6点北京出生的",
+        skill="zodiac",
+        expected_tool_calls=["calculate_zodiac", "show_zodiac_chart"],
+        requires_birth_info=True,
+        description="有信息应计算星盘"
+    ),
+    TestCase(
+        id="Z3",
+        category=TestCategory.SKILL_ZODIAC,
+        name="上升星座分析",
+        message="我的上升星座是什么特质",
+        skill="zodiac",
+        requires_chart=True,
+        expected_keywords=["上升", "星座"],
+        description="有星盘后的上升分析"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 5. 塔罗 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="T1",
+        category=TestCategory.SKILL_TAROT,
+        name="单牌抽取",
+        message="帮我抽一张塔罗牌",
+        skill="tarot",
+        expected_tool_calls=["draw_tarot_cards", "show_tarot_spread"],
+        expected_keywords=["牌", "塔罗"],
+        description="单牌抽取测试"
+    ),
+    TestCase(
+        id="T2",
+        category=TestCategory.SKILL_TAROT,
+        name="三牌阵",
+        message="用三牌阵看看我的感情",
+        skill="tarot",
+        expected_tool_calls=["draw_tarot_cards"],
+        expected_keywords=["过去", "现在", "未来"],
+        description="三牌阵感情解读"
+    ),
+    TestCase(
+        id="T3",
+        category=TestCategory.SKILL_TAROT,
+        name="抉择占卜",
+        message="我该不该接受这份工作？帮我抽张牌",
+        skill="tarot",
+        expected_tool_calls=["draw_tarot_cards"],
+        expected_keywords=["牌"],
+        description="是否占卜测试"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 6. 职业 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="CA1",
+        category=TestCategory.SKILL_CAREER,
+        name="职业迷茫",
+        message="我不知道自己适合什么工作",
+        skill="career",
+        expected_keywords=["职业", "方向", "适合"],
+        description="职业方向探索"
+    ),
+    TestCase(
+        id="CA2",
+        category=TestCategory.SKILL_CAREER,
+        name="职业转型",
+        message="我是做技术的，想转产品经理可行吗",
+        skill="career",
+        expected_keywords=["技术", "产品", "转型"],
+        description="职业转型咨询"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 7. 人生教练 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="L1",
+        category=TestCategory.SKILL_LIFECOACH,
+        name="迷茫咨询",
+        message="我感觉很迷茫，不知道人生的方向",
+        skill="lifecoach",
+        expected_keywords=["迷茫", "方向"],
+        description="人生迷茫咨询"
+    ),
+    TestCase(
+        id="L2",
+        category=TestCategory.SKILL_LIFECOACH,
+        name="协议触发",
+        message="我想做人生重置",
+        skill="lifecoach",
+        expected_keywords=["重置", "人生"],
+        description="协议触发测试"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8. 心理探索 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="P1",
+        category=TestCategory.SKILL_PSYCH,
+        name="焦虑咨询",
+        message="最近工作压力大，经常失眠",
+        skill="psych",
+        expected_keywords=["压力", "睡眠", "焦虑"],
+        description="焦虑相关咨询"
+    ),
+    TestCase(
+        id="P2",
+        category=TestCategory.SKILL_PSYCH,
+        name="情绪探索",
+        message="我经常感到莫名的难过",
+        skill="psych",
+        expected_keywords=["难过", "情绪", "感受"],
+        description="情绪探索测试"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 9. 正念导师 Skill 测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="M1",
+        category=TestCategory.SKILL_MINDFULNESS,
+        name="冥想引导",
+        message="我想做个冥想",
+        skill="mindfulness",
+        expected_keywords=["冥想", "呼吸", "放松"],
+        description="冥想引导测试"
+    ),
+    TestCase(
+        id="M2",
+        category=TestCategory.SKILL_MINDFULNESS,
+        name="正念练习",
+        message="帮我做个正念呼吸",
+        skill="mindfulness",
+        expected_keywords=["呼吸", "当下"],
+        description="正念呼吸练习"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 10. 边界测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="E1",
+        category=TestCategory.EDGE_CASES,
+        name="空消息",
+        message="",
+        expected_keywords=[],
+        description="空消息处理"
+    ),
+    TestCase(
+        id="E2",
+        category=TestCategory.EDGE_CASES,
+        name="无意义输入",
+        message="asdfghjkl",
+        expected_keywords=[],
+        description="无意义输入处理"
+    ),
+    TestCase(
+        id="E3",
+        category=TestCategory.EDGE_CASES,
+        name="超长输入",
+        message="我" * 500,
+        expected_keywords=[],
+        description="超长输入处理"
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 11. 多技能切换测试
+    # ─────────────────────────────────────────────────────────────────────────
+    TestCase(
+        id="MS1",
+        category=TestCategory.MULTI_SKILL,
+        name="八字+星盘融合",
+        message="从八字和星盘两个角度分析我的事业",
+        expected_tool_calls=["activate_skills"],
+        expected_keywords=["事业"],
+        description="多skill融合分析"
+    ),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 测试执行器
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 测试用户ID
+TEST_USER_ID = UUID("f43b745f-5a70-4ed1-aaa7-637fb1f87a61")
+
+# 测试出生信息
+TEST_BIRTH_INFO = {
+    "birth_date": "1990-05-15",
+    "birth_time": "08:30",
+    "timezone": "Asia/Shanghai",
+    "location": "Shanghai",
+    "gender": "male"
+}
+
+
+async def run_single_test(test: TestCase, verbose: bool = True) -> TestResult:
+    """运行单个测试用例"""
+    start_time = datetime.now()
+
+    if verbose:
+        print(f"\n{'─' * 60}")
+        print(f"[{test.id}] {test.name}")
+        print(f"类别: {test.category.value}")
+        print(f"消息: {test.message[:50]}{'...' if len(test.message) > 50 else ''}")
+
+    # 准备上下文
+    try:
+        profile = await get_unified_profile(TEST_USER_ID)
+    except Exception:
+        profile = {"identity": {"birth_info": TEST_BIRTH_INFO if test.requires_birth_info else {}}}
+
+    # 如果需要出生信息，注入到profile
+    if test.requires_birth_info:
+        if "identity" not in profile:
+            profile["identity"] = {}
+        profile["identity"]["birth_info"] = TEST_BIRTH_INFO
+
+    # 创建会话
+    try:
+        conversation = await create_conversation(test.skill or "core", TEST_USER_ID)
+        conversation_id = str(conversation.id)
+    except Exception:
+        conversation_id = str(uuid4())
+
+    context = AgentContext(
+        user_id=str(TEST_USER_ID),
+        user_tier="premium",
+        profile=profile,
+        skill_data={},
+        history=[],
+        skill=test.skill,
+        conversation_id=conversation_id
+    )
+
+    # 运行Agent
+    agent = CoreAgent(llm=get_llm_client(), max_iterations=5)
+
+    llm_reply = ""
+    tool_calls = []
+    tool_results = []
+    iterations = 0
+    error = None
+
+    try:
+        async for event in agent.run(test.message, context):
+            if event.type == "content":
+                llm_reply += event.data.get("content", "")
+            elif event.type == "tool_call":
+                tool_calls.append({
+                    "name": event.data.get("name"),
+                    "arguments": event.data.get("arguments", {})
+                })
+            elif event.type == "tool_result":
+                tool_results.append({
+                    "name": event.data.get("name"),
+                    "result": event.data.get("result", {})
+                })
+            elif event.type == "thinking":
+                iterations = event.data.get("iteration", 0) + 1
+            elif event.type == "done":
+                break
+            elif event.type == "error":
+                error = event.data.get("error", "Unknown error")
+                break
+    except Exception as e:
+        error = str(e)
+
+    duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+    # 判断成功与否
+    success = error is None and (llm_reply.strip() or tool_calls)
+
+    result = TestResult(
+        test_id=test.id,
+        success=success,
+        llm_reply=llm_reply,
+        tool_calls=tool_calls,
+        tool_results=tool_results,
+        iterations=iterations,
+        error=error,
+        duration_ms=duration_ms
+    )
+
+    if verbose:
+        status = "✅ PASS" if success else "❌ FAIL"
+        print(f"状态: {status}")
+        print(f"耗时: {duration_ms}ms")
+        print(f"迭代: {iterations}次")
+        print(f"工具调用: {[tc['name'] for tc in tool_calls]}")
+        print(f"回复预览: {llm_reply[:100]}{'...' if len(llm_reply) > 100 else ''}")
+        if error:
+            print(f"错误: {error}")
+
+    return result
+
+
+async def run_category_tests(category: TestCategory, verbose: bool = True) -> List[TestResult]:
+    """运行某个类别的所有测试"""
+    tests = [t for t in TEST_CASES if t.category == category]
+    results = []
+
+    print(f"\n{'═' * 60}")
+    print(f"  {category.value} ({len(tests)} 个测试)")
+    print('═' * 60)
+
+    for test in tests:
+        result = await run_single_test(test, verbose)
+        results.append(result)
+        await asyncio.sleep(1)  # 避免rate limit
+
+    return results
+
+
+async def run_all_tests(categories: Optional[List[TestCategory]] = None, verbose: bool = True) -> Dict[TestCategory, List[TestResult]]:
+    """运行所有测试"""
+    if categories is None:
+        categories = list(TestCategory)
+
+    all_results = {}
+
+    print("\n" + "╔" + "═" * 58 + "╗")
+    print("║" + " " * 15 + "CoreAgent + Skills E2E 测试" + " " * 16 + "║")
+    print("╚" + "═" * 58 + "╝")
+    print(f"\n测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"测试用户: {TEST_USER_ID}")
+    print(f"测试类别: {len(categories)} 个")
+    print(f"测试用例: {sum(1 for t in TEST_CASES if t.category in categories)} 个")
+
+    for category in categories:
+        results = await run_category_tests(category, verbose)
+        all_results[category] = results
+
+    return all_results
+
+
+def generate_report(all_results: Dict[TestCategory, List[TestResult]]) -> str:
+    """生成测试报告"""
+    lines = []
+    lines.append("\n" + "╔" + "═" * 58 + "╗")
+    lines.append("║" + " " * 20 + "测试报告汇总" + " " * 20 + "║")
+    lines.append("╚" + "═" * 58 + "╝")
+
+    total_tests = 0
+    total_passed = 0
+    total_duration = 0
+    tool_call_stats = {}
+
+    for category, results in all_results.items():
+        passed = sum(1 for r in results if r.success)
+        total = len(results)
+        total_tests += total
+        total_passed += passed
+
+        lines.append(f"\n┌{'─' * 58}┐")
+        lines.append(f"│ {category.value:<52} {passed}/{total} │")
+        lines.append(f"└{'─' * 58}┘")
+
+        for result in results:
+            status = "✅" if result.success else "❌"
+            test = next(t for t in TEST_CASES if t.id == result.test_id)
+            lines.append(f"  {status} [{result.test_id}] {test.name}")
+            lines.append(f"      耗时: {result.duration_ms}ms | 迭代: {result.iterations}")
+            lines.append(f"      工具: {[tc['name'] for tc in result.tool_calls]}")
+            lines.append(f"      回复: {result.llm_reply[:60]}...")
+
+            total_duration += result.duration_ms
+
+            for tc in result.tool_calls:
+                tool_name = tc["name"]
+                tool_call_stats[tool_name] = tool_call_stats.get(tool_name, 0) + 1
+
+            if result.error:
+                lines.append(f"      错误: {result.error}")
+
+    # 汇总统计
+    lines.append(f"\n{'═' * 60}")
+    lines.append("统计摘要")
+    lines.append('─' * 60)
+    lines.append(f"  总测试数: {total_tests}")
+    lines.append(f"  通过: {total_passed} ({total_passed/total_tests*100:.1f}%)")
+    lines.append(f"  失败: {total_tests - total_passed}")
+    lines.append(f"  总耗时: {total_duration/1000:.2f}s")
+    lines.append(f"  平均耗时: {total_duration/total_tests:.0f}ms")
+
+    lines.append(f"\n工具调用统计:")
+    for tool, count in sorted(tool_call_stats.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"  - {tool}: {count}次")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 快速测试模式
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def quick_test():
+    """快速测试模式 - 只测试核心场景"""
+    quick_categories = [
+        TestCategory.ROUTING,
+        TestCategory.SKILL_CORE,
+        TestCategory.SKILL_TAROT,  # 塔罗不需要出生信息
+    ]
+
+    results = await run_all_tests(quick_categories, verbose=True)
+    report = generate_report(results)
+    print(report)
+
+    # 保存报告
+    report_path = os.path.join(os.path.dirname(__file__), "e2e_test_report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"\n报告已保存到: {report_path}")
+
+
+async def full_test():
+    """完整测试模式 - 测试所有场景"""
+    results = await run_all_tests(verbose=True)
+    report = generate_report(results)
+    print(report)
+
+    # 保存报告
+    report_path = os.path.join(os.path.dirname(__file__), "e2e_test_report_full.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"\n报告已保存到: {report_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 主入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def main():
+    """主函数"""
+    import argparse
+    parser = argparse.ArgumentParser(description="CoreAgent + Skills E2E 测试")
+    parser.add_argument("--quick", action="store_true", help="快速测试模式")
+    parser.add_argument("--full", action="store_true", help="完整测试模式")
+    parser.add_argument("--category", type=str, help="测试特定类别")
+    parser.add_argument("--test-id", type=str, help="测试特定用例")
+    args = parser.parse_args()
+
+    if args.test_id:
+        # 测试单个用例
+        test = next((t for t in TEST_CASES if t.id == args.test_id), None)
+        if test:
+            result = await run_single_test(test, verbose=True)
+            print(f"\n完整回复:\n{result.llm_reply}")
+        else:
+            print(f"未找到测试用例: {args.test_id}")
+    elif args.category:
+        # 测试特定类别
+        try:
+            category = TestCategory[args.category.upper()]
+            results = await run_category_tests(category, verbose=True)
+            report = generate_report({category: results})
+            print(report)
+        except KeyError:
+            print(f"未找到类别: {args.category}")
+            print(f"可用类别: {[c.name for c in TestCategory]}")
+    elif args.full:
+        await full_test()
+    else:
+        await quick_test()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

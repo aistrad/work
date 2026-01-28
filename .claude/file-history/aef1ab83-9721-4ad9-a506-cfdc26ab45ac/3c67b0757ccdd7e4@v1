@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+真实用户场景端到端测试
+连接真实数据库，测试 CoreAgent + Skill + VibeProfile 协作
+
+用法:
+    cd /home/aiscend/work/vibelife/apps/api
+    python scripts/test_real_user_scenarios.py
+
+特性:
+- 使用真实数据库 (106.37.170.238:8224/vibelife)
+- 测试多个 Skill (bazi, zodiac, tarot, career, vibe_id)
+- 测试 VibeProfile 提取和使用
+- 测试工具调用链路完整性
+"""
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from uuid import UUID
+from dataclasses import dataclass
+
+# 添加项目路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# 设置测试环境变量
+os.environ["VIBELIFE_ENV"] = "test"
+
+# 加载 .env.test
+from dotenv import load_dotenv
+_project_root = Path(__file__).resolve().parents[2]  # scripts -> api -> apps -> project root
+load_dotenv(_project_root / ".env.test")
+
+print(f"✓ 数据库连接: {os.environ.get('VIBELIFE_DB_HOST')}:{os.environ.get('VIBELIFE_DB_PORT')}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 测试场景定义
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RealScenario:
+    """真实用户场景"""
+    name: str
+    skill: str
+    user_message: str
+    description: str
+    expected_tools: List[str]  # 期望调用的工具
+    check_profile_usage: bool = False  # 是否检查 profile 使用
+
+
+REAL_SCENARIOS = [
+    # ─────────────────────────────────────────────────────────────────────
+    # Core Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="日常倾诉 - 情感支持",
+        skill="core",
+        user_message="最近工作压力好大，感觉很焦虑，不知道该怎么办",
+        description="用户寻求情感支持和倾听",
+        expected_tools=[],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="目标设定",
+        skill="core",
+        user_message="我想设定一个目标：在3个月内学会弹吉他，请帮我记录",
+        description="用户设定目标，需要调用 write_user_data 工具",
+        expected_tools=["write_user_data"],
+        check_profile_usage=False
+    ),
+    RealScenario(
+        name="查询目标",
+        skill="core",
+        user_message="看看我设定的所有目标",
+        description="用户查询已设定的目标",
+        expected_tools=["query_user_data"],
+        check_profile_usage=False
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Bazi Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="八字查询 - 事业运",
+        skill="bazi",
+        user_message="帮我看看我的事业运势怎么样",
+        description="用户查询八字事业运",
+        expected_tools=["show_bazi_chart"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="八字查询 - 今日运势",
+        skill="bazi",
+        user_message="今天的运势如何？",
+        description="用户查询今日运势",
+        expected_tools=["show_daily_fortune"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="八字查询 - 大运流年",
+        skill="bazi",
+        user_message="我今年的流年运势如何？",
+        description="用户查询流年运势",
+        expected_tools=["show_bazi_chart", "analyze_grand_fortune"],
+        check_profile_usage=True
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Zodiac Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="星座查询 - 本周运势",
+        skill="zodiac",
+        user_message="我的星座本周运势如何？",
+        description="用户查询星座本周运势",
+        expected_tools=["show_zodiac_chart", "show_weekly_fortune"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="星座查询 - 月相",
+        skill="zodiac",
+        user_message="现在是什么月相？",
+        description="用户查询当前月相",
+        expected_tools=["show_lunar_phase"],
+        check_profile_usage=False
+    ),
+    RealScenario(
+        name="星座查询 - 行星逆行",
+        skill="zodiac",
+        user_message="现在有哪些行星逆行？",
+        description="用户查询行星逆行情况",
+        expected_tools=["show_retrograde_planets"],
+        check_profile_usage=False
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Tarot Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="塔罗占卜 - 单张牌",
+        skill="tarot",
+        user_message="帮我抽一张塔罗牌，看看今天的指引",
+        description="用户请求单张塔罗牌占卜",
+        expected_tools=["draw_tarot_card"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="塔罗占卜 - 三牌阵",
+        skill="tarot",
+        user_message="我想用三牌阵看看我的感情问题：过去-现在-未来",
+        description="用户请求三牌阵占卜",
+        expected_tools=["draw_tarot_spread"],
+        check_profile_usage=True
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # VibeID Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="VibeID - 查看人格画像",
+        skill="vibe_id",
+        user_message="展示我的人格画像",
+        description="用户查看完整人格画像",
+        expected_tools=["show_vibe_id"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="VibeID - 查看原型雷达图",
+        skill="vibe_id",
+        user_message="我想看12原型的分布",
+        description="用户查看原型雷达图",
+        expected_tools=["show_archetype_radar"],
+        check_profile_usage=True
+    ),
+    RealScenario(
+        name="VibeID - 查看阴影原型",
+        skill="vibe_id",
+        user_message="分析我的阴影原型",
+        description="用户想了解阴影原型",
+        expected_tools=["show_vibe_id", "get_archetype_info"],
+        check_profile_usage=True
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Career Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="职业规划 - 职业建议",
+        skill="career",
+        user_message="我想做职业规划，你有什么建议吗？",
+        description="用户寻求职业规划建议",
+        expected_tools=["get_career_insights"],
+        check_profile_usage=True
+    ),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 跨 Skill 场景
+    # ─────────────────────────────────────────────────────────────────────
+    RealScenario(
+        name="综合分析 - 事业+星座",
+        skill="bazi",  # 从八字开始
+        user_message="结合我的八字和星座，帮我看看事业方向",
+        description="用户请求综合多个维度分析",
+        expected_tools=["show_bazi_chart", "use_skill"],  # 可能切换到其他 skill
+        check_profile_usage=True
+    ),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 测试用户数据管理
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_or_create_test_user() -> Dict[str, Any]:
+    """获取或创建测试用户"""
+    from stores.db import fetchrow, execute
+
+    TEST_USER_ID = "test-real-scenario-001"
+
+    # 检查用户是否存在
+    row = await fetchrow(
+        "SELECT user_id, profile FROM unified_profiles WHERE user_id = $1",
+        UUID(TEST_USER_ID)
+    )
+
+    if row:
+        print(f"✓ 使用已有测试用户: {TEST_USER_ID}")
+        profile = row["profile"]
+        if isinstance(profile, str):
+            profile = json.loads(profile)
+        return {
+            "user_id": TEST_USER_ID,
+            "profile": profile
+        }
+
+    # 创建新用户
+    print(f"✓ 创建新测试用户: {TEST_USER_ID}")
+
+    test_profile = {
+        "display_name": "测试用户",
+        "gender": "male",
+        "birth_info": {
+            "datetime": "1995-06-15T10:30:00",
+            "year": 1995,
+            "month": 6,
+            "day": 15,
+            "hour": 10,
+            "minute": 30,
+            "location": "北京",
+            "timezone": "Asia/Shanghai",
+            "solar_datetime": "1995-06-15T10:30:00",
+            "lunar_date": "1995年五月十八"
+        },
+        "extracted": {
+            "personality_traits": ["内向", "思考型", "完美主义"],
+            "life_challenges": ["职业方向不清晰", "人际关系压力"],
+            "values": ["成长", "稳定", "自由"],
+            "interests": ["阅读", "音乐", "旅行"]
+        },
+        "skill_data": {
+            "bazi": {
+                "calculated": True,
+                "pillars": {
+                    "year": {"heavenly_stem": "乙", "earthly_branch": "亥"},
+                    "month": {"heavenly_stem": "壬", "earthly_branch": "午"},
+                    "day": {"heavenly_stem": "丙", "earthly_branch": "申"},
+                    "hour": {"heavenly_stem": "癸", "earthly_branch": "巳"}
+                },
+                "day_master": "丙火",
+                "five_elements": {"金": 2, "木": 1, "水": 3, "火": 2, "土": 0},
+                "strength": "偏弱",
+                "use_god": "木"
+            },
+            "zodiac": {
+                "sun_sign": "Gemini",
+                "moon_sign": "Pisces",
+                "rising_sign": "Libra",
+                "chart_calculated": True
+            },
+            "vibe_id": {
+                "calculated": True,
+                "archetypes": {
+                    "core": {"primary": "Sage", "secondary": "Creator"},
+                    "inner": {"primary": "Caregiver", "secondary": "Innocent"},
+                    "outer": {"primary": "Hero", "secondary": "Explorer"},
+                    "shadow": {"primary": "Outlaw", "secondary": "Jester"}
+                },
+                "scores": {
+                    "Sage": 85.0,
+                    "Creator": 75.0,
+                    "Hero": 70.0,
+                    "Caregiver": 68.0,
+                    "Explorer": 65.0,
+                    "Outlaw": 60.0,
+                    "Jester": 55.0,
+                    "Lover": 52.0,
+                    "Ruler": 50.0,
+                    "Magician": 48.0,
+                    "Innocent": 45.0,
+                    "Everyman": 40.0
+                }
+            }
+        },
+        "portrait": "一个1995年出生的90后，性格内向但有深度思考能力，追求完美主义。目前在职业发展上面临选择，寻求成长与稳定的平衡。"
+    }
+
+    await execute(
+        """
+        INSERT INTO unified_profiles (user_id, profile, created_at, updated_at)
+        VALUES ($1, $2, NOW(), NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            profile = EXCLUDED.profile,
+            updated_at = NOW()
+        """,
+        UUID(TEST_USER_ID),
+        json.dumps(test_profile)
+    )
+
+    return {
+        "user_id": TEST_USER_ID,
+        "profile": test_profile
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景执行器
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run_scenario(
+    scenario: RealScenario,
+    user_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """执行单个场景测试"""
+    from services.agent import create_agent, AgentContext
+
+    print(f"\n{'='*80}")
+    print(f"📝 {scenario.name}")
+    print(f"{'='*80}")
+    print(f"🔹 Skill: {scenario.skill}")
+    print(f"🔹 用户: \"{scenario.user_message}\"")
+    print(f"🔹 期望: {scenario.description}")
+    print(f"🔹 期望工具: {', '.join(scenario.expected_tools) if scenario.expected_tools else '无'}")
+    print(f"{'─'*80}\n")
+
+    # 构建上下文
+    context = AgentContext(
+        user_id=user_data["user_id"],
+        user_tier="paid",
+        profile=user_data["profile"],
+        skill_data=user_data["profile"].get("skill_data", {}),
+        history=[],
+        skill=scenario.skill,
+        voice_mode="warm",
+        portrait=user_data["profile"].get("portrait")
+    )
+
+    # 创建 Agent
+    agent = create_agent(max_iterations=5)
+
+    # 收集事件
+    tool_calls = []
+    content_parts = []
+    sop_events = []
+    thinking_count = 0
+
+    try:
+        print("📤 Agent 输出:\n")
+
+        async for event in agent.run(scenario.user_message, context):
+
+            if event.type == "thinking":
+                thinking_count += 1
+                iteration = event.data.get('iteration', 0) + 1
+                print(f"  💭 思考中 (第 {iteration} 轮)...")
+
+            elif event.type == "sop_phase":
+                sop_events.append(event.data)
+                data = event.data
+                print(f"  📋 SOP: skill={data.get('skill')}, scenario={data.get('scenario')}, action={data.get('action')}")
+
+            elif event.type == "tool_call":
+                data = event.data
+                tool_calls.append(data)
+                tool_name = data['name']
+                print(f"\n  🔧 工具调用: {tool_name}")
+
+                args = data.get('arguments', '{}')
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        pass
+
+                # 格式化参数显示
+                if args:
+                    args_str = json.dumps(args, ensure_ascii=False, indent=6)
+                    if len(args_str) > 300:
+                        args_str = args_str[:300] + "..."
+                    print(f"     参数: {args_str}")
+
+            elif event.type == "tool_result":
+                data = event.data
+                result = data.get('result', {})
+
+                if isinstance(result, dict):
+                    status = result.get('status', 'unknown')
+                    print(f"  ✅ 结果: status={status}")
+
+                    # 显示关键信息
+                    if 'data' in result and result['data']:
+                        result_data = result['data']
+                        if isinstance(result_data, dict):
+                            # 显示部分数据
+                            sample_keys = list(result_data.keys())[:3]
+                            print(f"     数据字段: {', '.join(sample_keys)}...")
+                else:
+                    print(f"  ✅ 结果: {str(result)[:100]}")
+
+            elif event.type == "content":
+                content = event.data.get("content", "")
+                content_parts.append(content)
+                print(content, end="", flush=True)
+
+            elif event.type == "done":
+                if not content_parts:
+                    final = event.data.get("content", "")
+                    if final:
+                        print(final)
+
+            elif event.type == "error":
+                error_msg = event.data.get('error')
+                print(f"\n  ❌ 错误: {error_msg}")
+
+    except Exception as e:
+        print(f"\n❌ 执行异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "scenario": scenario.name,
+            "success": False,
+            "error": str(e)
+        }
+
+    # 检查结果
+    full_content = "".join(content_parts)
+    tool_names = [tc['name'] for tc in tool_calls]
+
+    # 验证期望工具
+    tools_matched = True
+    if scenario.expected_tools:
+        tools_matched = any(
+            expected in tool_names
+            for expected in scenario.expected_tools
+        )
+
+    print(f"\n\n{'─'*80}")
+    print("📊 执行结果:")
+    print(f"  • 思考轮次: {thinking_count}")
+    print(f"  • SOP 事件: {len(sop_events)}")
+    print(f"  • 工具调用: {len(tool_calls)}")
+    if tool_calls:
+        print(f"  • 工具列表: {', '.join(tool_names)}")
+    print(f"  • 期望工具: {', '.join(scenario.expected_tools) if scenario.expected_tools else '无'}")
+    print(f"  • 工具匹配: {'✓' if tools_matched else '✗'}")
+    print(f"  • 回复长度: {len(full_content)} 字符")
+    print(f"  • Token 使用: {agent.usage}")
+
+    # Profile 使用检查
+    if scenario.check_profile_usage:
+        # 检查 profile 数据是否被使用
+        profile_used = (
+            any(skill in str(tool_calls) for skill in ['bazi', 'zodiac', 'vibe_id']) or
+            any(field in full_content for field in ['出生', '八字', '星座', '原型'])
+        )
+        print(f"  • Profile 使用: {'✓' if profile_used else '✗'}")
+
+    return {
+        "scenario": scenario.name,
+        "skill": scenario.skill,
+        "success": True,
+        "tools_matched": tools_matched,
+        "tool_calls": tool_names,
+        "thinking_count": thinking_count,
+        "sop_events": len(sop_events),
+        "content_length": len(full_content),
+        "usage": agent.usage
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 主测试流程
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def main():
+    """主测试函数"""
+    print("\n" + "═"*80)
+    print("🚀 真实用户场景端到端测试")
+    print("   CoreAgent + Skill + VibeProfile 协作")
+    print("═"*80)
+    print(f"📅 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔧 环境: {os.environ.get('VIBELIFE_ENV', 'unknown')}")
+    print(f"📦 数据库: {os.environ.get('VIBELIFE_DB_HOST')}:{os.environ.get('VIBELIFE_DB_PORT')}")
+    print("═"*80)
+
+    # 测试数据库连接
+    print("\n🔌 测试数据库连接...")
+    try:
+        from stores.db import get_connection
+        async with get_connection() as conn:
+            result = await conn.fetchval("SELECT 1")
+            print(f"  ✅ 数据库连接成功")
+    except Exception as e:
+        print(f"  ❌ 数据库连接失败: {e}")
+        return
+
+    # 初始化工具注册表
+    print("\n🔧 初始化工具注册表...")
+    from services.agent.tool_registry import ToolRegistry
+    ToolRegistry.initialize()
+
+    # 获取所有注册的工具
+    all_tools = list(ToolRegistry._handlers.keys())
+    print(f"  ✅ 已注册 {len(all_tools)} 个工具")
+    print(f"     {', '.join(all_tools[:10])}...")
+
+    # 获取或创建测试用户
+    print("\n👤 准备测试用户...")
+    user_data = await get_or_create_test_user()
+    print(f"  ✅ 用户 ID: {user_data['user_id']}")
+
+    # 显示用户数据摘要
+    profile = user_data['profile']
+    birth_info = profile.get('birth_info', {})
+    print(f"  • 出生: {birth_info.get('year')}-{birth_info.get('month')}-{birth_info.get('day')}")
+    print(f"  • 八字: {'✓' if profile.get('skill_data', {}).get('bazi') else '✗'}")
+    print(f"  • 星座: {'✓' if profile.get('skill_data', {}).get('zodiac') else '✗'}")
+    print(f"  • VibeID: {'✓' if profile.get('skill_data', {}).get('vibe_id') else '✗'}")
+
+    # 运行测试场景
+    print("\n" + "═"*80)
+    print("🎬 开始执行测试场景")
+    print("═"*80)
+
+    results = []
+    for i, scenario in enumerate(REAL_SCENARIOS, 1):
+        print(f"\n\n[场景 {i}/{len(REAL_SCENARIOS)}]")
+
+        try:
+            result = await run_scenario(scenario, user_data)
+            results.append(result)
+
+            # 短暂延迟，避免 API 限流
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"\n❌ 场景执行失败: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append({
+                "scenario": scenario.name,
+                "success": False,
+                "error": str(e)
+            })
+
+    # 汇总报告
+    print("\n\n" + "═"*80)
+    print("📈 测试汇总报告")
+    print("═"*80)
+
+    success_count = sum(1 for r in results if r.get('success'))
+    tools_matched_count = sum(1 for r in results if r.get('tools_matched'))
+
+    print(f"\n总体统计:")
+    print(f"  • 总场景数: {len(REAL_SCENARIOS)}")
+    print(f"  • 成功场景: {success_count}/{len(REAL_SCENARIOS)}")
+    print(f"  • 工具匹配: {tools_matched_count}/{len(REAL_SCENARIOS)}")
+    print(f"  • 成功率: {success_count/len(REAL_SCENARIOS)*100:.1f}%")
+
+    # 按 Skill 分组统计
+    print(f"\n按 Skill 统计:")
+    skill_stats = {}
+    for r in results:
+        if not r.get('success'):
+            continue
+        skill = r.get('skill', 'unknown')
+        if skill not in skill_stats:
+            skill_stats[skill] = {
+                'count': 0,
+                'total_tokens': 0,
+                'total_tools': 0
+            }
+        skill_stats[skill]['count'] += 1
+        usage = r.get('usage', {})
+        skill_stats[skill]['total_tokens'] += usage.get('total_tokens', 0)
+        skill_stats[skill]['total_tools'] += len(r.get('tool_calls', []))
+
+    for skill, stats in sorted(skill_stats.items()):
+        print(f"  • {skill:12} 场景数: {stats['count']:2}, "
+              f"工具调用: {stats['total_tools']:3}, "
+              f"Tokens: {stats['total_tokens']:6}")
+
+    # Token 总计
+    total_tokens = sum(
+        r.get('usage', {}).get('total_tokens', 0)
+        for r in results if r.get('success')
+    )
+    print(f"\n总 Token 消耗: {total_tokens:,}")
+
+    # 失败场景
+    failed = [r for r in results if not r.get('success')]
+    if failed:
+        print(f"\n⚠️  失败场景:")
+        for r in failed:
+            print(f"  • {r['scenario']}: {r.get('error', 'unknown')}")
+
+    print("\n" + "═"*80)
+    print("✅ 测试完成")
+    print("═"*80)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

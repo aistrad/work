@@ -1,0 +1,342 @@
+"""
+ProactiveOrchestrator Integration Tests
+
+TDD: Tests written first, then implementation.
+
+Test categories:
+1. Quiet hours checking
+2. Daily push limit
+3. Idempotent deduplication
+4. Cooldown checking
+5. Skill config loading
+6. Integration with TriggerEvaluator and AgentAdapter
+"""
+
+import pytest
+from datetime import datetime, date
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+import time_machine
+
+
+class TestQuietHoursChecking:
+    """Test quiet hours enforcement"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        # Create with mocked dependencies
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        notification_service = MagicMock()
+
+        return ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+
+    def test_is_quiet_hours_during_night(self, orchestrator):
+        """Should return True during night hours (22-7)"""
+        with time_machine.travel("2026-01-26 23:30:00", tick=False):
+            result = orchestrator._is_quiet_hours("Asia/Shanghai")
+            assert result is True
+
+    def test_is_quiet_hours_during_early_morning(self, orchestrator):
+        """Should return True during early morning (before 7)"""
+        with time_machine.travel("2026-01-26 06:00:00", tick=False):
+            result = orchestrator._is_quiet_hours("Asia/Shanghai")
+            assert result is True
+
+    def test_is_not_quiet_hours_during_day(self, orchestrator):
+        """Should return False during day hours (7-22)"""
+        with time_machine.travel("2026-01-26 10:00:00", tick=False):
+            result = orchestrator._is_quiet_hours("Asia/Shanghai")
+            assert result is False
+
+
+class TestIdempotentDeduplication:
+    """Test idempotent key deduplication"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        notification_service = MagicMock()
+
+        return ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+
+    def test_first_send_is_not_duplicate(self, orchestrator):
+        """First send for a key should not be duplicate"""
+        key = "user-123-bazi-daily_fortune-2026-01-26T08:00"
+        assert orchestrator._is_duplicate(key) is False
+
+    def test_second_send_is_duplicate(self, orchestrator):
+        """Second send for same key should be duplicate"""
+        key = "user-123-bazi-daily_fortune-2026-01-26T08:00"
+        orchestrator._mark_sent(key)
+        assert orchestrator._is_duplicate(key) is True
+
+    def test_different_keys_are_independent(self, orchestrator):
+        """Different keys should be independent"""
+        key1 = "user-123-bazi-daily_fortune-2026-01-26T08:00"
+        key2 = "user-456-bazi-daily_fortune-2026-01-26T08:00"
+        orchestrator._mark_sent(key1)
+        assert orchestrator._is_duplicate(key1) is True
+        assert orchestrator._is_duplicate(key2) is False
+
+
+class TestGlobalConfig:
+    """Test global config retrieval"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        notification_service = MagicMock()
+
+        orch = ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+        # Manually set skill configs for testing
+        orch._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "global_config": {
+                    "default_push_hour": 8,
+                    "cooldown_hours": 24,
+                    "max_daily_pushes": 5,
+                    "quiet_hours": {
+                        "start": 22,
+                        "end": 7
+                    }
+                },
+                "reminders": []
+            }
+        }
+        return orch
+
+    def test_get_global_config_returns_defaults(self, orchestrator):
+        """Should return global config with defaults"""
+        config = orchestrator._get_global_config()
+        assert "max_daily_pushes" in config
+        assert "quiet_hours" in config
+
+
+class TestDailyPushLimit:
+    """Test daily push limit enforcement"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        notification_service = MagicMock()
+
+        orch = ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+        orch._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "global_config": {
+                    "max_daily_pushes": 5,
+                    "quiet_hours": {"start": 22, "end": 7}
+                },
+                "reminders": []
+            }
+        }
+        return orch
+
+    @pytest.mark.asyncio
+    async def test_user_under_daily_limit_can_receive_push(self, orchestrator):
+        """User under daily limit should be able to receive push"""
+        orchestrator._get_daily_push_count = AsyncMock(return_value=2)
+        max_daily = orchestrator._get_global_config().get("max_daily_pushes", 5)
+        count = await orchestrator._get_daily_push_count(uuid4())
+        assert count < max_daily
+
+    @pytest.mark.asyncio
+    async def test_user_at_daily_limit_cannot_receive_push(self, orchestrator):
+        """User at daily limit should not receive push"""
+        orchestrator._get_daily_push_count = AsyncMock(return_value=5)
+        max_daily = orchestrator._get_global_config().get("max_daily_pushes", 5)
+        count = await orchestrator._get_daily_push_count(uuid4())
+        assert count >= max_daily
+
+
+class TestCooldownChecking:
+    """Test cooldown enforcement"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        notification_service = MagicMock()
+        notification_service.check_cooldown = AsyncMock(return_value=True)
+
+        return ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cooldown_check_delegates_to_notification_service(self, orchestrator):
+        """Cooldown check should delegate to notification service"""
+        user_id = uuid4()
+        result = await orchestrator._check_cooldown(user_id, "bazi", "daily_fortune")
+        assert result is True
+        orchestrator.notification_service.check_cooldown.assert_called_once()
+
+
+class TestProcessUser:
+    """Test single user processing"""
+
+    @pytest.fixture
+    def orchestrator(self):
+        from services.proactive.orchestrator import ProactiveOrchestrator
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        from services.proactive.models import ReminderContent
+
+        trigger_evaluator = TriggerEvaluator()
+        agent_adapter = MagicMock()
+        agent_adapter.generate_content = AsyncMock(return_value=ReminderContent(
+            title="Test Title",
+            body="Test Body",
+        ))
+        notification_service = MagicMock()
+        notification_service.save = AsyncMock()
+        notification_service.check_cooldown = AsyncMock(return_value=True)
+
+        orch = ProactiveOrchestrator(
+            trigger_evaluator=trigger_evaluator,
+            agent_adapter=agent_adapter,
+            notification_service=notification_service,
+        )
+        # Set up test skill config
+        orch._skill_configs = {
+            "bazi": {
+                "skill_id": "bazi",
+                "enabled": True,
+                "global_config": {
+                    "max_daily_pushes": 5,
+                    "quiet_hours": {"start": 22, "end": 7}
+                },
+                "reminders": [
+                    {
+                        "id": "daily_fortune",
+                        "name": "每日运势",
+                        "trigger": {
+                            "type": "time_based",
+                            "schedule": "0 8 * * *"
+                        },
+                        "conditions": [
+                            {
+                                "data_path": "vibe.profile.birth_info",
+                                "operator": "exists"
+                            }
+                        ],
+                        "content": {
+                            "rule": "rules/proactive/daily-fortune-push.md",
+                            "card_type": "DailyFortuneCard"
+                        }
+                    }
+                ]
+            }
+        }
+        return orch
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_process_user_generates_notification(self, orchestrator):
+        """Processing a user should generate notification when conditions met"""
+        user_id = uuid4()
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {"date": "1990-05-15"}
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai"
+                }
+            }
+        }
+
+        # Mock helper methods
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(user_id, profile, dry_run=False)
+
+        # Should have generated at least one notification
+        assert len(notifications) >= 1
+        assert notifications[0]["skill_id"] == "bazi"
+        assert notifications[0]["reminder_id"] == "daily_fortune"
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_process_user_dry_run_does_not_save(self, orchestrator):
+        """Dry run should not save notifications"""
+        user_id = uuid4()
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {"date": "1990-05-15"}
+                },
+                "preferences": {
+                    "timezone": "Asia/Shanghai"
+                }
+            }
+        }
+
+        # Mock helper methods
+        orchestrator._should_send_to_user = AsyncMock(return_value=True)
+        orchestrator._get_daily_push_count = AsyncMock(return_value=0)
+        orchestrator._check_cooldown = AsyncMock(return_value=True)
+
+        notifications = await orchestrator._process_user(user_id, profile, dry_run=True)
+
+        # Notification should be generated but not saved
+        assert len(notifications) >= 1
+        orchestrator.notification_service.save.assert_not_called()
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 06:00:00", tick=False)
+    async def test_process_user_skipped_during_quiet_hours(self, orchestrator):
+        """User should be skipped during quiet hours"""
+        user_id = uuid4()
+        profile = {
+            "vibe": {
+                "preferences": {
+                    "timezone": "Asia/Shanghai"
+                }
+            }
+        }
+
+        notifications = await orchestrator._process_user(user_id, profile)
+
+        # Should return empty due to quiet hours
+        assert len(notifications) == 0

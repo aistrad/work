@@ -1,0 +1,351 @@
+基于我的分析，我需要向您确认几个关键问题：
+                                                                                                                           
+● User answered Claude's questions:
+  ⎿  · 新增工具时，目前最痛苦的点是什么？需要同时修改哪些文件？ → 后端 4 处修改, 前后端都要改, 容易漏改遗忘
+     · V6 设计了 YAML 工具定义 (tools.yaml + tool_schema.py)，但目前未启用。您希望的最终架构是？ → YAML 为单一数据源 (推荐)
+     · tool_executor.py 的 if-elif 分发（25+ 分支）如何改进？ → 动态注册表 (推荐)
+
+● 感谢确认。现在我已经有了完整的分析基础，让我绘制时序图并给出解决方案。
+
+  ---
+  Ultra Analysis Report
+
+  当前工具系统时序图
+
+  ┌──────────┐     ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌─────────────┐
+  │  用户    │     │  chat_v5 │     │  CoreAgent │     │   tools.py   │     │tool_executor│
+  └────┬─────┘     └────┬─────┘     └─────┬──────┘     └──────┬───────┘     └──────┬──────┘
+       │                │                 │                   │                    │
+       │ 1. 发送消息    │                 │                   │                    │
+       │───────────────>│                 │                   │                    │
+       │                │                 │                   │                    │
+       │                │ 2. create_agent │                   │                    │
+       │                │────────────────>│                   │                    │
+       │                │                 │                   │                    │
+       │                │ 3. agent.run()  │                   │                    │
+       │                │────────────────>│                   │                    │
+       │                │                 │                   │                    │
+       │                │                 │ 4. _get_current_tools()                │
+       │                │                 │──────────────────>│                    │
+       │                │                 │                   │                    │
+       │                │                 │ 5. ToolRegistry   │                    │
+       │                │                 │   .get_tools()    │                    │
+       │                │                 │<──────────────────│                    │
+       │                │                 │                   │                    │
+       │                │                 │ 6. LLM 决定调用   │                    │
+       │                │                 │    show_bazi_chart│                    │
+       │                │                 │                   │                    │
+       │                │                 │ 7. _execute_tool()│                    │
+       │                │                 │──────────────────────────────────────>│
+       │                │                 │                   │                    │
+       │                │                 │                   │ 8. is_ui_tool()   │
+       │                │                 │                   │    UI_TOOLS 检查  │
+       │                │                 │                   │                    │
+       │                │                 │                   │ 9. if-elif 分发   │
+       │                │                 │                   │    25+ 分支       │
+       │                │                 │                   │                    │
+       │                │                 │<──────────────────────────────────────│
+       │                │                 │  10. 工具结果     │                    │
+       │                │                 │                   │                    │
+       │                │<────────────────│ 11. SSE 流式响应  │                    │
+       │<───────────────│                 │                   │                    │
+       │ 12. Generative UI 渲染          │                   │                    │
+       │                │                 │                   │                    │
+
+  问题识别
+
+  硬编码问题地图
+
+  新增一个工具需要修改:
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  1️⃣ tools.py:376-385                                                    │
+  │     SKILL_TOOLS = {                                                     │
+  │         "bazi": [                                                       │
+  │             SHOW_BAZI_CHART_TOOL,  ← 新增工具定义                        │
+  │             NEW_TOOL_HERE,         ← 🔴 修改点1                         │
+  │         ],                                                              │
+  │     }                                                                   │
+  │                                                                         │
+  │  2️⃣ tool_executor.py:23-48                                              │
+  │     UI_TOOLS = {                                                        │
+  │         "show_bazi_chart",                                              │
+  │         "new_tool_here",           ← 🔴 修改点2                         │
+  │     }                                                                   │
+  │                                                                         │
+  │  3️⃣ tool_executor.py:82-121                                             │
+  │     async def execute_ui_tool(...):                                     │
+  │         if tool_name == "show_bazi_chart":                              │
+  │             return _execute_show_bazi_chart(...)                        │
+  │         elif tool_name == "new_tool_here":  ← 🔴 修改点3                │
+  │             return _execute_new_tool(...)                               │
+  │                                                                         │
+  │  4️⃣ tool_executor.py:XXX (新函数)                                       │
+  │     def _execute_new_tool(...):     ← 🔴 修改点4                        │
+  │         # 实现逻辑                                                      │
+  │                                                                         │
+  │  5️⃣ 前端 apps/web/src/skills/bazi/tools/new-tool.tsx                   │
+  │     export const newTool = {        ← 🔴 修改点5                        │
+  │         name, parameters, render                                        │
+  │     }                                                                   │
+  │                                                                         │
+  │  6️⃣ 前端 apps/web/src/skills/bazi/tools/index.ts                       │
+  │     export { newTool } from "./new-tool"  ← 🔴 修改点6                  │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  建议方案: YAML 单一数据源 + 动态注册表
+
+  目标架构时序图
+
+  ┌──────────┐     ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌─────────────┐
+  │  用户    │     │  chat_v5 │     │  CoreAgent │     │ ToolRegistry │     │ToolHandlers │
+  └────┬─────┘     └────┬─────┘     └─────┬──────┘     └──────┬───────┘     └──────┬──────┘
+       │                │                 │                   │                    │
+       │                │                 │ 启动时自动加载     │                    │
+       │                │                 │──────────────────>│                    │
+       │                │                 │                   │                    │
+       │                │                 │                   │ load_from_yaml()   │
+       │                │                 │                   │ skills/*/tools.yaml│
+       │                │                 │                   │                    │
+       │                │                 │                   │ auto_discover()    │
+       │                │                 │                   │──────────────────>│
+       │                │                 │                   │                    │
+       │                │                 │                   │ register_handlers()│
+       │                │                 │                   │ @tool_handler      │
+       │                │                 │                   │<──────────────────│
+       │                │                 │                   │                    │
+       │ 1. 发送消息    │                 │                   │                    │
+       │───────────────>│ 2. agent.run()  │                   │                    │
+       │                │────────────────>│                   │                    │
+       │                │                 │                   │                    │
+       │                │                 │ 3. get_tools()    │                    │
+       │                │                 │──────────────────>│                    │
+       │                │                 │<──────────────────│ 4. 从 YAML 缓存   │
+       │                │                 │                   │                    │
+       │                │                 │ 5. LLM 工具调用   │                    │
+       │                │                 │                   │                    │
+       │                │                 │ 6. execute()      │                    │
+       │                │                 │──────────────────>│                    │
+       │                │                 │                   │                    │
+       │                │                 │                   │ 7. handlers[name]()│
+       │                │                 │                   │──────────────────>│
+       │                │                 │                   │<──────────────────│
+       │                │                 │<──────────────────│ 8. 结果           │
+       │                │                 │                   │                    │
+       │<───────────────│<────────────────│ 9. SSE 响应       │                    │
+
+  核心改动
+
+  Step 1: 统一 ToolRegistry (tool_schema.py)
+
+  # 从 YAML 加载工具定义 + 从 Python 模块发现执行器
+  class UnifiedToolRegistry:
+      _tools: Dict[str, ToolDef] = {}
+      _handlers: Dict[str, Callable] = {}
+
+      @classmethod
+      def load_skill(cls, skill_id: str):
+          # 从 YAML 加载定义
+          tools = load_skill_tools(skill_id)  # 已存在
+          for tool in tools:
+              cls._tools[tool.name] = tool
+
+          # 从 Python 模块发现执行器
+          handlers = discover_handlers(skill_id)
+          cls._handlers.update(handlers)
+
+      @classmethod
+      def get_tools_openai(cls, skill_id: str) -> List[Dict]:
+          return [t.to_openai_format() for t in cls._tools.values()
+                  if t.skill_id == skill_id or t.is_global]
+
+      @classmethod
+      async def execute(cls, tool_name: str, args: Dict, context: AgentContext):
+          if tool_name not in cls._handlers:
+              raise ToolNotFoundError(tool_name)
+          return await cls._handlers[tool_name](args, context)
+
+  Step 2: 动态 Handler 注册 (装饰器)
+
+  # apps/api/skills/bazi/tools/handlers.py
+  from services.agent.tool_registry import tool_handler
+
+  @tool_handler("show_bazi_chart")
+  async def execute_show_bazi_chart(args: Dict, context: AgentContext) -> Dict:
+      """执行 show_bazi_chart 工具"""
+      skill_data = context.skill_data.get("bazi", {})
+      chart = skill_data.get("chart", {})
+      return {
+          "fourPillars": chart.get("four_pillars"),
+          "dayMaster": chart.get("day_master"),
+          "fiveElements": chart.get("five_elements"),
+          ...
+      }
+
+  Step 3: CoreAgent 使用统一 Registry
+
+  # core.py
+  def _get_current_tools(self, context: AgentContext) -> List[Dict]:
+      # 替换硬编码
+      return UnifiedToolRegistry.get_tools_openai(self._active_skill)
+
+  async def _execute_tool(self, tool_name: str, tool_args: str, context: AgentContext):
+      args = json.loads(tool_args) if tool_args else {}
+      # 替换 if-elif
+      return await UnifiedToolRegistry.execute(tool_name, args, context)
+
+  新增工具只需修改 2 处
+
+  新增工具 (改进后):
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  1️⃣ apps/api/skills/bazi/tools/tools.yaml                               │
+  │     display:                                                            │
+  │       - name: show_new_feature      ← ✅ 新增工具定义                    │
+  │         description: ...                                                │
+  │         card_type: new_feature_card                                     │
+  │                                                                         │
+  │  2️⃣ apps/api/skills/bazi/tools/handlers.py                              │
+  │     @tool_handler("show_new_feature")   ← ✅ 新增执行器                  │
+  │     async def execute_show_new_feature(...):                            │
+  │         return {...}                                                    │
+  │                                                                         │
+  │  ──────────────────────────────────────────────────────────────────────│
+  │  前端 (可选): 如果需要自定义渲染，再添加 tsx 组件                        │
+  │  默认使用通用卡片渲染器                                                  │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  下一步行动
+
+  1. Phase 1: 动态 Handler 注册表 (消除 if-elif)
+    - 创建 @tool_handler 装饰器
+    - 将现有 25+ 个 _execute_* 函数迁移为装饰器形式
+    - CoreAgent 使用注册表分发
+  2. Phase 2: YAML 工具定义启用
+    - CoreAgent 从 tool_schema.py 获取工具列表
+    - 删除 tools.py 中的硬编码
+  3. Phase 3: 前端 Schema 同步
+    - 后端 /api/tools/schema 端点返回工具定义
+    - 前端根据 schema 动态渲染或生成类型
+
+  ---
+  是否需要我开始实施 Phase 1 (动态 Handler 注册表)?
+
+✻ Brewed for 2m 48s
+
+❯ 全部执行，自我测试，知道通过 
+
+● 开始执行全部重构。
+
+● Write(apps/api/services/agent/tool_registry.py)
+  ⎿  Wrote 282 lines to apps/api/services/agent/tool_registry.py
+      1 """
+      2 Unified Tool Registry v6 - 统一工具注册表
+      3 解决工具注册的硬编码问题：
+      4 1. 从 YAML 加载工具定义 (Single Source of Truth)
+      5 2. 使用 @tool_handler 装饰器动态注册执行器
+      6 3. 消除 if-elif 分发，使用注册表查找
+      7 新增工具只需修改 2 处：
+      8 1. skills/{skill_id}/tools/tools.yaml - 工具定义
+     … +272 lines (ctrl+o to expand)
+
+● 现在创建全局工具处理器和 Skill 专属处理器。
+
+● Write(apps/api/services/agent/global_handlers.py)
+  ⎿  Wrote 228 lines to apps/api/services/agent/global_handlers.py
+      1 """
+      2 Global Tool Handlers - 全局工具执行器
+      3 使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+      4 """
+      5 import json
+      6 import logging
+      7 from datetime import datetime
+      8 from typing import Dict, Any
+     … +218 lines (ctrl+o to expand)
+
+● Write(apps/api/skills/bazi/tools/handlers.py)
+  ⎿  Wrote 253 lines to apps/api/skills/bazi/tools/handlers.py   
+      1 """
+      2 Bazi Skill Tool Handlers - 八字工具执行器
+      3 使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+      4 """
+      5 import logging
+      6 from datetime import datetime
+      7 from typing import Dict, Any, Optional
+      8 from uuid import UUID
+     … +243 lines (ctrl+o to expand)
+
+● Search(pattern: "apps/api/skills/zodiac/tools/*")
+  ⎿  Found 0 files 
+
+● Bash(mkdir -p /home/aiscend/work/vibelife/apps/api/skills/zodiac/tools)
+  ⎿  (No content)
+
+● Write(apps/api/skills/zodiac/tools/tools.yaml)
+  ⎿  Wrote 83 lines to apps/api/skills/zodiac/tools/tools.yaml     
+      1 version: "1.0"
+      2 skill_id: zodiac
+      3 # 收集型工具
+      4 collect:
+      5   - name: collect_zodiac_info
+      6     description: |
+      7       收集用户的出生信息以进行星盘分析。
+      8       当用户想要进行星座/占星分析但尚未提供出生信息时调用。
+      9     card_type: zodiac_form
+     … +73 lines (ctrl+o to expand)
+
+● Write(apps/api/skills/zodiac/tools/handlers.py)
+  ⎿  Wrote 135 lines to apps/api/skills/zodiac/tools/handlers.py          
+      1 """
+      2 Zodiac Skill Tool Handlers - 星座工具执行器
+      3 使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+      4 """
+      5 import logging
+      6 from datetime import datetime
+      7 from typing import Dict, Any
+      8 from services.agent.tool_registry import tool_handler, ToolContext
+     … +125 lines (ctrl+o to expand)
+
+● Bash(mkdir -p /home/aiscend/work/vibelife/apps/api/skills/tarot/tools /home/aiscend/work/vibelife/apps/api/skills/career/tools)
+  ⎿  (No content)
+
+● Write(apps/api/skills/tarot/tools/tools.yaml)
+  ⎿  Wrote 38 lines to apps/api/skills/tarot/tools/tools.yaml
+      1 version: "1.0"
+      2 skill_id: tarot
+      3 # 计算型工具
+      4 compute:
+      5   - name: draw_tarot_cards
+      6     description: |
+      7       抽塔罗牌。根据用户问题和选择的牌阵抽取塔罗牌。
+      8     card_type: tarot_spread
+      9     when_to_call: |
+     … +28 lines (ctrl+o to expand)
+
+● Write(apps/api/skills/tarot/tools/handlers.py)
+  ⎿  Wrote 42 lines to apps/api/skills/tarot/tools/handlers.py            
+      1 """
+      2 Tarot Skill Tool Handlers - 塔罗工具执行器
+      3 使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+      4 """
+      5 import logging
+      6 from typing import Dict, Any
+      7 from services.agent.tool_registry import tool_handler, ToolContext
+     … +32 lines (ctrl+o to expand)
+
+● Write(apps/api/skills/career/tools/tools.yaml)
+  ⎿  Wrote 24 lines to apps/api/skills/career/tools/tools.yaml
+      1 version: "1.0"
+      2 skill_id: career
+      3 # 展示型工具
+      4 display:
+      5   - name: show_career_analysis
+      6     description: |
+      7       展示职业分析。当用户问职业方向、发展建议时调用。
+      8     card_type: career_analysis
+      9     when_to_call: |
+     … +14 lines (ctrl+o to expand)

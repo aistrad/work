@@ -1,0 +1,296 @@
+     1→from __future__ import annotations
+     2→
+     3→import json
+     4→import os
+     5→from typing import Any, Dict, Iterable, List, Optional, Tuple
+     6→
+     7→import httpx
+     8→
+     9→
+    10→class GlmError(RuntimeError):
+    11→    pass
+    12→
+    13→
+    14→def _env(name: str) -> str:
+    15→    v = (os.getenv(name) or "").strip()
+    16→    if not v:
+    17→        raise GlmError(f"missing_env:{name}")
+    18→    return v
+    19→
+    20→
+    21→def call_chat_completions(
+    22→    *,
+    23→    messages: List[Dict[str, Any]],
+    24→    model: Optional[str] = None,
+    25→    max_tokens: int = 1200,
+    26→    temperature: float = 0.6,
+    27→    timeout_s: float = 120.0,
+    28→) -> Tuple[str, Dict[str, Any]]:
+    29→    """Call Z.AI GLM OpenAI-compatible Chat Completions endpoint.
+    30→
+    31→    Docs: https://docs.z.ai/guides/llm/glm-4.5
+    32→    """
+    33→    base_url = (os.getenv("GLM_BASE_URL") or "https://api.z.ai/api/paas/v4").rstrip("/")
+    34→    api_key = (os.getenv("GLM_API_KEY") or os.getenv("ZAI_GLM_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
+    35→    if not api_key:
+    36→        raise GlmError("missing_env:GLM_API_KEY_OR_ZAI_GLM_KEY")
+    37→    model_name = (model or os.getenv("FORTUNE_AI_GLM_MODEL") or "").strip() or "glm-4.7"
+    38→    thinking_type = (os.getenv("FORTUNE_AI_GLM_THINKING") or "disabled").strip().lower()
+    39→    if thinking_type not in ("enabled", "disabled"):
+    40→        thinking_type = "disabled"
+    41→
+    42→    url = f"{base_url}/chat/completions"
+    43→    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    44→
+    45→    def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
+    46→        try:
+    47→            with httpx.Client(timeout=timeout_s) as client:
+    48→                resp = client.post(url, headers=headers, json=payload)
+    49→        except httpx.RequestError as e:
+    50→            raise GlmError(f"glm_request_error:{type(e).__name__}:{str(e)[:200]}")
+    51→
+    52→        if resp.status_code >= 400:
+    53→            try:
+    54→                j = resp.json()
+    55→            except Exception:
+    56→                j = None
+    57→            msg = ""
+    58→            if isinstance(j, dict):
+    59→                err = j.get("error")
+    60→                if isinstance(err, dict) and err.get("message"):
+    61→                    msg = str(err.get("message") or "")
+    62→            msg = msg or (resp.text or "")[:200]
+    63→            raise GlmError(f"glm_http_error:{resp.status_code}:{msg}")
+    64→
+    65→        try:
+    66→            return resp.json()
+    67→        except Exception:
+    68→            raise GlmError(f"glm_invalid_response:non_json:{(resp.text or '')[:200]}")
+    69→
+    70→    def _extract_text(data: Dict[str, Any]) -> Tuple[str, str]:
+    71→        choices = data.get("choices")
+    72→        if not isinstance(choices, list) or not choices:
+    73→            raise GlmError("glm_invalid_response:no_choices")
+    74→        first = choices[0]
+    75→        if not isinstance(first, dict):
+    76→            raise GlmError("glm_invalid_response:invalid_choice")
+    77→        msg = first.get("message")
+    78→        if not isinstance(msg, dict):
+    79→            raise GlmError("glm_invalid_response:missing_message")
+    80→        content = msg.get("content")
+    81→        reasoning = msg.get("reasoning_content")
+    82→        if isinstance(content, str) and content.strip():
+    83→            return content.strip(), str(reasoning or "")
+    84→        if isinstance(content, list):
+    85→            # Some OpenAI-compatible variants may return content as a list of parts.
+    86→            parts: list[str] = []
+    87→            for p in content:
+    88→                if isinstance(p, str):
+    89→                    parts.append(p)
+    90→                elif isinstance(p, dict) and isinstance(p.get("text"), str):
+    91→                    parts.append(str(p.get("text") or ""))
+    92→            text = "".join(parts).strip()
+    93→            if text:
+    94→                return text, str(reasoning or "")
+    95→        return "", str(reasoning or "")
+    96→
+    97→    payload = {
+    98→        "model": model_name,
+    99→        "max_tokens": int(max_tokens),
+   100→        "temperature": float(temperature),
+   101→        "stream": False,
+   102→        "thinking": {"type": thinking_type},
+   103→        "messages": messages,
+   104→    }
+   105→    data = _post(payload)
+   106→    text, reasoning = _extract_text(data)
+   107→    if text:
+   108→        return text, data
+   109→    if reasoning and thinking_type == "enabled":
+   110→        # Z.AI returns reasoning_content without final content when thinking is enabled.
+   111→        payload_fallback = dict(payload)
+   112→        payload_fallback["thinking"] = {"type": "disabled"}
+   113→        data_fallback = _post(payload_fallback)
+   114→        text_fallback, _ = _extract_text(data_fallback)
+   115→        if text_fallback:
+   116→            return text_fallback, data_fallback
+   117→    raise GlmError("glm_invalid_response:empty_content")
+   118→
+   119→
+   120→def call_messages_api(
+   121→    *,
+   122→    system: str,
+   123→    messages: List[Dict[str, Any]],
+   124→    model: Optional[str] = None,
+   125→    max_tokens: int = 1200,
+   126→    temperature: float = 0.6,
+   127→    timeout_s: float = 120.0,
+   128→) -> Tuple[str, Dict[str, Any]]:
+   129→    """Backward-compatible shim for older Anthropic-style callers.
+   130→
+   131→    It converts `system` + anthropic-style `messages` into OpenAI-style messages
+   132→    and calls Z.AI GLM Chat Completions.
+   133→    """
+   134→    out: List[Dict[str, Any]] = [{"role": "system", "content": (system or "").strip()}]
+   135→    for m in messages or []:
+   136→        if not isinstance(m, dict):
+   137→            continue
+   138→        role = str(m.get("role") or "user")
+   139→        content = m.get("content")
+   140→        if isinstance(content, list):
+   141→            parts: list[str] = []
+   142→            for blk in content:
+   143→                if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+   144→                    parts.append(str(blk.get("text") or ""))
+   145→            content_s = "".join(parts).strip()
+   146→        else:
+   147→            content_s = str(content or "").strip()
+   148→        out.append({"role": role, "content": content_s})
+   149→    return call_chat_completions(
+   150→        messages=out,
+   151→        model=model,
+   152→        max_tokens=max_tokens,
+   153→        temperature=temperature,
+   154→        timeout_s=timeout_s,
+   155→    )
+   156→
+   157→
+   158→def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+   159→    s = (text or "").strip()
+   160→    if not s:
+   161→        return None
+   162→    # Fast path: whole response is JSON
+   163→    if s.startswith("{") and s.endswith("}"):
+   164→        try:
+   165→            obj = json.loads(s)
+   166→            return obj if isinstance(obj, dict) else None
+   167→        except Exception:
+   168→            pass
+   169→    # Best-effort: find first {...} JSON object
+   170→    start = s.find("{")
+   171→    if start < 0:
+   172→        return None
+   173→    depth = 0
+   174→    in_str = False
+   175→    esc = False
+   176→    for i in range(start, len(s)):
+   177→        ch = s[i]
+   178→        if in_str:
+   179→            if esc:
+   180→                esc = False
+   181→            elif ch == "\\":
+   182→                esc = True
+   183→            elif ch == "\"":
+   184→                in_str = False
+   185→            continue
+   186→        if ch == "\"":
+   187→            in_str = True
+   188→            continue
+   189→        if ch == "{":
+   190→            depth += 1
+   191→        elif ch == "}":
+   192→            depth -= 1
+   193→            if depth == 0:
+   194→                frag = s[start : i + 1]
+   195→                try:
+   196→                    obj = json.loads(frag)
+   197→                    return obj if isinstance(obj, dict) else None
+   198→                except Exception:
+   199→                    return None
+   200→    return None
+   201→
+   202→
+   203→def stream_chat_completions(
+   204→    *,
+   205→    messages: List[Dict[str, Any]],
+   206→    model: Optional[str] = None,
+   207→    max_tokens: int = 1200,
+   208→    temperature: float = 0.6,
+   209→    timeout_s: float = 300.0,
+   210→) -> Iterable[str]:
+   211→    """
+   212→    Stream text deltas from Z.AI GLM OpenAI-compatible Chat Completions endpoint.
+   213→
+   214→    Yields incremental `content` strings as they arrive.
+   215→    """
+   216→    base_url = (os.getenv("GLM_BASE_URL") or "https://api.z.ai/api/paas/v4").rstrip("/")
+   217→    api_key = (os.getenv("GLM_API_KEY") or os.getenv("ZAI_GLM_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
+   218→    if not api_key:
+   219→        raise GlmError("missing_env:GLM_API_KEY_OR_ZAI_GLM_KEY")
+   220→
+   221→    model_name = (model or os.getenv("FORTUNE_AI_GLM_MODEL") or "").strip() or "glm-4.7"
+   222→    thinking_type = (os.getenv("FORTUNE_AI_GLM_THINKING") or "disabled").strip().lower()
+   223→    if thinking_type not in ("enabled", "disabled"):
+   224→        thinking_type = "disabled"
+   225→
+   226→    url = f"{base_url}/chat/completions"
+   227→    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+   228→
+   229→    payload = {
+   230→        "model": model_name,
+   231→        "max_tokens": int(max_tokens),
+   232→        "temperature": float(temperature),
+   233→        "stream": True,
+   234→        "thinking": {"type": thinking_type},
+   235→        "messages": messages,
+   236→    }
+   237→
+   238→    timeout = httpx.Timeout(timeout_s, connect=10.0)
+   239→    try:
+   240→        with httpx.Client(timeout=timeout) as client:
+   241→            with client.stream("POST", url, headers=headers, json=payload) as resp:
+   242→                if resp.status_code >= 400:
+   243→                    try:
+   244→                        j = resp.json()
+   245→                    except Exception:
+   246→                        j = None
+   247→                    msg = ""
+   248→                    if isinstance(j, dict):
+   249→                        err = j.get("error")
+   250→                        if isinstance(err, dict) and err.get("message"):
+   251→                            msg = str(err.get("message") or "")
+   252→                    msg = msg or (resp.text or "")[:200]
+   253→                    raise GlmError(f"glm_http_error:{resp.status_code}:{msg}")
+   254→
+   255→                for raw_line in resp.iter_lines():
+   256→                    line = (raw_line or "").strip()
+   257→                    if not line:
+   258→                        continue
+   259→                    if not line.startswith("data:"):
+   260→                        continue
+   261→                    data = line[5:].strip()
+   262→                    if not data:
+   263→                        continue
+   264→                    if data == "[DONE]":
+   265→                        break
+   266→                    try:
+   267→                        obj = json.loads(data)
+   268→                    except Exception:
+   269→                        continue
+   270→
+   271→                    choices = obj.get("choices")
+   272→                    if not isinstance(choices, list) or not choices:
+   273→                        continue
+   274→                    first = choices[0] if isinstance(choices[0], dict) else None
+   275→                    if not first:
+   276→                        continue
+   277→
+   278→                    delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+   279→                    content = delta.get("content")
+   280→                    if isinstance(content, str) and content:
+   281→                        yield content
+   282→                        continue
+   283→
+   284→                    # Tolerate alternative formats (some providers use message/content)
+   285→                    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+   286→                    content2 = msg.get("content")
+   287→                    if isinstance(content2, str) and content2:
+   288→                        yield content2
+   289→
+   290→    except httpx.RequestError as e:
+   291→        raise GlmError(f"glm_request_error:{type(e).__name__}:{str(e)[:200]}")
+   292→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

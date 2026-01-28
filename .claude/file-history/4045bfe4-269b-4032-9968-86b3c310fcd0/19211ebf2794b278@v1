@@ -1,0 +1,301 @@
+"""
+Mentis OS v3.0 - Vision 图像理解服务
+
+支持使用 GPT-4 Vision 或 Gemini Vision 分析图片内容。
+"""
+from __future__ import annotations
+
+import base64
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+# 配置
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+VISION_PROVIDER = os.getenv("MENTIS_VISION_PROVIDER", "openai")  # openai or google
+VISION_MODEL = os.getenv("MENTIS_VISION_MODEL", "gpt-4o")
+
+OPENAI_VISION_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_VISION_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+
+@dataclass
+class VisionResult:
+    """图像分析结果"""
+    description: str
+    emotion_detected: Optional[str]
+    scene: Optional[str]
+    objects: List[str]
+    text_content: Optional[str]
+    confidence: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "description": self.description,
+            "emotion_detected": self.emotion_detected,
+            "scene": self.scene,
+            "objects": self.objects,
+            "text_content": self.text_content,
+            "confidence": self.confidence,
+        }
+
+
+class VisionError(Exception):
+    """Vision 服务错误"""
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+# Mentis 专用提示词
+MENTIS_VISION_PROMPT = """分析这张图片，提取与用户情绪和状态相关的信息。
+
+请以 JSON 格式返回以下信息：
+{
+  "description": "图片的简要描述（50字以内）",
+  "emotion_detected": "从图片中感知到的情绪（如 joy, sadness, calm, anxiety 等，或 null）",
+  "scene": "场景类型（work, home, outdoor, social, 或 null）",
+  "objects": ["识别到的主要物体列表"],
+  "text_content": "图片中的文字内容（如有）",
+  "mood_context": "这张图片可能反映的心情或状态"
+}
+
+只返回 JSON，不要其他文字。"""
+
+
+async def analyze_image(
+    image_data: bytes,
+    mime_type: str = "image/jpeg",
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    分析图片内容
+
+    Args:
+        image_data: 图片数据（bytes）
+        mime_type: MIME 类型
+        prompt: 自定义提示词（可选）
+
+    Returns:
+        VisionResult: 分析结果
+
+    Raises:
+        VisionError: 分析失败
+    """
+    if VISION_PROVIDER == "google" and GOOGLE_API_KEY:
+        return await _analyze_with_gemini(image_data, mime_type, prompt)
+    elif OPENAI_API_KEY:
+        return await _analyze_with_openai(image_data, mime_type, prompt)
+    else:
+        raise VisionError("vision/no-api-key", "未配置 Vision API Key")
+
+
+async def analyze_image_url(
+    image_url: str,
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    分析图片 URL
+
+    Args:
+        image_url: 图片 URL
+        prompt: 自定义提示词
+
+    Returns:
+        VisionResult: 分析结果
+    """
+    if VISION_PROVIDER == "google" and GOOGLE_API_KEY:
+        # Gemini 需要下载图片
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(image_url)
+            response.raise_for_status()
+            image_data = response.content
+            mime_type = response.headers.get("content-type", "image/jpeg")
+        return await _analyze_with_gemini(image_data, mime_type, prompt)
+    elif OPENAI_API_KEY:
+        return await _analyze_with_openai_url(image_url, prompt)
+    else:
+        raise VisionError("vision/no-api-key", "未配置 Vision API Key")
+
+
+async def analyze_base64(
+    base64_image: str,
+    mime_type: str = "image/jpeg",
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    分析 base64 编码的图片
+
+    Args:
+        base64_image: base64 编码的图片
+        mime_type: MIME 类型
+        prompt: 自定义提示词
+
+    Returns:
+        VisionResult: 分析结果
+    """
+    try:
+        # 移除可能的 data URL 前缀
+        if "," in base64_image:
+            prefix, base64_image = base64_image.split(",", 1)
+            if "jpeg" in prefix:
+                mime_type = "image/jpeg"
+            elif "png" in prefix:
+                mime_type = "image/png"
+            elif "gif" in prefix:
+                mime_type = "image/gif"
+            elif "webp" in prefix:
+                mime_type = "image/webp"
+
+        image_data = base64.b64decode(base64_image)
+        return await analyze_image(image_data, mime_type, prompt)
+    except Exception as e:
+        if isinstance(e, VisionError):
+            raise
+        raise VisionError("vision/decode-error", f"图片解码失败: {str(e)}")
+
+
+async def _analyze_with_openai(
+    image_data: bytes,
+    mime_type: str,
+    prompt: Optional[str],
+) -> VisionResult:
+    """使用 OpenAI Vision API"""
+    base64_image = base64.b64encode(image_data).decode()
+    data_url = f"data:{mime_type};base64,{base64_image}"
+
+    return await _analyze_with_openai_url(data_url, prompt)
+
+
+async def _analyze_with_openai_url(
+    image_url: str,
+    prompt: Optional[str],
+) -> VisionResult:
+    """使用 OpenAI Vision API (URL)"""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or MENTIS_VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "max_tokens": 500,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(
+                OPENAI_VISION_URL,
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+
+            return _parse_vision_response(content)
+
+        except httpx.HTTPStatusError as e:
+            raise VisionError(
+                "vision/api-error",
+                f"OpenAI API 错误: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VisionError("vision/error", f"图片分析失败: {str(e)}")
+
+
+async def _analyze_with_gemini(
+    image_data: bytes,
+    mime_type: str,
+    prompt: Optional[str],
+) -> VisionResult:
+    """使用 Gemini Vision API"""
+    base64_image = base64.b64encode(image_data).decode()
+
+    url = f"{GEMINI_VISION_URL}?key={GOOGLE_API_KEY}"
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt or MENTIS_VISION_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_image,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 500,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+
+            result = response.json()
+            content = result["candidates"][0]["content"]["parts"][0]["text"]
+
+            return _parse_vision_response(content)
+
+        except httpx.HTTPStatusError as e:
+            raise VisionError(
+                "vision/api-error",
+                f"Gemini API 错误: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VisionError("vision/error", f"图片分析失败: {str(e)}")
+
+
+def _parse_vision_response(content: str) -> VisionResult:
+    """解析 Vision API 响应"""
+    import json
+
+    try:
+        # 尝试解析 JSON
+        # 移除可能的 markdown 代码块
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        data = json.loads(content.strip())
+
+        return VisionResult(
+            description=data.get("description", ""),
+            emotion_detected=data.get("emotion_detected"),
+            scene=data.get("scene"),
+            objects=data.get("objects", []),
+            text_content=data.get("text_content"),
+            confidence=data.get("confidence"),
+        )
+    except json.JSONDecodeError:
+        # 如果无法解析 JSON，返回原始描述
+        return VisionResult(
+            description=content[:200],
+            emotion_detected=None,
+            scene=None,
+            objects=[],
+            text_content=None,
+            confidence=None,
+        )

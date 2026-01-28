@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+LLM 配置验证工具
+验证所有 LLM provider 的 API Key 和端点配置是否正确
+
+使用方法:
+    python scripts/validate_llm_config.py
+    python scripts/validate_llm_config.py --fix  # 显示修复建议
+"""
+import os
+import sys
+import asyncio
+import argparse
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+import httpx
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv('/home/aiscend/work/vibelife/.env.test', override=True)
+load_dotenv('/home/aiscend/work/vibelife/.env', override=True)
+
+
+@dataclass
+class ProviderConfig:
+    """Provider 配置"""
+    name: str
+    env_key: str
+    env_url: str
+    default_url: str
+    model: str
+    test_endpoint: str  # 测试用的 endpoint 路径
+    headers_builder: callable  # 构建请求头的函数
+
+
+# Anthropic 兼容格式的请求头
+def anthropic_headers(api_key: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01"
+    }
+
+
+# OpenAI 兼容格式的请求头
+def openai_headers(api_key: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+
+# Provider 配置定义
+PROVIDERS: Dict[str, ProviderConfig] = {
+    "deepseek": ProviderConfig(
+        name="DeepSeek V3",
+        env_key="DEEPSEEK_API_KEY",
+        env_url="DEEPSEEK_BASE_URL",
+        default_url="https://api.deepseek.com/anthropic",
+        model="deepseek-chat",
+        test_endpoint="/messages",
+        headers_builder=anthropic_headers
+    ),
+    "glm": ProviderConfig(
+        name="GLM 4.7 (Anthropic)",
+        env_key="GLM_API_KEY",
+        env_url="GLM_BASE_URL",
+        default_url="https://open.bigmodel.cn/api/anthropic/v1",
+        model="glm-4.7",
+        test_endpoint="/messages",
+        headers_builder=anthropic_headers
+    ),
+    "claude": ProviderConfig(
+        name="Claude (代理)",
+        env_key="CLAUDE_API_KEY",
+        env_url="CLAUDE_BASE_URL",
+        default_url="https://www.zz166.cn/api/v1",
+        model="claude-sonnet-4-20250514",
+        test_endpoint="/messages",
+        headers_builder=anthropic_headers
+    ),
+    "gemini": ProviderConfig(
+        name="Gemini (代理)",
+        env_key="GEMINI_API_KEY",
+        env_url="GEMINI_BASE_URL",
+        default_url="https://new.12ai.org/v1",
+        model="gemini-2.5-flash",
+        test_endpoint="/chat/completions",
+        headers_builder=openai_headers
+    ),
+}
+
+
+@dataclass
+class ValidationResult:
+    """验证结果"""
+    provider: str
+    name: str
+    status: str  # ok, error, warning, skip
+    message: str
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    fix_suggestion: Optional[str] = None
+
+
+async def test_provider(provider_id: str, config: ProviderConfig) -> ValidationResult:
+    """测试单个 provider"""
+    api_key = os.getenv(config.env_key, "")
+    base_url = os.getenv(config.env_url, config.default_url)
+
+    # 检查 API Key
+    if not api_key:
+        return ValidationResult(
+            provider=provider_id,
+            name=config.name,
+            status="error",
+            message=f"API Key 未设置",
+            api_key="(empty)",
+            base_url=base_url,
+            fix_suggestion=f"在 .env 中设置 {config.env_key}=your_api_key"
+        )
+
+    # 检查 API Key 格式
+    key_preview = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else api_key
+
+    # 构建测试请求
+    url = f"{base_url.rstrip('/')}{config.test_endpoint}"
+    headers = config.headers_builder(api_key)
+
+    # Anthropic 格式的测试请求体
+    if config.test_endpoint == "/messages":
+        payload = {
+            "model": config.model,
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }
+    else:
+        # OpenAI 格式
+        payload = {
+            "model": config.model,
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code == 200:
+                return ValidationResult(
+                    provider=provider_id,
+                    name=config.name,
+                    status="ok",
+                    message="API 连接正常",
+                    api_key=key_preview,
+                    base_url=base_url
+                )
+            elif response.status_code == 401:
+                return ValidationResult(
+                    provider=provider_id,
+                    name=config.name,
+                    status="error",
+                    message=f"API Key 无效 (401)",
+                    api_key=key_preview,
+                    base_url=base_url,
+                    fix_suggestion=f"检查 {config.env_key} 是否正确"
+                )
+            elif response.status_code == 404:
+                return ValidationResult(
+                    provider=provider_id,
+                    name=config.name,
+                    status="error",
+                    message=f"端点不存在 (404)",
+                    api_key=key_preview,
+                    base_url=base_url,
+                    fix_suggestion=f"检查 {config.env_url} 是否正确，当前: {base_url}"
+                )
+            else:
+                body = response.text[:200]
+                return ValidationResult(
+                    provider=provider_id,
+                    name=config.name,
+                    status="warning",
+                    message=f"HTTP {response.status_code}: {body}",
+                    api_key=key_preview,
+                    base_url=base_url
+                )
+    except httpx.TimeoutException:
+        return ValidationResult(
+            provider=provider_id,
+            name=config.name,
+            status="warning",
+            message="请求超时 (30s)",
+            api_key=key_preview,
+            base_url=base_url
+        )
+    except Exception as e:
+        return ValidationResult(
+            provider=provider_id,
+            name=config.name,
+            status="error",
+            message=f"连接失败: {str(e)}",
+            api_key=key_preview,
+            base_url=base_url
+        )
+
+
+async def validate_all(show_fix: bool = False) -> List[ValidationResult]:
+    """验证所有 provider"""
+    print("=" * 70)
+    print("VibeLife LLM 配置验证")
+    print("=" * 70)
+
+    results = []
+
+    for provider_id, config in PROVIDERS.items():
+        print(f"\n检测 {config.name}...", end=" ", flush=True)
+        result = await test_provider(provider_id, config)
+        results.append(result)
+
+        # 状态图标
+        icons = {"ok": "✅", "error": "❌", "warning": "⚠️", "skip": "⏭️"}
+        print(icons.get(result.status, "?"))
+
+    # 打印详细结果
+    print("\n" + "=" * 70)
+    print("验证结果")
+    print("=" * 70)
+
+    for r in results:
+        icon = {"ok": "✅", "error": "❌", "warning": "⚠️", "skip": "⏭️"}.get(r.status, "?")
+        print(f"\n{icon} {r.name} ({r.provider})")
+        print(f"   状态: {r.message}")
+        if r.api_key:
+            print(f"   Key:  {r.api_key}")
+        if r.base_url:
+            print(f"   URL:  {r.base_url}")
+        if show_fix and r.fix_suggestion:
+            print(f"   修复: {r.fix_suggestion}")
+
+    # 汇总
+    print("\n" + "=" * 70)
+    ok_count = sum(1 for r in results if r.status == "ok")
+    error_count = sum(1 for r in results if r.status == "error")
+    warning_count = sum(1 for r in results if r.status == "warning")
+
+    print(f"汇总: ✅ {ok_count} 正常 | ❌ {error_count} 错误 | ⚠️ {warning_count} 警告")
+
+    if error_count > 0:
+        print("\n提示: 使用 --fix 参数查看修复建议")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="验证 LLM 配置")
+    parser.add_argument("--fix", action="store_true", help="显示修复建议")
+    args = parser.parse_args()
+
+    asyncio.run(validate_all(show_fix=args.fix))
+
+
+if __name__ == "__main__":
+    main()

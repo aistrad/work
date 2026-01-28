@@ -1,0 +1,527 @@
+# VibeLife Landing Page 视觉资产清单
+
+> **版本**: 7.2
+> **配套文档**: LandingPage-Design-v1.md, LandingPage-Components.md
+> **配色体系**: 高级灰棕 + Morandi 中饱和色系 + Linear 精致风格
+> **文案理念**: 从"命定"到"选择"，从"认知"到"行动"
+
+---
+
+## 一、设计资产总览
+
+### 1.1 资产分类
+
+| 分类 | 数量 | 格式 | 用途 |
+|------|------|------|------|
+| Logo & 符号 | 3 | SVG | 品牌标识 |
+| 原型图标 | 12 | SVG | 原型卡片 |
+| 心理学家头像 | 3 | JPG/WebP | 心理学背书 |
+| 插图 | 5 | SVG/PNG | 装饰与说明 |
+| 图标 | 20+ | SVG | UI 元素 |
+
+---
+
+## 二、Logo & 品牌符号
+
+### 2.1 VibeID 主符号
+
+```
+资产名称: vibeid-symbol
+格式: SVG
+尺寸: 160px × 160px (默认), 120px (mobile), 200px (hero-large)
+用途: Hero 首屏, 最终CTA, 加载动画
+
+设计要求:
+- 12片花瓣结构，对应12原型（12种生命策略）
+- 渐变色使用12原型配色 (v7.1)
+- 支持动画（呼吸效果 + 旋转）
+- 提供静态版本用于打印
+
+色彩配置 (v7.1 更新):
+  花瓣1:  #FFB7C5 (Innocent - 樱花粉)
+  花瓣2:  #9B59B6 (Sage - 智慧紫)
+  花瓣3:  #87CEEB (Explorer - 天空蓝)
+  花瓣4:  #8B0000 (Outlaw - 深红色)
+  花瓣5:  #8E44AD (Magician - 魔法紫)
+  花瓣6:  #E74C3C (Hero - 英雄红)
+  花瓣7:  #E91E63 (Lover - 玫瑰粉)
+  花瓣8:  #F39C12 (Jester - 欢乐金)
+  花瓣9:  #27AE60 (Regular - 平和绿)
+  花瓣10: #2ECC71 (Caregiver - 关怀绿)
+  花瓣11: #D4AF37 (Ruler - 皇金色)
+  花瓣12: #3498DB (Creator - 创意蓝)
+```
+
+### 2.2 VibeLife Logo
+
+```
+资产名称: vibelife-logo
+格式: SVG
+变体:
+  - vibelife-logo-full.svg (图标+文字)
+  - vibelife-logo-icon.svg (仅图标)
+  - vibelife-logo-text.svg (仅文字)
+
+用途: 导航栏, Footer, 加载页
+
+字体: Merriweather Bold
+色彩 (v7.1):
+  - 默认: #262626 (ink-800)
+  - 白底反色: #F8F7F4 (bg-primary)
+```
+
+### 2.3 品牌辅助图形
+
+```
+资产名称: brand-pattern
+格式: SVG (可平铺)
+用途: 背景装饰, 卡片纹理
+
+设计要求:
+- 极简几何图案
+- 低不透明度 (5-10%)
+- 融合东方云纹 + 西方星座连线元素
+- 主色调: 暖棕 #7A6B5A (accent-primary)
+
+设计理念: 呼应"东方与西方，殊途同归"的品牌主张
+```
+
+---
+
+## 三、12原型图标系统
+
+### 3.1 图标规格
+
+```
+格式: SVG
+尺寸: 48px × 48px (基准), 24px/32px/64px (变体)
+风格: 线性图标, 2px 描边, 圆润拐角
+色彩: 单色 (继承父级颜色) 或 原型专属色
+
+设计理念:
+- 每种原型代表"一种生命策略"
+- 图标传达原型核心能量而非标签
+```
+
+### 3.2 12原型图标清单 (v7.2 Morandi 中饱和配色)
+
+| 原型 | 文件名 | 视觉元素 | 专属色 | 渐变 | Tagline |
+|------|--------|----------|--------|------|------------|
+| Innocent | archetype-innocent.svg | 花朵/蝴蝶 | #F2B8B8 | 135deg → #FDF0F0 | 相信美好，是一种选择 |
+| Sage | archetype-sage.svg | 书籍/眼镜 | #9480A8 | 135deg → #E8E0EB | 理解，是我与世界连接的方式 |
+| Explorer | archetype-explorer.svg | 罗盘/山峰 | #7DB8C5 | 135deg → #E4F2F5 | 自由是选择的能力，不是逃避的借口 |
+| Outlaw | archetype-outlaw.svg | 闪电/面具 | #A8524F | 135deg → #E8D5D5 | 打破旧规则，是为了建立更好的规则 |
+| Magician | archetype-magician.svg | 水晶球/魔法棒 | #8570AB | 135deg → #E0DAE8 | 转化现实，从转化自己的视角开始 |
+| Hero | archetype-hero.svg | 盾牌/剑 | #D46560 | 135deg → #F5E0DE | 真正的强大，是知道何时柔软 |
+| Lover | archetype-lover.svg | 心形/玫瑰 | #D47D90 | 135deg → #F5E6EA | 全情投入，是我存在的方式 |
+| Jester | archetype-jester.svg | 面具/彩球 | #E5AD58 | 135deg → #FAF0DD | 快乐是智慧，不是逃避 |
+| Regular | archetype-regular.svg | 房屋/握手 | #6F9A6F | 135deg → #E2EFE2 | 归属感，是人类最深的需要之一 |
+| Caregiver | archetype-caregiver.svg | 双手/心 | #80C494 | 135deg → #E5F5EA | 照顾他人，也要记得照顾自己 |
+| Ruler | archetype-ruler.svg | 王冠/权杖 | #C99D58 | 135deg → #F7F0E0 | 建立秩序，是为了让更多人受益 |
+| Creator | archetype-creator.svg | 画笔/调色板 | #5C94C3 | 135deg → #E0ECF5 | 创造，是为了让世界多一种可能 |
+
+---
+
+## 四、心理学家头像
+
+### 4.1 头像规格
+
+```
+格式: JPG (主) + WebP (优化)
+尺寸: 200px × 200px (源文件), 80px/120px/160px (响应式)
+风格: 黑白/灰阶, 轻微对比度增强
+处理: 去背景, 圆形裁切, 边缘柔化
+```
+
+### 4.2 头像清单 (v1.3 文案更新)
+
+| 人物 | 文件名 | 来源建议 | 关联说明 |
+|------|--------|----------|----------|
+| 卡尔·荣格 | psychologist-jung.jpg | 公共领域历史照片 | 我们的四维模型和阴影系统，源自荣格的原型理论 |
+| 西格蒙德·弗洛伊德 | psychologist-freud.jpg | 公共领域历史照片 | 我们对"内心"与"阴影"的区分，受益于弗洛伊德的意识层次理论 |
+| 阿尔弗雷德·阿德勒 | psychologist-adler.jpg | 公共领域历史照片 | 我们的"勇气系统"和"行动建议"，基于阿德勒的目的论心理学 |
+
+### 4.3 头像使用场景
+
+```
+心理学背书 Section（标题：三位心理学巨匠的智慧）:
+  - 尺寸: 80px (mobile), 120px (desktop)
+  - 滤镜: grayscale(100%)
+  - 悬浮: grayscale(50%) + 轻微放大
+  - 边框: 2px solid var(--gold-500)  // 古金色装饰
+
+展示内容:
+  - 姓名 + 英文名
+  - 头衔
+  - 贡献领域
+  - 名言引用
+  - connection 字段（与产品的关联说明）
+```
+
+---
+
+## 五、体系图标
+
+### 5.1 三大体系图标 (v7.1 配色 + v1.3 文案)
+
+```
+Eastern (东方命理)
+  文件名: system-eastern.svg
+  视觉元素: 八卦简化 / 太极阴阳 / 中式云纹
+  色彩: #B85450 (element-fire 赤陶色)
+  配套文案:
+    - tags: ['八字', '五行', '十神', '行运']
+    - heritage: '3000年 · 理解你的能量结构'
+    - insight: '回答"我天生带着什么能量"'
+
+Western (西方占星)
+  文件名: system-western.svg
+  视觉元素: 星座连线 / 行星轨道 / 六芒星
+  色彩: #5B7B9A (element-water 雾霾蓝)
+  配套文案:
+    - tags: ['太阳', '月亮', '上升', '行星']
+    - heritage: '2000年 · 理解你的多面自我'
+    - insight: '回答"我的不同面向从何而来"'
+
+Psychology (深度心理)
+  文件名: system-psychology.svg
+  视觉元素: 神经网络 / 曼陀罗 / 意识层级
+  色彩: #8E7FA0 (mystic-500 神秘紫)
+  配套文案:
+    - tags: ['荣格原型', '阴影理论', '个体化']
+    - heritage: '100年 · 理解你的成长方向'
+    - insight: '回答"我如何变得更完整"'
+```
+
+### 5.2 融合符号
+
+```
+文件名: system-fusion.svg
+设计: 三元素融合 → VibeID
+动画版本: system-fusion-animated.svg (Lottie)
+
+底部融合说明文案:
+"单独看，它们各说各话。融合看，它们指向同一个你。"
+```
+
+---
+
+## 六、UI 图标
+
+### 6.1 导航图标
+
+| 图标 | 文件名 | 用途 | 色彩 |
+|------|--------|------|------|
+| 菜单 | icon-menu.svg | 移动端导航 | ink-800 |
+| 关闭 | icon-close.svg | 弹窗关闭 | ink-600 |
+| 箭头-右 | icon-arrow-right.svg | CTA 按钮 | accent-primary |
+| 箭头-下 | icon-arrow-down.svg | 滚动提示 | ink-400 |
+| 返回 | icon-back.svg | 页面返回 | ink-600 |
+
+### 6.2 功能图标
+
+| 图标 | 文件名 | 用途 | 色彩 |
+|------|--------|------|------|
+| 锁 | icon-lock.svg | 隐私保护 | gold-500 |
+| 用户 | icon-user.svg | 用户数量 | mystic-500 |
+| 日历 | icon-calendar.svg | 出生日期 | accent-primary |
+| 时钟 | icon-clock.svg | 时间提示 | ink-500 |
+| 信息 | icon-info.svg | 提示信息 | mystic-500 |
+| 展开 | icon-expand.svg | 详情展开 | accent-secondary |
+| 学位帽 | icon-academic.svg | 心理学研究 | gold-500 |
+| 地球 | icon-globe.svg | 东西方智慧 | mystic-500 |
+
+### 6.3 社交图标
+
+| 图标 | 文件名 | 用途 |
+|------|--------|------|
+| 微信 | icon-wechat.svg | 分享/登录 |
+| 微博 | icon-weibo.svg | 分享 |
+| 小红书 | icon-xiaohongshu.svg | 分享 |
+| 复制链接 | icon-link.svg | 复制分享 |
+
+---
+
+## 七、装饰元素
+
+### 7.1 背景装饰 (v7.1 配色)
+
+```
+光晕效果:
+  文件名: bg-glow-mystic.svg, bg-glow-gold.svg
+  用途: Section 背景装饰
+  尺寸: 400px × 400px
+  模糊: 60px
+  不透明度: 5-10% (降低以保持高级感)
+  色彩:
+    - mystic: rgba(142, 127, 160, 0.1)  // 神秘紫
+    - gold: rgba(187, 169, 120, 0.1)    // 古金色
+
+星点装饰:
+  文件名: bg-dots.svg
+  用途: 暗色区域背景
+  分布: 随机散布
+  色彩: vellum-400
+```
+
+### 7.2 分隔装饰
+
+```
+波浪分隔:
+  文件名: divider-wave.svg
+  用途: Section 之间过渡
+  高度: 60px
+  响应式: 100% 宽度
+  色彩: vellum-300
+
+渐变分隔:
+  CSS 实现, 无需图片资产
+  渐变: bg-primary → bg-secondary
+```
+
+---
+
+## 八、动画资产 (Lottie)
+
+### 8.1 加载动画
+
+```
+文件名: loading-vibeid.json
+格式: Lottie JSON
+时长: 2s loop
+内容: VibeID 符号旋转 + 呼吸
+配色: 使用 v7.1 12原型色
+```
+
+### 8.2 体系融合动画
+
+```
+文件名: fusion-animation.json
+格式: Lottie JSON
+时长: 4s
+触发: 滚动到 Section 2（三种智慧，一个完整的你）
+内容: 东方/西方/心理学 → 融合 → VibeID
+```
+
+### 8.3 成功动画
+
+```
+文件名: success-checkmark.json
+格式: Lottie JSON
+时长: 1.5s (一次)
+用途: 表单提交成功, 完成状态
+色彩: color-success (#5A9A6A)
+```
+
+### 8.4 旅程启动动画
+
+```
+文件名: journey-start.json
+格式: Lottie JSON
+时长: 2s (一次)
+触发: 用户点击 CTA "90秒，开启你的自我探索 →"
+内容: 12色花瓣依次绽放
+```
+
+---
+
+## 九、字体资产
+
+### 9.1 Web 字体 (v7.1 升级)
+
+```
+Inter (正文):
+  来源: Google Fonts
+  权重: 400 (Regular), 500 (Medium), 600 (SemiBold)
+  子集: latin, latin-ext
+
+Merriweather (英文标题):
+  来源: Google Fonts
+  权重: 400 (Regular), 700 (Bold)
+  子集: latin, latin-ext
+
+Noto Sans SC (中文正文):
+  来源: Google Fonts
+  权重: 400, 500, 600
+
+Noto Serif SC (中文标题):
+  来源: Google Fonts
+  权重: 400, 700
+```
+
+### 9.2 字体加载策略
+
+```html
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Merriweather:wght@400;700&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@400;700&display=swap" rel="stylesheet">
+```
+
+---
+
+## 十、配色速查表 (v7.2)
+
+### 10.1 核心色系
+
+| 用途 | CSS 变量 | 色值 | 说明 |
+|------|----------|------|------|
+| 页面背景 | `--bg-primary` | #F8F7F4 | 柔和暖灰 |
+| 次级背景 | `--bg-secondary` | #F2F1EE | Section 交替 |
+| 三级背景 | `--bg-tertiary` | #ECEAE6 | 对比区域 |
+| 卡片背景 | `--bg-elevated` | #FFFFFF | 悬浮元素 |
+| 主文字 | `--ink-800` | #262626 | 深灰非纯黑 |
+| 次级文字 | `--ink-500` | #717171 | 中灰 |
+| 辅助文字 | `--ink-400` | #A1A1A1 | 浅灰 |
+| **主强调色** | `--accent-primary` | **#7A6B5A** | **高级灰棕** |
+| 强调色悬停 | `--accent-hover` | #6B5C4B | hover 态 |
+| 强调色点击 | `--accent-active` | #5C4D3C | active 态 |
+| 古金色 | `--gold-500` | #BBA978 | 东方智慧 |
+| 神秘紫 | `--mystic-500` | #8E7FA0 | 灵性洞察 |
+| 边框/分隔 | `--vellum-300` | #EDE9E2 | 羊皮纸色 |
+
+### 10.2 五行配色
+
+| 五行 | CSS 变量 | 色值 | 说明 |
+|------|----------|------|------|
+| 木 | `--element-wood` | #4A7C59 | 生长、创造力 |
+| 火 | `--element-fire` | #B85450 | 激情、转化 |
+| 土 | `--element-earth` | #B8A060 | 稳定、滋养 |
+| 金 | `--element-metal` | #A8A8A8 | 精准、价值 |
+| 水 | `--element-water` | #5B7B9A | 智慧、流动 |
+
+### 10.3 语义色
+
+| 用途 | CSS 变量 | 色值 |
+|------|----------|------|
+| 成功 | `--color-success` | #5A9A6A |
+| 警告 | `--color-warning` | #C4956A |
+| 错误 | `--color-error` | #C46A6A |
+| 信息 | `--color-info` | #6A8AC4 |
+
+### 10.4 12原型配色 (Morandi 中饱和版 - v7.2)
+
+| 原型 | 色值 | 渐变 |
+|------|------|------|
+| Innocent | #F2B8B8 | 135deg → #FDF0F0 |
+| Sage | #9480A8 | 135deg → #E8E0EB |
+| Explorer | #7DB8C5 | 135deg → #E4F2F5 |
+| Outlaw | #A8524F | 135deg → #E8D5D5 |
+| Magician | #8570AB | 135deg → #E0DAE8 |
+| Hero | #D46560 | 135deg → #F5E0DE |
+| Lover | #D47D90 | 135deg → #F5E6EA |
+| Jester | #E5AD58 | 135deg → #FAF0DD |
+| Regular | #6F9A6F | 135deg → #E2EFE2 |
+| Caregiver | #80C494 | 135deg → #E5F5EA |
+| Ruler | #C99D58 | 135deg → #F7F0E0 |
+| Creator | #5C94C3 | 135deg → #E0ECF5 |
+
+---
+
+## 十一、资产目录结构
+
+```
+public/
+├── images/
+│   ├── logo/
+│   │   ├── vibelife-logo-full.svg
+│   │   ├── vibelife-logo-icon.svg
+│   │   └── vibelife-logo-text.svg
+│   │
+│   ├── symbols/
+│   │   └── vibeid-symbol.svg
+│   │
+│   ├── archetypes/
+│   │   ├── archetype-innocent.svg
+│   │   ├── archetype-sage.svg
+│   │   ├── archetype-explorer.svg
+│   │   ├── archetype-outlaw.svg
+│   │   ├── archetype-magician.svg
+│   │   ├── archetype-hero.svg
+│   │   ├── archetype-lover.svg
+│   │   ├── archetype-jester.svg
+│   │   ├── archetype-regular.svg
+│   │   ├── archetype-caregiver.svg
+│   │   ├── archetype-ruler.svg
+│   │   └── archetype-creator.svg
+│   │
+│   ├── systems/
+│   │   ├── system-eastern.svg
+│   │   ├── system-western.svg
+│   │   ├── system-psychology.svg
+│   │   └── system-fusion.svg
+│   │
+│   ├── psychologists/
+│   │   ├── psychologist-jung.jpg
+│   │   ├── psychologist-jung.webp
+│   │   ├── psychologist-freud.jpg
+│   │   ├── psychologist-freud.webp
+│   │   ├── psychologist-adler.jpg
+│   │   └── psychologist-adler.webp
+│   │
+│   ├── icons/
+│   │   ├── icon-menu.svg
+│   │   ├── icon-close.svg
+│   │   ├── icon-arrow-right.svg
+│   │   ├── icon-arrow-down.svg
+│   │   ├── icon-lock.svg
+│   │   ├── icon-user.svg
+│   │   ├── icon-academic.svg
+│   │   ├── icon-globe.svg
+│   │   └── ...
+│   │
+│   └── decorations/
+│       ├── bg-glow-mystic.svg
+│       ├── bg-glow-gold.svg
+│       ├── bg-dots.svg
+│       └── divider-wave.svg
+│
+└── animations/
+    ├── loading-vibeid.json
+    ├── fusion-animation.json
+    ├── success-checkmark.json
+    └── journey-start.json
+```
+
+---
+
+## 十二、资产制作检查清单
+
+### 12.1 SVG 优化要求
+
+- [ ] 使用 SVGO 压缩
+- [ ] 移除多余元数据
+- [ ] 合并相同路径
+- [ ] 使用 currentColor 支持颜色继承
+- [ ] viewBox 设置正确
+
+### 12.2 图片优化要求
+
+- [ ] 提供 WebP 格式
+- [ ] 提供 2x 分辨率版本
+- [ ] 文件大小 < 100KB
+- [ ] 正确的 alt 描述
+
+### 12.3 动画优化要求
+
+- [ ] Lottie 文件 < 50KB
+- [ ] 帧率 ≤ 60fps
+- [ ] 提供 reduced-motion 静态替代
+
+### 12.4 配色验证
+
+- [ ] 所有颜色使用 v7.1 CSS 变量
+- [ ] 对比度符合 WCAG AA 标准
+- [ ] 与「暖阳神秘」风格统一
+
+### 12.5 文案配套验证
+
+- [ ] 12原型 Tagline 使用 v1.3 优化版本
+- [ ] 心理学家 connection 字段已添加
+- [ ] 体系卡片 insight 字段已添加
+- [ ] 避免使用"命运""算命"等表达
+
+---
+
+*文档结束 - VibeLife Landing Page 视觉资产清单 v7.2*
+*配色体系: 高级灰棕 + Morandi 中饱和色系 + Linear 精致风格*
+*文案理念: 从"命定"到"选择"，从"认知"到"行动"*

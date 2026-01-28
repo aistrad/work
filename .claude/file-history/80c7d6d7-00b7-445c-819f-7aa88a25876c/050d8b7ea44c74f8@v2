@@ -1,0 +1,182 @@
+# 深度调试：荣格心理占星不调用工具 + 简化 Skill 互调规范
+
+## 问题一：jungastro 不调用工具
+
+### 根本原因
+`jungastro/SKILL.md` 缺少 `external_tools: ["calculate_zodiac"]` 配置，导致工具不可用。
+
+---
+
+## 问题二：Skill 互调规范混乱
+
+### 当前问题
+
+存在 **4 种** 互调方式，不统一：
+
+| 方式 | 示例 | 问题 |
+|------|------|------|
+| **直接导入服务** | `from skills.zodiac.services import calculate_zodiac` | 紧耦合，直接访问数据 |
+| **requires_skill_data** | `context.skill_data["zodiac"]["chart"]` | 直接访问数据 |
+| **external_tools** | 工具列表声明 | ✅ 正确方式 |
+| **compute_type/compute_tool** | 元数据声明 | 与 external_tools 重复 |
+
+---
+
+## 简化方案：统一使用 external_tools
+
+### 新规范
+
+**原则**：
+1. Skill 之间 **只能** 通过工具调用，不能直接访问数据
+2. 所有依赖在 `external_tools` 中声明
+3. 移除 `requires_skill_data`（被 external_tools 替代）
+4. 保留 `compute_type/compute_tool`（仅用于 SOP 提示，不控制加载）
+
+### 修改前
+
+```yaml
+# jungastro/SKILL.md
+---
+requires_birth_info: true
+requires_compute: true
+compute_type: zodiac
+compute_tool: calculate_zodiac
+requires_skill_data:
+  - bazi
+  - zodiac
+# 缺少 external_tools！
+---
+```
+
+```python
+# jungastro/tools/handlers.py
+from skills.zodiac.services import calculate_zodiac  # ❌ 直接导入
+```
+
+### 修改后
+
+```yaml
+# jungastro/SKILL.md
+---
+requires_birth_info: true
+requires_compute: true
+compute_type: zodiac
+compute_tool: calculate_zodiac
+external_tools:         # ✅ 统一声明
+  - calculate_zodiac
+# 移除 requires_skill_data
+---
+```
+
+```python
+# jungastro/tools/handlers.py
+# ✅ 通过 ToolRegistry 调用
+from services.agent.tool_registry import ToolRegistry
+
+async def get_zodiac_chart(context: ToolContext) -> Optional[Dict[str, Any]]:
+    # 不直接导入，而是调用工具
+    result = await ToolRegistry.execute(
+        "calculate_zodiac",
+        {
+            "birth_date": birth_info.get("date"),
+            "birth_time": birth_info.get("time"),
+            "birth_place": birth_info.get("place"),
+        },
+        context
+    )
+    return result.get("chart")
+```
+
+---
+
+## 需要修改的文件
+
+### 1. jungastro Skill
+
+| 文件 | 修改 |
+|------|------|
+| `apps/api/skills/jungastro/SKILL.md` | 添加 `external_tools: ["calculate_zodiac"]`，移除 `requires_skill_data` |
+| `apps/api/skills/jungastro/tools/handlers.py` | 移除直接导入，改用 `ToolRegistry.execute` |
+
+### 2. synastry Skill（类似）
+
+| 文件 | 修改 |
+|------|------|
+| `apps/api/skills/synastry/SKILL.md` | 添加 `external_tools: ["calculate_synastry"]`，移除 `requires_skill_data` |
+| `apps/api/skills/synastry/services/synastry_engine.py` | 移除直接导入，改用 `ToolRegistry.execute` |
+
+### 3. vibe_id Skill（类似）
+
+| 文件 | 修改 |
+|------|------|
+| `apps/api/skills/vibe_id/SKILL.md` | 添加 `external_tools: ["calculate_bazi", "calculate_zodiac"]`，移除 `requires_skill_data` |
+| `apps/api/skills/vibe_id/tools/handlers.py` | 改用 `ToolRegistry.execute` |
+
+### 4. （可选）框架层
+
+| 文件 | 修改 |
+|------|------|
+| `apps/api/services/agent/skill_loader.py` | 移除 `requires_skill_data` 处理逻辑 |
+| `apps/api/services/agent/prompt_builder.py` | 简化 SOP 提示，不再检查 skill_data |
+
+---
+
+## 新的互调规范文档
+
+```markdown
+# Skill 互调规范（V10）
+
+## 原则
+1. Skill 之间只能通过 **工具调用** 交互
+2. 禁止直接 import 其他 Skill 的服务
+3. 禁止直接访问其他 Skill 的 skill_data
+
+## 配置方式
+
+在 SKILL.md 中声明需要的外部工具：
+
+​```yaml
+external_tools:
+  - calculate_zodiac    # 从 zodiac skill 导入
+  - calculate_bazi      # 从 bazi skill 导入
+​```
+
+## 调用方式
+
+​```python
+from services.agent.tool_registry import ToolRegistry
+
+# 异步调用外部工具
+result = await ToolRegistry.execute(
+    "calculate_zodiac",
+    {"birth_date": "1980-02-11", "birth_time": "14:30", "birth_place": "北京"},
+    context
+)
+chart = result.get("chart")
+​```
+
+## 迁移检查清单
+
+- [ ] 移除 `from skills.xxx.services import ...`
+- [ ] 移除 `context.skill_data["xxx"]` 访问
+- [ ] 添加 `external_tools` 到 SKILL.md
+- [ ] 改用 `ToolRegistry.execute()` 调用
+```
+
+---
+
+## 验证步骤
+
+1. 修改 jungastro SKILL.md 和 handlers.py
+2. 重启服务
+3. 测试对话：
+   - "我的生日是哪天" → 正确返回
+   - "给我来个荣格分析" → 调用 calculate_zodiac → show_psychological_portrait
+4. 检查日志确认工具调用顺序
+
+---
+
+## 未解决问题
+
+1. **工具返回值缓存**：如果每次都调用 calculate_zodiac，会重复计算。可能需要工具层缓存。
+2. **SOP 提示优化**：是否需要更新 SOP 提示，告知 LLM 直接调用 show 工具（因为它会内部调用 calculate）？

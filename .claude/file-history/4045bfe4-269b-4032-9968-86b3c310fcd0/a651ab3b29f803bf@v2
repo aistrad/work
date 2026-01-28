@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import List, Optional
+
+from stores import mentis_db
+
+
+@dataclass
+class BehaviorMatch:
+    matched: bool
+    behavior: Optional[str]
+    confidence: float
+    auto_checkin: bool
+    momentum_delta: int
+    task_id: Optional[str] = None  # 关联的待办任务 ID
+
+
+# 规格定义: 匹配阈值
+THRESHOLDS = {
+    "PENDING_TASK_PRIORITY": 0.80,  # 待办任务优先匹配阈值
+    "AUTO_CHECKIN": 0.85,           # >= 0.85 自动确认
+    "CONFIRM_CARD": 0.60,           # 0.60-0.85 弹确认卡
+    "IGNORE": 0.60,                 # < 0.60 忽略
+}
+
+# 扩展的行为库
+BEHAVIOR_LIBRARY = [
+    {
+        "id": "meditation",
+        "aliases": ["冥想", "呼吸练习", "静心", "打坐", "禅修", "正念"],
+        "patterns": ["做了冥想", "练习冥想", "冥想了", "静心了"],
+        "momentum_reward": 1,
+    },
+    {
+        "id": "hydration",
+        "aliases": ["喝水", "补水", "喝了杯水", "多喝水"],
+        "patterns": ["喝了水", "喝水了", "补充水分"],
+        "momentum_reward": 1,
+    },
+    {
+        "id": "emotion_control",
+        "aliases": ["控制情绪", "忍住", "没发火", "冷静下来", "深呼吸"],
+        "patterns": ["控制住了", "忍住了", "冷静了", "没有发脾气"],
+        "momentum_reward": 2,
+    },
+    {
+        "id": "exercise",
+        "aliases": ["运动", "健身", "跑步", "散步", "锻炼", "瑜伽"],
+        "patterns": ["运动了", "锻炼了", "跑了步", "健身了"],
+        "momentum_reward": 2,
+    },
+    {
+        "id": "reading",
+        "aliases": ["阅读", "看书", "读书"],
+        "patterns": ["读了书", "看了书", "阅读了"],
+        "momentum_reward": 1,
+    },
+    {
+        "id": "journaling",
+        "aliases": ["日记", "记录", "反思", "复盘"],
+        "patterns": ["写日记", "记录了", "反思了", "复盘了"],
+        "momentum_reward": 1,
+    },
+    {
+        "id": "sleep",
+        "aliases": ["早睡", "睡眠", "休息"],
+        "patterns": ["早睡了", "睡得好", "休息好了"],
+        "momentum_reward": 2,
+    },
+    {
+        "id": "healthy_eating",
+        "aliases": ["健康饮食", "少吃", "控制饮食"],
+        "patterns": ["吃得健康", "没吃零食", "控制住饮食"],
+        "momentum_reward": 1,
+    },
+]
+
+
+def fuzzy_match(s1: str, s2: str) -> float:
+    """模糊匹配，返回 0-1 的相似度"""
+    return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+
+def calculate_match_confidence(text: str, behavior: dict) -> float:
+    """
+    计算匹配置信度
+
+    规格要求:
+    - 完全匹配 (完整短语): 0.90-0.95
+    - 包含匹配 (关键词): 0.75-0.85
+    - 模糊匹配: 0.60-0.75
+    """
+    content = text.lower()
+
+    # 1. 精确模式匹配 -> 高置信度 (0.92-0.95)
+    patterns = behavior.get("patterns", [])
+    for pattern in patterns:
+        if pattern in content:
+            return 0.92
+        # "了X" 模式 (如 "冥想了" vs "了冥想")
+        for alias in behavior["aliases"]:
+            if f"了{alias}" in content or f"{alias}了" in content:
+                return 0.93
+
+    # 2. 完整别名匹配 -> 较高置信度 (0.85-0.90)
+    for alias in behavior["aliases"]:
+        if alias == content:  # 完全匹配
+            return 0.95
+        if alias in content:  # 包含匹配
+            # 检查是否是独立词 (前后无其他汉字)
+            idx = content.find(alias)
+            before = content[idx - 1] if idx > 0 else " "
+            after = content[idx + len(alias)] if idx + len(alias) < len(content) else " "
+            if not before.isalpha() and not after.isalpha():
+                return 0.88
+            return 0.78
+
+    # 3. 模糊匹配 -> 中等置信度 (0.60-0.75)
+    max_fuzzy = 0.0
+    for alias in behavior["aliases"]:
+        # 检查内容中的每个片段
+        for i in range(len(content) - len(alias) + 1):
+            segment = content[i:i + len(alias) + 2]
+            ratio = fuzzy_match(alias, segment)
+            if ratio > max_fuzzy:
+                max_fuzzy = ratio
+
+    if max_fuzzy > 0.8:
+        return 0.65 + (max_fuzzy - 0.8) * 0.5  # 0.65-0.75
+
+    return 0.0  # 不匹配
+
+
+def get_pending_tasks(user_id: str) -> List[dict]:
+    """获取用户待办任务"""
+    try:
+        rows = mentis_db.fetch_all(
+            """
+            SELECT id, type, title, momentum_reward
+            FROM action_task
+            WHERE user_id = %s AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            (user_id,),
+        )
+        return rows or []
+    except Exception:
+        return []
+
+
+def task_matches_text(task: dict, text: str) -> float:
+    """检查任务是否匹配文本，返回置信度"""
+    content = text.lower()
+    task_type = task.get("type", "").lower()
+    task_title = task.get("title", "").lower()
+
+    # 检查任务类型匹配
+    if task_type in content:
+        return 0.90
+
+    # 检查任务标题关键词匹配
+    title_words = [w for w in task_title.split() if len(w) > 1]
+    matched_words = sum(1 for w in title_words if w in content)
+    if title_words and matched_words > 0:
+        return 0.80 + (matched_words / len(title_words)) * 0.15
+
+    return 0.0
+
+
+def match_behavior(text: str, user_id: str = None) -> BehaviorMatch:
+    """
+    行为匹配
+
+    规格要求:
+    1. 优先匹配待办任务
+    2. 分层策略:
+       - >= 0.85: auto_checkin=True (自动确认)
+       - 0.60-0.85: auto_checkin=False (需确认)
+       - < 0.60: matched=False (忽略)
+    """
+    content = text or ""
+
+    # === 1. 优先检查待办任务 ===
+    if user_id:
+        pending_tasks = get_pending_tasks(user_id)
+        for task in pending_tasks:
+            conf = task_matches_text(task, content)
+            if conf >= THRESHOLDS["PENDING_TASK_PRIORITY"]:
+                return BehaviorMatch(
+                    matched=True,
+                    behavior=task.get("type", "task"),
+                    confidence=conf,
+                    auto_checkin=conf >= THRESHOLDS["AUTO_CHECKIN"],
+                    momentum_delta=int(task.get("momentum_reward") or 1),
+                    task_id=str(task.get("id")),
+                )
+
+    # === 2. 匹配行为库 ===
+    best_match = None
+    best_confidence = 0.0
+
+    for behavior in BEHAVIOR_LIBRARY:
+        conf = calculate_match_confidence(content, behavior)
+        if conf > best_confidence:
+            best_confidence = conf
+            best_match = behavior
+
+    # === 3. 应用分层策略 ===
+    if best_confidence >= THRESHOLDS["AUTO_CHECKIN"]:
+        # >= 0.85: 自动确认
+        return BehaviorMatch(
+            matched=True,
+            behavior=best_match["id"],
+            confidence=best_confidence,
+            auto_checkin=True,
+            momentum_delta=int(best_match["momentum_reward"]),
+        )
+    elif best_confidence >= THRESHOLDS["CONFIRM_CARD"]:
+        # 0.60-0.85: 需要确认
+        return BehaviorMatch(
+            matched=True,
+            behavior=best_match["id"],
+            confidence=best_confidence,
+            auto_checkin=False,  # 需要用户确认
+            momentum_delta=int(best_match["momentum_reward"]),
+        )
+    else:
+        # < 0.60: 不匹配
+        return BehaviorMatch(
+            matched=False,
+            behavior=None,
+            confidence=best_confidence,
+            auto_checkin=False,
+            momentum_delta=0,
+        )
+
+
+def update_stream_entry_behavior(*, stream_id: str, behavior: BehaviorMatch) -> None:
+    """更新 stream_entry 的行为匹配结果"""
+    if not behavior.matched or not behavior.behavior:
+        return
+    mentis_db.execute(
+        """
+        UPDATE stream_entry
+        SET matched_behavior = %s,
+            matched_confidence = %s,
+            auto_checkin = %s
+        WHERE id = %s
+        """,
+        (behavior.behavior, float(behavior.confidence), behavior.auto_checkin, stream_id),
+    )

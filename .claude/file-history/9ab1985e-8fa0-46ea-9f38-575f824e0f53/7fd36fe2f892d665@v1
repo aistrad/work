@@ -1,0 +1,262 @@
+"""
+Mentis OS v3.0 - Daily Digest API 路由
+
+端点:
+- GET  /v3/digest           - 列出日记
+- GET  /v3/digest/{date}    - 获取指定日期日记
+- POST /v3/digest/{date}/generate - 生成日记
+- PUT  /v3/digest/{id}/style - 更新风格
+- GET  /v3/digest/{date}/trajectory - 获取情绪轨迹
+- GET  /v3/digest/{date}/energy - 获取能量曲线
+"""
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from api.auth_routes import resolve_user_id
+from services import daily_digest_service
+
+router = APIRouter(prefix="/v3/digest", tags=["digest"])
+
+
+# =============================================================================
+# 请求/响应模型
+# =============================================================================
+
+class DigestGenerateRequest(BaseModel):
+    """生成日记请求"""
+    style: str = Field(default="minimal", pattern="^(minimal|artistic|magazine|warm)$")
+
+
+class DigestStyleUpdateRequest(BaseModel):
+    """更新风格请求"""
+    style: str = Field(..., pattern="^(minimal|artistic|magazine|warm)$")
+
+
+class EmotionPointResponse(BaseModel):
+    """情绪轨迹点"""
+    time: str
+    emotion: str
+    intensity: int
+
+
+class EnergyPointResponse(BaseModel):
+    """能量曲线点"""
+    time: str
+    energy: int
+
+
+class DigestResponse(BaseModel):
+    """日记响应"""
+    id: str
+    user_id: str
+    date: str
+    title: Optional[str]
+    summary: Optional[str]
+    prose: str
+    style: str
+    entry_count: int
+    emotion_trajectory: List[EmotionPointResponse]
+    energy_curve: List[EnergyPointResponse]
+    key_tags: List[str]
+    source_entries: List[str]
+    is_shared: bool
+    share_url: Optional[str]
+    created_at: Optional[str]
+
+
+class DigestListResponse(BaseModel):
+    """日记列表响应"""
+    digests: List[DigestResponse]
+    total: int
+
+
+# =============================================================================
+# 路由
+# =============================================================================
+
+@router.get("", response_model=DigestListResponse)
+async def list_digests(
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    列出用户的日记
+
+    - **limit**: 每页数量 (1-100, 默认 30)
+    - **offset**: 偏移量
+    """
+    service = daily_digest_service.DailyDigestService()
+    digests = service.list_digests(user_id, limit, offset)
+
+    return DigestListResponse(
+        digests=[_digest_to_response(d) for d in digests],
+        total=len(digests),
+    )
+
+
+@router.get("/{date_str}", response_model=DigestResponse)
+async def get_digest(
+    date_str: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    获取指定日期的日记
+
+    - **date_str**: 日期 (YYYY-MM-DD 格式)
+    """
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    service = daily_digest_service.DailyDigestService()
+    digest = service.get_digest_by_date(user_id, target_date)
+
+    if not digest:
+        raise HTTPException(status_code=404, detail=f"No digest found for {date_str}")
+
+    return _digest_to_response(digest)
+
+
+@router.post("/{date_str}/generate", response_model=DigestResponse)
+async def generate_digest(
+    date_str: str,
+    request: DigestGenerateRequest = DigestGenerateRequest(),
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    生成指定日期的日记
+
+    - **date_str**: 日期 (YYYY-MM-DD 格式)
+    - **style**: 风格 (minimal/artistic/magazine/warm)
+    """
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    # 不能生成未来日期的日记
+    if target_date > date.today():
+        raise HTTPException(status_code=400, detail="Cannot generate digest for future dates")
+
+    try:
+        service = daily_digest_service.DailyDigestService()
+        digest = await service.generate_digest(user_id, target_date, request.style)
+        return _digest_to_response(digest)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate digest: {str(e)}")
+
+
+@router.put("/{digest_id}/style", response_model=DigestResponse)
+async def update_digest_style(
+    digest_id: str,
+    request: DigestStyleUpdateRequest,
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    更新日记风格 (重新生成)
+
+    - **digest_id**: 日记 ID
+    - **style**: 新风格 (minimal/artistic/magazine/warm)
+    """
+    try:
+        service = daily_digest_service.DailyDigestService()
+        digest = await service.regenerate_digest(digest_id, request.style)
+
+        # 验证用户权限
+        if digest.user_id != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return _digest_to_response(digest)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update style: {str(e)}")
+
+
+@router.get("/{date_str}/trajectory", response_model=List[EmotionPointResponse])
+async def get_emotion_trajectory(
+    date_str: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    获取指定日期的情绪轨迹
+
+    - **date_str**: 日期 (YYYY-MM-DD 格式)
+    """
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    service = daily_digest_service.DailyDigestService()
+    trajectory = service.get_emotion_trajectory(user_id, target_date)
+
+    return [EmotionPointResponse(**p) for p in trajectory]
+
+
+@router.get("/{date_str}/energy", response_model=List[EnergyPointResponse])
+async def get_energy_curve(
+    date_str: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    获取指定日期的能量曲线
+
+    - **date_str**: 日期 (YYYY-MM-DD 格式)
+    """
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    service = daily_digest_service.DailyDigestService()
+    curve = service.get_energy_curve(user_id, target_date)
+
+    return [EnergyPointResponse(**p) for p in curve]
+
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+def _digest_to_response(digest: daily_digest_service.DailyDigest) -> DigestResponse:
+    """将 DailyDigest 转换为响应模型"""
+    return DigestResponse(
+        id=digest.id or "",
+        user_id=digest.user_id,
+        date=digest.date.isoformat(),
+        title=digest.title,
+        summary=digest.summary,
+        prose=digest.prose,
+        style=digest.style,
+        entry_count=digest.entry_count,
+        emotion_trajectory=[
+            EmotionPointResponse(
+                time=p.time,
+                emotion=p.emotion,
+                intensity=p.intensity,
+            )
+            for p in digest.emotion_trajectory
+        ],
+        energy_curve=[
+            EnergyPointResponse(
+                time=p.time,
+                energy=p.energy,
+            )
+            for p in digest.energy_curve
+        ],
+        key_tags=digest.key_tags,
+        source_entries=digest.source_entries,
+        is_shared=digest.is_shared,
+        share_url=digest.share_url,
+        created_at=digest.created_at.isoformat() if digest.created_at else None,
+    )

@@ -1,0 +1,420 @@
+"""
+Stream Adapter - 将 CoreAgent 内部事件转换为前端协议格式
+
+设计原则：
+- CoreAgent 输出统一的内部事件格式（AgentEvent）
+- StreamAdapter 负责转换为特定前端协议
+- 未来换前端方案只需写新的 Adapter，不改 CoreAgent
+
+支持的协议：
+- AI SDK Data Stream Protocol (Vercel)
+- 可扩展支持其他协议
+"""
+import json
+from typing import AsyncGenerator, Dict, Any
+from uuid import uuid4
+from dataclasses import dataclass
+
+from .core import AgentEvent
+
+
+@dataclass
+class StreamConfig:
+    """流配置"""
+    protocol: str = "ai-sdk-6"  # ai-sdk-6, sse-legacy, custom
+    include_step_events: bool = True
+
+
+class BaseStreamAdapter:
+    """基础流适配器"""
+
+    def __init__(self, config: StreamConfig = None):
+        self.config = config or StreamConfig()
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[str, None]:
+        """将内部事件转换为协议格式"""
+        raise NotImplementedError
+
+
+class AISDKv6Adapter(BaseStreamAdapter):
+    """
+    AI SDK Data Stream Protocol 适配器
+
+    协议格式：
+    - data: {"type":"start","messageId":"..."}\n\n
+    - data: {"type":"text-delta","id":"...","delta":"..."}\n\n
+    - data: {"type":"finish"}\n\n
+    - data: [DONE]\n\n
+
+    参考: https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
+    """
+
+    def __init__(self, config: StreamConfig = None):
+        super().__init__(config)
+        self.message_id = f"msg_{uuid4().hex[:24]}"
+        self.text_id = f"text_{uuid4().hex[:12]}"
+        self._text_started = False
+
+    def _format(self, data: Dict[str, Any] | str) -> Dict[str, str]:
+        """格式化为 SSE 事件 (sse-starlette 格式)"""
+        if isinstance(data, str):
+            return {"data": data}
+        return {"data": json.dumps(data, ensure_ascii=False)}
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[Dict[str, str], None]:
+        """将 AgentEvent 转换为 AI SDK 格式 (sse-starlette dict 格式)"""
+
+        # 1. 消息开始
+        yield self._format({"type": "start", "messageId": self.message_id})
+
+        # 2. 步骤开始
+        if self.config.include_step_events:
+            yield self._format({"type": "start-step"})
+
+        async for event in events:
+            if event.type == "thinking":
+                # thinking 事件不输出到前端
+                pass
+
+            elif event.type == "content":
+                # 文本增量
+                if not self._text_started:
+                    yield self._format({"type": "text-start", "id": self.text_id})
+                    self._text_started = True
+
+                content = event.data.get("content", "")
+                if content:
+                    yield self._format({
+                        "type": "text-delta",
+                        "id": self.text_id,
+                        "delta": content
+                    })
+
+            elif event.type == "tool_call":
+                # 结束之前的文本块
+                if self._text_started:
+                    yield self._format({"type": "text-end", "id": self.text_id})
+                    self._text_started = False
+                    # 为下一个文本块生成新 ID
+                    self.text_id = f"text_{uuid4().hex[:12]}"
+
+                # 工具调用
+                tool_call_id = event.data.get("id")
+                tool_name = event.data.get("name")
+                args_str = event.data.get("arguments", "{}")
+
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except json.JSONDecodeError:
+                    args = {}
+
+                yield self._format({
+                    "type": "tool-input-start",
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name
+                })
+                yield self._format({
+                    "type": "tool-input-available",
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name,
+                    "input": args
+                })
+
+            elif event.type == "tool_result":
+                # 工具结果
+                yield self._format({
+                    "type": "tool-output-available",
+                    "toolCallId": event.data.get("id"),
+                    "output": event.data.get("result")
+                })
+
+            elif event.type == "error":
+                # 错误
+                yield self._format({
+                    "type": "error",
+                    "errorText": str(event.data.get("error", "Unknown error"))
+                })
+
+            elif event.type == "done":
+                # 完成信号在循环结束后统一处理
+                pass
+
+        # 3. 结束文本块（如果还有）
+        if self._text_started:
+            yield self._format({"type": "text-end", "id": self.text_id})
+
+        # 4. 步骤结束
+        if self.config.include_step_events:
+            yield self._format({"type": "finish-step"})
+
+        # 5. 消息结束
+        yield self._format({"type": "finish"})
+
+        # 6. 流终止
+        yield self._format("[DONE]")
+
+
+class LegacySSEAdapter(BaseStreamAdapter):
+    """
+    AI SDK 4.x Data Stream Protocol 适配器
+
+    格式 (参考 https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol):
+    - 0:"text"                                    - Text Part
+    - 9:{toolCallId, toolName, args}              - Tool Call Part
+    - a:{toolCallId, result}                      - Tool Result Part
+    - e:{finishReason, usage, isContinued}        - Finish Step Part
+    - d:{finishReason, usage}                     - Finish Message Part
+    """
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[str, None]:
+        async for event in events:
+            if event.type == "content":
+                content = event.data.get("content", "")
+                if content:
+                    yield f'0:{json.dumps(content, ensure_ascii=False)}\n'
+
+            elif event.type == "tool_call":
+                tool_call_id = event.data.get("id")
+                tool_name = event.data.get("name")
+                args_str = event.data.get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except json.JSONDecodeError:
+                    args = {}
+
+                yield f'9:{json.dumps({"toolCallId": tool_call_id, "toolName": tool_name, "args": args}, ensure_ascii=False)}\n'
+
+            elif event.type == "tool_result":
+                yield f'a:{json.dumps({"toolCallId": event.data.get("id"), "result": event.data.get("result")}, ensure_ascii=False)}\n'
+
+            elif event.type == "error":
+                yield f'3:{json.dumps(str(event.data.get("error", "Unknown error")))}\n'
+
+        # Finish Step Part (必需，让 AI SDK 正确解析 parts)
+        yield f'e:{json.dumps({"finishReason": "stop", "usage": {"promptTokens": 0, "completionTokens": 0}, "isContinued": False})}\n'
+        # Finish Message Part
+        yield f'd:{json.dumps({"finishReason": "stop", "usage": {"promptTokens": 0, "completionTokens": 0}})}\n'
+
+
+class OpenAIAdapter(BaseStreamAdapter):
+    """
+    OpenAI 兼容格式适配器
+
+    输出标准 OpenAI Chat Completions SSE 格式，兼容 AI SDK 4.x useChat
+
+    格式：
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"content":"..."}}]}
+    data: {"id":"chatcmpl-xxx","choices":[{"delta":{"tool_calls":[...]}}]}
+    data: [DONE]
+    """
+
+    def __init__(self, config: StreamConfig = None):
+        super().__init__(config)
+        self.completion_id = f"chatcmpl-{uuid4().hex[:24]}"
+        self._tool_call_index = 0
+
+    def _format(self, data: Dict[str, Any] | str) -> Dict[str, str]:
+        """格式化为 SSE 事件"""
+        if isinstance(data, str):
+            return {"data": data}
+        return {"data": json.dumps(data, ensure_ascii=False)}
+
+    def _make_chunk(self, delta: Dict[str, Any], finish_reason: str = None) -> Dict[str, Any]:
+        """构建 OpenAI 格式的 chunk"""
+        return {
+            "id": self.completion_id,
+            "object": "chat.completion.chunk",
+            "created": int(__import__("time").time()),
+            "model": "vibelife-agent",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        }
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[Dict[str, str], None]:
+        """将 AgentEvent 转换为 OpenAI 兼容格式"""
+
+        # 发送 role 标识
+        yield self._format(self._make_chunk({"role": "assistant"}))
+
+        async for event in events:
+            if event.type == "thinking":
+                # thinking 事件不输出
+                pass
+
+            elif event.type == "content":
+                content = event.data.get("content", "")
+                if content:
+                    yield self._format(self._make_chunk({"content": content}))
+
+            elif event.type == "tool_call":
+                tool_call_id = event.data.get("id")
+                tool_name = event.data.get("name")
+                args_str = event.data.get("arguments", "{}")
+
+                # OpenAI tool_calls 格式
+                tool_call = {
+                    "index": self._tool_call_index,
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args_str if isinstance(args_str, str) else json.dumps(args_str)
+                    }
+                }
+                yield self._format(self._make_chunk({"tool_calls": [tool_call]}))
+                self._tool_call_index += 1
+
+            elif event.type == "tool_result":
+                # OpenAI 格式中，tool_result 通常不在流中返回
+                # 但我们可以作为特殊内容发送，让前端知道工具执行完成
+                result = event.data.get("result", {})
+                # 将工具结果作为特殊格式发送（前端可以解析）
+                yield self._format({
+                    "id": self.completion_id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": None
+                    }],
+                    "tool_result": {
+                        "tool_call_id": event.data.get("id"),
+                        "result": result
+                    }
+                })
+
+            elif event.type == "error":
+                # 错误作为内容发送
+                error_msg = str(event.data.get("error", "Unknown error"))
+                yield self._format(self._make_chunk({"content": f"\n\n❌ Error: {error_msg}"}))
+
+        # 发送完成信号
+        yield self._format(self._make_chunk({}, finish_reason="stop"))
+        yield self._format("[DONE]")
+
+
+class TextStreamAdapter(BaseStreamAdapter):
+    """
+    纯文本流适配器 (AI SDK streamProtocol: 'text')
+
+    只输出纯文本内容，不包含任何格式化。
+    适用于 AI SDK 4.x/6.x 的 streamProtocol: 'text' 模式。
+    """
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[str, None]:
+        """将 AgentEvent 转换为纯文本流"""
+        async for event in events:
+            if event.type == "content":
+                content = event.data.get("content", "")
+                if content:
+                    yield content
+
+            elif event.type == "error":
+                error_msg = str(event.data.get("error", "Unknown error"))
+                yield f"\n\n❌ Error: {error_msg}"
+
+
+class SimpleToolAdapter(BaseStreamAdapter):
+    """
+    简单工具标记适配器
+
+    在文本流中嵌入 [[TOOL:toolName:jsonData]] 标记，
+    前端解析后渲染对应的工具卡片。
+
+    格式：
+    - 0:"text" - 普通文本
+    - 0:"[[TOOL:show_bazi_chart:{...}]]" - 工具结果标记
+    - d:{finishReason} - 结束
+
+    内部工具过滤：
+    - use_skill, search_db 等内部工具不发送给前端
+    - 错误信息友好化处理
+    """
+
+    # 内部工具列表 - 不发送给前端
+    INTERNAL_TOOLS = {
+        "use_skill",      # 技能路由
+        "search_db",      # 数据库搜索
+        "get_context",    # 获取上下文
+        "update_memory",  # 更新记忆
+        "log_event",      # 日志事件
+    }
+
+    # 错误信息友好化映射
+    ERROR_MESSAGES = {
+        "quota": "今日对话次数已用完，升级会员可获得更多次数",
+        "timeout": "服务响应超时，请稍后重试",
+        "network": "网络连接不稳定，请稍后重试",
+        "rate_limit": "请求过于频繁，请稍后重试",
+        "auth": "登录已过期，请重新登录",
+        "permission": "暂无权限访问此功能",
+        "not_found": "未找到相关信息",
+        "invalid": "输入信息有误，请检查后重试",
+    }
+
+    def _get_friendly_error(self, error: str) -> str:
+        """将技术错误转换为用户友好的消息"""
+        error_lower = error.lower()
+        for key, message in self.ERROR_MESSAGES.items():
+            if key in error_lower:
+                return message
+        # 默认友好消息
+        return "抱歉，遇到了一些问题，请稍后重试"
+
+    async def adapt(self, events: AsyncGenerator[AgentEvent, None]) -> AsyncGenerator[str, None]:
+        async for event in events:
+            if event.type == "content":
+                content = event.data.get("content", "")
+                if content:
+                    yield f'0:{json.dumps(content, ensure_ascii=False)}\n'
+
+            elif event.type == "tool_result":
+                tool_name = event.data.get("name", "unknown")
+
+                # 过滤内部工具，不发送给前端
+                if tool_name in self.INTERNAL_TOOLS:
+                    continue
+
+                # 检查工具结果是否包含错误
+                result = event.data.get("result", {})
+                if isinstance(result, dict) and result.get("error"):
+                    # 工具执行出错，不发送原始错误给前端
+                    # Agent 会根据错误生成友好的文本回复
+                    continue
+
+                # 将工具结果嵌入文本流作为特殊标记
+                marker = f'[[TOOL:{tool_name}:{json.dumps(result, ensure_ascii=False)}]]'
+                yield f'0:{json.dumps(marker, ensure_ascii=False)}\n'
+
+            elif event.type == "error":
+                # 错误信息友好化
+                raw_error = str(event.data.get("error", "Unknown error"))
+                friendly_error = self._get_friendly_error(raw_error)
+                yield f'3:{json.dumps(friendly_error)}\n'
+
+            elif event.type == "protocol_progress":
+                # 协议进度更新 - 使用 AI SDK Data Stream Protocol data part (2:[key, value])
+                yield f'2:{json.dumps(["protocol_progress", event.data], ensure_ascii=False)}\n'
+
+            elif event.type == "protocol_completed":
+                # 协议完成 - 使用 AI SDK Data Stream Protocol data part (2:[key, value])
+                yield f'2:{json.dumps(["protocol_completed", event.data], ensure_ascii=False)}\n'
+
+        # Finish Message Part
+        yield f'd:{json.dumps({"finishReason": "stop", "usage": {"promptTokens": 0, "completionTokens": 0}})}\n'
+
+
+def get_adapter(protocol: str = "openai") -> BaseStreamAdapter:
+    """获取适配器实例"""
+    adapters = {
+        "openai": OpenAIAdapter,
+        "text": TextStreamAdapter,
+        "ai-sdk-6": AISDKv6Adapter,
+        "legacy": LegacySSEAdapter,
+        "simple": SimpleToolAdapter,
+    }
+    adapter_class = adapters.get(protocol, OpenAIAdapter)
+    return adapter_class()

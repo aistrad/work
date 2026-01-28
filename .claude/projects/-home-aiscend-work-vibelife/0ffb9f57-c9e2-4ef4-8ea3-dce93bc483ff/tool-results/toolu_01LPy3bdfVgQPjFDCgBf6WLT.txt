@@ -1,0 +1,385 @@
+     1→"""
+     2→Tool Executor v10 - 工具执行器
+     3→
+     4→从 core.py 拆分出来的工具执行逻辑，支持：
+     5→- 统一工具执行
+     6→- 自动 checkpoint 保存
+     7→- Phase 1 路由工具处理
+     8→- 工具结果处理
+     9→
+    10→与 ContextManager 协作：
+    11→- 工具执行后自动保存 checkpoint
+    12→- 收集工具数据自动累积
+    13→"""
+    14→import json
+    15→import logging
+    16→from dataclasses import dataclass
+    17→from typing import Optional, Dict, Any, Callable, Awaitable
+    18→
+    19→from .tool_registry import ToolRegistry, ToolContext
+    20→from .skill_loader import load_skill, get_skill_rules, load_rule
+    21→
+    22→logger = logging.getLogger(__name__)
+    23→
+    24→
+    25→@dataclass
+    26→class ToolResult:
+    27→    """工具执行结果"""
+    28→    data: Dict[str, Any]
+    29→    should_checkpoint: bool = False
+    30→    checkpoint_data: Optional[Dict[str, Any]] = None
+    31→    should_reload_context: bool = False  # 是否需要重新加载上下文
+    32→
+    33→
+    34→class ToolExecutor:
+    35→    """
+    36→    工具执行器
+    37→
+    38→    职责：
+    39→    1. 执行工具调用
+    40→    2. 处理 Phase 1 路由工具
+    41→    3. 返回执行结果
+    42→
+    43→    LLM-First v10.3: 移除硬编码工具分类
+    44→    - CHECKPOINT_TOOLS / COLLECT_TOOLS 移至 tools.yaml 配置
+    45→    - 工具属性由配置驱动，不在代码中硬编码
+    46→    """
+    47→
+    48→    def __init__(self):
+    49→        from .context_manager import get_context_manager
+    50→        self.context_manager = get_context_manager()
+    51→
+    52→    async def execute(
+    53→        self,
+    54→        tool_name: str,
+    55→        tool_args: str,
+    56→        context: ToolContext,
+    57→        current_message: str = "",
+    58→        reload_callback: Optional[Callable[[], Awaitable[None]]] = None
+    59→    ) -> ToolResult:
+    60→        """
+    61→        执行工具调用
+    62→
+    63→        Args:
+    64→            tool_name: 工具名称
+    65→            tool_args: 工具参数（JSON 字符串）
+    66→            context: 工具上下文
+    67→            current_message: 当前用户消息（用于路由）
+    68→            reload_callback: 上下文重载回调（用于 activate_skill 后重新构建 prompt）
+    69→
+    70→        Returns:
+    71→            ToolResult 包含执行结果和 checkpoint 信息
+    72→        """
+    73→        try:
+    74→            args = json.loads(tool_args) if tool_args else {}
+    75→        except json.JSONDecodeError:
+    76→            args = {}
+    77→
+    78→        # ═══════════════════════════════════════════════════════════════
+    79→        # Phase 1 路由工具
+    80→        # ═══════════════════════════════════════════════════════════════
+    81→
+    82→        # 移除 activate_skill：统一使用 activate_skills
+    83→
+    84→        # LLM-First: 不再提供平台级的 show_protocol_invitation/show_skill_intro/recommend_skills
+    85→        # 若某 Skill 自行实现了同名工具，走通用 ToolRegistry 执行路径
+    86→
+    87→        # 兼容旧的 use_skill
+    88→        if tool_name == "use_skill":
+    89→            # 兼容别名（仍接受）：映射为 activate_skills
+    90→            s = args.get("skill")
+    91→            new_args = {"skills": [s] if s else [], "rule": args.get("scenario")}
+    92→            return await self._handle_activate_skill(new_args, context, current_message, reload_callback)
+    93→
+    94→        # ═══════════════════════════════════════════════════════════════
+    95→        # Session 管理工具（v10 新增）
+    96→        # ═══════════════════════════════════════════════════════════════
+    97→
+    98→        if tool_name == "save_checkpoint":
+    99→            return await self._handle_save_checkpoint(args, context)
+   100→
+   101→        if tool_name == "read_session_context":
+   102→            return await self._handle_read_session_context(args, context)
+   103→
+   104→        if tool_name == "add_finding":
+   105→            return await self._handle_add_finding(args, context)
+   106→
+   107→        if tool_name == "complete_session":
+   108→            return await self._handle_complete_session(args, context)
+   109→
+   110→        # ═══════════════════════════════════════════════════════════════
+   111→        # 通用工具执行
+   112→        # ═══════════════════════════════════════════════════════════════
+   113→
+   114→        if ToolRegistry.has_handler(tool_name):
+   115→            result = await ToolRegistry.execute(tool_name, args, context)
+   116→
+   117→            # LLM-First v10.3: 从工具结果中读取 checkpoint 属性
+   118→            # 不再硬编码工具分类，由工具自身声明
+   119→            should_checkpoint = False
+   120→            checkpoint_data = None
+   121→
+   122→            if isinstance(result, dict):
+   123→                # 工具返回 _should_checkpoint 表示需要保存
+   124→                should_checkpoint = bool(result.get("_should_checkpoint"))
+   125→                # 工具返回 _checkpoint_data 表示要保存的数据
+   126→                if result.get("_checkpoint_data"):
+   127→                    checkpoint_data = result.get("_checkpoint_data")
+   128→
+   129→            # LLM-First: 识别由 Core 原子工具返回的上下文重载标志
+   130→            should_reload = False
+   131→            if isinstance(result, dict):
+   132→                should_reload = bool(result.get("_should_reload_context"))
+   133→            # 明确约定：activate_skills 一定触发重载
+   134→            if tool_name == "activate_skills":
+   135→                should_reload = True
+   136→
+   137→            return ToolResult(
+   138→                data=result,
+   139→                should_checkpoint=should_checkpoint,
+   140→                checkpoint_data=checkpoint_data,
+   141→                should_reload_context=should_reload,
+   142→            )
+   143→
+   144→        # 未知工具
+   145→        logger.warning(f"[ToolExecutor] Unknown tool: {tool_name}")
+   146→        return ToolResult(
+   147→            data={
+   148→                "status": "unknown_tool",
+   149→                "tool": tool_name,
+   150→                "message": f"工具 {tool_name} 暂未实现"
+   151→            }
+   152→        )
+   153→
+   154→    async def _handle_activate_skill(
+   155→        self,
+   156→        args: Dict[str, Any],
+   157→        context: ToolContext,
+   158→        current_message: str,
+   159→        reload_callback: Optional[Callable[[], Awaitable[None]]]
+   160→    ) -> ToolResult:
+   161→        """处理 activate_skills 工具（统一入口）"""
+   162→        skills = args.get("skills") or ([])
+   163→        rule = args.get("rule")
+   164→
+   165→        # 统一：至少需要一个 skill
+   166→        if not skills:
+   167→            return ToolResult(
+   168→                data={"status": "error", "message": "No skills specified"}
+   169→            )
+   170→
+   171→        # 兼容：若传入单 skill，规范化为列表
+   172→        if isinstance(skills, str):
+   173→            skills = [skills]
+   174→
+   175→        # 同步 skill 到数据库
+   176→        if context.conversation_id:
+   177→            try:
+   178→                from stores.conversation_repo import update_conversation_skill
+   179→                from uuid import UUID
+   180→                conv_id = UUID(context.conversation_id)
+   181→                await update_conversation_skill(conv_id, skills[0])
+   182→            except Exception as e:
+   183→                logger.warning(f"[ToolExecutor] Failed to sync skill to DB: {e}")
+   184→
+   185→        result = {
+   186→            "status": "activated",
+   187→            "skill": skills[0],
+   188→            "skills": skills,
+   189→            "rule": rule,
+   190→            "message": f"已激活 {', '.join(skills)}",
+   191→        }
+   192→
+   193→        # 触发上下文重载
+   194→        if reload_callback:
+   195→            await reload_callback()
+   196→
+   197→        return ToolResult(
+   198→            data=result,
+   199→            should_reload_context=True
+   200→        )
+   201→
+   202→    async def _route_rule(self, skill_id: str, message: str) -> Optional[str]:
+   203→        """自动路由规则"""
+   204→        skill = load_skill(skill_id)
+   205→        if not skill:
+   206→            return None
+   207→
+   208→        rules = get_skill_rules(skill_id)
+   209→        if not rules:
+   210→            return skill.default_scenario
+   211→
+   212→        # v10.1: 让 LLM 选择，这里返回 None
+   213→        return None
+   214→
+   215→    # 兼容说明：上述平台级工具已移除；如需展示协议/技能介绍/推荐，请使用 `show` 统一展示工具。
+   216→
+   217→    async def _handle_save_checkpoint(
+   218→        self,
+   219→        args: Dict[str, Any],
+   220→        context: ToolContext
+   221→    ) -> ToolResult:
+   222→        """处理 save_checkpoint 工具（v10 新增）"""
+   223→        step = args.get("step", 0)
+   224→        phase = args.get("phase")
+   225→        collected_data = args.get("collected_data", {})
+   226→
+   227→        if not context.user_id or context.user_id == "guest":
+   228→            return ToolResult(
+   229→                data={"status": "error", "message": "需要登录才能保存进度"}
+   230→            )
+   231→
+   232→        if not context.skill_id:
+   233→            return ToolResult(
+   234→                data={"status": "error", "message": "No active skill"}
+   235→            )
+   236→
+   237→        await self.context_manager.save_checkpoint(
+   238→            user_id=context.user_id,
+   239→            skill_id=context.skill_id,
+   240→            step=step,
+   241→            phase=phase,
+   242→            collected_data=collected_data
+   243→        )
+   244→
+   245→        return ToolResult(
+   246→            data={
+   247→                "status": "success",
+   248→                "message": f"进度已保存：第 {step} 步",
+   249→                "step": step,
+   250→                "skill_id": context.skill_id
+   251→            },
+   252→            should_checkpoint=False  # 已经保存了
+   253→        )
+   254→
+   255→    async def _handle_read_session_context(
+   256→        self,
+   257→        args: Dict[str, Any],
+   258→        context: ToolContext
+   259→    ) -> ToolResult:
+   260→        """处理 read_session_context 工具（v10 新增）"""
+   261→        if not context.user_id or context.user_id == "guest":
+   262→            return ToolResult(
+   263→                data={"status": "error", "message": "需要登录才能读取会话"}
+   264→            )
+   265→
+   266→        if not context.skill_id:
+   267→            return ToolResult(
+   268→                data={"status": "error", "message": "No active skill"}
+   269→            )
+   270→
+   271→        session_context = await self.context_manager.load_session_context(
+   272→            user_id=context.user_id,
+   273→            skill_id=context.skill_id
+   274→        )
+   275→
+   276→        result = {
+   277→            "status": "success",
+   278→            "has_checkpoint": session_context.has_checkpoint,
+   279→            "skill_id": session_context.skill_id,
+   280→            "rule_id": session_context.rule_id,
+   281→        }
+   282→
+   283→        if session_context.session:
+   284→            result["session"] = session_context.session.to_dict()
+   285→
+   286→        if session_context.checkpoint:
+   287→            result["checkpoint"] = session_context.checkpoint.to_dict()
+   288→
+   289→        if session_context.findings:
+   290→            result["findings"] = [f.to_dict() for f in session_context.findings[-5:]]
+   291→
+   292→        return ToolResult(data=result)
+   293→
+   294→    async def _handle_add_finding(
+   295→        self,
+   296→        args: Dict[str, Any],
+   297→        context: ToolContext
+   298→    ) -> ToolResult:
+   299→        """处理 add_finding 工具（v10 新增）"""
+   300→        finding_type = args.get("type", "insight")
+   301→        content = args.get("content", "")
+   302→
+   303→        if not content:
+   304→            return ToolResult(
+   305→                data={"status": "error", "message": "content 不能为空"}
+   306→            )
+   307→
+   308→        if not context.user_id or context.user_id == "guest":
+   309→            return ToolResult(
+   310→                data={"status": "error", "message": "需要登录才能记录发现"}
+   311→            )
+   312→
+   313→        if not context.skill_id:
+   314→            return ToolResult(
+   315→                data={"status": "error", "message": "No active skill"}
+   316→            )
+   317→
+   318→        await self.context_manager.add_finding(
+   319→            user_id=context.user_id,
+   320→            skill_id=context.skill_id,
+   321→            finding_type=finding_type,
+   322→            content=content,
+   323→            rule_id=context.scenario_id
+   324→        )
+   325→
+   326→        return ToolResult(
+   327→            data={
+   328→                "status": "success",
+   329→                "message": f"已记录发现：[{finding_type}] {content[:50]}...",
+   330→                "type": finding_type
+   331→            }
+   332→        )
+   333→
+   334→    async def _handle_complete_session(
+   335→        self,
+   336→        args: Dict[str, Any],
+   337→        context: ToolContext
+   338→    ) -> ToolResult:
+   339→        """处理 complete_session 工具（v10 新增）"""
+   340→        summary = args.get("summary", "")
+   341→
+   342→        if not context.user_id or context.user_id == "guest":
+   343→            return ToolResult(
+   344→                data={"status": "error", "message": "需要登录才能完成会话"}
+   345→            )
+   346→
+   347→        if not context.skill_id:
+   348→            return ToolResult(
+   349→                data={"status": "error", "message": "No active skill"}
+   350→            )
+   351→
+   352→        await self.context_manager.complete_session(
+   353→            user_id=context.user_id,
+   354→            skill_id=context.skill_id,
+   355→            summary=summary
+   356→        )
+   357→
+   358→        return ToolResult(
+   359→            data={
+   360→                "status": "success",
+   361→                "message": "会话已完成",
+   362→                "skill_id": context.skill_id,
+   363→                "summary": summary
+   364→            }
+   365→        )
+   366→
+   367→
+   368→# ═══════════════════════════════════════════════════════════════════════════
+   369→# Singleton
+   370→# ═══════════════════════════════════════════════════════════════════════════
+   371→
+   372→_tool_executor: Optional[ToolExecutor] = None
+   373→
+   374→
+   375→def get_tool_executor() -> ToolExecutor:
+   376→    """获取 ToolExecutor 单例"""
+   377→    global _tool_executor
+   378→    if _tool_executor is None:
+   379→        _tool_executor = ToolExecutor()
+   380→    return _tool_executor
+   381→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

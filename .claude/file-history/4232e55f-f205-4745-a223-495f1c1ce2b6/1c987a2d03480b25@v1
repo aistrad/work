@@ -1,0 +1,289 @@
+"""
+OAuth Service - Google and Apple OAuth integration
+"""
+import os
+import httpx
+from typing import Optional
+from uuid import UUID
+
+from .jwt import JWTService
+from stores.user_repo import UserRepository
+
+
+class OAuthService:
+    """OAuth authentication service for Google and Apple"""
+
+    # OAuth configuration
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
+    APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "")
+    APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Google OAuth
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def verify_google_token(cls, id_token: str) -> Optional[dict]:
+        """
+        Verify Google ID token and return user info.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
+                )
+                if response.status_code != 200:
+                    return None
+
+                data = response.json()
+
+                # Verify audience matches our client ID
+                if data.get("aud") != cls.GOOGLE_CLIENT_ID:
+                    return None
+
+                return {
+                    "provider": "google",
+                    "provider_id": data.get("sub"),
+                    "email": data.get("email"),
+                    "email_verified": data.get("email_verified") == "true",
+                    "name": data.get("name"),
+                    "picture": data.get("picture")
+                }
+        except Exception:
+            return None
+
+    @classmethod
+    async def google_login(
+        cls,
+        id_token: str,
+        onboarding_data: Optional[dict] = None
+    ) -> dict:
+        """
+        Login or register user with Google OAuth.
+
+        Single login method policy:
+        - Each account can only use ONE authentication method
+        - If email is already registered with another method, return error
+        - No account linking allowed
+
+        Returns:
+            dict with tokens and user info, or raises ValueError
+        """
+        # Verify token
+        google_user = await cls.verify_google_token(id_token)
+        if not google_user:
+            raise ValueError("Invalid Google token")
+
+        # Check if user exists with this Google ID
+        existing_auth = await UserRepository.get_auth_by_identifier(
+            "google", google_user["provider_id"]
+        )
+
+        if existing_auth:
+            # User exists with Google, return tokens
+            user = await UserRepository.get_by_id(existing_auth["user_id"])
+            if not user:
+                raise ValueError("User not found")
+
+            # Check account status
+            if user.get("status") == "pending_deletion":
+                # Reactivate account on login
+                await UserRepository.update(
+                    user["id"],
+                    status="active",
+                    deletion_requested_at=None,
+                    deletion_scheduled_at=None
+                )
+            elif user.get("status") != "active":
+                raise ValueError("Account is not active")
+        else:
+            # New user - check if email already registered with DIFFERENT method
+            if google_user.get("email"):
+                # Check all auth types for this email
+                for auth_type in ["email", "apple"]:
+                    existing = await UserRepository.get_auth_by_identifier(
+                        auth_type, google_user["email"]
+                    )
+                    if existing:
+                        raise ValueError(
+                            f"This email is already registered with {auth_type}. "
+                            "Please use that login method instead."
+                        )
+
+            # Create new user
+            user = await UserRepository.create(
+                display_name=google_user.get("name"),
+                birth_datetime=onboarding_data.get("birth_datetime") if onboarding_data else None,
+                birth_location=onboarding_data.get("birth_location") if onboarding_data else None,
+                gender=onboarding_data.get("gender") if onboarding_data else None
+            )
+
+            # Create Google auth
+            await UserRepository.create_auth(
+                user_id=user["id"],
+                auth_type="google",
+                auth_identifier=google_user["provider_id"],
+                auth_credential=None
+            )
+
+            # Create skill profile if onboarding data provided
+            if onboarding_data and onboarding_data.get("skill"):
+                await UserRepository.create_skill_profile(
+                    user_id=user["id"],
+                    skill=onboarding_data["skill"],
+                    voice_mode=onboarding_data.get("voice_mode", "warm"),
+                    profile_data={
+                        "interview_responses": onboarding_data.get("interview_responses", {}),
+                        "focus_areas": onboarding_data.get("focus_areas", [])
+                    }
+                )
+
+        # Generate tokens
+        access_token = JWTService.create_access_token(
+            str(user["id"]), user["vibe_id"]
+        )
+        refresh_token = JWTService.create_refresh_token(
+            str(user["id"]), user["vibe_id"]
+        )
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": JWTService.get_token_expiry(),
+            "user": {
+                "user_id": str(user["id"]),
+                "vibe_id": user["vibe_id"],
+                "display_name": user.get("display_name")
+            }
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Apple OAuth
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def verify_apple_token(cls, id_token: str) -> Optional[dict]:
+        """
+        Verify Apple ID token and return user info.
+        """
+        try:
+            import jwt
+            from jwt import PyJWKClient
+
+            # Get Apple's public keys
+            jwks_client = PyJWKClient("https://appleid.apple.com/auth/keys")
+            signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+
+            # Decode and verify token
+            data = jwt.decode(
+                id_token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=cls.APPLE_CLIENT_ID,
+                issuer="https://appleid.apple.com"
+            )
+
+            return {
+                "provider": "apple",
+                "provider_id": data.get("sub"),
+                "email": data.get("email"),
+                "email_verified": data.get("email_verified", False),
+                "name": None  # Apple doesn't always provide name
+            }
+        except Exception:
+            return None
+
+    @classmethod
+    async def apple_login(
+        cls,
+        id_token: str,
+        user_name: Optional[str] = None,
+        onboarding_data: Optional[dict] = None
+    ) -> Optional[dict]:
+        """
+        Login or register user with Apple OAuth.
+        user_name is only provided on first login.
+        """
+        # Verify token
+        apple_user = await cls.verify_apple_token(id_token)
+        if not apple_user:
+            return None
+
+        # Check if user exists with this Apple ID
+        existing_auth = await UserRepository.get_auth_by_identifier(
+            "apple", apple_user["provider_id"]
+        )
+
+        if existing_auth:
+            # User exists, return tokens
+            user = await UserRepository.get_by_id(existing_auth["user_id"])
+            if not user:
+                return None
+        else:
+            # Check if email already registered
+            if apple_user.get("email"):
+                email_auth = await UserRepository.get_auth_by_identifier(
+                    "email", apple_user["email"]
+                )
+                if email_auth:
+                    # Link Apple to existing account
+                    user = await UserRepository.get_by_id(email_auth["user_id"])
+                    await UserRepository.create_auth(
+                        user_id=user["id"],
+                        auth_type="apple",
+                        auth_identifier=apple_user["provider_id"],
+                        auth_credential=None
+                    )
+                else:
+                    # Create new user
+                    user = await UserRepository.create(
+                        display_name=user_name or apple_user.get("email", "").split("@")[0],
+                        birth_datetime=onboarding_data.get("birth_datetime") if onboarding_data else None,
+                        birth_location=onboarding_data.get("birth_location") if onboarding_data else None,
+                        gender=onboarding_data.get("gender") if onboarding_data else None
+                    )
+
+                    # Create Apple auth
+                    await UserRepository.create_auth(
+                        user_id=user["id"],
+                        auth_type="apple",
+                        auth_identifier=apple_user["provider_id"],
+                        auth_credential=None
+                    )
+
+                    # Create skill profile if onboarding data provided
+                    if onboarding_data and onboarding_data.get("skill"):
+                        await UserRepository.create_skill_profile(
+                            user_id=user["id"],
+                            skill=onboarding_data["skill"],
+                            voice_mode=onboarding_data.get("voice_mode", "warm"),
+                            profile_data={
+                                "interview_responses": onboarding_data.get("interview_responses", {}),
+                                "focus_areas": onboarding_data.get("focus_areas", [])
+                            }
+                        )
+            else:
+                return None
+
+        # Generate tokens
+        access_token = JWTService.create_access_token(
+            str(user["id"]), user["vibe_id"]
+        )
+        refresh_token = JWTService.create_refresh_token(
+            str(user["id"]), user["vibe_id"]
+        )
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": JWTService.get_token_expiry(),
+            "user": {
+                "user_id": str(user["id"]),
+                "vibe_id": user["vibe_id"],
+                "display_name": user.get("display_name")
+            }
+        }

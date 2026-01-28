@@ -1,0 +1,406 @@
+"""
+Relationship Service - Core relationship analysis logic
+Based on: vibelife spec v3.0, section 2.2.4
+
+Analysis Output:
+1. Relationship diagnosis (一句话结论)
+2. Communication style recommendation
+3. Action prescriptions (话术模板)
+4. Compatibility scores (for paid tier)
+5. Risk warnings
+
+Privacy-First Design:
+- No raw birth data in output
+- No explicit type labels
+- Focus on actionable advice
+"""
+
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any
+from uuid import UUID, uuid4
+from datetime import datetime
+from enum import Enum
+
+from ..vibe_engine import get_llm_service, create_system_message, create_user_message
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Enums and Types
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RelationshipType(str, Enum):
+    ROMANTIC = "romantic"      # 恋爱关系
+    FAMILY = "family"          # 家庭关系
+    FRIENDSHIP = "friendship"  # 朋友关系
+    WORK = "work"             # 工作关系
+    GENERAL = "general"        # 一般关系
+
+
+class CompatibilityDimension(str, Enum):
+    COMMUNICATION = "communication"  # 沟通
+    VALUES = "values"               # 价值观
+    EMOTION = "emotion"             # 情感
+    LIFESTYLE = "lifestyle"          # 生活方式
+    GROWTH = "growth"               # 成长
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CompatibilityScore:
+    """Score for a compatibility dimension"""
+    dimension: CompatibilityDimension
+    score: int  # 0-100
+    description: str
+    is_strength: bool  # True if this is a strong point
+
+    def to_dict(self) -> dict:
+        return {
+            "dimension": self.dimension.value,
+            "score": self.score,
+            "description": self.description,
+            "is_strength": self.is_strength,
+        }
+
+
+@dataclass
+class ActionPrescription:
+    """Actionable advice with templates"""
+    category: str  # e.g., "开场白", "化解冲突", "表达关心"
+    template: str  # The actual phrase to use
+    context: str   # When to use this
+    icon: str = "💬"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class RelationshipAnalysis:
+    """Complete relationship analysis result"""
+    id: UUID
+    user1_id: UUID
+    user2_id: Optional[UUID]  # None for single-user mode
+
+    # Core analysis
+    relationship_type: RelationshipType
+    headline: str           # One-line diagnosis
+    communication_style: str  # Recommended approach
+    summary: str            # Detailed explanation
+
+    # Scores (premium)
+    scores: List[CompatibilityScore] = field(default_factory=list)
+    overall_score: Optional[int] = None
+
+    # Action prescriptions
+    prescriptions: List[ActionPrescription] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    # Metadata
+    created_at: datetime = field(default_factory=datetime.now)
+    is_mutual: bool = False  # True if both users participated
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "user1_id": str(self.user1_id),
+            "user2_id": str(self.user2_id) if self.user2_id else None,
+            "relationship_type": self.relationship_type.value,
+            "headline": self.headline,
+            "communication_style": self.communication_style,
+            "summary": self.summary,
+            "scores": [s.to_dict() for s in self.scores],
+            "overall_score": self.overall_score,
+            "prescriptions": [p.to_dict() for p in self.prescriptions],
+            "warnings": self.warnings,
+            "created_at": self.created_at.isoformat(),
+            "is_mutual": self.is_mutual,
+        }
+
+    def to_basic_dict(self) -> dict:
+        """Return basic version (free tier)"""
+        return {
+            "id": str(self.id),
+            "headline": self.headline,
+            "communication_style": self.communication_style,
+            "prescriptions": [self.prescriptions[0].to_dict()] if self.prescriptions else [],
+            "is_mutual": self.is_mutual,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+RELATIONSHIP_SYSTEM_PROMPT = """你是 VibeLife 的关系分析专家。你需要分析两个人之间的关系，并给出实用的建议。
+
+核心原则：
+1. 隐私优先：绝不在输出中包含具体的生日、时辰、地点等信息
+2. 不贴标签：不直接说出日主、上升星座、MBTI类型等
+3. 行动导向：给出可以直接使用的话术和建议
+4. 正向引导：避免制造焦虑，强调如何改善关系
+
+输出要求：
+- headline: 一句话概括关系特点（有画面感，不超过30字）
+- communication_style: 推荐的沟通方式（一句话）
+- summary: 详细分析（200-300字）
+- prescriptions: 3个具体的话术模板
+- warnings: 1-2个注意事项
+
+输出格式：JSON"""
+
+ANALYSIS_PROMPT_TEMPLATE = """请分析以下两人的关系：
+
+用户1信息（发起者）：
+{user1_profile}
+
+用户2信息（对方）：
+{user2_profile}
+
+关系类型：{relationship_type}
+
+请以 JSON 格式输出分析结果：
+{{
+    "headline": "关系一句话概括",
+    "communication_style": "推荐沟通方式",
+    "summary": "详细分析...",
+    "scores": [
+        {{"dimension": "communication", "score": 85, "description": "...", "is_strength": true}},
+        {{"dimension": "values", "score": 70, "description": "...", "is_strength": false}},
+        {{"dimension": "emotion", "score": 75, "description": "...", "is_strength": true}},
+        {{"dimension": "lifestyle", "score": 60, "description": "...", "is_strength": false}},
+        {{"dimension": "growth", "score": 80, "description": "...", "is_strength": true}}
+    ],
+    "prescriptions": [
+        {{"category": "开场白", "template": "...", "context": "适合在...时使用"}},
+        {{"category": "化解冲突", "template": "...", "context": "当...时使用"}},
+        {{"category": "表达关心", "template": "...", "context": "日常中使用"}}
+    ],
+    "warnings": ["注意事项1", "注意事项2"]
+}}"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Relationship Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RelationshipService:
+    """Main service for relationship analysis"""
+
+    def __init__(self):
+        self._llm = None
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = get_llm_service()
+        return self._llm
+
+    async def analyze(
+        self,
+        user1_id: UUID,
+        user1_profile: Dict[str, Any],
+        user2_profile: Dict[str, Any],
+        relationship_type: str = "general",
+        user2_id: Optional[UUID] = None,
+    ) -> RelationshipAnalysis:
+        """
+        Analyze relationship between two people.
+
+        Args:
+            user1_id: Initiator's user ID
+            user1_profile: Initiator's profile data
+            user2_profile: Partner's profile data (can be partial)
+            relationship_type: Type of relationship
+            user2_id: Partner's user ID (if they participated)
+
+        Returns:
+            RelationshipAnalysis with recommendations
+        """
+        analysis_id = uuid4()
+        rel_type = RelationshipType(relationship_type)
+
+        # Sanitize profiles - remove sensitive data from prompt
+        safe_profile1 = self._sanitize_profile(user1_profile)
+        safe_profile2 = self._sanitize_profile(user2_profile)
+
+        prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+            user1_profile=json.dumps(safe_profile1, ensure_ascii=False, indent=2),
+            user2_profile=json.dumps(safe_profile2, ensure_ascii=False, indent=2),
+            relationship_type=self._get_type_label(rel_type),
+        )
+
+        messages = [
+            create_system_message(RELATIONSHIP_SYSTEM_PROMPT),
+            create_user_message(prompt),
+        ]
+
+        try:
+            response = await self.llm.chat(messages)
+
+            # Parse response
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+
+            data = json.loads(content)
+
+            # Build analysis object
+            scores = [
+                CompatibilityScore(
+                    dimension=CompatibilityDimension(s["dimension"]),
+                    score=s["score"],
+                    description=s["description"],
+                    is_strength=s["is_strength"],
+                )
+                for s in data.get("scores", [])
+            ]
+
+            prescriptions = [
+                ActionPrescription(
+                    category=p["category"],
+                    template=p["template"],
+                    context=p["context"],
+                )
+                for p in data.get("prescriptions", [])
+            ]
+
+            # Calculate overall score
+            overall = None
+            if scores:
+                overall = sum(s.score for s in scores) // len(scores)
+
+            return RelationshipAnalysis(
+                id=analysis_id,
+                user1_id=user1_id,
+                user2_id=user2_id,
+                relationship_type=rel_type,
+                headline=data.get("headline", ""),
+                communication_style=data.get("communication_style", ""),
+                summary=data.get("summary", ""),
+                scores=scores,
+                overall_score=overall,
+                prescriptions=prescriptions,
+                warnings=data.get("warnings", []),
+                is_mutual=user2_id is not None,
+            )
+
+        except Exception as e:
+            logger.error(f"Relationship analysis failed: {e}")
+            # Return fallback analysis
+            return self._get_fallback_analysis(
+                analysis_id, user1_id, user2_id, rel_type
+            )
+
+    def _sanitize_profile(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove sensitive information from profile for prompting"""
+        # Keep only non-identifying information
+        basic = profile.get("basic", {})
+        life_context = profile.get("life_context", {})
+
+        return {
+            "characteristics": {
+                "element_tendency": basic.get("element_tendency"),  # e.g., "木旺"
+                "personality_traits": life_context.get("personality_traits", []),
+                "communication_style": life_context.get("communication_style"),
+                "values": life_context.get("values", []),
+            },
+            "context": {
+                "current_phase": life_context.get("current_phase"),
+                "main_concerns": life_context.get("main_concerns", []),
+            }
+        }
+
+    def _get_type_label(self, rel_type: RelationshipType) -> str:
+        """Get display label for relationship type"""
+        labels = {
+            RelationshipType.ROMANTIC: "恋爱/伴侣",
+            RelationshipType.FAMILY: "家人",
+            RelationshipType.FRIENDSHIP: "朋友",
+            RelationshipType.WORK: "同事/工作伙伴",
+            RelationshipType.GENERAL: "一般关系",
+        }
+        return labels.get(rel_type, "一般关系")
+
+    def _get_fallback_analysis(
+        self,
+        analysis_id: UUID,
+        user1_id: UUID,
+        user2_id: Optional[UUID],
+        rel_type: RelationshipType,
+    ) -> RelationshipAnalysis:
+        """Return fallback analysis when LLM fails"""
+        return RelationshipAnalysis(
+            id=analysis_id,
+            user1_id=user1_id,
+            user2_id=user2_id,
+            relationship_type=rel_type,
+            headline="你们有独特的相处模式",
+            communication_style="耐心倾听，真诚表达",
+            summary="每段关系都有其独特之处。建议在日常相处中多观察对方的反应，找到适合你们的沟通节奏。",
+            scores=[],
+            prescriptions=[
+                ActionPrescription(
+                    category="开场白",
+                    template="我想听听你的想法...",
+                    context="当想开启重要话题时",
+                ),
+            ],
+            warnings=["请完善双方信息以获得更准确的分析"],
+            is_mutual=user2_id is not None,
+        )
+
+    async def analyze_with_minimal_info(
+        self,
+        user1_id: UUID,
+        user1_profile: Dict[str, Any],
+        partner_info: Dict[str, Any],
+        relationship_type: str = "general",
+    ) -> RelationshipAnalysis:
+        """
+        Analyze with minimal partner info (zodiac sign or Chinese zodiac only).
+
+        Args:
+            user1_id: Initiator's user ID
+            user1_profile: Initiator's profile
+            partner_info: Minimal info like {"zodiac": "leo"} or {"chinese_zodiac": "tiger"}
+            relationship_type: Type of relationship
+
+        Returns:
+            RelationshipAnalysis (less detailed)
+        """
+        # Build a partial profile from minimal info
+        partial_profile = {
+            "basic": partner_info,
+            "life_context": {},
+        }
+
+        return await self.analyze(
+            user1_id=user1_id,
+            user1_profile=user1_profile,
+            user2_profile=partial_profile,
+            relationship_type=relationship_type,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_relationship_service: Optional[RelationshipService] = None
+
+
+def get_relationship_service() -> RelationshipService:
+    """Get singleton relationship service instance"""
+    global _relationship_service
+    if _relationship_service is None:
+        _relationship_service = RelationshipService()
+    return _relationship_service

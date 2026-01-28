@@ -1,0 +1,387 @@
+"""
+ReminderService - 用户提醒服务
+
+职责:
+1. 创建/取消/查询用户自定义提醒
+2. 计算下次触发时间
+3. 与 ProactiveEngine 集成
+"""
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, date, time, timedelta
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from croniter import croniter
+import pytz
+
+from stores.db import get_connection
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UserReminder:
+    """用户提醒对象"""
+    id: UUID
+    user_id: UUID
+    reminder_type: str
+    title: str
+    description: Optional[str]
+    schedule: Optional[str]
+    schedule_type: str
+    next_trigger_at: Optional[datetime]
+    last_triggered_at: Optional[datetime]
+    status: str
+    metadata: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "reminder_type": self.reminder_type,
+            "title": self.title,
+            "description": self.description,
+            "schedule": self.schedule,
+            "schedule_type": self.schedule_type,
+            "next_trigger_at": self.next_trigger_at.isoformat() if self.next_trigger_at else None,
+            "last_triggered_at": self.last_triggered_at.isoformat() if self.last_triggered_at else None,
+            "status": self.status,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ReminderService:
+    """用户提醒服务"""
+
+    def _calculate_next_trigger(
+        self,
+        schedule: str,
+        schedule_type: str,
+        timezone: str = "Asia/Shanghai",
+        base_time: Optional[datetime] = None,
+    ) -> Optional[datetime]:
+        """
+        计算下次触发时间
+
+        Args:
+            schedule: 调度表达式（cron 或 HH:MM 或 ISO 日期）
+            schedule_type: 调度类型
+            timezone: 用户时区
+            base_time: 基准时间（默认当前时间）
+
+        Returns:
+            下次触发时间 (UTC)
+        """
+        tz = pytz.timezone(timezone)
+        now = base_time or datetime.now(tz)
+
+        if schedule_type == "once":
+            # ISO 日期时间格式
+            try:
+                trigger_time = datetime.fromisoformat(schedule)
+                if trigger_time.tzinfo is None:
+                    trigger_time = tz.localize(trigger_time)
+                return trigger_time.astimezone(pytz.UTC)
+            except ValueError:
+                logger.error(f"Invalid once schedule format: {schedule}")
+                return None
+
+        elif schedule_type == "daily":
+            # HH:MM 格式
+            try:
+                hour, minute = map(int, schedule.split(":"))
+                trigger_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if trigger_time <= now:
+                    trigger_time += timedelta(days=1)
+                return trigger_time.astimezone(pytz.UTC)
+            except ValueError:
+                logger.error(f"Invalid daily schedule format: {schedule}")
+                return None
+
+        elif schedule_type == "weekly":
+            # 格式: "1,3,5 08:00" (周一三五早8点)
+            try:
+                days_part, time_part = schedule.split(" ")
+                weekdays = [int(d) for d in days_part.split(",")]
+                hour, minute = map(int, time_part.split(":"))
+
+                trigger_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # 找到下一个有效的周几
+                for i in range(7):
+                    check_time = trigger_time + timedelta(days=i)
+                    if check_time.isoweekday() in weekdays and check_time > now:
+                        return check_time.astimezone(pytz.UTC)
+                # 回到第一个有效周几
+                for i in range(7):
+                    check_time = trigger_time + timedelta(days=i + 7)
+                    if check_time.isoweekday() in weekdays:
+                        return check_time.astimezone(pytz.UTC)
+            except ValueError:
+                logger.error(f"Invalid weekly schedule format: {schedule}")
+                return None
+
+        elif schedule_type == "cron":
+            # Cron 表达式
+            try:
+                cron = croniter(schedule, now)
+                next_time = cron.get_next(datetime)
+                return next_time.astimezone(pytz.UTC)
+            except Exception as e:
+                logger.error(f"Invalid cron expression: {schedule}, error: {e}")
+                return None
+
+        return None
+
+    async def create(
+        self,
+        user_id: UUID,
+        reminder_type: str,
+        title: str,
+        schedule: str,
+        schedule_type: str = "daily",
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        timezone: str = "Asia/Shanghai",
+    ) -> UserReminder:
+        """
+        创建用户提醒
+
+        Args:
+            user_id: 用户 ID
+            reminder_type: 提醒类型 (goal_checkin, daily_plan, milestone, custom)
+            title: 提醒标题
+            schedule: 调度表达式
+            schedule_type: 调度类型 (once, daily, weekly, monthly, cron)
+            description: 描述
+            metadata: 关联元数据
+            timezone: 用户时区
+
+        Returns:
+            创建的 UserReminder 对象
+        """
+        next_trigger = self._calculate_next_trigger(schedule, schedule_type, timezone)
+
+        query = """
+            INSERT INTO user_reminders
+                (user_id, reminder_type, title, description, schedule, schedule_type, next_trigger_at, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, user_id, reminder_type, title, description, schedule, schedule_type,
+                      next_trigger_at, last_triggered_at, status, metadata, created_at, updated_at
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(
+                    query,
+                    user_id,
+                    reminder_type,
+                    title,
+                    description,
+                    schedule,
+                    schedule_type,
+                    next_trigger,
+                    metadata or {},
+                )
+                return self._row_to_reminder(row)
+        except Exception as e:
+            logger.error(f"Failed to create reminder: {e}")
+            raise
+
+    async def cancel(
+        self,
+        user_id: UUID,
+        reminder_id: UUID,
+    ) -> bool:
+        """
+        取消提醒
+
+        Args:
+            user_id: 用户 ID
+            reminder_id: 提醒 ID
+
+        Returns:
+            是否取消成功
+        """
+        query = """
+            UPDATE user_reminders
+            SET status = 'cancelled', updated_at = NOW()
+            WHERE id = $1 AND user_id = $2 AND status = 'active'
+            RETURNING id
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, reminder_id, user_id)
+                return row is not None
+        except Exception as e:
+            logger.error(f"Failed to cancel reminder: {e}")
+            raise
+
+    async def list(
+        self,
+        user_id: UUID,
+        reminder_type: Optional[str] = None,
+        status: str = "active",
+        limit: int = 50,
+    ) -> List[UserReminder]:
+        """
+        列出用户提醒
+
+        Args:
+            user_id: 用户 ID
+            reminder_type: 提醒类型过滤
+            status: 状态过滤
+            limit: 返回数量限制
+
+        Returns:
+            UserReminder 列表
+        """
+        conditions = ["user_id = $1"]
+        params: List[Any] = [user_id]
+        param_idx = 2
+
+        if reminder_type:
+            conditions.append(f"reminder_type = ${param_idx}")
+            params.append(reminder_type)
+            param_idx += 1
+
+        if status:
+            conditions.append(f"status = ${param_idx}")
+            params.append(status)
+            param_idx += 1
+
+        query = f"""
+            SELECT id, user_id, reminder_type, title, description, schedule, schedule_type,
+                   next_trigger_at, last_triggered_at, status, metadata, created_at, updated_at
+            FROM user_reminders
+            WHERE {' AND '.join(conditions)}
+            ORDER BY next_trigger_at ASC NULLS LAST
+            LIMIT {limit}
+        """
+
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, *params)
+                return [self._row_to_reminder(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to list reminders: {e}")
+            raise
+
+    async def get(
+        self,
+        user_id: UUID,
+        reminder_id: UUID,
+    ) -> Optional[UserReminder]:
+        """
+        获取单个提醒
+
+        Args:
+            user_id: 用户 ID
+            reminder_id: 提醒 ID
+
+        Returns:
+            UserReminder 对象，不存在返回 None
+        """
+        query = """
+            SELECT id, user_id, reminder_type, title, description, schedule, schedule_type,
+                   next_trigger_at, last_triggered_at, status, metadata, created_at, updated_at
+            FROM user_reminders
+            WHERE id = $1 AND user_id = $2
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, reminder_id, user_id)
+                return self._row_to_reminder(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get reminder: {e}")
+            raise
+
+    async def mark_triggered(
+        self,
+        reminder_id: UUID,
+        timezone: str = "Asia/Shanghai",
+    ) -> Optional[UserReminder]:
+        """
+        标记提醒已触发，并更新下次触发时间
+
+        Args:
+            reminder_id: 提醒 ID
+            timezone: 用户时区
+
+        Returns:
+            更新后的 UserReminder 对象
+        """
+        # 先获取当前提醒信息
+        get_query = """
+            SELECT schedule, schedule_type FROM user_reminders WHERE id = $1
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(get_query, reminder_id)
+                if not row:
+                    return None
+
+                schedule = row["schedule"]
+                schedule_type = row["schedule_type"]
+
+                # 计算下次触发时间
+                if schedule_type == "once":
+                    next_trigger = None
+                    new_status = "completed"
+                else:
+                    next_trigger = self._calculate_next_trigger(schedule, schedule_type, timezone)
+                    new_status = "active"
+
+                # 更新
+                update_query = """
+                    UPDATE user_reminders
+                    SET last_triggered_at = NOW(),
+                        next_trigger_at = $2,
+                        status = $3,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    RETURNING id, user_id, reminder_type, title, description, schedule, schedule_type,
+                              next_trigger_at, last_triggered_at, status, metadata, created_at, updated_at
+                """
+                row = await conn.fetchrow(update_query, reminder_id, next_trigger, new_status)
+                return self._row_to_reminder(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to mark reminder triggered: {e}")
+            raise
+
+    def _row_to_reminder(self, row) -> UserReminder:
+        """将数据库行转换为 UserReminder 对象"""
+        return UserReminder(
+            id=row["id"],
+            user_id=row["user_id"],
+            reminder_type=row["reminder_type"],
+            title=row["title"],
+            description=row["description"],
+            schedule=row["schedule"],
+            schedule_type=row["schedule_type"],
+            next_trigger_at=row["next_trigger_at"],
+            last_triggered_at=row["last_triggered_at"],
+            status=row["status"],
+            metadata=row["metadata"] or {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_service: Optional[ReminderService] = None
+
+
+def get_reminder_service() -> ReminderService:
+    """获取单例 ReminderService"""
+    global _service
+    if _service is None:
+        _service = ReminderService()
+    return _service

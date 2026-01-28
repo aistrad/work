@@ -1,0 +1,261 @@
+/**
+ * Fortune AI Agent Service - FastAPI Tool Client
+ *
+ * TASK-3.2.1: 实现 FastAPI Tool 客户端
+ * REQ: REQ-AGENT-004
+ * Design: §3.2.2
+ * HOS-REF: §10.5.3
+ */
+
+import { z } from 'zod';
+import { tool } from 'ai';
+
+// Configuration
+const FASTAPI_BASE_URL = process.env.FASTAPI_BASE_URL || 'http://localhost:8230';
+const SERVICE_TOKEN = process.env.AGENT_SERVICE_TOKEN || '';
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+// Types
+interface ToolCallResult<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+// Helper: Call FastAPI Tool endpoint with retry
+async function callFastAPITool<T>(
+  endpoint: string,
+  method: 'GET' | 'POST',
+  params: Record<string, unknown>,
+  retries = MAX_RETRIES
+): Promise<ToolCallResult<T>> {
+  const url = new URL(`/api/agent/tool${endpoint}`, FASTAPI_BASE_URL);
+
+  // For GET requests, add params to URL
+  if (method === 'GET') {
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        url.searchParams.append(key, String(value));
+      }
+    });
+  }
+
+  const options: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${SERVICE_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+  };
+
+  if (method === 'POST') {
+    options.body = JSON.stringify(params);
+  }
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url.toString(), options);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json() as T;
+      return { success: true, data };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+      if (attempt === retries) {
+        console.error(`Tool call failed after ${retries} attempts:`, errorMessage);
+        return { success: false, error: errorMessage };
+      }
+
+      console.warn(`Tool call attempt ${attempt} failed, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+    }
+  }
+
+  return { success: false, error: 'Max retries exceeded' };
+}
+
+// =============================================================================
+// Tool Definitions
+// =============================================================================
+
+/**
+ * Get user context tool
+ */
+export const getUserContextTool = tool({
+  description: '获取用户的完整上下文信息，包括数字孪生、最近消息、活跃承诺和当前计划',
+  parameters: z.object({
+    userId: z.number().describe('用户ID'),
+    layers: z.string().optional().describe('要获取的层级，逗号分隔: L1,L2,L3'),
+    includeRecentMessages: z.number().optional().describe('包含的最近消息数量'),
+  }),
+  execute: async ({ userId, layers, includeRecentMessages }) => {
+    const result = await callFastAPITool<{
+      user_id: number;
+      twin: Record<string, unknown>;
+      recent_messages: Array<{ role: string; content: string }>;
+      active_commitments: Array<{ task_id: string; title: string; status: string }>;
+      current_plan: { plan_name: string; current_day: number } | null;
+      facts_hash: string;
+    }>('/context', 'GET', {
+      user_id: userId,
+      layers: layers || 'L1,L2,L3',
+      include_recent_messages: includeRecentMessages || 5,
+    });
+
+    if (!result.success) {
+      return { error: result.error };
+    }
+
+    return result.data;
+  },
+});
+
+/**
+ * Create commitment tool
+ */
+export const createCommitmentTool = tool({
+  description: '为用户创建一个行动承诺任务',
+  parameters: z.object({
+    userId: z.number().describe('用户ID'),
+    title: z.string().describe('任务标题'),
+    category: z.enum(['energy_boost', 'reflection', 'practice', 'social', 'general']).describe('任务类别'),
+    auraReward: z.number().optional().describe('完成奖励的能量值'),
+  }),
+  execute: async ({ userId, title, category, auraReward }) => {
+    const result = await callFastAPITool<{
+      commitment_id: string;
+      status: string;
+      created_at: string;
+    }>('/commitment', 'POST', {
+      user_id: userId,
+      title,
+      category,
+      aura_reward: auraReward || 10,
+    });
+
+    if (!result.success) {
+      return { error: result.error };
+    }
+
+    return {
+      commitmentId: result.data?.commitment_id,
+      status: result.data?.status,
+      message: `已创建任务: ${title}`,
+    };
+  },
+});
+
+/**
+ * Update twin tool
+ */
+export const updateTwinTool = tool({
+  description: '更新用户的数字孪生数据，用于记录用户状态变化',
+  parameters: z.object({
+    userId: z.number().describe('用户ID'),
+    layer: z.enum(['L1', 'L2', 'L3']).describe('更新的层级'),
+    path: z.string().describe('JSON路径，如 dynamic_emotional.current_mood'),
+    newValue: z.unknown().describe('新值'),
+    confidence: z.number().min(0).max(1).optional().describe('置信度 0-1'),
+    trigger: z.string().optional().describe('触发类型'),
+  }),
+  execute: async ({ userId, layer, path, newValue, confidence, trigger }) => {
+    const result = await callFastAPITool<{
+      updated: boolean;
+      log_id: number | null;
+    }>('/twin_update', 'POST', {
+      user_id: userId,
+      layer,
+      path,
+      new_value: newValue,
+      confidence: confidence || 0.8,
+      source: 'agent',
+      trigger: trigger || 'chat_insight',
+    });
+
+    if (!result.success) {
+      return { error: result.error };
+    }
+
+    return {
+      updated: result.data?.updated,
+      logId: result.data?.log_id,
+    };
+  },
+});
+
+/**
+ * Create share card tool
+ */
+export const createShareCardTool = tool({
+  description: '创建一个可分享的卡片，用于用户分享到社交媒体',
+  parameters: z.object({
+    userId: z.number().describe('用户ID'),
+    cardType: z.enum(['daily_guidance', 'insight', 'achievement', 'chain_invite']).describe('卡片类型'),
+    content: z.object({
+      title: z.string().describe('卡片标题'),
+      body: z.string().describe('卡片内容'),
+      imageUrl: z.string().optional().describe('图片URL'),
+    }).describe('卡片内容'),
+  }),
+  execute: async ({ userId, cardType, content }) => {
+    const result = await callFastAPITool<{
+      card_id: string;
+      share_url: string;
+    }>('/share_card', 'POST', {
+      user_id: userId,
+      card_type: cardType,
+      content,
+    });
+
+    if (!result.success) {
+      return { error: result.error };
+    }
+
+    return {
+      cardId: result.data?.card_id,
+      shareUrl: result.data?.share_url,
+    };
+  },
+});
+
+/**
+ * Get bazi facts tool
+ */
+export const getBaziFactsTool = tool({
+  description: '获取用户的八字命理数据',
+  parameters: z.object({
+    userId: z.number().describe('用户ID'),
+  }),
+  execute: async ({ userId }) => {
+    const result = await callFastAPITool<{
+      user_id: number;
+      bazi: Record<string, unknown> | null;
+      facts_hash: string | null;
+    }>(`/facts/${userId}`, 'GET', {});
+
+    if (!result.success) {
+      return { error: result.error };
+    }
+
+    return {
+      userId: result.data?.user_id,
+      bazi: result.data?.bazi,
+      factsHash: result.data?.facts_hash,
+    };
+  },
+});
+
+// Export all tools
+export const fastAPITools = {
+  getUserContext: getUserContextTool,
+  createCommitment: createCommitmentTool,
+  updateTwin: updateTwinTool,
+  createShareCard: createShareCardTool,
+  getBaziFacts: getBaziFactsTool,
+};

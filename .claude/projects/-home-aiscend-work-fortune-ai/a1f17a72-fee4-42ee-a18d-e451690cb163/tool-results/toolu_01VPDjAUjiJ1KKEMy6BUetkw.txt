@@ -1,0 +1,333 @@
+     1→from __future__ import annotations
+     2→
+     3→import math
+     4→import os
+     5→from datetime import datetime
+     6→from typing import Any, Dict, Optional
+     7→
+     8→from fastapi import APIRouter, HTTPException, Request
+     9→from fastapi.responses import JSONResponse
+    10→from pydantic import BaseModel, Field
+    11→
+    12→from api.deps import get_client_ip, get_user_agent, require_auth, require_csrf
+    13→from services import auth_service, bazi_facts
+    14→from services.bazi_engine import DEFAULT_LOCATION
+    15→
+    16→
+    17→router = APIRouter(prefix="/api/auth", tags=["auth"])
+    18→
+    19→
+    20→def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    21→    return JSONResponse({"ok": True, "data": data or {}})
+    22→
+    23→
+    24→def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    25→    return JSONResponse(
+    26→        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+    27→        status_code=status,
+    28→    )
+    29→
+    30→
+    31→def _cookie_secure() -> bool:
+    32→    return os.getenv("FORTUNE_COOKIE_SECURE", "0") == "1"
+    33→
+    34→
+    35→def _set_session_cookies(resp: JSONResponse, tokens: auth_service.SessionTokens) -> None:
+    36→    max_age = 30 * 24 * 3600
+    37→    resp.set_cookie(
+    38→        "fortune_session",
+    39→        tokens.session_token,
+    40→        httponly=True,
+    41→        samesite="lax",
+    42→        secure=_cookie_secure(),
+    43→        max_age=max_age,
+    44→        path="/",
+    45→    )
+    46→    resp.set_cookie(
+    47→        "fortune_csrf",
+    48→        tokens.csrf_token,
+    49→        httponly=False,
+    50→        samesite="lax",
+    51→        secure=_cookie_secure(),
+    52→        max_age=max_age,
+    53→        path="/",
+    54→    )
+    55→
+    56→
+    57→def _clear_session_cookies(resp: JSONResponse) -> None:
+    58→    resp.delete_cookie("fortune_session", path="/")
+    59→    resp.delete_cookie("fortune_csrf", path="/")
+    60→
+    61→
+    62→class RegisterRequest(BaseModel):
+    63→    email: str = Field(..., min_length=3)
+    64→    password: str = Field(..., min_length=8)
+    65→    name: str = Field(..., min_length=1)
+    66→    gender: str = Field(..., min_length=1)
+    67→    birthday_local: str = Field(..., min_length=19, description="YYYY-MM-DD HH:MM:SS")
+    68→    tz_offset_hours: float = Field(8.0)
+    69→    location: Dict[str, Any]
+    70→
+    71→
+    72→class LoginRequest(BaseModel):
+    73→    email: str = Field(..., min_length=3)
+    74→    password: str = Field(..., min_length=1)
+    75→
+    76→
+    77→class PasswordChangeRequest(BaseModel):
+    78→    old_password: str = Field(..., min_length=1)
+    79→    new_password: str = Field(..., min_length=8)
+    80→
+    81→
+    82→class DeleteAccountRequest(BaseModel):
+    83→    password: str = Field(..., min_length=1)
+    84→
+    85→
+    86→class PreviewRequest(BaseModel):
+    87→    gender: str = Field(..., min_length=1)
+    88→    birthday_local: str = Field(..., min_length=10, description="YYYY-MM-DD HH:MM[:SS]")
+    89→    tz_offset_hours: float = Field(8.0)
+    90→    location: Dict[str, Any] = Field(default_factory=dict)
+    91→    name: Optional[str] = None
+    92→
+    93→
+    94→def _finite_float(x: Any) -> Optional[float]:
+    95→    try:
+    96→        v = float(x)
+    97→    except Exception:
+    98→        return None
+    99→    return v if math.isfinite(v) else None
+   100→
+   101→
+   102→def _coerce_location(location: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+   103→    default = {
+   104→        "name": str(DEFAULT_LOCATION.get("name") or "北京"),
+   105→        "longitude": float(DEFAULT_LOCATION.get("longitude") or 116.4074),
+   106→        "latitude": float(DEFAULT_LOCATION.get("latitude") or 39.9042),
+   107→    }
+   108→    if not isinstance(location, dict):
+   109→        return default, True
+   110→
+   111→    name = str(location.get("name") or "").strip() or default["name"]
+   112→    lon = _finite_float(location.get("longitude"))
+   113→    lat = _finite_float(location.get("latitude"))
+   114→    if lon is None or lat is None:
+   115→        return {**default, "name": name}, True
+   116→    if lon < -180 or lon > 180 or lat < -90 or lat > 90:
+   117→        return {**default, "name": name}, True
+   118→    return {"name": name, "longitude": lon, "latitude": lat}, False
+   119→
+   120→
+   121→def _parse_birthday_local(text: str) -> datetime:
+   122→    s = str(text or "").strip()
+   123→    if len(s) == 16 and s[10] == " " and s[13] == ":":
+   124→        s = s + ":00"
+   125→    try:
+   126→        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+   127→    except Exception:
+   128→        raise auth_service.AuthError("invalid_birthday_local")
+   129→
+   130→
+   131→@router.post("/register")
+   132→def register(req: RegisterRequest, request: Request):
+   133→    try:
+   134→        user_id = auth_service.register_user(
+   135→            email=req.email,
+   136→            password=req.password,
+   137→            name=req.name,
+   138→            gender=req.gender,
+   139→            birthday_local=req.birthday_local,
+   140→            tz_offset_hours=req.tz_offset_hours,
+   141→            location=req.location,
+   142→        )
+   143→        tokens = auth_service.create_session(user_id, ip=get_client_ip(request), user_agent=get_user_agent(request))
+   144→        auth_service.update_last_login(user_id)
+   145→        resp = _ok({"user_id": user_id, "email": req.email.strip().lower(), "profile_summary": {"name": req.name, "gender": req.gender, "location_name": str(req.location.get("name") or "")}})
+   146→        _set_session_cookies(resp, tokens)
+   147→        return resp
+   148→    except auth_service.AuthError as e:
+   149→        msg = str(e)
+   150→        if msg == "email_exists":
+   151→            return _err(409, "conflict", "email_exists", {"field": "email"})
+   152→        if msg == "invalid_email":
+   153→            return _err(400, "invalid_request", "invalid_email", {"field": "email"})
+   154→        if msg == "invalid_credentials":
+   155→            return _err(401, "unauthorized", "invalid_credentials")
+   156→        if msg == "password_too_short":
+   157→            return _err(400, "invalid_request", "password_too_short", {"field": "password"})
+   158→        if msg == "invalid_birthday_local":
+   159→            return _err(400, "invalid_request", "invalid_birthday_local", {"field": "birthday_local"})
+   160→        if msg == "invalid_location":
+   161→            return _err(400, "invalid_request", "invalid_location", {"field": "location"})
+   162→        if msg == "invalid_gender":
+   163→            return _err(400, "invalid_request", "invalid_gender", {"field": "gender"})
+   164→        return _err(400, "invalid_request", msg)
+   165→    except Exception:
+   166→        return _err(500, "internal_error", "register_failed")
+   167→
+   168→
+   169→@router.post("/login")
+   170→def login(req: LoginRequest, request: Request):
+   171→    try:
+   172→        user_id = auth_service.authenticate(req.email, req.password)
+   173→        tokens = auth_service.create_session(user_id, ip=get_client_ip(request), user_agent=get_user_agent(request))
+   174→        auth_service.update_last_login(user_id)
+   175→        resp = _ok({"user_id": user_id, "email": req.email.strip().lower()})
+   176→        _set_session_cookies(resp, tokens)
+   177→        return resp
+   178→    except auth_service.AuthError:
+   179→        return _err(401, "unauthorized", "invalid_credentials")
+   180→    except Exception:
+   181→        return _err(500, "internal_error", "login_failed")
+   182→
+   183→
+   184→@router.get("/me")
+   185→def me(request: Request):
+   186→    auth = require_auth(request)
+   187→    return _ok(
+   188→        {
+   189→            "user_id": int(auth["user_id"]),
+   190→            "email": str(auth.get("email") or ""),
+   191→            "name": str(auth.get("name") or ""),
+   192→            "persona_style": str(auth.get("persona_style") or "warm"),
+   193→        }
+   194→    )
+   195→
+   196→
+   197→@router.post("/logout")
+   198→def logout(request: Request):
+   199→    auth = require_auth(request)
+   200→    require_csrf(request, auth)
+   201→    auth_service.revoke_session(str(auth["session_id"]))
+   202→    resp = _ok({})
+   203→    _clear_session_cookies(resp)
+   204→    return resp
+   205→
+   206→
+   207→@router.get("/sessions")
+   208→def sessions(request: Request):
+   209→    auth = require_auth(request)
+   210→    rows = auth_service.list_sessions(int(auth["user_id"]))
+   211→    items = [
+   212→        {
+   213→            "session_id": str(r["session_id"]),
+   214→            "created_at": str(r["created_at"]),
+   215→            "expires_at": str(r["expires_at"]),
+   216→            "ip": str(r.get("ip") or ""),
+   217→            "user_agent": str(r.get("user_agent") or ""),
+   218→            "revoked_at": (str(r["revoked_at"]) if r.get("revoked_at") else None),
+   219→        }
+   220→        for r in rows
+   221→    ]
+   222→    return _ok({"sessions": items})
+   223→
+   224→
+   225→@router.post("/logout-all")
+   226→def logout_all(request: Request):
+   227→    auth = require_auth(request)
+   228→    require_csrf(request, auth)
+   229→    auth_service.revoke_all_sessions(int(auth["user_id"]))
+   230→    resp = _ok({})
+   231→    _clear_session_cookies(resp)
+   232→    return resp
+   233→
+   234→
+   235→@router.put("/password")
+   236→def change_password(req: PasswordChangeRequest, request: Request):
+   237→    auth = require_auth(request)
+   238→    require_csrf(request, auth)
+   239→    try:
+   240→        auth_service.change_password(int(auth["user_id"]), req.old_password, req.new_password)
+   241→    except auth_service.AuthError:
+   242→        return _err(401, "unauthorized", "invalid_credentials")
+   243→    auth_service.revoke_all_sessions(int(auth["user_id"]))
+   244→    resp = _ok({})
+   245→    _clear_session_cookies(resp)
+   246→    return resp
+   247→
+   248→
+   249→@router.delete("/account")
+   250→def delete_account(req: DeleteAccountRequest, request: Request):
+   251→    auth = require_auth(request)
+   252→    require_csrf(request, auth)
+   253→    try:
+   254→        auth_service.delete_account(int(auth["user_id"]), req.password)
+   255→    except auth_service.AuthError:
+   256→        return _err(401, "unauthorized", "invalid_credentials")
+   257→    auth_service.revoke_all_sessions(int(auth["user_id"]))
+   258→    resp = _ok({})
+   259→    _clear_session_cookies(resp)
+   260→    return resp
+   261→
+   262→
+   263→@router.post("/preview")
+   264→def preview(req: PreviewRequest):
+   265→    """
+   266→    Public, non-persistent preview for "try before you sign up".
+   267→
+   268→    - Does NOT write any DB rows.
+   269→    - Returns a small derived payload for rendering the preview card.
+   270→    """
+   271→    try:
+   272→        gender = str(req.gender or "").strip()
+   273→        if gender not in ("男", "女"):
+   274→            raise auth_service.AuthError("invalid_gender")
+   275→
+   276→        tz = _finite_float(req.tz_offset_hours)
+   277→        if tz is None or tz < -12 or tz > 14:
+   278→            raise auth_service.AuthError("invalid_tz_offset_hours")
+   279→
+   280→        birthday_local = _parse_birthday_local(req.birthday_local)
+   281→        loc, used_default = _coerce_location(req.location)
+   282→
+   283→        facts = bazi_facts.compute_facts(
+   284→            name=str(req.name or "你"),
+   285→            gender=gender,
+   286→            birthday_local=birthday_local,
+   287→            tz_offset_hours=float(tz),
+   288→            location=loc,
+   289→        )
+   290→        bazi = facts.get("bazi") or {}
+   291→        luck = bazi.get("luck") or {}
+   292→        strength = bazi.get("strength")
+   293→        strength_status = ""
+   294→        favorable_elements: list[str] = []
+   295→        if isinstance(strength, dict):
+   296→            strength_status = str(strength.get("status") or "")
+   297→            fe = strength.get("favorable_elements")
+   298→            if isinstance(fe, list):
+   299→                favorable_elements = [str(x) for x in fe if x is not None]
+   300→        elif strength is not None:
+   301→            strength_status = str(strength)
+   302→
+   303→        return _ok(
+   304→            {
+   305→                "pillars": bazi.get("pillars") or {},
+   306→                "day_master": bazi.get("day_master") or {},
+   307→                "wuxing_count": bazi.get("wuxing_count") or {},
+   308→                "strength": strength_status,
+   309→                "favorable_elements": favorable_elements,
+   310→                "luck": {
+   311→                    "forward": (luck.get("forward") if "forward" in luck else None),
+   312→                    "start_age_year": (luck.get("start_age_year") if "start_age_year" in luck else None),
+   313→                },
+   314→                "digest": bazi_facts.make_bazi_digest(facts),
+   315→                "used_default_location": bool(used_default),
+   316→            }
+   317→        )
+   318→    except auth_service.AuthError as e:
+   319→        msg = str(e)
+   320→        if msg == "invalid_gender":
+   321→            return _err(400, "invalid_request", "invalid_gender", {"field": "gender"})
+   322→        if msg == "invalid_birthday_local":
+   323→            return _err(400, "invalid_request", "invalid_birthday_local", {"field": "birthday_local"})
+   324→        if msg == "invalid_tz_offset_hours":
+   325→            return _err(400, "invalid_request", "invalid_tz_offset_hours", {"field": "tz_offset_hours"})
+   326→        return _err(400, "invalid_request", msg)
+   327→    except Exception:
+   328→        return _err(500, "internal_error", "preview_failed")
+   329→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

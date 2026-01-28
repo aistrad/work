@@ -1,0 +1,479 @@
+"""
+Session Manager v10 - 会话状态管理
+
+管理用户的活跃会话生命周期：
+- 获取当前活跃会话
+- 开始新会话
+- 暂停/恢复会话
+- 完成会话
+
+与 ContextManager 协作：
+- SessionManager: 管理会话生命周期
+- ContextManager: 管理会话内的数据
+"""
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+class SessionStatus(str, Enum):
+    """会话状态"""
+    IN_PROGRESS = "in_progress"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
+
+
+@dataclass
+class ActiveSession:
+    """活跃会话信息"""
+    skill_id: str
+    rule_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    started_at: Optional[str] = None
+    last_activity: Optional[str] = None
+    status: str = SessionStatus.IN_PROGRESS
+    goal: Optional[str] = None
+    checkpoint_step: int = 0
+    checkpoint_total: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ActiveSession":
+        return cls(
+            skill_id=data.get("skill_id", ""),
+            rule_id=data.get("rule_id"),
+            conversation_id=data.get("conversation_id"),
+            started_at=data.get("started_at"),
+            last_activity=data.get("last_activity"),
+            status=data.get("status", SessionStatus.IN_PROGRESS),
+            goal=data.get("goal"),
+            checkpoint_step=data.get("checkpoint_step", 0),
+            checkpoint_total=data.get("checkpoint_total", 0)
+        )
+
+    @property
+    def is_active(self) -> bool:
+        """会话是否活跃"""
+        return self.status in (SessionStatus.IN_PROGRESS, SessionStatus.PAUSED)
+
+    @property
+    def progress_text(self) -> str:
+        """进度文本"""
+        if self.checkpoint_total > 0:
+            return f"{self.checkpoint_step}/{self.checkpoint_total}"
+        return ""
+
+
+class SessionManager:
+    """
+    会话状态管理器
+
+    职责：
+    1. 检测活跃会话
+    2. 判断是否应该恢复会话
+    3. 管理会话生命周期
+    """
+
+    # 会话恢复关键词
+    RESUME_KEYWORDS = ["继续", "接着", "上次", "回来了", "继续聊", "接着说", "where we left"]
+    # 放弃会话关键词
+    ABANDON_KEYWORDS = ["算了", "不用了", "重新开始", "换个", "别的"]
+
+    def __init__(self):
+        from .context_manager import get_context_manager
+        self.context_manager = get_context_manager()
+
+    async def get_active_session(self, user_id: str) -> Optional[ActiveSession]:
+        """
+        获取当前活跃会话
+
+        从 profile.state.active_session 读取
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return None
+
+        try:
+            user_uuid = UUID(user_id)
+            state = await UnifiedProfileRepository.get_state(user_uuid)
+
+            active_session_data = state.get("active_session")
+            if not active_session_data:
+                return None
+
+            session = ActiveSession.from_dict(active_session_data)
+
+            # 检查是否仍然活跃
+            if not session.is_active:
+                return None
+
+            # 获取最新的 checkpoint 信息
+            if session.skill_id:
+                skill_state = await UnifiedProfileRepository.get_skill_state(
+                    user_uuid, session.skill_id
+                )
+                skill_session = skill_state.get("_session", {})
+                checkpoint = skill_session.get("checkpoint", {})
+                session.checkpoint_step = checkpoint.get("step", 0)
+                session.checkpoint_total = checkpoint.get("total_steps", 0)
+
+            logger.info(f"[SessionManager] Found active session: skill={session.skill_id}, rule={session.rule_id}, step={session.checkpoint_step}")
+
+            return session
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to get active session: {e}")
+            return None
+
+    def should_resume(
+        self,
+        message: str,
+        active_session: Optional[ActiveSession]
+    ) -> bool:
+        """
+        判断是否应该恢复会话
+
+        检查：
+        1. 是否有活跃会话
+        2. 用户消息是否包含恢复关键词
+        3. 用户消息是否包含放弃关键词
+        """
+        if not active_session:
+            return False
+
+        message_lower = message.lower().strip()
+
+        # 检查放弃关键词
+        for keyword in self.ABANDON_KEYWORDS:
+            if keyword in message_lower:
+                return False
+
+        # 检查恢复关键词
+        for keyword in self.RESUME_KEYWORDS:
+            if keyword in message_lower:
+                return True
+
+        # 如果消息很短（可能是简单回复），倾向于继续
+        if len(message_lower) < 20:
+            return True
+
+        # 默认：如果有未完成的会话，提示用户
+        return False
+
+    def should_ask_resume(
+        self,
+        message: str,
+        active_session: Optional[ActiveSession]
+    ) -> bool:
+        """
+        判断是否应该询问用户是否继续
+
+        如果：
+        1. 有活跃会话
+        2. 不是明确的恢复或放弃
+        3. 消息与会话主题相关
+
+        则应该询问
+        """
+        if not active_session:
+            return False
+
+        message_lower = message.lower().strip()
+
+        # 明确恢复或放弃，不需要询问
+        for keyword in self.RESUME_KEYWORDS + self.ABANDON_KEYWORDS:
+            if keyword in message_lower:
+                return False
+
+        # 有未完成的会话，应该询问
+        return active_session.is_active and active_session.checkpoint_step > 0
+
+    async def start_session(
+        self,
+        user_id: str,
+        skill_id: str,
+        rule_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        goal: Optional[str] = None,
+        total_steps: int = 0
+    ) -> ActiveSession:
+        """
+        开始新会话
+
+        写入 profile.state.active_session
+        初始化 profile.skills.{skill_id}._session
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        session = ActiveSession(
+            skill_id=skill_id,
+            rule_id=rule_id,
+            conversation_id=conversation_id,
+            started_at=now,
+            last_activity=now,
+            status=SessionStatus.IN_PROGRESS,
+            goal=goal,
+            checkpoint_step=0,
+            checkpoint_total=total_steps
+        )
+
+        if user_id == "guest":
+            return session
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 更新全局 active_session
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": session.to_dict()
+            })
+
+            # 初始化 skill session
+            await self.context_manager.start_session(
+                user_id, skill_id, rule_id, goal, total_steps
+            )
+
+            logger.info(f"[SessionManager] Started session: skill={skill_id}, rule={rule_id}")
+
+            return session
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to start session: {e}")
+            return session
+
+    async def pause_session(self, user_id: str) -> None:
+        """
+        暂停会话
+
+        更新 status 为 paused
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+            state = await UnifiedProfileRepository.get_state(user_uuid)
+
+            active_session = state.get("active_session", {})
+            if active_session:
+                active_session["status"] = SessionStatus.PAUSED
+                active_session["last_activity"] = datetime.now(timezone.utc).isoformat()
+
+                await UnifiedProfileRepository.update_state(user_uuid, {
+                    "active_session": active_session
+                })
+
+            logger.info(f"[SessionManager] Paused session for user={user_id}")
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to pause session: {e}")
+
+    async def resume_session(self, user_id: str) -> Optional[ActiveSession]:
+        """
+        恢复会话
+
+        更新 status 为 in_progress
+        返回完整的会话上下文
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        session = await self.get_active_session(user_id)
+        if not session:
+            return None
+
+        if user_id == "guest":
+            return session
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 更新状态
+            session.status = SessionStatus.IN_PROGRESS
+            session.last_activity = datetime.now(timezone.utc).isoformat()
+
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": session.to_dict()
+            })
+
+            logger.info(f"[SessionManager] Resumed session: skill={session.skill_id}")
+
+            return session
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to resume session: {e}")
+            return session
+
+    async def complete_session(
+        self,
+        user_id: str,
+        summary: Optional[str] = None
+    ) -> None:
+        """
+        完成会话
+
+        更新 status 为 completed
+        清理 checkpoint，保留 findings
+        """
+        session = await self.get_active_session(user_id)
+        if not session:
+            return
+
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 清除 active_session
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": None
+            })
+
+            # 完成 skill session
+            await self.context_manager.complete_session(
+                user_id, session.skill_id, summary
+            )
+
+            logger.info(f"[SessionManager] Completed session: skill={session.skill_id}")
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to complete session: {e}")
+
+    async def abandon_session(self, user_id: str) -> None:
+        """
+        放弃会话
+
+        更新 status 为 abandoned
+        清理所有状态
+        """
+        session = await self.get_active_session(user_id)
+        if not session:
+            return
+
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 清除 active_session
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": None
+            })
+
+            # 清理 skill session（不保留 findings）
+            await self.context_manager.clear_session(
+                user_id, session.skill_id, keep_findings=False
+            )
+
+            logger.info(f"[SessionManager] Abandoned session: skill={session.skill_id}")
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to abandon session: {e}")
+
+    async def update_activity(
+        self,
+        user_id: str,
+        conversation_id: Optional[str] = None
+    ) -> None:
+        """
+        更新会话活动时间
+
+        每次用户交互时调用
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+            state = await UnifiedProfileRepository.get_state(user_uuid)
+
+            active_session = state.get("active_session", {})
+            if active_session:
+                active_session["last_activity"] = datetime.now(timezone.utc).isoformat()
+                if conversation_id:
+                    active_session["conversation_id"] = conversation_id
+
+                await UnifiedProfileRepository.update_state(user_uuid, {
+                    "active_session": active_session
+                })
+
+        except Exception as e:
+            logger.error(f"[SessionManager] Failed to update activity: {e}")
+
+    def build_resume_prompt(self, session: ActiveSession) -> str:
+        """
+        构建会话恢复提示（用于询问用户）
+
+        返回一段友好的提示文本
+        """
+        if not session:
+            return ""
+
+        lines = []
+
+        # 根据 skill 和 rule 生成友好描述
+        # 动态获取技能显示名（fallback 为 skill_id）
+        try:
+            from services.agent.skill_loader import load_skill, get_rule_name
+        except Exception:
+            load_skill = None
+            get_rule_name = None
+
+        skill_name = session.skill_id
+        if load_skill:
+            skill = load_skill(session.skill_id)
+            if skill and getattr(skill, 'name', None):
+                skill_name = skill.name
+
+        if session.rule_id:
+            rule_name = session.rule_id
+            if get_rule_name:
+                rule_name = get_rule_name(session.skill_id, session.rule_id)
+            lines.append(f"你之前在进行「{rule_name}」流程")
+        else:
+            lines.append(f"你之前在使用「{skill_name}」")
+
+        if session.checkpoint_step > 0 and session.checkpoint_total > 0:
+            lines.append(f"已完成 {session.checkpoint_step}/{session.checkpoint_total} 步")
+
+        if session.goal:
+            lines.append(f"目标：{session.goal}")
+
+        lines.append("\n要继续上次的进度吗？说「继续」可以接着聊，说「重新开始」可以从头来。")
+
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_session_manager: Optional[SessionManager] = None
+
+
+def get_session_manager() -> SessionManager:
+    """获取 SessionManager 单例"""
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = SessionManager()
+    return _session_manager

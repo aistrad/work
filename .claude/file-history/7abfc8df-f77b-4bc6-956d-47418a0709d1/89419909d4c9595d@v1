@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+运行 Migration 024: VibeProfile v8.0 三层架构迁移
+
+使用方法:
+    python scripts/run_migration_024.py [--dry-run]
+
+迁移内容:
+1. skill_data.* → skills.*
+2. life_context._paths.lifecoach.content → skills.lifecoach
+3. 初始化 vibe.insight 和 vibe.target
+4. 确保 identity 结构存在
+"""
+import asyncio
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stores.db import execute, fetch, fetchval
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+async def check_migration_status():
+    """检查迁移前后的状态"""
+    stats = await fetchval("""
+        SELECT jsonb_build_object(
+            'total_users', (SELECT COUNT(*) FROM unified_profiles),
+            'has_skills', (SELECT COUNT(*) FROM unified_profiles WHERE profile ? 'skills'),
+            'has_vibe', (SELECT COUNT(*) FROM unified_profiles WHERE profile ? 'vibe'),
+            'has_skill_data', (SELECT COUNT(*) FROM unified_profiles WHERE profile ? 'skill_data'),
+            'has_life_context_lifecoach', (
+                SELECT COUNT(*) FROM unified_profiles
+                WHERE profile -> 'life_context' -> '_paths' -> 'lifecoach' -> 'content' IS NOT NULL
+            ),
+            'has_lifecoach_in_skills', (
+                SELECT COUNT(*) FROM unified_profiles
+                WHERE profile -> 'skills' ? 'lifecoach'
+            )
+        )
+    """)
+    return stats
+
+
+async def run_migration(dry_run: bool = False):
+    """运行迁移"""
+    logger.info("=" * 60)
+    logger.info("Migration 024: VibeProfile v8.0 三层架构迁移")
+    logger.info("=" * 60)
+
+    # 检查迁移前状态
+    logger.info("\n迁移前状态:")
+    before_stats = await check_migration_status()
+    for key, value in before_stats.items():
+        logger.info(f"  {key}: {value}")
+
+    if dry_run:
+        logger.info("\n[DRY RUN] 以下 SQL 将被执行:")
+        migration_file = Path(__file__).parent.parent / "stores/migrations/024_migrate_to_vibeprofile_v8.sql"
+        if migration_file.exists():
+            logger.info(migration_file.read_text())
+        logger.info("\n[DRY RUN] 未执行任何更改")
+        return
+
+    # 执行迁移
+    logger.info("\n执行迁移...")
+
+    # Step 1: 将 skill_data 复制到 skills
+    logger.info("Step 1: 复制 skill_data → skills")
+    result = await execute("""
+        UPDATE unified_profiles
+        SET profile = jsonb_set(
+            COALESCE(profile, '{}'::jsonb),
+            '{skills}',
+            COALESCE(profile -> 'skill_data', '{}'::jsonb)
+        )
+        WHERE profile ? 'skill_data'
+          AND (NOT profile ? 'skills' OR profile -> 'skills' = '{}'::jsonb)
+    """)
+    logger.info(f"  → 已更新")
+
+    # Step 2: 将 life_context._paths.lifecoach.content 复制到 skills.lifecoach
+    logger.info("Step 2: 复制 life_context.lifecoach → skills.lifecoach")
+    result = await execute("""
+        UPDATE unified_profiles
+        SET profile = jsonb_set(
+            jsonb_set(
+                COALESCE(profile, '{}'::jsonb),
+                '{skills}',
+                COALESCE(profile -> 'skills', '{}'::jsonb)
+            ),
+            '{skills, lifecoach}',
+            profile -> 'life_context' -> '_paths' -> 'lifecoach' -> 'content'
+        )
+        WHERE profile -> 'life_context' -> '_paths' -> 'lifecoach' -> 'content' IS NOT NULL
+          AND jsonb_typeof(profile -> 'life_context' -> '_paths' -> 'lifecoach' -> 'content') = 'object'
+          AND (
+              NOT profile -> 'skills' ? 'lifecoach'
+              OR profile -> 'skills' -> 'lifecoach' = '{}'::jsonb
+          )
+    """)
+    logger.info(f"  → 已更新")
+
+    # Step 3: 初始化 vibe 结构
+    logger.info("Step 3: 初始化 vibe 结构")
+    result = await execute("""
+        UPDATE unified_profiles
+        SET profile = jsonb_set(
+            COALESCE(profile, '{}'::jsonb),
+            '{vibe}',
+            jsonb_build_object(
+                'insight', jsonb_build_object(
+                    'essence', '{}'::jsonb,
+                    'dynamic', '{}'::jsonb,
+                    'pattern', '{}'::jsonb
+                ),
+                'target', jsonb_build_object(
+                    'north_star', COALESCE(profile -> 'skills' -> 'lifecoach' -> 'north_star', '{}'::jsonb),
+                    'goals', COALESCE(profile -> 'skills' -> 'lifecoach' -> 'goals', '[]'::jsonb),
+                    'focus', jsonb_build_object(
+                        'primary', NULL,
+                        'active_goal', NULL,
+                        'heat_map', '{}'::jsonb
+                    ),
+                    'milestones', jsonb_build_object(
+                        'streak', COALESCE(profile -> 'skills' -> 'lifecoach' -> 'progress', '{}'::jsonb)
+                    )
+                )
+            )
+        )
+        WHERE NOT profile ? 'vibe' OR profile -> 'vibe' = '{}'::jsonb
+    """)
+    logger.info(f"  → 已更新")
+
+    # Step 4: 确保 identity 结构存在
+    logger.info("Step 4: 确保 identity 结构存在")
+    result = await execute("""
+        UPDATE unified_profiles
+        SET profile = jsonb_set(
+            COALESCE(profile, '{}'::jsonb),
+            '{identity}',
+            jsonb_build_object(
+                'display_name', COALESCE(profile -> 'account' -> 'display_name', NULL),
+                'birth_info', COALESCE(profile -> 'birth_info', '{}'::jsonb)
+            )
+        )
+        WHERE NOT profile ? 'identity'
+           OR (profile -> 'identity' = '{}'::jsonb AND profile ? 'birth_info')
+    """)
+    logger.info(f"  → 已更新")
+
+    # 检查迁移后状态
+    logger.info("\n迁移后状态:")
+    after_stats = await check_migration_status()
+    for key, value in after_stats.items():
+        logger.info(f"  {key}: {value}")
+
+    logger.info("\n✅ 迁移完成!")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="运行 Migration 024")
+    parser.add_argument("--dry-run", action="store_true", help="仅显示将要执行的操作，不实际执行")
+    args = parser.parse_args()
+
+    asyncio.run(run_migration(dry_run=args.dry_run))
+
+
+if __name__ == "__main__":
+    main()

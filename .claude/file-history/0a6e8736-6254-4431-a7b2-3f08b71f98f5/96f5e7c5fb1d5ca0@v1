@@ -1,0 +1,246 @@
+-- Migration 023: Fix triggers after Migration 022
+-- Created: 2026-01-20
+--
+-- Purpose: Fix triggers that were accidentally deleted by Migration 022's CASCADE
+--
+-- Issues Fixed:
+-- 1. Rebuild forward sync trigger (vibe_users → unified_profiles)
+-- 2. Fix trg_init_skill_subscriptions to use unified_profiles
+--
+-- Background:
+-- Migration 022's "DROP COLUMN ... CASCADE" deleted trigger_sync_account_to_profile
+-- This caused vibe_users updates to NOT sync to unified_profiles
+
+BEGIN;
+
+-- ============================================================================
+-- Step 1: Rebuild forward sync trigger (only core fields that still exist)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION sync_core_fields_to_profile()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Sync only the 3 core fields that exist in both tables:
+    -- vibe_id, status, tier
+    -- (Migration 022 removed: display_name, avatar_url, birth_*, timezone, language, deletion_*)
+
+    UPDATE unified_profiles
+    SET profile = jsonb_set(
+        jsonb_set(
+            jsonb_set(
+                COALESCE(profile, '{}'::jsonb),
+                '{account, vibe_id}',
+                to_jsonb(NEW.vibe_id)
+            ),
+            '{account, status}',
+            to_jsonb(COALESCE(NEW.status, 'active'))
+        ),
+        '{account, tier}',
+        to_jsonb(COALESCE(NEW.tier, 'free'))
+    ),
+    updated_at = NOW()
+    WHERE user_id = NEW.id;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION sync_core_fields_to_profile() IS
+'Forward sync: vibe_users → unified_profiles (only vibe_id, status, tier)
+Created by Migration 023 to fix trigger deleted by Migration 022 CASCADE';
+
+DROP TRIGGER IF EXISTS trigger_sync_core_to_profile ON vibe_users;
+
+CREATE TRIGGER trigger_sync_core_to_profile
+    AFTER INSERT OR UPDATE OF vibe_id, status, tier
+    ON vibe_users
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_core_fields_to_profile();
+
+-- ============================================================================
+-- Step 2: Fix trg_init_skill_subscriptions (use unified_profiles)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION init_default_skill_subscriptions()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Initialize default skill subscriptions in unified_profiles
+    -- (user_skill_subscriptions table no longer exists after refactoring)
+
+    UPDATE unified_profiles
+    SET profile = jsonb_set(
+        COALESCE(profile, '{}'::jsonb),
+        '{preferences, subscribed_skills}',
+        jsonb_build_object(
+            'core', jsonb_build_object(
+                'status', 'subscribed',
+                'push_enabled', true,
+                'subscribed_at', to_jsonb(NOW()::text),
+                'trial_messages_used', 0
+            ),
+            'lifecoach', jsonb_build_object(
+                'status', 'subscribed',
+                'push_enabled', true,
+                'subscribed_at', to_jsonb(NOW()::text),
+                'trial_messages_used', 0
+            ),
+            'mindfulness', jsonb_build_object(
+                'status', 'subscribed',
+                'push_enabled', true,
+                'subscribed_at', to_jsonb(NOW()::text),
+                'trial_messages_used', 0
+            )
+        )
+    )
+    WHERE user_id = NEW.id
+    AND NOT (profile->'preferences' ? 'subscribed_skills');
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION init_default_skill_subscriptions() IS
+'Initialize default skill subscriptions in unified_profiles.preferences.subscribed_skills
+Fixed by Migration 023 to use unified_profiles instead of deleted user_skill_subscriptions table';
+
+-- Trigger already exists, just update the function
+
+-- ============================================================================
+-- Step 3: Verify triggers are working
+-- ============================================================================
+
+DO $$
+DECLARE
+    forward_trigger_exists BOOLEAN;
+    reverse_trigger_exists BOOLEAN;
+    skill_trigger_exists BOOLEAN;
+BEGIN
+    -- Check forward trigger
+    SELECT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trigger_sync_core_to_profile'
+        AND tgrelid = 'vibe_users'::regclass
+    ) INTO forward_trigger_exists;
+
+    -- Check reverse trigger
+    SELECT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trigger_sync_status_from_profile'
+        AND tgrelid = 'unified_profiles'::regclass
+    ) INTO reverse_trigger_exists;
+
+    -- Check skill subscription trigger
+    SELECT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trg_init_skill_subscriptions'
+        AND tgrelid = 'vibe_users'::regclass
+    ) INTO skill_trigger_exists;
+
+    RAISE NOTICE '';
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'Migration 023 Trigger Verification:';
+    RAISE NOTICE '  Forward sync (vibe_users → profiles): %',
+        CASE WHEN forward_trigger_exists THEN '✓' ELSE '✗' END;
+    RAISE NOTICE '  Reverse sync (profiles → vibe_users): %',
+        CASE WHEN reverse_trigger_exists THEN '✓' ELSE '✗' END;
+    RAISE NOTICE '  Skill subscriptions init: %',
+        CASE WHEN skill_trigger_exists THEN '✓' ELSE '✗' END;
+    RAISE NOTICE '========================================';
+
+    IF NOT forward_trigger_exists THEN
+        RAISE EXCEPTION 'Forward trigger not found!';
+    END IF;
+
+    IF NOT reverse_trigger_exists THEN
+        RAISE EXCEPTION 'Reverse trigger not found!';
+    END IF;
+
+    IF NOT skill_trigger_exists THEN
+        RAISE WARNING 'Skill subscription trigger not found (may need manual recreation)';
+    END IF;
+END $$;
+
+-- ============================================================================
+-- Step 4: Test forward sync with a sample update
+-- ============================================================================
+
+DO $$
+DECLARE
+    test_user_id UUID;
+    vu_status TEXT;
+    up_status TEXT;
+BEGIN
+    -- Get a random user
+    SELECT id INTO test_user_id
+    FROM vibe_users
+    LIMIT 1;
+
+    IF test_user_id IS NULL THEN
+        RAISE NOTICE 'No users found for testing, skipping sync test';
+        RETURN;
+    END IF;
+
+    -- Update vibe_users (trigger should fire)
+    UPDATE vibe_users
+    SET updated_at = NOW()
+    WHERE id = test_user_id;
+
+    -- Check if sync worked
+    SELECT status INTO vu_status
+    FROM vibe_users
+    WHERE id = test_user_id;
+
+    SELECT profile->'account'->>'status' INTO up_status
+    FROM unified_profiles
+    WHERE user_id = test_user_id;
+
+    RAISE NOTICE '';
+    RAISE NOTICE 'Forward Sync Test:';
+    RAISE NOTICE '  vibe_users.status: %', vu_status;
+    RAISE NOTICE '  unified_profiles.account.status: %', up_status;
+
+    IF vu_status = up_status THEN
+        RAISE NOTICE '  ✓ Sync successful!';
+    ELSE
+        RAISE WARNING '  ✗ Sync failed! Status mismatch.';
+    END IF;
+END $$;
+
+-- ============================================================================
+-- Step 5: Record migration
+-- ============================================================================
+
+INSERT INTO migration_log (migration_name, description)
+VALUES (
+    '023_fix_triggers',
+    'Fixed triggers deleted by Migration 022 CASCADE: (1) Rebuilt forward sync trigger for vibe_id/status/tier, (2) Fixed skill subscriptions trigger to use unified_profiles'
+)
+ON CONFLICT DO NOTHING;
+
+-- ============================================================================
+-- Step 6: Summary
+-- ============================================================================
+
+DO $$
+BEGIN
+    RAISE NOTICE '';
+    RAISE NOTICE '╔══════════════════════════════════════════════════════════════╗';
+    RAISE NOTICE '║          Migration 023 Completed Successfully                ║';
+    RAISE NOTICE '╚══════════════════════════════════════════════════════════════╝';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Fixed Issues:';
+    RAISE NOTICE '  1. ✓ Rebuilt forward sync trigger (vibe_users → unified_profiles)';
+    RAISE NOTICE '  2. ✓ Fixed skill subscriptions trigger (use unified_profiles)';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Trigger Behavior:';
+    RAISE NOTICE '  Forward: vibe_id, status, tier → unified_profiles.account.*';
+    RAISE NOTICE '  Reverse: unified_profiles.account.status → vibe_users.status';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Next Steps:';
+    RAISE NOTICE '  1. Fix UserRepository.create() to use 8-column schema';
+    RAISE NOTICE '  2. Fix verify_migration_021.py to check only existing fields';
+    RAISE NOTICE '  3. Test user creation flow';
+    RAISE NOTICE '';
+END $$;
+
+COMMIT;

@@ -1,0 +1,220 @@
+/**
+ * Fortune AI Agent Runtime - Chat API Route
+ *
+ * This is the main entry point for AI chat interactions.
+ * Uses Vercel AI SDK for streaming responses with tool execution.
+ *
+ * Architecture:
+ * 1. Auth from Cookie (fortune_session)
+ * 2. Fetch context from FastAPI internal API
+ * 3. Start run (record user message)
+ * 4. Stream response with Vercel AI SDK
+ * 5. Finalize run (commit all side effects)
+ */
+import { streamText } from 'ai';
+import { cookies } from 'next/headers';
+
+import { selectModel } from '@/lib/models/model-provider';
+import { buildSystemPrompt, buildMessages, fetchContext, type UserContext } from '@/lib/context/context-builder';
+import { getToolsForCommandWithContext } from '@/lib/skills';
+
+const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8230';
+const INTERNAL_SERVICE_TOKEN = process.env.FORTUNE_INTERNAL_SERVICE_TOKEN || '';
+
+// Helper to build internal API headers
+function internalHeaders(sessionCookie: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Cookie: `fortune_session=${sessionCookie}`,
+  };
+  if (INTERNAL_SERVICE_TOKEN) {
+    headers['X-Service-Token'] = INTERNAL_SERVICE_TOKEN;
+  }
+  return headers;
+}
+
+// Request body type
+interface ChatRequest {
+  session_id?: string | null;
+  message: string;
+  command?: string | null;
+}
+
+// Response from run/start
+interface RunStartResponse {
+  run_id: string;
+  session_id: string;
+  user_message_id: number;
+}
+
+export async function POST(req: Request) {
+  const correlationId = `chat-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+
+  try {
+    // 1. Get session cookie
+    const cookieStore = await cookies();
+    const sessionCookie = cookieStore.get('fortune_session')?.value;
+
+    if (!sessionCookie) {
+      return new Response(JSON.stringify({ error: 'unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // 2. Parse request body
+    const body: ChatRequest = await req.json();
+    const { session_id, message, command } = body;
+
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return new Response(JSON.stringify({ error: 'invalid_message' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // 3. Fetch context from FastAPI
+    let context: UserContext;
+    try {
+      context = await fetchContext(session_id ?? null, message, sessionCookie);
+    } catch (error) {
+      console.error('[chat] Failed to fetch context:', error);
+      return new Response(JSON.stringify({ error: 'context_fetch_failed' }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // 4. Start run (record user message)
+    let runData: RunStartResponse;
+    try {
+      const startRes = await fetch(`${FASTAPI_URL}/internal/chat/run/start`, {
+        method: 'POST',
+        headers: internalHeaders(sessionCookie),
+        body: JSON.stringify({
+          session_id: session_id ?? null,
+          message,
+          correlation_id: correlationId,
+        }),
+      });
+
+      if (!startRes.ok) {
+        throw new Error(`run/start failed: ${startRes.status}`);
+      }
+
+      runData = await startRes.json();
+    } catch (error) {
+      console.error('[chat] Failed to start run:', error);
+      return new Response(JSON.stringify({ error: 'run_start_failed' }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // 5. Build system prompt and messages
+    const systemPrompt = buildSystemPrompt(context);
+    const messages = buildMessages(context, message);
+
+    // 6. Select tools based on command (with user context for auth)
+    const tools = getToolsForCommandWithContext(command, { sessionCookie });
+
+    // 7. Stream response with Vercel AI SDK 6
+    const result = streamText({
+      model: selectModel(),
+      system: systemPrompt,
+      messages,
+      tools,
+      maxSteps: 5, // Allow up to 5 agentic steps (tool calls + responses)
+
+      // Finalize run when streaming completes
+      onFinish: async ({ text, steps, usage }: { text: string; steps: unknown[]; usage: { promptTokens: number; completionTokens: number } }) => {
+        try {
+          // Collect tool calls and A2UI cards from steps
+          const allToolCalls: Array<{ toolName: string; args: unknown }> = [];
+          const a2uiCards: Array<Record<string, unknown>> = [];
+
+          // Type-safe iteration over steps
+          const stepsArray = steps as Array<{
+            toolCalls?: Array<{ toolName: string; args: unknown }>;
+            toolResults?: Array<{ result: unknown }>;
+          }> | undefined;
+
+          for (const step of stepsArray || []) {
+            if (step.toolCalls) {
+              for (const tc of step.toolCalls) {
+                allToolCalls.push({
+                  toolName: tc.toolName,
+                  args: tc.args,
+                });
+              }
+            }
+            if (step.toolResults) {
+              for (const tr of step.toolResults) {
+                if (
+                  tr.result &&
+                  typeof tr.result === 'object' &&
+                  'type' in tr.result &&
+                  (tr.result as Record<string, unknown>).type === 'a2ui_card'
+                ) {
+                  a2uiCards.push(tr.result as Record<string, unknown>);
+                }
+              }
+            }
+          }
+
+          // Finalize run
+          await fetch(`${FASTAPI_URL}/internal/chat/run/finalize`, {
+            method: 'POST',
+            headers: internalHeaders(sessionCookie),
+            body: JSON.stringify({
+              run_id: runData.run_id,
+              session_id: runData.session_id,
+              assistant_content: text,
+              tool_calls: allToolCalls.length > 0 ? allToolCalls : undefined,
+              a2ui_cards: a2uiCards.length > 0 ? a2uiCards : undefined,
+              prompt_tokens: usage?.promptTokens ?? 0,
+              completion_tokens: usage?.completionTokens ?? 0,
+            }),
+          });
+        } catch (error) {
+          console.error('[chat] Failed to finalize run:', error);
+          // Don't throw - the response has already been sent
+        }
+      },
+    });
+
+    // 8. Return streaming response
+    // Add session_id to response headers for client to track
+    const response = result.toDataStreamResponse();
+
+    // Clone response to add custom headers
+    const headers = new Headers(response.headers);
+    headers.set('X-Session-Id', runData.session_id);
+    headers.set('X-Run-Id', runData.run_id);
+    headers.set('X-Correlation-Id', correlationId);
+
+    return new Response(response.body, {
+      status: response.status,
+      headers,
+    });
+  } catch (error) {
+    console.error('[chat] Unexpected error:', error);
+    return new Response(
+      JSON.stringify({
+        error: 'internal_error',
+        correlation_id: correlationId,
+      }),
+      {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  }
+}
+
+// Health check for the chat endpoint
+export async function GET() {
+  return new Response(JSON.stringify({ status: 'ok', service: 'agent_runtime' }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}

@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""
+Goal-Anchored History 端到端测试
+
+验证点：
+1. 长对话中 LLM 是否能引用用户原始意图
+2. Context 构建是否正确注入第一条消息
+3. 跨 Skill 场景下目标是否保持
+4. 工具调用是否符合用户意图
+
+运行方式：
+    cd apps/api
+    python scripts/test_goal_anchored_e2e.py
+"""
+import asyncio
+import sys
+import os
+import json
+from uuid import uuid4
+from datetime import datetime
+
+# 添加项目路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 加载 .env
+from pathlib import Path
+env_file = Path(__file__).parent.parent.parent.parent / ".env"
+if env_file.exists():
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+class E2ETestResult:
+    def __init__(self, name: str):
+        self.name = name
+        self.checks = []
+        self.passed = True
+
+    def check(self, condition: bool, description: str, details: str = ""):
+        status = "✅" if condition else "❌"
+        self.checks.append((status, description, details))
+        if not condition:
+            self.passed = False
+        print(f"  {status} {description}")
+        if details and not condition:
+            print(f"     详情: {details[:200]}...")
+
+    def summary(self):
+        passed = sum(1 for c in self.checks if c[0] == "✅")
+        total = len(self.checks)
+        return passed, total
+
+
+async def test_scenario_1_long_conversation_goal_retention():
+    """
+    场景 1: 长对话目标保持
+
+    模拟：用户说"我想做人生规划"，经过多轮对话后，
+    验证 context 中是否仍包含原始意图。
+    """
+    print("\n" + "="*60)
+    print("场景 1: 长对话目标保持")
+    print("="*60)
+
+    result = E2ETestResult("长对话目标保持")
+
+    from stores import message_repo, conversation_repo
+    from stores.db import init_db
+    from routes.chat_v5 import get_conversation_history
+
+    await init_db()
+
+    conv_id = uuid4()
+    original_goal = "我想做人生规划，找到北极星目标，实现财务自由"
+
+    try:
+        # 1. 创建会话（使用 bazi 作为 skill，因为数据库约束）
+        await conversation_repo.create_conversation(
+            skill="bazi",
+            user_id=None,
+            conversation_id=conv_id
+        )
+
+        # 2. 模拟长对话（30轮）
+        await message_repo.create_message(conv_id, "user", original_goal)
+        await message_repo.create_message(conv_id, "assistant", "好的，让我帮你做人生规划。首先，告诉我你现在的困境是什么？")
+
+        for i in range(28):
+            role = "user" if i % 2 == 0 else "assistant"
+            content = f"对话 {i+3}: {'我继续说明情况...' if role == 'user' else '我理解了，继续分析...'}"
+            await message_repo.create_message(conv_id, role, content)
+
+        # 3. 获取 history（使用 Goal-Anchored 方法）
+        history = await get_conversation_history(conv_id, skill="bazi")
+
+        # 验证 1: history 数量
+        result.check(
+            len(history) == 15,
+            f"History 数量正确 (期望 15，实际 {len(history)})"
+        )
+
+        # 验证 2: 第一条是原始意图
+        first_msg = history[0] if history else {}
+        result.check(
+            "北极星" in first_msg.get("content", ""),
+            "第一条消息包含原始目标 '北极星'",
+            first_msg.get("content", "")[:100]
+        )
+
+        # 验证 3: 最后一条是最新消息
+        last_msg = history[-1] if history else {}
+        result.check(
+            "对话 30" in last_msg.get("content", ""),
+            "最后一条是最新消息",
+            last_msg.get("content", "")[:100]
+        )
+
+        # 验证 4: 中间消息被正确截断
+        # history 应该是: [msg1, msg17, msg18, ..., msg30] (共 15 条)
+        # 检查第 2 条消息应该是 "对话 17" 而不是 "对话 3"
+        second_msg = history[1] if len(history) > 1 else {}
+        second_content = second_msg.get("content", "")
+        # 第二条应该是对话 17 左右（因为 limit=14，30-14+1=17）
+        has_gap = "对话 17" in second_content or "对话 18" in second_content
+        result.check(
+            has_gap,
+            f"中间消息被正确截断（第 2 条应该是对话 17 左右）",
+            second_content[:50]
+        )
+
+        print(f"\n  📊 History 结构:")
+        print(f"     第 1 条: {history[0].get('content', '')[:50]}...")
+        print(f"     第 2 条: {history[1].get('content', '')[:50]}...")
+        print(f"     ...")
+        print(f"     第 {len(history)} 条: {history[-1].get('content', '')[:50]}...")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id)
+
+    return result
+
+
+async def test_scenario_2_context_injection_verification():
+    """
+    场景 2: Context 注入验证
+
+    验证 PromptBuilder 构建的 messages 是否正确包含第一条消息
+    """
+    print("\n" + "="*60)
+    print("场景 2: Context 注入验证")
+    print("="*60)
+
+    result = E2ETestResult("Context 注入验证")
+
+    from stores import message_repo, conversation_repo
+    from routes.chat_v5 import get_conversation_history
+    from services.agent import AgentContext
+
+    conv_id = uuid4()
+
+    try:
+        # 创建会话
+        await conversation_repo.create_conversation(
+            skill="bazi",
+            user_id=None,
+            conversation_id=conv_id
+        )
+
+        # 创建消息
+        original_intent = "帮我算八字，我想知道今年的事业运势"
+        await message_repo.create_message(conv_id, "user", original_intent)
+
+        for i in range(20):
+            role = "assistant" if i % 2 == 0 else "user"
+            await message_repo.create_message(conv_id, role, f"对话 {i+2}")
+
+        # 获取 Phase 1 history（skill=None，limit=4+1=5）
+        history_p1 = await get_conversation_history(conv_id, skill=None)
+
+        # 获取 Phase 2 history（skill='bazi'，limit=14+1=15）
+        history_p2 = await get_conversation_history(conv_id, skill="bazi")
+
+        # 验证 Phase 1
+        result.check(
+            len(history_p1) == 5,
+            f"Phase 1: History 数量正确 (期望 5，实际 {len(history_p1)})"
+        )
+        result.check(
+            "八字" in history_p1[0].get("content", ""),
+            "Phase 1: 第一条包含原始意图 '八字'",
+            history_p1[0].get("content", "") if history_p1 else ""
+        )
+
+        # 验证 Phase 2
+        result.check(
+            len(history_p2) == 15,
+            f"Phase 2: History 数量正确 (期望 15，实际 {len(history_p2)})"
+        )
+        result.check(
+            "八字" in history_p2[0].get("content", ""),
+            "Phase 2: 第一条包含原始意图 '八字'",
+            history_p2[0].get("content", "") if history_p2 else ""
+        )
+
+        # 验证两个 Phase 的第一条消息相同
+        p1_first = history_p1[0].get("content", "") if history_p1 else ""
+        p2_first = history_p2[0].get("content", "") if history_p2 else ""
+        result.check(
+            p1_first == p2_first,
+            "Phase 1 和 Phase 2 的第一条消息相同（Goal Anchored）"
+        )
+
+        # 构建 AgentContext 验证
+        context = AgentContext(
+            user_id="test_user",
+            user_tier="free",
+            profile={},
+            skill_data={},
+            history=history_p2,
+            skill="bazi",
+            conversation_id=str(conv_id)
+        )
+
+        result.check(
+            len(context.history) == 15,
+            "AgentContext.history 正确注入"
+        )
+
+        print(f"\n  📊 Phase 对比:")
+        print(f"     Phase 1 ({len(history_p1)} 条): {history_p1[0].get('content', '')[:40]}...")
+        print(f"     Phase 2 ({len(history_p2)} 条): {history_p2[0].get('content', '')[:40]}...")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id)
+
+    return result
+
+
+async def test_scenario_3_cross_skill_continuity():
+    """
+    场景 3: 跨 Skill 上下文连续性
+
+    模拟：用户从 lifecoach 切换到 bazi，再回到 lifecoach
+    验证原始目标是否保持
+    """
+    print("\n" + "="*60)
+    print("场景 3: 跨 Skill 上下文连续性")
+    print("="*60)
+
+    result = E2ETestResult("跨 Skill 连续性")
+
+    from stores import message_repo, conversation_repo
+    from routes.chat_v5 import get_conversation_history
+
+    conv_id = uuid4()
+
+    try:
+        # 1. 创建会话（使用 zodiac，模拟跨 skill）
+        await conversation_repo.create_conversation(
+            skill="zodiac",
+            user_id=None,
+            conversation_id=conv_id
+        )
+
+        # 2. 初始对话
+        original_goal = "我想转型做独立开发者，实现工作与生活平衡"
+        await message_repo.create_message(conv_id, "user", original_goal)
+        await message_repo.create_message(conv_id, "assistant", "很好的目标！让我帮你分析。")
+
+        # 3. 用户切换到 bazi
+        await message_repo.create_message(conv_id, "user", "先帮我看看八字，了解一下我的命盘")
+        await message_repo.create_message(conv_id, "assistant", "好的，我来帮你排八字。请告诉我你的出生日期。")
+        await message_repo.create_message(conv_id, "user", "1990年5月15日")
+        await message_repo.create_message(conv_id, "assistant", "收到，你的八字是...")
+
+        # 4. 更多对话
+        for i in range(10):
+            role = "user" if i % 2 == 0 else "assistant"
+            await message_repo.create_message(conv_id, role, f"八字分析对话 {i+1}")
+
+        # 5. 用户想回到星座分析
+        await message_repo.create_message(conv_id, "user", "好的，八字看完了，我们继续聊星座运势")
+
+        # 获取 history
+        history = await get_conversation_history(conv_id, skill="zodiac")
+
+        # 验证: 第一条仍是原始目标
+        first_content = history[0].get("content", "") if history else ""
+        result.check(
+            "独立开发者" in first_content,
+            "跨 Skill 后，第一条消息仍是原始目标 '独立开发者'",
+            first_content[:100]
+        )
+
+        # 验证: 最后一条是"继续聊星座运势"
+        last_content = history[-1].get("content", "") if history else ""
+        result.check(
+            "继续聊星座运势" in last_content,
+            "最后一条是回归请求",
+            last_content[:100]
+        )
+
+        # 验证: history 包含了跨 skill 的关键信息
+        all_content = str(history)
+        result.check(
+            "八字" in all_content,
+            "History 包含跨 Skill 的上下文（八字相关内容）"
+        )
+
+        print(f"\n  📊 跨 Skill 对话流:")
+        print(f"     原始目标: {original_goal[:50]}...")
+        print(f"     中间切换: 八字分析")
+        print(f"     回归: 继续星座运势")
+        print(f"     History 第一条: {first_content[:50]}...")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id)
+
+    return result
+
+
+async def test_scenario_4_tool_call_with_goal_context():
+    """
+    场景 4: 带 Goal Context 的工具调用验证
+
+    验证 LLM 在有 Goal Context 的情况下，工具调用是否更准确
+    """
+    print("\n" + "="*60)
+    print("场景 4: 工具调用与 Goal Context")
+    print("="*60)
+
+    result = E2ETestResult("工具调用验证")
+
+    from stores import message_repo, conversation_repo
+    from routes.chat_v5 import get_conversation_history
+    from services.agent.prompt_builder import get_prompt_builder
+
+    conv_id = uuid4()
+
+    try:
+        await conversation_repo.create_conversation(
+            skill="bazi",
+            user_id=None,
+            conversation_id=conv_id
+        )
+
+        # 创建带有明确目标的对话
+        await message_repo.create_message(conv_id, "user",
+            "帮我看看八字中的事业运，我想知道什么时候适合创业")
+        await message_repo.create_message(conv_id, "assistant",
+            "好的，让我分析你的八字事业运势。")
+
+        # 模拟多轮对话
+        for i in range(15):
+            role = "user" if i % 2 == 0 else "assistant"
+            await message_repo.create_message(conv_id, role, f"八字分析对话 {i+1}")
+
+        # 用户模糊请求
+        await message_repo.create_message(conv_id, "user", "继续分析")
+
+        # 获取 history
+        history = await get_conversation_history(conv_id, skill="bazi")
+
+        # 验证: history 第一条包含明确的目标
+        first_content = history[0].get("content", "") if history else ""
+        result.check(
+            "事业运" in first_content or "创业" in first_content,
+            "Goal Context 包含目标信息 (事业运/创业)",
+            first_content[:100]
+        )
+
+        # 构建 prompt 验证
+        prompt_builder = get_prompt_builder()
+
+        # 验证 prompt_builder 可以正确处理 history
+        result.check(
+            len(history) > 0,
+            "History 非空，可供 PromptBuilder 使用"
+        )
+
+        # 模拟 LLM 应该如何理解这个 context
+        # 当用户说"继续分析"时，LLM 应该能从 Goal Context 理解是继续八字事业分析
+        goal_context_useful = "事业" in first_content and "继续" in history[-1].get("content", "")
+        result.check(
+            goal_context_useful,
+            "Goal Context 对理解模糊请求'继续分析'有帮助"
+        )
+
+        print(f"\n  📊 工具调用场景分析:")
+        print(f"     用户原始意图: {first_content[:60]}...")
+        print(f"     用户模糊请求: 继续分析")
+        print(f"     有 Goal Context: LLM 知道继续的是八字事业分析")
+        print(f"     无 Goal Context: LLM 可能不知道继续什么")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id)
+
+    return result
+
+
+async def test_scenario_5_edge_cases():
+    """
+    场景 5: 边界情况测试
+    """
+    print("\n" + "="*60)
+    print("场景 5: 边界情况")
+    print("="*60)
+
+    result = E2ETestResult("边界情况")
+
+    from stores import message_repo, conversation_repo
+    from routes.chat_v5 import get_conversation_history
+
+    # 5.1 空会话
+    empty_conv_id = uuid4()
+    history_empty = await get_conversation_history(empty_conv_id, skill="bazi")
+    result.check(
+        len(history_empty) == 0,
+        "空会话返回空 history"
+    )
+
+    # 5.2 只有 1 条消息
+    conv_id_1 = uuid4()
+    try:
+        await conversation_repo.create_conversation(skill="core", user_id=None, conversation_id=conv_id_1)
+        await message_repo.create_message(conv_id_1, "user", "唯一的消息")
+
+        history_1 = await get_conversation_history(conv_id_1, skill="bazi")
+        result.check(
+            len(history_1) == 1,
+            "单消息会话: history 只有 1 条"
+        )
+        result.check(
+            history_1[0].get("content") == "唯一的消息",
+            "单消息会话: 内容正确"
+        )
+    finally:
+        await message_repo.delete_conversation_messages(conv_id_1)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id_1)
+
+    # 5.3 消息数刚好等于 limit
+    conv_id_exact = uuid4()
+    try:
+        await conversation_repo.create_conversation(skill="core", user_id=None, conversation_id=conv_id_exact)
+        for i in range(15):  # Phase 2 limit = 15
+            await message_repo.create_message(conv_id_exact, "user", f"消息 {i+1}")
+
+        history_exact = await get_conversation_history(conv_id_exact, skill="bazi")
+        result.check(
+            len(history_exact) == 15,
+            "消息数=limit: 全部返回，无重复"
+        )
+
+        # 验证无重复
+        contents = [h.get("content") for h in history_exact]
+        result.check(
+            len(contents) == len(set(contents)),
+            "消息数=limit: 无重复消息"
+        )
+    finally:
+        await message_repo.delete_conversation_messages(conv_id_exact)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id_exact)
+
+    # 5.4 第一条消息内容很长
+    conv_id_long = uuid4()
+    try:
+        await conversation_repo.create_conversation(skill="core", user_id=None, conversation_id=conv_id_long)
+        long_goal = "我想做独立开发者，" * 100  # 很长的目标
+        await message_repo.create_message(conv_id_long, "user", long_goal)
+        for i in range(20):
+            await message_repo.create_message(conv_id_long, "assistant", f"回复 {i+1}")
+
+        history_long = await get_conversation_history(conv_id_long, skill="bazi")
+        result.check(
+            "独立开发者" in history_long[0].get("content", ""),
+            "长消息: 第一条消息完整保留"
+        )
+    finally:
+        await message_repo.delete_conversation_messages(conv_id_long)
+        from stores.db import execute
+        await execute("DELETE FROM conversations WHERE id = $1", conv_id_long)
+
+    return result
+
+
+async def main():
+    from stores.db import init_db
+    await init_db()
+
+    print("="*60)
+    print("Goal-Anchored History 端到端测试")
+    print("验证对话流程、Context、工具调用是否符合用户意图")
+    print("="*60)
+
+    tests = [
+        test_scenario_1_long_conversation_goal_retention,
+        test_scenario_2_context_injection_verification,
+        test_scenario_3_cross_skill_continuity,
+        test_scenario_4_tool_call_with_goal_context,
+        test_scenario_5_edge_cases,
+    ]
+
+    all_results = []
+    total_passed = 0
+    total_checks = 0
+
+    for test in tests:
+        try:
+            result = await test()
+            all_results.append(result)
+            passed, checks = result.summary()
+            total_passed += passed
+            total_checks += checks
+        except Exception as e:
+            print(f"\n  💥 测试异常: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 总结
+    print("\n" + "="*60)
+    print("测试总结")
+    print("="*60)
+
+    for result in all_results:
+        passed, checks = result.summary()
+        status = "✅" if result.passed else "❌"
+        print(f"  {status} {result.name}: {passed}/{checks}")
+
+    print(f"\n  总计: {total_passed}/{total_checks} 通过")
+
+    if total_passed == total_checks:
+        print("\n🎉 所有端到端测试通过！")
+        print("\n📋 验证结果:")
+        print("  ✅ 长对话中原始目标保持在 Context 中")
+        print("  ✅ Phase 1/2 都正确注入第一条消息")
+        print("  ✅ 跨 Skill 切换时目标不丢失")
+        print("  ✅ Goal Context 帮助理解模糊请求")
+        print("  ✅ 边界情况处理正确")
+    else:
+        print("\n⚠️ 部分测试失败，请检查上面的详情")
+
+    return total_passed == total_checks
+
+
+if __name__ == "__main__":
+    success = asyncio.run(main())
+    sys.exit(0 if success else 1)

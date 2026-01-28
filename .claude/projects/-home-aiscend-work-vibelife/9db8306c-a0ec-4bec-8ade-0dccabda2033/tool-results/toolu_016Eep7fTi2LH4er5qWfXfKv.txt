@@ -1,0 +1,751 @@
+     1→# VibeLife V9 系统架构文档
+     2→
+     3→> Version: 9.0 | 2026-01-24
+     4→> 核心理念：遵循 Claude Agent SDK 的渐进式 Skill 架构
+     5→
+     6→---
+     7→
+     8→## 1. 架构升级核心
+     9→
+    10→### 1.1 从 V8 到 V9
+    11→
+    12→| 维度 | V8 | V9 |
+    13→|------|----|----|
+    14→| Skill 加载 | 全量加载 | 渐进式（frontmatter → 完整内容） |
+    15→| Skill 激活 | 单一 | 多 Skill 并行 |
+    16→| 工具调用 | Skill 隔离 | 跨 Skill 编排 |
+    17→| 新场景 | 新建 Skill + 工具 | LLM 自主编排现有 Skill |
+    18→
+    19→### 1.2 Claude Agent SDK Skill 原则
+    20→
+    21→```
+    22→启动时：
+    23→  - Core Skill 全文加载（精简，全程激活）
+    24→  - 其他 Skill 只加载 frontmatter
+    25→       ↓
+    26→Phase 1：LLM 看到 Core + Skill 列表，选择 Skill(s)
+    27→       ↓
+    28→Phase 2：加载已选 Skill(s) 的完整内容 + tools/rules
+    29→```
+    30→
+    31→**核心理念**：
+    32→1. **Core 全程激活**：Core Skill 全文 + 工具始终可用
+    33→2. **Frontmatter 即摘要**：description 包含工具列表，无需额外字段
+    34→3. **Skill 可叠加**：不是互斥的，可以同时激活多个
+    35→4. **LLM 自主编排**：不需要为每个场景写新 Skill
+    36→
+    37→---
+    38→
+    39→## 2. Skill 系统
+    40→
+    41→### 2.1 两层架构
+    42→
+    43→```
+    44→┌─────────────────────────────────────────────────────────────┐
+    45→│  Core Layer (全程激活，全文加载)                              │
+    46→│  └─ core: 生命对话者 + 全局工具                              │
+    47→├─────────────────────────────────────────────────────────────┤
+    48→│  Skill Layer (按需激活，渐进加载)                            │
+    49→│  ├─ bazi, zodiac, synastry, tarot                           │
+    50→│  ├─ jungastro, career, lifecoach, mindfulness               │
+    51→└─────────────────────────────────────────────────────────────┘
+    52→```
+    53→
+    54→### 2.2 目录结构
+    55→
+    56→```
+    57→skills/{skill_id}/
+    58→├── SKILL.md              # frontmatter + 专家身份
+    59→├── rules/                # 规则文件（按需加载）
+    60→├── tools/
+    61→│   ├── tools.yaml        # 工具 Schema
+    62→│   └── handlers.py       # 执行器
+    63→└── services/
+    64→    └── api.py
+    65→```
+    66→
+    67→### 2.3 SKILL.md Frontmatter 规范
+    68→
+    69→```yaml
+    70→---
+    71→id: zodiac
+    72→name: 西方占星
+    73→version: 2.0.0
+    74→description: |
+    75→  星盘计算与解读。
+    76→  工具：calculate_zodiac, show_zodiac_chart, show_zodiac_transit
+    77→triggers:
+    78→  - 星座
+    79→  - 星盘
+    80→  - 运势
+    81→category: astrology
+    82→---
+    83→```
+    84→
+    85→**极简原则**：description 内嵌工具列表，无需额外 `tools_summary` 字段。
+    86→
+    87→### 2.4 Core Skill 规范
+    88→
+    89→Core Skill 全程加载，必须保持精简（<500 tokens）。
+    90→
+    91→#### SKILL.md（目标版本）
+    92→
+    93→```yaml
+    94→---
+    95→id: core
+    96→name: Vibe
+    97→description: |
+    98→  生命对话者。全程激活，提供对话能力和全局工具。
+    99→  工具：activate_skills, ask, save, read, search, show, remind
+   100→---
+   101→
+   102→# Vibe - 生命对话者
+   103→
+   104→## 人格
+   105→
+   106→温暖但不粘腻，智慧但不说教，好奇但不窥探，诚实但不伤害。
+   107→
+   108→> "我不是来给你答案的，我是来陪你找到你自己的答案的。"
+   109→
+   110→## 核心能力
+   111→
+   112→1. **倾听共情**：先理解情绪，再处理事件
+   113→2. **模式觉察**：发现用户自己没意识到的重复模式
+   114→3. **引导探索**：用问题引导用户自己发现答案
+   115→4. **适度沉默**：知道什么时候不说比说更好
+   116→
+   117→## 禁止
+   118→
+   119→- 不说"你应该..."
+   120→- 不给未经请求的建议
+   121→- 不预测具体事件
+   122→- 不透露技术细节（模型名称等）
+   123→
+   124→## 危机处理
+   125→
+   126→强烈负面情绪时，参考 rules/crisis.md
+   127→```
+   128→
+   129→#### tools.yaml（7 个原子工具）
+   130→
+   131→```yaml
+   132→version: "3.0"
+   133→skill_id: core
+   134→
+   135→tools:
+   136→  # 1. 路由
+   137→  - name: activate_skills
+   138→    type: action
+   139→    description: 激活一个或多个 Skill
+   140→    parameters:
+   141→      - name: skills
+   142→        type: array
+   143→        required: true
+   144→
+   145→  # 2. 提问（合并 request_info + ask_user_question）
+   146→  - name: ask
+   147→    type: collect
+   148→    description: 向用户提问或请求信息
+   149→    card_type: collect_form
+   150→    parameters:
+   151→      - name: question
+   152→        type: string
+   153→        required: true
+   154→      - name: form_type
+   155→        type: string
+   156→        enum: [birth, text, select, custom]
+   157→
+   158→  # 3. 保存（合并 save_birth_info + write_state）
+   159→  - name: save
+   160→    type: action
+   161→    description: 保存数据到用户档案
+   162→    parameters:
+   163→      - name: path
+   164→        type: string
+   165→        required: true
+   166→        description: "identity.birth_info | state.* | skills.{id}.* | goals.*"
+   167→      - name: data
+   168→        type: object
+   169→        required: true
+   170→
+   171→  # 4. 读取
+   172→  - name: read
+   173→    type: action
+   174→    description: 读取用户数据
+   175→    parameters:
+   176→      - name: path
+   177→        type: string
+   178→        required: true
+   179→
+   180→  # 5. 检索
+   181→  - name: search
+   182→    type: search
+   183→    description: 检索知识库
+   184→    parameters:
+   185→      - name: query
+   186→        type: string
+   187→        required: true
+   188→      - name: top_k
+   189→        type: integer
+   190→        default: 5
+   191→
+   192→  # 6. 展示（合并 show_card + show_all_skills + recommend_skill）
+   193→  - name: show
+   194→    type: display
+   195→    description: 展示内容
+   196→    parameters:
+   197→      - name: type
+   198→        type: string
+   199→        required: true
+   200→        enum: [card, skill_list, recommendation, insight]
+   201→      - name: card_type
+   202→        type: string
+   203→        enum: [list, tree, table, form, chart, progress, custom]
+   204→      - name: data
+   205→        type: object
+   206→
+   207→  # 7. 提醒（合并 set/list/cancel_reminder）
+   208→  - name: remind
+   209→    type: action
+   210→    description: 管理提醒
+   211→    parameters:
+   212→      - name: action
+   213→        type: string
+   214→        required: true
+   215→        enum: [set, list, cancel]
+   216→      - name: id
+   217→        type: string
+   218→      - name: title
+   219→        type: string
+   220→      - name: schedule
+   221→        type: string
+   222→```
+   223→
+   224→#### 工具合并说明
+   225→
+   226→| 原工具 | 合并到 |
+   227→|--------|--------|
+   228→| `request_info` + `ask_user_question` | `ask` |
+   229→| `save_birth_info` + `write_state` + `save_skill_data` | `save` |
+   230→| `read_state` + `read_user_data` | `read` |
+   231→| `search_db` | `search` |
+   232→| `show_card` + `show_all_skills` + `recommend_skill` | `show` |
+   233→| `set_reminder` + `list_reminders` + `cancel_reminder` | `remind` |
+   234→
+   235→#### 删除的工具
+   236→
+   237→| 删除 | 原因 |
+   238→|------|------|
+   239→| `append_to_list` | 用 `save` 替代 |
+   240→| `query_user_data` / `delete_user_data` | 用 `read` + `save(data=null)` 替代 |
+   241→| `create_trigger` / `list_triggers` / `cancel_trigger` | 用 `remind` 替代 |
+   242→| `save_checkpoint` / `read_session_context` / `add_finding` / `complete_session` | 框架处理 |
+   243→
+   244→#### 场景验证
+   245→
+   246→| 场景 | 工具调用 |
+   247→|------|---------|
+   248→| 帮我算命 | `activate_skills(["bazi"])` |
+   249→| 我1990年出生 | `save(path="identity.birth_info", data={...})` |
+   250→| 请输入出生时间 | `ask(question="...", form_type="birth")` |
+   251→| 今天心情不好 | `save(path="state.emotion", data="sad")` |
+   252→| 我有什么目标 | `read(path="goals")` |
+   253→| 找职业知识 | `search(query="职业规划")` |
+   254→| 展示星盘 | `show(type="card", card_type="custom", data={...})` |
+   255→| 有什么功能 | `show(type="skill_list")` |
+   256→| 推荐适合我的 | `show(type="recommendation", data={skill_id: "bazi"})` |
+   257→| 明天8点提醒 | `remind(action="set", title="...", schedule="...")` |
+   258→| 我有哪些提醒 | `remind(action="list")` |
+   259→| 取消这个提醒 | `remind(action="cancel", id="xxx")` |
+   260→
+   261→#### 迁移内容
+   262→
+   263→| 原位置 | 迁移到 |
+   264→|--------|--------|
+   265→| goal_tracking 子技能 | `lifecoach` Skill |
+   266→| relationship_calc 子技能 | `synastry` Skill |
+   267→| time_window 子技能 | `bazi` Skill rules/ |
+   268→| 对话示例 | `core/rules/examples.md` |
+   269→| 危机处理详情 | `core/rules/crisis.md` |
+   270→| 硬编码路由规则 | 删除，LLM 自主决定 |
+   271→
+   272→---
+   273→
+   274→## 3. CoreAgent 架构
+   275→
+   276→### 3.1 两阶段执行
+   277→
+   278→```
+   279→用户消息
+   280→    │
+   281→    ▼
+   282→┌─────────────────────────────────────────────────────────────┐
+   283→│  Phase 1: Skill 选择                                         │
+   284→│                                                              │
+   285→│  System Prompt：                                             │
+   286→│  - Core Skill 全文（精简）                                   │
+   287→│  - 其他 Skill 的 frontmatter（id, name, description）        │
+   288→│                                                              │
+   289→│  可用工具：                                                  │
+   290→│  - Core 全局工具（始终可用）                                  │
+   291→│  - activate_skills(skills: List[str])                        │
+   292→└─────────────────────────────────────────────────────────────┘
+   293→    │
+   294→    │ LLM: activate_skills(["zodiac", "bazi"])
+   295→    ▼
+   296→┌─────────────────────────────────────────────────────────────┐
+   297→│  Phase 2: Skill 执行                                         │
+   298→│                                                              │
+   299→│  System Prompt：                                             │
+   300→│  - Core Skill 全文（始终存在）                               │
+   301→│  - 已激活 Skill 的完整 SKILL.md                              │
+   302→│  - 相关 rules/*.md                                          │
+   303→│  - Profile + Skill Data                                     │
+   304→│                                                              │
+   305→│  可用工具：                                                  │
+   306→│  - Core 全局工具（始终可用）                                  │
+   307→│  - 已激活 Skill 的所有工具                                   │
+   308→│  - activate_skills（支持动态切换）                           │
+   309→└─────────────────────────────────────────────────────────────┘
+   310→    │
+   311→    ▼
+   312→流式输出
+   313→```
+   314→
+   315→### 3.2 关键代码
+   316→
+   317→#### skill_loader.py
+   318→
+   319→```python
+   320→@dataclass
+   321→class SkillMeta:
+   322→    """frontmatter（Phase 1 展示）"""
+   323→    id: str
+   324→    name: str
+   325→    description: str  # 内含工具列表
+   326→    triggers: List[str]
+   327→    category: str
+   328→
+   329→@dataclass
+   330→class SkillFull:
+   331→    """完整内容（Phase 2 加载）"""
+   332→    meta: SkillMeta
+   333→    content: str
+   334→    tools: List[ToolDef]
+   335→    rules: Dict[str, str]
+   336→
+   337→# Core Skill 特殊处理：启动时全文加载
+   338→_core_skill: SkillFull = None
+   339→
+   340→def get_core_skill() -> SkillFull:
+   341→    """获取 Core Skill（全程可用）"""
+   342→    global _core_skill
+   343→    if not _core_skill:
+   344→        _core_skill = load_skill_full("core")
+   345→    return _core_skill
+   346→
+   347→def load_all_skill_metas() -> Dict[str, SkillMeta]:
+   348→    """启动时加载所有非 Core Skill 的 frontmatter"""
+   349→    pass
+   350→
+   351→def load_skill_full(skill_id: str) -> Optional[SkillFull]:
+   352→    """按需加载完整内容"""
+   353→    pass
+   354→```
+   355→
+   356→#### core.py
+   357→
+   358→```python
+   359→def _get_current_tools(self) -> List[Dict]:
+   360→    """获取当前可用工具"""
+   361→    tools = []
+   362→
+   363→    # 1. Core 工具始终可用
+   364→    core_tools = ToolRegistry.get_tools_for_skill("core")
+   365→    tools.extend(core_tools)
+   366→
+   367→    # 2. 已激活 Skill 的工具
+   368→    for skill_id in self._active_skills:
+   369→        skill_tools = ToolRegistry.get_tools_for_skill(skill_id)
+   370→        tools.extend(skill_tools)
+   371→
+   372→    return tools
+   373→```
+   374→
+   375→---
+   376→
+   377→## 4. 场景处理示例
+   378→
+   379→### 4.1 "今天和老公相处怎么样"
+   380→
+   381→**V8（错误）**：需要新建 relationship_weather Skill
+   382→
+   383→**V9（正确）**：
+   384→```
+   385→Phase 1：
+   386→  - Core 工具已可用
+   387→  - activate_skills(["zodiac"])
+   388→
+   389→Phase 2：
+   390→  - Core 工具 + zodiac 工具
+   391→  - calculate_zodiac(用户, today)
+   392→  - calculate_zodiac(伴侣, today)
+   393→  - 综合分析行运对关系的影响
+   394→  - ✅ 无需新 Skill
+   395→```
+   396→
+   397→### 4.2 "帮我看看职业运势"
+   398→
+   399→```
+   400→Phase 1：activate_skills(["bazi", "career"])
+   401→
+   402→Phase 2：
+   403→  - Core 工具 + bazi 工具 + career 工具
+   404→  - calculate_bazi → 获取命盘
+   405→  - show_career_analysis → 综合分析
+   406→  - ✅ 无需 includes 配置
+   407→```
+   408→
+   409→### 4.3 "我想看合盘"
+   410→
+   411→```
+   412→Phase 1：activate_skills(["synastry"])
+   413→
+   414→Phase 2：
+   415→  - Core 工具 + synastry 工具
+   416→  - 使用 synastry 的完整 SOP
+   417→  - ✅ 现有功能不变
+   418→```
+   419→
+   420→---
+   421→
+   422→## 5. 数据模型（继承 V8）
+   423→
+   424→```yaml
+   425→profile:
+   426→  account: { vibe_id, display_name, tier }
+   427→  identity:
+   428→    birth_info: { date, time, place, timezone, gender }
+   429→  state:
+   430→    emotion: "neutral"
+   431→    focus: ["career"]
+   432→  preferences:
+   433→    subscribed_skills: { bazi: {...}, zodiac: {...} }
+   434→  skill_data:
+   435→    bazi: { chart, features }
+   436→    zodiac: { chart, current_transits }
+   437→  extracted: { facts, goals, concerns }
+   438→  life_context: { goals, tasks, reminders }
+   439→```
+   440→
+   441→---
+   442→
+   443→## 6. 迁移路径
+   444→
+   445→| Step | 内容 |
+   446→|------|------|
+   447→| 1 | 精简 Core SKILL.md（<500 tokens），删除示例和子技能 |
+   448→| 2 | 原子化 Core tools.yaml（30+ → 7 个） |
+   449→| 3 | 迁移子技能到对应 Skill（goal_tracking → lifecoach） |
+   450→| 4 | 每个 SKILL.md description 内嵌工具列表 |
+   451→| 5 | skill_loader.py：Core 全文加载 + 其他 frontmatter |
+   452→| 6 | core.py：Core 工具始终可用 + `activate_skills` |
+   453→| 7 | 移除 routing.yaml 的 `includes` 和硬编码路由规则 |
+   454→
+   455→---
+   456→
+   457→## 7. 关键文件
+   458→
+   459→| 文件 | 改动 |
+   460→|------|------|
+   461→| `apps/api/skills/core/SKILL.md` | 精简到 <500 tokens |
+   462→| `apps/api/skills/core/tools/tools.yaml` | 30+ → 7 个原子工具 |
+   463→| `apps/api/skills/core/rules/` | 新增 examples.md, crisis.md |
+   464→| `apps/api/services/agent/skill_loader.py` | Core 全文 + 分层加载 |
+   465→| `apps/api/services/agent/core.py` | Core 工具始终可用 |
+   466→| `apps/api/services/agent/prompt_builder.py` | Phase 1 上下文 |
+   467→| `apps/api/skills/*/SKILL.md` | description 内嵌工具列表 |
+   468→
+   469→---
+   470→
+   471→## 8. Skill 构建工具统一
+   472→
+   473→### 8.1 vibelife-create vs vibelife-skill 现状
+   474→
+   475→| 方面 | vibelife-create | vibelife-skill |
+   476→|------|----------------|----------------|
+   477→| **定位** | 工作流指导（5 Phase） | 知识库入库执行 |
+   478→| **有工具** | ❌ 无（纯指导） | ✓ run_pipeline, run_extractor |
+   479→| **输出** | 设计文档 + 代码结构 | 知识库数据 |
+   480→| **架构版本** | v12（已过时） | v12（已过时） |
+   481→
+   482→### 8.2 合并为 vibelife-build
+   483→
+   484→**合并原因**：
+   485→1. **用户视角统一**：创建 Skill 应该是一个完整流程
+   486→2. **避免重复维护**：两者都需要更新到 V9
+   487→3. **职责互补**：工作流指导 + 执行工具 = 完整能力
+   488→
+   489→**合并后结构**：
+   490→
+   491→```
+   492→.claude/skills/vibelife-build/
+   493→├── SKILL.md                    # V9 格式
+   494→├── rules/
+   495→│   ├── workflow.md             # 来自 vibelife-create
+   496→│   ├── skill-spec-v9.md        # V9 Skill 规范
+   497→│   ├── best-practices.md       # 最佳实践
+   498→│   └── interface-contracts.md  # 接口契约
+   499→└── templates/                  # 代码模板
+   500→    ├── SKILL.md.template
+   501→    ├── tools.yaml.template
+   502→    └── handlers.py.template
+   503→```
+   504→
+   505→---
+   506→
+   507→## 9. Skill 创建全流程（V9 版本）
+   508→
+   509→### 9.1 流程总览
+   510→
+   511→```
+   512→┌─────────────────────────────────────────────────────────────────┐
+   513→│  Phase 1: 需求收集 (5min)                                        │
+   514→│  ───────────────────                                            │
+   515→│  收集：skill_id, name, description（含工具列表）, triggers      │
+   516→│  输出：完整的 frontmatter                                        │
+   517→└─────────────────────────────────────────────────────────────────┘
+   518→                              │
+   519→                              ▼
+   520→┌─────────────────────────────────────────────────────────────────┐
+   521→│  Phase 2: 设计 SKILL.md (15min)                                  │
+   522→│  ───────────────────                                            │
+   523→│  原则：                                                          │
+   524→│  - description 内嵌工具列表（V9 要求）                          │
+   525→│  - 精简内容 <500 tokens                                         │
+   526→│  - 强制工具调用规则                                              │
+   527→│  - 详细规则放 rules/*.md                                        │
+   528→└─────────────────────────────────────────────────────────────────┘
+   529→                              │
+   530→                              ▼
+   531→┌─────────────────────────────────────────────────────────────────┐
+   532→│  Phase 3: 后端实现 (30min)                                       │
+   533→│  ───────────────────                                            │
+   534→│  - tools.yaml：定义工具 Schema                                   │
+   535→│  - handlers.py：使用 @tool_handler 装饰器                        │
+   536→│  - services/api.py：业务逻辑（可选）                             │
+   537→│  注意：不再需要配置 routing.yaml 的 includes/skill_data         │
+   538→└─────────────────────────────────────────────────────────────────┘
+   539→                              │
+   540→                              ▼
+   541→┌─────────────────────────────────────────────────────────────────┐
+   542→│  Phase 4: 前端实现 (30min)                                       │
+   543→│  ───────────────────                                            │
+   544→│  - 卡片组件：apps/web/src/skills/{skill_id}/cards/              │
+   545→│  - CardRegistry 注册                                             │
+   546→│  - initCards.ts 懒加载配置                                       │
+   547→└─────────────────────────────────────────────────────────────────┘
+   548→                              │
+   549→                              ▼
+   550→┌─────────────────────────────────────────────────────────────────┐
+   551→│  Phase 5: 验证 (10min)                                           │
+   552→│  ───────────────────                                            │
+   553→│  - TypeScript 编译                                               │
+   554→│  - 工具调用测试                                                  │
+   555→│  - 卡片渲染测试                                                  │
+   556→└─────────────────────────────────────────────────────────────────┘
+   557→```
+   558→
+   559→### 9.2 V9 SKILL.md 模板
+   560→
+   561→```yaml
+   562→---
+   563→id: {skill_id}
+   564→name: {中文名称}
+   565→version: 1.0.0
+   566→description: |
+   567→  {一句话功能描述}。
+   568→  工具：{tool1}, {tool2}, {tool3}
+   569→triggers:
+   570→  - {触发词1}
+   571→  - {触发词2}
+   572→category: {astrology|wellness|professional|relationship}
+   573→---
+   574→
+   575→# {Skill 中文名}
+   576→
+   577→## 专家身份
+   578→
+   579→{2-3 段专家角色描述}
+   580→
+   581→**强制工具调用规则（必须遵守）**：
+   582→- **禁止编造数据**！必须调用 `{compute_tool}` 工具计算
+   583→- 用户提供信息后，**必须**先调用 `{compute_tool}`
+   584→- 计算完成后，**必须**调用 `{display_tool}` 展示卡片
+   585→- **禁止**在文本中直接写分析结果而不调用工具
+   586→
+   587→## 核心能力索引
+   588→
+   589→| 能力 | 规则文件 | 触发场景 |
+   590→|-----|---------|---------|
+   591→| {能力1} | `rules/{file1}.md` | {场景描述} |
+   592→| {能力2} | `rules/{file2}.md` | {场景描述} |
+   593→
+   594→## 工具快速参考
+   595→
+   596→| 工具 | 用途 | 何时调用 |
+   597→|-----|------|---------|
+   598→| `{collect_tool}` | 收集信息 | 用户未提供信息时 |
+   599→| `{compute_tool}` | 计算数据 | 用户提供信息后 |
+   600→| `{display_tool}` | 展示结果 | 计算完成后 |
+   601→
+   602→## 伦理边界
+   603→
+   604→- {禁止事项1}
+   605→- {禁止事项2}
+   606→```
+   607→
+   608→### 9.3 V9 tools.yaml 模板
+   609→
+   610→```yaml
+   611→version: "2.0"
+   612→skill_id: {skill_id}
+   613→
+   614→tools:
+   615→  # 收集工具
+   616→  - name: collect_{skill_id}_info
+   617→    type: collect
+   618→    description: 收集用户信息
+   619→    card_type: collect_form
+   620→    parameters:
+   621→      - name: form_type
+   622→        type: string
+   623→        required: true
+   624→
+   625→  # 计算工具
+   626→  - name: calculate_{skill_id}
+   627→    type: compute
+   628→    description: 计算{功能}
+   629→    parameters:
+   630→      - name: data
+   631→        type: object
+   632→        required: true
+   633→
+   634→  # 展示工具
+   635→  - name: show_{skill_id}_chart
+   636→    type: display
+   637→    description: 展示{结果}卡片
+   638→    card_type: {skill_id}_chart
+   639→    parameters:
+   640→      - name: chart_data
+   641→        type: object
+   642→        required: true
+   643→```
+   644→
+   645→### 9.4 V9 与 V12 对比
+   646→
+   647→| 维度 | V12 | V9 |
+   648→|------|-----|-----|
+   649→| **Skill 依赖** | routing.yaml 的 `includes`/`skill_data` | LLM 调用 `activate_skills(["a","b"])` |
+   650→| **工具发现** | 硬编码配置 | description 内嵌工具列表 |
+   651→| **SOP 配置** | routing.yaml 的 `requires_*` 字段 | SKILL.md 的强制工具调用规则 |
+   652→| **全局工具** | routing.yaml 的 `global_tools` | Core 工具始终可用 |
+   653→
+   654→---
+   655→
+   656→## 10. 现有 Skill 迁移指南
+   657→
+   658→### 10.1 zodiac 迁移示例
+   659→
+   660→**当前（V12）**：
+   661→```yaml
+   662→---
+   663→id: zodiac
+   664→name: 西方占星
+   665→description: 星盘计算与解读
+   666→triggers: [星座, 星盘, 运势]
+   667→---
+   668→```
+   669→
+   670→**目标（V9）**：
+   671→```yaml
+   672→---
+   673→id: zodiac
+   674→name: 西方占星
+   675→version: 2.0.0
+   676→description: |
+   677→  星盘计算与解读。
+   678→  工具：calculate_zodiac, show_zodiac_chart, show_zodiac_transit
+   679→triggers:
+   680→  - 星座
+   681→  - 星盘
+   682→  - 运势
+   683→category: astrology
+   684→---
+   685→```
+   686→
+   687→### 10.2 lifecoach 迁移要点
+   688→
+   689→**问题**：当前 330 行，包含大量 SOP 详情
+   690→
+   691→**迁移方案**：
+   692→1. SKILL.md 精简到 <500 tokens
+   693→2. SOP 详情迁移到 `rules/*.md`
+   694→3. description 内嵌工具列表
+   695→
+   696→**迁移后结构**：
+   697→```
+   698→skills/lifecoach/
+   699→├── SKILL.md              # 精简版（<500 tokens）
+   700→├── rules/
+   701→│   ├── _index.md         # 规则索引
+   702→│   ├── dankoe.md         # Dan Koe 协议
+   703→│   ├── covey.md          # Covey 七习惯
+   704→│   ├── yangming.md       # 王阳明心学
+   705→│   └── liaofan.md        # 了凡四训
+   706→└── tools/
+   707→    └── ...
+   708→```
+   709→
+   710→### 10.3 迁移检查清单
+   711→
+   712→**SKILL.md 检查**：
+   713→- [ ] description 包含工具列表
+   714→- [ ] 内容 <500 tokens
+   715→- [ ] 有强制工具调用规则
+   716→- [ ] 详细规则移到 rules/*.md
+   717→
+   718→**routing.yaml 清理**：
+   719→- [ ] 删除 `includes` 配置
+   720→- [ ] 删除 `skill_data` 配置
+   721→- [ ] 保留 `triggers`（供 Phase 1 使用）
+   722→- [ ] 保留 `category`（供分类使用）
+   723→
+   724→**代码更新**：
+   725→- [ ] skill_loader.py 支持渐进式加载
+   726→- [ ] core.py 支持 `activate_skills` 多 Skill 激活
+   727→- [ ] 删除硬编码路由逻辑
+   728→
+   729→---
+   730→
+   731→## 11. 版本历史
+   732→
+   733→- **V9.1** (2026-01-24):
+   734→  - 新增 Skill 构建工具统一方案（vibelife-create + vibelife-skill → vibelife-build）
+   735→  - 新增 Skill 创建全流程（V9 版本 5 Phase）
+   736→  - 新增 V9 SKILL.md / tools.yaml 模板
+   737→  - 新增现有 Skill 迁移指南（zodiac, lifecoach 示例）
+   738→  - 新增迁移检查清单
+   739→- **V9.0** (2026-01-24):
+   740→  - 两层架构：Core Layer + Skill Layer
+   741→  - Core 全程激活（精简到 <500 tokens）
+   742→  - 7 个原子工具：activate_skills, ask, save, read, search, show, remind
+   743→  - 多 Skill 并行激活 + LLM 自主编排
+   744→  - 渐进式加载（frontmatter → 完整内容）
+   745→- **V8.3** (2026-01-23): VibeProfile v13 + VibeExtractor
+   746→- **V8.0** (2026-01-19): VibeProfile 整合 + Knowledge v2
+   747→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

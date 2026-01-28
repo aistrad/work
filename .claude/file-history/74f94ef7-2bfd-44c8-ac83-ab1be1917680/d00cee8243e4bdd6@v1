@@ -1,0 +1,223 @@
+"""
+VibeLife Monthly Review Generator
+月运回顾卡生成器 - 八字月运回顾与展望
+"""
+
+from datetime import date, datetime, timedelta
+from typing import Optional
+from pydantic import BaseModel
+import asyncpg
+
+from ..vibe_engine.llm_orchestrator import LLMOrchestrator
+from tools.bazi.transit import BaziTransitCalculator
+
+
+class MonthlyReviewData(BaseModel):
+    """月运回顾数据"""
+    user_id: str
+    month: str  # YYYY-MM
+    month_name: str  # 如 "丙寅月"
+
+    # 本月回顾
+    current_month_summary: str
+    current_month_highlights: list[str]
+    current_month_challenges: list[str]
+
+    # 下月展望
+    next_month_name: str
+    next_month_outlook: str
+    next_month_opportunities: list[str]
+    next_month_cautions: list[str]
+
+    # 关键建议
+    key_advice: str
+
+    # 元数据
+    generated_at: datetime
+    share_url: Optional[str] = None
+
+
+class MonthlyReviewGenerator:
+    """月运回顾生成器"""
+
+    def __init__(self, db_pool: asyncpg.Pool, llm: LLMOrchestrator = None):
+        self.db = db_pool
+        self.llm = llm
+        self.transit_calc = BaziTransitCalculator()
+
+    async def generate_review(self, user_id: str) -> MonthlyReviewData:
+        """生成月运回顾"""
+        today = date.today()
+        month_str = today.strftime("%Y-%m")
+
+        # 获取用户八字信息
+        user_profile = await self._get_user_bazi_profile(user_id)
+
+        # 获取当前月份和下个月份的干支
+        current_month_gz = self._get_month_ganzhi(today)
+        next_month = today.replace(day=1) + timedelta(days=32)
+        next_month_gz = self._get_month_ganzhi(next_month)
+
+        # 生成回顾内容
+        review_content = await self._generate_review_content(
+            user_profile, current_month_gz, next_month_gz
+        )
+
+        return MonthlyReviewData(
+            user_id=user_id,
+            month=month_str,
+            month_name=current_month_gz,
+            current_month_summary=review_content["current_summary"],
+            current_month_highlights=review_content["current_highlights"],
+            current_month_challenges=review_content["current_challenges"],
+            next_month_name=next_month_gz,
+            next_month_outlook=review_content["next_outlook"],
+            next_month_opportunities=review_content["next_opportunities"],
+            next_month_cautions=review_content["next_cautions"],
+            key_advice=review_content["key_advice"],
+            generated_at=datetime.now()
+        )
+
+    async def _get_user_bazi_profile(self, user_id: str) -> Optional[dict]:
+        """获取用户八字档案"""
+        row = await self.db.fetchrow("""
+            SELECT u.birth_datetime, u.birth_location, sp.profile_data
+            FROM vibe_users u
+            LEFT JOIN skill_profiles sp ON u.id = sp.user_id AND sp.skill_id = 'bazi'
+            WHERE u.id = $1::uuid
+        """, user_id)
+
+        if row:
+            return {
+                "birth_datetime": row["birth_datetime"],
+                "birth_location": row["birth_location"],
+                "profile_data": row["profile_data"] or {}
+            }
+        return None
+
+    def _get_month_ganzhi(self, target_date: date) -> str:
+        """获取月份干支"""
+        # 简化版本，实际应从 transit 模块获取
+        HEAVENLY_STEMS = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
+        EARTHLY_BRANCHES = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+
+        year = target_date.year
+        month = target_date.month
+
+        # 计算年干（以立春为界）
+        year_stem_idx = (year - 4) % 10
+
+        # 月干计算（根据年干推算）
+        month_stem_base = (year_stem_idx * 2 + 2) % 10
+        # 寅月开始，需要调整月份
+        month_branch_idx = (month + 1) % 12  # 简化，实际要考虑节气
+
+        month_stem_idx = (month_stem_base + month - 1) % 10
+        month_branch_idx = (month + 1) % 12
+
+        return f"{HEAVENLY_STEMS[month_stem_idx]}{EARTHLY_BRANCHES[month_branch_idx]}月"
+
+    async def _generate_review_content(
+        self,
+        user_profile: dict,
+        current_month: str,
+        next_month: str
+    ) -> dict:
+        """使用 LLM 生成回顾内容"""
+        if not self.llm:
+            return self._get_default_content(current_month, next_month)
+
+        prompt = f"""作为一个温暖的命理顾问，请基于以下信息生成月运回顾内容：
+
+用户八字信息：{user_profile.get('profile_data', {}).get('chart', '未提供')}
+当前月份：{current_month}
+下个月份：{next_month}
+
+请以JSON格式返回，包含以下字段：
+{{
+    "current_summary": "本月运势总结（2-3句话）",
+    "current_highlights": ["本月亮点1", "本月亮点2"],
+    "current_challenges": ["本月挑战1"],
+    "next_outlook": "下月展望（2-3句话）",
+    "next_opportunities": ["下月机会1", "下月机会2"],
+    "next_cautions": ["下月注意事项"],
+    "key_advice": "核心建议（1句话）"
+}}
+
+要求：
+1. 语气温暖亲切，像一个懂你的朋友
+2. 结合月份五行能量给出具体建议
+3. 保持积极正向，挑战也要给出化解方法
+4. 简洁有力，每个要点不超过20字"""
+
+        try:
+            response = await self.llm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800
+            )
+
+            import json
+            content = response.content
+            # 尝试提取 JSON
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            return json.loads(content)
+        except Exception:
+            return self._get_default_content(current_month, next_month)
+
+    def _get_default_content(self, current_month: str, next_month: str) -> dict:
+        """默认回顾内容"""
+        return {
+            "current_summary": f"{current_month}的能量整体平稳，是沉淀和积累的好时机。",
+            "current_highlights": ["工作效率提升", "人际关系和谐"],
+            "current_challenges": ["需要注意休息，避免过度劳累"],
+            "next_outlook": f"{next_month}带来新的能量转换，适合开启新计划。",
+            "next_opportunities": ["适合学习新技能", "财运有所提升"],
+            "next_cautions": ["重要决定多加考虑"],
+            "key_advice": "顺应能量流动，保持内心平静"
+        }
+
+    async def get_review_history(
+        self,
+        user_id: str,
+        limit: int = 12
+    ) -> list[dict]:
+        """获取历史月运回顾"""
+        rows = await self.db.fetch("""
+            SELECT content, created_at
+            FROM skill_insights
+            WHERE user_id = $1::uuid
+              AND skill_id = 'bazi'
+              AND insight_type = 'monthly_review'
+            ORDER BY created_at DESC
+            LIMIT $2
+        """, user_id, limit)
+
+        return [
+            {
+                "content": row["content"],
+                "created_at": row["created_at"].isoformat()
+            }
+            for row in rows
+        ]
+
+    async def save_review(self, review: MonthlyReviewData) -> str:
+        """保存月运回顾"""
+        import json
+        result = await self.db.fetchrow("""
+            INSERT INTO skill_insights (
+                id, user_id, skill_id, insight_type, title, content, created_at
+            ) VALUES (
+                uuid_generate_v4(), $1::uuid, 'bazi', 'monthly_review',
+                $2, $3, NOW()
+            )
+            RETURNING id
+        """,
+            review.user_id,
+            f"{review.month} 月运回顾",
+            json.dumps(review.model_dump(), ensure_ascii=False, default=str)
+        )
+        return str(result["id"])

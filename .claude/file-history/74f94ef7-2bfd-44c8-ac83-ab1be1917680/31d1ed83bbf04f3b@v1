@@ -1,0 +1,277 @@
+"""
+VibeLife Notification Service
+通知投递服务 - 发送提醒通知到各种渠道
+"""
+
+from datetime import datetime
+from typing import Optional
+from enum import Enum
+from pydantic import BaseModel
+import asyncpg
+import json
+import logging
+
+from .scheduler import ReminderTask, ReminderType
+from .generator import ContentGenerator, GeneratedContent
+
+logger = logging.getLogger(__name__)
+
+
+class NotificationChannel(str, Enum):
+    IN_APP = "in_app"           # 站内通知
+    PUSH = "push"               # Push 通知 (FCM/APNs)
+    WECHAT = "wechat"           # 微信服务通知
+    EMAIL = "email"             # 邮件
+
+
+class NotificationStatus(str, Enum):
+    PENDING = "pending"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    READ = "read"
+    FAILED = "failed"
+
+
+class Notification(BaseModel):
+    """通知记录"""
+    id: Optional[str] = None
+    user_id: str
+    notification_type: str
+    channel: NotificationChannel
+    title: str
+    content: str
+    status: NotificationStatus = NotificationStatus.PENDING
+    created_at: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
+    read_at: Optional[datetime] = None
+
+
+class NotificationService:
+    """通知服务"""
+
+    def __init__(self, db_pool: asyncpg.Pool, content_generator: ContentGenerator = None):
+        self.db = db_pool
+        self.content_generator = content_generator
+
+    async def send_reminder(
+        self,
+        task: ReminderTask,
+        channels: list[NotificationChannel] = None
+    ) -> list[Notification]:
+        """发送提醒通知"""
+        if channels is None:
+            # 获取用户偏好的通知渠道
+            channels = await self._get_user_channels(task.user_id)
+
+        # 生成内容
+        content = None
+        if self.content_generator:
+            content = await self.content_generator.generate_reminder_content(task)
+        else:
+            content = GeneratedContent(
+                title=f"{task.reminder_type.value} 提醒",
+                content=task.event_name,
+                short_content=task.event_name
+            )
+
+        notifications = []
+        for channel in channels:
+            notification = await self._send_to_channel(task, content, channel)
+            if notification:
+                notifications.append(notification)
+
+        return notifications
+
+    async def _get_user_channels(self, user_id: str) -> list[NotificationChannel]:
+        """获取用户启用的通知渠道"""
+        row = await self.db.fetchrow("""
+            SELECT in_app_enabled, push_enabled, wechat_enabled
+            FROM reminder_settings
+            WHERE user_id = $1
+        """, user_id)
+
+        channels = []
+        if row:
+            if row["in_app_enabled"]:
+                channels.append(NotificationChannel.IN_APP)
+            if row["push_enabled"]:
+                channels.append(NotificationChannel.PUSH)
+            if row["wechat_enabled"]:
+                channels.append(NotificationChannel.WECHAT)
+        else:
+            # 默认只有站内通知
+            channels.append(NotificationChannel.IN_APP)
+
+        return channels
+
+    async def _send_to_channel(
+        self,
+        task: ReminderTask,
+        content: GeneratedContent,
+        channel: NotificationChannel
+    ) -> Optional[Notification]:
+        """发送到指定渠道"""
+        try:
+            if channel == NotificationChannel.IN_APP:
+                return await self._send_in_app(task, content)
+            elif channel == NotificationChannel.PUSH:
+                return await self._send_push(task, content)
+            elif channel == NotificationChannel.WECHAT:
+                return await self._send_wechat(task, content)
+            elif channel == NotificationChannel.EMAIL:
+                return await self._send_email(task, content)
+        except Exception as e:
+            logger.error(f"Failed to send notification via {channel}: {e}")
+            return None
+
+    async def _send_in_app(
+        self,
+        task: ReminderTask,
+        content: GeneratedContent
+    ) -> Notification:
+        """发送站内通知"""
+        result = await self.db.fetchrow("""
+            INSERT INTO user_notifications (
+                id, user_id, notification_type, title, content, read, created_at
+            ) VALUES (
+                uuid_generate_v4(), $1::uuid, $2, $3, $4, false, NOW()
+            )
+            RETURNING id, created_at
+        """, task.user_id, task.reminder_type.value, content.title, content.content)
+
+        return Notification(
+            id=str(result["id"]),
+            user_id=task.user_id,
+            notification_type=task.reminder_type.value,
+            channel=NotificationChannel.IN_APP,
+            title=content.title,
+            content=content.content,
+            status=NotificationStatus.SENT,
+            created_at=result["created_at"],
+            sent_at=datetime.now()
+        )
+
+    async def _send_push(
+        self,
+        task: ReminderTask,
+        content: GeneratedContent
+    ) -> Optional[Notification]:
+        """发送 Push 通知 (预留实现)"""
+        # TODO: 集成 FCM / APNs
+        logger.info(f"Push notification (stub): {content.short_content}")
+
+        # 记录发送尝试
+        result = await self.db.fetchrow("""
+            INSERT INTO user_notifications (
+                id, user_id, notification_type, title, content, read, created_at
+            ) VALUES (
+                uuid_generate_v4(), $1::uuid, $2, $3, $4, false, NOW()
+            )
+            RETURNING id, created_at
+        """, task.user_id, f"push_{task.reminder_type.value}", content.title, content.short_content)
+
+        return Notification(
+            id=str(result["id"]),
+            user_id=task.user_id,
+            notification_type=task.reminder_type.value,
+            channel=NotificationChannel.PUSH,
+            title=content.title,
+            content=content.short_content,
+            status=NotificationStatus.PENDING,  # Push 需要确认送达
+            created_at=result["created_at"]
+        )
+
+    async def _send_wechat(
+        self,
+        task: ReminderTask,
+        content: GeneratedContent
+    ) -> Optional[Notification]:
+        """发送微信服务通知 (预留实现)"""
+        # TODO: 集成微信模板消息
+        logger.info(f"WeChat notification (stub): {content.short_content}")
+        return None
+
+    async def _send_email(
+        self,
+        task: ReminderTask,
+        content: GeneratedContent
+    ) -> Optional[Notification]:
+        """发送邮件通知 (预留实现)"""
+        # TODO: 集成邮件服务
+        logger.info(f"Email notification (stub): {content.title}")
+        return None
+
+    async def get_user_notifications(
+        self,
+        user_id: str,
+        unread_only: bool = False,
+        limit: int = 50,
+        offset: int = 0
+    ) -> list[Notification]:
+        """获取用户的通知列表"""
+        query = """
+            SELECT id, user_id::text, notification_type, title, content, read, created_at
+            FROM user_notifications
+            WHERE user_id = $1::uuid
+        """
+        params = [user_id]
+
+        if unread_only:
+            query += " AND read = false"
+
+        query += " ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+        params.extend([limit, offset])
+
+        rows = await self.db.fetch(query, *params)
+
+        return [
+            Notification(
+                id=str(row["id"]),
+                user_id=row["user_id"],
+                notification_type=row["notification_type"],
+                channel=NotificationChannel.IN_APP,
+                title=row["title"] or "",
+                content=row["content"] or "",
+                status=NotificationStatus.READ if row["read"] else NotificationStatus.DELIVERED,
+                created_at=row["created_at"]
+            )
+            for row in rows
+        ]
+
+    async def get_unread_count(self, user_id: str) -> int:
+        """获取未读通知数量"""
+        result = await self.db.fetchval("""
+            SELECT COUNT(*) FROM user_notifications
+            WHERE user_id = $1::uuid AND read = false
+        """, user_id)
+        return result or 0
+
+    async def mark_as_read(self, notification_id: str, user_id: str) -> bool:
+        """标记通知为已读"""
+        result = await self.db.execute("""
+            UPDATE user_notifications
+            SET read = true
+            WHERE id = $1::uuid AND user_id = $2::uuid
+        """, notification_id, user_id)
+        return "UPDATE 1" in result
+
+    async def mark_all_as_read(self, user_id: str) -> int:
+        """标记所有通知为已读"""
+        result = await self.db.execute("""
+            UPDATE user_notifications
+            SET read = true
+            WHERE user_id = $1::uuid AND read = false
+        """, user_id)
+        # 解析更新的行数
+        if "UPDATE" in result:
+            count = int(result.split()[1])
+            return count
+        return 0
+
+    async def delete_notification(self, notification_id: str, user_id: str) -> bool:
+        """删除通知"""
+        result = await self.db.execute("""
+            DELETE FROM user_notifications
+            WHERE id = $1::uuid AND user_id = $2::uuid
+        """, notification_id, user_id)
+        return "DELETE 1" in result

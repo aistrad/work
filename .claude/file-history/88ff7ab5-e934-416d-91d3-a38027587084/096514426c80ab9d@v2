@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+数据迁移脚本: 将分散的用户数据表迁移到 unified_profiles
+
+迁移内容:
+1. user_skill_subscriptions → preferences.subscribed_skills
+2. user_push_preferences → preferences.push_settings
+3. user_data_store → life_context._paths
+4. skill_recommendation_blocks → preferences.blocked_skills
+
+使用方法:
+    python scripts/migrate_to_unified_profile.py [--dry-run] [--batch-size 100]
+
+选项:
+    --dry-run: 只检查数据，不执行迁移
+    --batch-size: 每批处理的用户数量 (默认 100)
+"""
+import argparse
+import asyncio
+import json
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from uuid import UUID
+
+# 添加项目根目录到 path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stores.db import get_connection, fetch, fetchrow, execute
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+class UnifiedProfileMigrator:
+    """统一 Profile 迁移器"""
+
+    def __init__(self, dry_run: bool = False, batch_size: int = 100):
+        self.dry_run = dry_run
+        self.batch_size = batch_size
+        self.stats = {
+            "users_processed": 0,
+            "subscriptions_migrated": 0,
+            "push_prefs_migrated": 0,
+            "user_data_migrated": 0,
+            "blocked_skills_migrated": 0,
+            "errors": 0,
+        }
+
+    async def run(self):
+        """执行迁移"""
+        logger.info("=" * 60)
+        logger.info("开始 VibeProfile 统一迁移")
+        logger.info(f"模式: {'DRY RUN (不写入数据)' if self.dry_run else 'LIVE (将写入数据)'}")
+        logger.info("=" * 60)
+
+        # 获取所有需要迁移的用户
+        users = await self._get_all_users()
+        logger.info(f"共找到 {len(users)} 个用户需要处理")
+
+        # 分批处理
+        for i in range(0, len(users), self.batch_size):
+            batch = users[i:i + self.batch_size]
+            logger.info(f"处理批次 {i // self.batch_size + 1}, 用户 {i + 1} - {i + len(batch)}")
+
+            for user_id in batch:
+                try:
+                    await self._migrate_user(user_id)
+                    self.stats["users_processed"] += 1
+                except Exception as e:
+                    logger.error(f"迁移用户 {user_id} 失败: {e}")
+                    self.stats["errors"] += 1
+
+        # 输出统计
+        self._print_stats()
+
+    async def _get_all_users(self) -> List[UUID]:
+        """获取所有需要迁移的用户 ID"""
+        query = """
+            SELECT DISTINCT user_id FROM (
+                SELECT user_id FROM user_skill_subscriptions
+                UNION
+                SELECT user_id FROM user_push_preferences
+                UNION
+                SELECT user_id FROM user_data_store
+                UNION
+                SELECT user_id FROM skill_recommendation_blocks
+            ) AS all_users
+        """
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query)
+                return [row["user_id"] for row in rows]
+        except Exception as e:
+            # 如果表不存在，返回空列表
+            logger.warning(f"获取用户列表失败（表可能不存在）: {e}")
+            return []
+
+    async def _migrate_user(self, user_id: UUID):
+        """迁移单个用户的数据"""
+        logger.debug(f"迁移用户: {user_id}")
+
+        # 获取当前 Profile
+        profile = await self._get_current_profile(user_id)
+
+        # 确保 preferences 存在
+        if "preferences" not in profile:
+            profile["preferences"] = {
+                "voice_mode": "warm",
+                "language": "zh-CN",
+            }
+
+        # 1. 迁移订阅数据
+        subscribed_skills = await self._migrate_subscriptions(user_id)
+        if subscribed_skills:
+            profile["preferences"]["subscribed_skills"] = subscribed_skills
+
+        # 2. 迁移推送偏好
+        push_settings = await self._migrate_push_preferences(user_id)
+        if push_settings:
+            profile["preferences"]["push_settings"] = push_settings
+
+        # 3. 迁移屏蔽 Skill
+        blocked_skills = await self._migrate_blocked_skills(user_id)
+        if blocked_skills:
+            profile["preferences"]["blocked_skills"] = blocked_skills
+
+        # 4. 迁移 user_data_store 到 life_context._paths
+        life_context_paths = await self._migrate_user_data(user_id)
+        if life_context_paths:
+            if "life_context" not in profile:
+                profile["life_context"] = {}
+            profile["life_context"]["_paths"] = life_context_paths
+
+        # 写入更新后的 Profile
+        if not self.dry_run:
+            await self._update_profile(user_id, profile)
+
+    async def _get_current_profile(self, user_id: UUID) -> Dict[str, Any]:
+        """获取当前 Profile"""
+        query = "SELECT profile FROM unified_profiles WHERE user_id = $1"
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id)
+            if row and row["profile"]:
+                profile = row["profile"]
+                if isinstance(profile, str):
+                    profile = json.loads(profile)
+                return profile
+        return {}
+
+    async def _migrate_subscriptions(self, user_id: UUID) -> Dict[str, Any]:
+        """迁移订阅数据"""
+        query = """
+            SELECT skill_id, status, push_enabled, subscribed_at,
+                   unsubscribed_at, trial_messages_used
+            FROM user_skill_subscriptions
+            WHERE user_id = $1
+        """
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, user_id)
+
+            subscribed_skills = {}
+            for row in rows:
+                subscribed_skills[row["skill_id"]] = {
+                    "status": row["status"],
+                    "push_enabled": row["push_enabled"],
+                    "subscribed_at": row["subscribed_at"].isoformat() if row["subscribed_at"] else None,
+                    "unsubscribed_at": row["unsubscribed_at"].isoformat() if row["unsubscribed_at"] else None,
+                    "trial_messages_used": row["trial_messages_used"] or 0,
+                }
+                self.stats["subscriptions_migrated"] += 1
+
+            return subscribed_skills
+        except Exception as e:
+            logger.warning(f"迁移订阅数据失败: {e}")
+            return {}
+
+    async def _migrate_push_preferences(self, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """迁移推送偏好"""
+        query = """
+            SELECT default_push_hour, max_daily_pushes, quiet_start_hour, quiet_end_hour
+            FROM user_push_preferences
+            WHERE user_id = $1
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, user_id)
+
+            if row:
+                self.stats["push_prefs_migrated"] += 1
+                return {
+                    "default_push_hour": row["default_push_hour"],
+                    "max_daily_pushes": row["max_daily_pushes"],
+                    "quiet_start_hour": row["quiet_start_hour"],
+                    "quiet_end_hour": row["quiet_end_hour"],
+                }
+            return None
+        except Exception as e:
+            logger.warning(f"迁移推送偏好失败: {e}")
+            return None
+
+    async def _migrate_blocked_skills(self, user_id: UUID) -> List[str]:
+        """迁移屏蔽 Skill"""
+        query = """
+            SELECT skill_id
+            FROM skill_recommendation_blocks
+            WHERE user_id = $1
+            AND (expires_at IS NULL OR expires_at > now())
+        """
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, user_id)
+
+            blocked_skills = [row["skill_id"] for row in rows]
+            self.stats["blocked_skills_migrated"] += len(blocked_skills)
+            return blocked_skills
+        except Exception as e:
+            logger.warning(f"迁移屏蔽 Skill 失败: {e}")
+            return []
+
+    async def _migrate_user_data(self, user_id: UUID) -> Dict[str, Any]:
+        """迁移 user_data_store 到 life_context._paths"""
+        query = """
+            SELECT data_path, content, version, updated_at
+            FROM user_data_store
+            WHERE user_id = $1
+        """
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, user_id)
+
+            paths = {}
+            for row in rows:
+                content = row["content"]
+                if isinstance(content, str):
+                    content = json.loads(content)
+
+                paths[row["data_path"]] = {
+                    "content": content,
+                    "version": row["version"],
+                    "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                }
+                self.stats["user_data_migrated"] += 1
+
+            return paths
+        except Exception as e:
+            logger.warning(f"迁移用户数据失败: {e}")
+            return {}
+
+    async def _update_profile(self, user_id: UUID, profile: Dict[str, Any]):
+        """更新 Profile"""
+        # 检查是否存在
+        exists_query = "SELECT 1 FROM unified_profiles WHERE user_id = $1"
+        async with get_connection() as conn:
+            exists = await conn.fetchval(exists_query, user_id)
+
+        profile_json = json.dumps(profile, ensure_ascii=False, default=str)
+
+        if exists:
+            query = """
+                UPDATE unified_profiles
+                SET profile = $2::jsonb, updated_at = NOW()
+                WHERE user_id = $1
+            """
+        else:
+            query = """
+                INSERT INTO unified_profiles (user_id, profile)
+                VALUES ($1, $2::jsonb)
+            """
+
+        async with get_connection() as conn:
+            await conn.execute(query, user_id, profile_json)
+
+    def _print_stats(self):
+        """输出统计信息"""
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("迁移统计")
+        logger.info("=" * 60)
+        logger.info(f"处理用户数: {self.stats['users_processed']}")
+        logger.info(f"订阅记录迁移: {self.stats['subscriptions_migrated']}")
+        logger.info(f"推送偏好迁移: {self.stats['push_prefs_migrated']}")
+        logger.info(f"用户数据迁移: {self.stats['user_data_migrated']}")
+        logger.info(f"屏蔽 Skill 迁移: {self.stats['blocked_skills_migrated']}")
+        logger.info(f"错误数: {self.stats['errors']}")
+        logger.info("=" * 60)
+
+        if self.dry_run:
+            logger.info("DRY RUN 完成 - 未写入任何数据")
+        else:
+            logger.info("迁移完成")
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="将分散的用户数据表迁移到 unified_profiles"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只检查数据，不执行迁移"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="每批处理的用户数量 (默认 100)"
+    )
+
+    args = parser.parse_args()
+
+    migrator = UnifiedProfileMigrator(
+        dry_run=args.dry_run,
+        batch_size=args.batch_size
+    )
+
+    await migrator.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

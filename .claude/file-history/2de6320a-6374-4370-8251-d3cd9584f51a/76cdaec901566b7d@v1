@@ -1,0 +1,212 @@
+"""
+Retrieval Service V2 - Hybrid search with Jieba preprocessing
+"""
+from typing import Optional, List, Dict, Any
+
+import jieba
+
+from stores import KnowledgeRepository
+from .embedding import EmbeddingService
+
+
+class RetrievalService:
+    """
+    Knowledge retrieval with hybrid search (Vector + FTS + RRF)
+
+    V2 improvements:
+    - Application-layer Jieba tokenization
+    - Uses PostgreSQL SQL functions for efficient RRF
+    - Supports section path information
+    """
+
+    @classmethod
+    def preprocess_query(cls, query: str) -> str:
+        """
+        Preprocess query with Jieba tokenization
+
+        Input:  "比肩代表独立能力strong independence"
+        Output: "比肩 代表 独立 能力 strong independence"
+        """
+        tokens = jieba.cut_for_search(query)
+        return " ".join(tokens)
+
+    @classmethod
+    async def search(
+        cls,
+        query: str,
+        skill_id: str,
+        top_k: int = 5,
+        use_hybrid: bool = True,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3
+    ) -> List[Dict[str, Any]]:
+        """
+        Search knowledge base with hybrid retrieval.
+
+        Args:
+            query: User's search query
+            skill_id: Skill to search in
+            top_k: Number of results to return
+            use_hybrid: Whether to use hybrid search (default True)
+            vector_weight: Weight for vector similarity
+            text_weight: Weight for text match
+
+        Returns:
+            List of matching chunks with content, score, and metadata
+        """
+        # Generate query embedding
+        query_embedding = await EmbeddingService.embed_query(query)
+
+        if use_hybrid:
+            # Preprocess query for FTS
+            query_preprocessed = cls.preprocess_query(query)
+
+            # Hybrid search using SQL function
+            results = await KnowledgeRepository.hybrid_search(
+                query_preprocessed=query_preprocessed,
+                embedding=query_embedding,
+                skill_id=skill_id,
+                top_k=top_k,
+                vector_weight=vector_weight,
+                text_weight=text_weight
+            )
+        else:
+            # Vector-only search
+            results = await KnowledgeRepository.vector_search(
+                embedding=query_embedding,
+                skill_id=skill_id,
+                top_k=top_k
+            )
+
+        return results
+
+    @classmethod
+    async def text_only_search(
+        cls,
+        query: str,
+        skill_id: str,
+        top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Search using full-text search only (no embeddings)"""
+        query_preprocessed = cls.preprocess_query(query)
+
+        results = await KnowledgeRepository.text_search(
+            query_preprocessed=query_preprocessed,
+            skill_id=skill_id,
+            top_k=top_k
+        )
+
+        return results
+
+    @classmethod
+    async def get_context_for_query(
+        cls,
+        query: str,
+        skill_id: str,
+        max_chunks: int = 3,
+        max_chars: int = 3000
+    ) -> str:
+        """
+        Get formatted context string for LLM from knowledge base.
+
+        Args:
+            query: User's query
+            skill_id: Skill to search in
+            max_chunks: Maximum number of chunks to include
+            max_chars: Maximum total characters
+
+        Returns:
+            Formatted context string for LLM prompt
+        """
+        chunks = await cls.search(query, skill_id, top_k=max_chunks)
+
+        if not chunks:
+            return ""
+
+        context_parts = []
+        total_chars = 0
+
+        for chunk in chunks:
+            content = chunk["content"]
+            section_title = chunk.get("section_title", "")
+
+            # Check character limit
+            if total_chars + len(content) > max_chars:
+                # Truncate to fit
+                remaining = max_chars - total_chars
+                if remaining > 100:
+                    content = content[:remaining] + "..."
+                else:
+                    break
+
+            # Format with section info
+            if section_title:
+                context_parts.append(f"### {section_title}\n{content}")
+            else:
+                context_parts.append(content)
+
+            total_chars += len(content)
+
+        return "\n\n".join(context_parts)
+
+    @classmethod
+    async def get_related_sections(
+        cls,
+        query: str,
+        skill_id: str,
+        top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get related sections with their hierarchy paths.
+
+        Returns simplified results for UI display.
+        """
+        results = await cls.search(query, skill_id, top_k=top_k)
+
+        sections = []
+        for r in results:
+            sections.append({
+                "id": str(r["id"]),
+                "title": r.get("section_title") or "Untitled",
+                "path": r.get("section_path") or [],
+                "preview": r["content"][:150] + "..." if len(r["content"]) > 150 else r["content"],
+                "score": r.get("score", 0),
+                "match_type": r.get("match_type", "unknown")
+            })
+
+        return sections
+
+    @classmethod
+    async def index_content(
+        cls,
+        skill_id: str,
+        content: str,
+        content_type: str = "knowledge",
+        section_path: Optional[List[str]] = None,
+        section_title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Index new content into knowledge base.
+
+        For bulk indexing, use the IngestionWorker instead.
+        """
+        # Generate embedding
+        embedding = await EmbeddingService.embed_text(content)
+
+        # Preprocess for search
+        search_text = cls.preprocess_query(content)
+
+        # Create chunk
+        chunk = await KnowledgeRepository.create_chunk(
+            skill_id=skill_id,
+            content=content,
+            search_text_preprocessed=search_text,
+            embedding=embedding,
+            content_type=content_type,
+            section_path=section_path,
+            section_title=section_title,
+            metadata=metadata
+        )
+
+        return chunk

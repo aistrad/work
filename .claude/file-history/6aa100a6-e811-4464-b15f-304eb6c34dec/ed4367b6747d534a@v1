@@ -1,0 +1,330 @@
+"""
+News Fetcher Service - 新闻热点抓取服务
+
+功能:
+- 从 Google News RSS 获取全球新闻热点
+- 支持中文和英文新闻源
+- 关键词预过滤（保留与 VibeLife Skill 相关的新闻）
+
+使用:
+    fetcher = NewsFetcher()
+    items = await fetcher.fetch_all()
+"""
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+from xml.etree import ElementTree
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NewsItem:
+    """新闻条目"""
+
+    title: str
+    link: str
+    source: str
+    published_at: Optional[datetime] = None
+    description: str = ""
+    # 预处理字段
+    matched_keywords: list[str] = field(default_factory=list)
+    potential_skills: list[str] = field(default_factory=list)
+
+
+# VibeLife 相关关键词（用于预过滤）
+VIBELIFE_KEYWORDS = {
+    # 心理 psych
+    "psych": [
+        "心理",
+        "焦虑",
+        "抑郁",
+        "压力",
+        "情绪",
+        "内耗",
+        "拖延",
+        "社恐",
+        "自卑",
+        "完美主义",
+        "边界感",
+        "依恋",
+        "原生家庭",
+        "讨好型",
+        "mental health",
+        "anxiety",
+        "depression",
+        "stress",
+        "burnout",
+        "overthinking",
+    ],
+    # 星座 zodiac
+    "zodiac": [
+        "星座",
+        "水瓶",
+        "双鱼",
+        "白羊",
+        "金牛",
+        "双子",
+        "巨蟹",
+        "狮子",
+        "处女",
+        "天秤",
+        "天蝎",
+        "射手",
+        "摩羯",
+        "运势",
+        "星盘",
+        "上升",
+        "月亮星座",
+        "zodiac",
+        "horoscope",
+        "astrology",
+        "mercury retrograde",
+        "水逆",
+    ],
+    # 人生教练 lifecoach
+    "lifecoach": [
+        "成长",
+        "自律",
+        "目标",
+        "习惯",
+        "时间管理",
+        "效率",
+        "迷茫",
+        "方向",
+        "职业规划",
+        "改变",
+        "行动",
+        "拖延症",
+        "self improvement",
+        "productivity",
+        "goal setting",
+        "habit",
+        "motivation",
+    ],
+    # 塔罗 tarot
+    "tarot": [
+        "塔罗",
+        "占卜",
+        "牌阵",
+        "tarot",
+        "divination",
+        "card reading",
+    ],
+    # 八字 bazi
+    "bazi": [
+        "八字",
+        "命理",
+        "五行",
+        "运势",
+        "生辰",
+        "命盘",
+        "chinese astrology",
+        "bazi",
+        "feng shui",
+    ],
+    # 荣格占星 jungastro
+    "jungastro": [
+        "荣格",
+        "阴影",
+        "原型",
+        "人格",
+        "潜意识",
+        "心理学",
+        "个体化",
+        "Jung",
+        "archetype",
+        "shadow work",
+        "individuation",
+    ],
+    # 通用心灵/情感
+    "general": [
+        "爱情",
+        "感情",
+        "恋爱",
+        "分手",
+        "复合",
+        "暧昧",
+        "单身",
+        "相亲",
+        "婚姻",
+        "离婚",
+        "出轨",
+        "relationship",
+        "love",
+        "dating",
+        "breakup",
+        "single",
+        "marriage",
+    ],
+}
+
+# Google News RSS 源
+GOOGLE_NEWS_FEEDS = [
+    # 中文新闻
+    {
+        "url": "https://news.google.com/rss/search?q=%E5%BF%83%E7%90%86+OR+%E7%84%A6%E8%99%91+OR+%E6%83%85%E7%BB%AA&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "name": "Google News CN - 心理",
+        "lang": "zh",
+    },
+    {
+        "url": "https://news.google.com/rss/search?q=%E6%98%9F%E5%BA%A7+OR+%E8%BF%90%E5%8A%BF&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "name": "Google News CN - 星座",
+        "lang": "zh",
+    },
+    {
+        "url": "https://news.google.com/rss/search?q=%E6%88%90%E9%95%BF+OR+%E8%87%AA%E5%BE%8B+OR+%E8%81%8C%E5%9C%BA&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "name": "Google News CN - 成长",
+        "lang": "zh",
+    },
+    # 英文新闻（可翻译后使用）
+    {
+        "url": "https://news.google.com/rss/search?q=mental+health+OR+anxiety+OR+stress&hl=en-US&gl=US&ceid=US:en",
+        "name": "Google News US - Mental Health",
+        "lang": "en",
+    },
+    {
+        "url": "https://news.google.com/rss/search?q=horoscope+OR+astrology+OR+zodiac&hl=en-US&gl=US&ceid=US:en",
+        "name": "Google News US - Astrology",
+        "lang": "en",
+    },
+    {
+        "url": "https://news.google.com/rss/search?q=self+improvement+OR+productivity+OR+motivation&hl=en-US&gl=US&ceid=US:en",
+        "name": "Google News US - Self Improvement",
+        "lang": "en",
+    },
+]
+
+
+class NewsFetcher:
+    """新闻抓取器"""
+
+    def __init__(
+        self,
+        feeds: list[dict] | None = None,
+        timeout: int = 30,
+        max_items_per_feed: int = 10,
+    ):
+        self.feeds = feeds or GOOGLE_NEWS_FEEDS
+        self.timeout = timeout
+        self.max_items_per_feed = max_items_per_feed
+
+    async def fetch_feed(self, feed: dict) -> list[NewsItem]:
+        """抓取单个 RSS Feed"""
+        items = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    feed["url"],
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; VibeLife/1.0)"
+                    },
+                ) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            f"Failed to fetch {feed['name']}: {response.status}"
+                        )
+                        return items
+
+                    content = await response.text()
+                    root = ElementTree.fromstring(content)
+
+                    # 解析 RSS 条目
+                    channel = root.find("channel")
+                    if channel is None:
+                        return items
+
+                    for item in channel.findall("item")[: self.max_items_per_feed]:
+                        title = item.findtext("title", "")
+                        link = item.findtext("link", "")
+                        description = item.findtext("description", "")
+                        pub_date = item.findtext("pubDate", "")
+
+                        # 解析发布时间
+                        published_at = None
+                        if pub_date:
+                            try:
+                                # RFC 822 format
+                                published_at = datetime.strptime(
+                                    pub_date, "%a, %d %b %Y %H:%M:%S %Z"
+                                )
+                            except ValueError:
+                                try:
+                                    published_at = datetime.strptime(
+                                        pub_date, "%a, %d %b %Y %H:%M:%S %z"
+                                    )
+                                except ValueError:
+                                    pass
+
+                        # 创建新闻条目
+                        news_item = NewsItem(
+                            title=title,
+                            link=link,
+                            source=feed["name"],
+                            published_at=published_at,
+                            description=description,
+                        )
+
+                        # 关键词匹配
+                        self._match_keywords(news_item)
+
+                        # 只保留匹配到关键词的条目
+                        if news_item.matched_keywords:
+                            items.append(news_item)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching {feed['name']}")
+        except Exception as e:
+            logger.error(f"Error fetching {feed['name']}: {e}")
+
+        return items
+
+    def _match_keywords(self, item: NewsItem) -> None:
+        """关键词匹配"""
+        text = f"{item.title} {item.description}".lower()
+
+        for skill, keywords in VIBELIFE_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword.lower() in text:
+                    if keyword not in item.matched_keywords:
+                        item.matched_keywords.append(keyword)
+                    if skill not in item.potential_skills and skill != "general":
+                        item.potential_skills.append(skill)
+
+    async def fetch_all(self) -> list[NewsItem]:
+        """并发抓取所有 RSS Feed"""
+        tasks = [self.fetch_feed(feed) for feed in self.feeds]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_items = []
+        for result in results:
+            if isinstance(result, list):
+                all_items.extend(result)
+            elif isinstance(result, Exception):
+                logger.error(f"Feed fetch failed: {result}")
+
+        # 去重（按标题）
+        seen_titles = set()
+        unique_items = []
+        for item in all_items:
+            # 简化标题用于去重
+            simplified = re.sub(r"[^\w\u4e00-\u9fff]", "", item.title.lower())
+            if simplified not in seen_titles:
+                seen_titles.add(simplified)
+                unique_items.append(item)
+
+        logger.info(f"Fetched {len(unique_items)} unique news items")
+        return unique_items
+
+    def filter_by_skill(
+        self, items: list[NewsItem], skill: str
+    ) -> list[NewsItem]:
+        """按 Skill 过滤新闻"""
+        return [item for item in items if skill in item.potential_skills]

@@ -1,0 +1,675 @@
+"""
+Mentis OS v3.0 - Daily Digest 服务
+
+核心功能:
+- 聚合当日日记条目
+- 生成情绪轨迹和能量曲线
+- 使用 LLM 生成优美的日记正文
+- 支持多种风格 (minimal, artistic, magazine, warm)
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from stores import mentis_db
+from services import glm_service, prompts
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 数据类型定义
+# =============================================================================
+
+@dataclass
+class DigestEntry:
+    """日记条目"""
+    id: str
+    time: str
+    content: str
+    emotion: str
+    intensity: int
+    energy_delta: int
+    tags: List[str]
+    media_urls: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EmotionPoint:
+    """情绪轨迹点"""
+    time: str
+    emotion: str
+    intensity: int
+
+
+@dataclass
+class EnergyPoint:
+    """能量曲线点"""
+    time: str
+    energy: int
+
+
+@dataclass
+class DailyDigest:
+    """每日精美日记"""
+    id: Optional[str]
+    user_id: str
+    date: date
+    title: Optional[str]
+    summary: Optional[str]
+    prose: str
+    style: str
+    entry_count: int
+    emotion_trajectory: List[EmotionPoint]
+    energy_curve: List[EnergyPoint]
+    key_tags: List[str]
+    source_entries: List[str]
+    is_shared: bool = False
+    share_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "date": self.date.isoformat(),
+            "title": self.title,
+            "summary": self.summary,
+            "prose": self.prose,
+            "style": self.style,
+            "entry_count": self.entry_count,
+            "emotion_trajectory": [
+                {"time": p.time, "emotion": p.emotion, "intensity": p.intensity}
+                for p in self.emotion_trajectory
+            ],
+            "energy_curve": [
+                {"time": p.time, "energy": p.energy}
+                for p in self.energy_curve
+            ],
+            "key_tags": self.key_tags,
+            "source_entries": self.source_entries,
+            "is_shared": self.is_shared,
+            "share_url": self.share_url,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# 风格模板
+# =============================================================================
+
+STYLE_INSTRUCTIONS = {
+    "minimal": "极简风格：简洁有力，留白多，像日本俳句的意境。用短句，不过度修饰。",
+    "artistic": "文艺风格：诗意盎然，善用比喻和意象。语言优美，有文学性。",
+    "magazine": "杂志风格：结构清晰，可用小标题分段。像一篇精致的生活随笔。",
+    "warm": "温暖风格：温情脉脉，像给朋友写信。亲切、真诚、有温度。",
+}
+
+
+# =============================================================================
+# Daily Digest 服务
+# =============================================================================
+
+class DailyDigestService:
+    """Daily Digest 服务"""
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or "glm-4-flash"
+
+    async def generate_digest(
+        self,
+        user_id: str,
+        target_date: date,
+        style: str = "minimal",
+    ) -> DailyDigest:
+        """
+        生成每日精美日记
+
+        Args:
+            user_id: 用户 ID
+            target_date: 目标日期
+            style: 风格 (minimal/artistic/magazine/warm)
+
+        Returns:
+            DailyDigest: 生成的日记
+        """
+        # 1. 获取当日所有日记条目
+        entries = self._get_entries_for_date(user_id, target_date)
+
+        if not entries:
+            raise ValueError(f"No entries found for {target_date}")
+
+        # 2. 计算情绪轨迹和能量曲线
+        emotion_trajectory = self._calculate_emotion_trajectory(entries)
+        energy_curve = self._calculate_energy_curve(user_id, entries)
+
+        # 3. 提取关键标签
+        key_tags = self._extract_key_tags(entries)
+
+        # 4. 使用 LLM 生成日记正文
+        prose = await self._generate_prose(
+            target_date,
+            style,
+            entries,
+            emotion_trajectory,
+            energy_curve,
+        )
+
+        # 5. 生成标题和摘要
+        title = await self._generate_title(prose, target_date, emotion_trajectory)
+        summary = await self._generate_summary(prose)
+
+        # 6. 保存到数据库
+        digest = DailyDigest(
+            id=None,
+            user_id=user_id,
+            date=target_date,
+            title=title,
+            summary=summary,
+            prose=prose,
+            style=style,
+            entry_count=len(entries),
+            emotion_trajectory=emotion_trajectory,
+            energy_curve=energy_curve,
+            key_tags=key_tags,
+            source_entries=[e.id for e in entries],
+        )
+
+        saved_digest = self._save_digest(digest)
+        return saved_digest
+
+    async def regenerate_digest(
+        self,
+        digest_id: str,
+        style: str,
+    ) -> DailyDigest:
+        """
+        重新生成日记 (使用新风格)
+
+        Args:
+            digest_id: 日记 ID
+            style: 新风格
+
+        Returns:
+            DailyDigest: 重新生成的日记
+        """
+        # 获取现有日记
+        existing = self._get_digest_by_id(digest_id)
+        if not existing:
+            raise ValueError(f"Digest not found: {digest_id}")
+
+        # 获取原始条目
+        entries = self._get_entries_by_ids(existing.source_entries)
+
+        # 重新生成正文
+        prose = await self._generate_prose(
+            existing.date,
+            style,
+            entries,
+            existing.emotion_trajectory,
+            existing.energy_curve,
+        )
+
+        # 重新生成标题和摘要
+        title = await self._generate_title(prose, existing.date, existing.emotion_trajectory)
+        summary = await self._generate_summary(prose)
+
+        # 更新数据库
+        mentis_db.execute(
+            """
+            UPDATE daily_digest
+            SET title = %s, summary = %s, prose = %s, style = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (title, summary, prose, style, digest_id),
+        )
+
+        existing.title = title
+        existing.summary = summary
+        existing.prose = prose
+        existing.style = style
+
+        return existing
+
+    def get_digest_by_date(
+        self,
+        user_id: str,
+        target_date: date,
+    ) -> Optional[DailyDigest]:
+        """获取指定日期的日记"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, user_id, date, title, summary, prose, style,
+                   entry_count, emotion_trajectory, energy_curve, key_tags,
+                   source_entries, is_shared, share_url, created_at
+            FROM daily_digest
+            WHERE user_id = %s AND date = %s
+            """,
+            (user_id, target_date),
+        )
+        return self._row_to_digest(row) if row else None
+
+    def list_digests(
+        self,
+        user_id: str,
+        limit: int = 30,
+        offset: int = 0,
+    ) -> List[DailyDigest]:
+        """列出用户的日记"""
+        rows = mentis_db.fetch_all(
+            """
+            SELECT id, user_id, date, title, summary, prose, style,
+                   entry_count, emotion_trajectory, energy_curve, key_tags,
+                   source_entries, is_shared, share_url, created_at
+            FROM daily_digest
+            WHERE user_id = %s
+            ORDER BY date DESC
+            LIMIT %s OFFSET %s
+            """,
+            (user_id, limit, offset),
+        )
+        return [self._row_to_digest(row) for row in rows]
+
+    def get_emotion_trajectory(
+        self,
+        user_id: str,
+        target_date: date,
+    ) -> List[Dict[str, Any]]:
+        """获取指定日期的情绪轨迹"""
+        entries = self._get_entries_for_date(user_id, target_date)
+        trajectory = self._calculate_emotion_trajectory(entries)
+        return [
+            {"time": p.time, "emotion": p.emotion, "intensity": p.intensity}
+            for p in trajectory
+        ]
+
+    def get_energy_curve(
+        self,
+        user_id: str,
+        target_date: date,
+    ) -> List[Dict[str, Any]]:
+        """获取指定日期的能量曲线"""
+        entries = self._get_entries_for_date(user_id, target_date)
+        curve = self._calculate_energy_curve(user_id, entries)
+        return [{"time": p.time, "energy": p.energy} for p in curve]
+
+    # =========================================================================
+    # 私有方法
+    # =========================================================================
+
+    def _get_entries_for_date(
+        self,
+        user_id: str,
+        target_date: date,
+    ) -> List[DigestEntry]:
+        """获取指定日期的所有日记条目"""
+        rows = mentis_db.fetch_all(
+            """
+            SELECT id, raw_content, emotion, tags, energy_delta, media_urls, created_at
+            FROM stream_entry
+            WHERE user_id = %s
+              AND DATE(created_at AT TIME ZONE 'Asia/Shanghai') = %s
+              AND type = 'vibe_diary'
+            ORDER BY created_at ASC
+            """,
+            (user_id, target_date),
+        )
+
+        entries = []
+        for row in rows:
+            emotion_data = row.get("emotion") or {}
+            if isinstance(emotion_data, str):
+                emotion_data = json.loads(emotion_data)
+
+            created_at = row.get("created_at")
+            time_str = created_at.strftime("%H:%M") if created_at else ""
+
+            entries.append(DigestEntry(
+                id=str(row.get("id")),
+                time=time_str,
+                content=row.get("raw_content") or "",
+                emotion=emotion_data.get("primary", "calm"),
+                intensity=int(emotion_data.get("intensity", 5)),
+                energy_delta=int(row.get("energy_delta") or 0),
+                tags=row.get("tags") or [],
+                media_urls=row.get("media_urls") or [],
+            ))
+
+        return entries
+
+    def _get_entries_by_ids(self, entry_ids: List[str]) -> List[DigestEntry]:
+        """根据 ID 列表获取条目"""
+        if not entry_ids:
+            return []
+
+        placeholders = ", ".join(["%s"] * len(entry_ids))
+        rows = mentis_db.fetch_all(
+            f"""
+            SELECT id, raw_content, emotion, tags, energy_delta, media_urls, created_at
+            FROM stream_entry
+            WHERE id IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            tuple(entry_ids),
+        )
+
+        entries = []
+        for row in rows:
+            emotion_data = row.get("emotion") or {}
+            if isinstance(emotion_data, str):
+                emotion_data = json.loads(emotion_data)
+
+            created_at = row.get("created_at")
+            time_str = created_at.strftime("%H:%M") if created_at else ""
+
+            entries.append(DigestEntry(
+                id=str(row.get("id")),
+                time=time_str,
+                content=row.get("raw_content") or "",
+                emotion=emotion_data.get("primary", "calm"),
+                intensity=int(emotion_data.get("intensity", 5)),
+                energy_delta=int(row.get("energy_delta") or 0),
+                tags=row.get("tags") or [],
+                media_urls=row.get("media_urls") or [],
+            ))
+
+        return entries
+
+    def _calculate_emotion_trajectory(
+        self,
+        entries: List[DigestEntry],
+    ) -> List[EmotionPoint]:
+        """计算情绪轨迹"""
+        return [
+            EmotionPoint(
+                time=e.time,
+                emotion=e.emotion,
+                intensity=e.intensity,
+            )
+            for e in entries
+        ]
+
+    def _calculate_energy_curve(
+        self,
+        user_id: str,
+        entries: List[DigestEntry],
+    ) -> List[EnergyPoint]:
+        """计算能量曲线"""
+        # 获取用户初始能量
+        row = mentis_db.fetch_one(
+            "SELECT energy_score FROM user_state WHERE user_id = %s",
+            (user_id,),
+        )
+        base_energy = int(row.get("energy_score") or 50) if row else 50
+
+        # 倒推当天开始时的能量
+        total_delta = sum(e.energy_delta for e in entries)
+        start_energy = base_energy - total_delta
+
+        curve = []
+        current_energy = start_energy
+
+        for entry in entries:
+            current_energy = max(0, min(100, current_energy + entry.energy_delta))
+            curve.append(EnergyPoint(
+                time=entry.time,
+                energy=current_energy,
+            ))
+
+        return curve
+
+    def _extract_key_tags(self, entries: List[DigestEntry]) -> List[str]:
+        """提取关键标签"""
+        tag_count: Dict[str, int] = {}
+        for entry in entries:
+            for tag in entry.tags:
+                tag_count[tag] = tag_count.get(tag, 0) + 1
+
+        # 按出现次数排序，取前 5 个
+        sorted_tags = sorted(tag_count.items(), key=lambda x: x[1], reverse=True)
+        return [tag for tag, _ in sorted_tags[:5]]
+
+    async def _generate_prose(
+        self,
+        target_date: date,
+        style: str,
+        entries: List[DigestEntry],
+        emotion_trajectory: List[EmotionPoint],
+        energy_curve: List[EnergyPoint],
+    ) -> str:
+        """使用 LLM 生成日记正文"""
+        # 格式化输入
+        entries_data = [
+            {
+                "time": e.time,
+                "content": e.content,
+                "emotion": e.emotion,
+            }
+            for e in entries
+        ]
+
+        emotion_journey = [
+            {
+                "time": p.time,
+                "emotion": p.emotion,
+                "intensity": p.intensity,
+            }
+            for p in emotion_trajectory
+        ]
+
+        energy_data = [
+            {
+                "time": p.time,
+                "energy": p.energy,
+            }
+            for p in energy_curve
+        ]
+
+        prompt = prompts.build_digest_prose_prompt(
+            date_str=target_date.strftime("%Y年%m月%d日"),
+            style=STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["minimal"]),
+            entries=entries_data,
+            emotion_journey=emotion_journey,
+            energy_curve=energy_data,
+        )
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.7,
+                max_tokens=1024,
+            )
+            return response.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate prose: {e}")
+            # 降级：简单拼接
+            return self._fallback_prose(target_date, entries)
+
+    async def _generate_title(
+        self,
+        prose: str,
+        target_date: date,
+        emotion_trajectory: List[EmotionPoint],
+    ) -> str:
+        """生成日记标题"""
+        primary_emotion = "calm"
+        if emotion_trajectory:
+            # 取最频繁的情绪
+            emotion_count: Dict[str, int] = {}
+            for p in emotion_trajectory:
+                emotion_count[p.emotion] = emotion_count.get(p.emotion, 0) + 1
+            primary_emotion = max(emotion_count.items(), key=lambda x: x[1])[0]
+
+        prompt = prompts.build_digest_title_prompt(
+            prose=prose,
+            date_str=target_date.strftime("%Y年%m月%d日"),
+            primary_emotion=primary_emotion,
+        )
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.8,
+                max_tokens=50,
+            )
+            return response.strip()[:20]  # 限制长度
+        except Exception as e:
+            logger.warning(f"Failed to generate title: {e}")
+            return target_date.strftime("%m月%d日的一天")
+
+    async def _generate_summary(self, prose: str) -> str:
+        """生成日记摘要"""
+        prompt = prompts.build_digest_summary_prompt(prose)
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.5,
+                max_tokens=100,
+            )
+            return response.strip()[:50]  # 限制长度
+        except Exception as e:
+            logger.warning(f"Failed to generate summary: {e}")
+            return prose[:50] + "..."
+
+    def _fallback_prose(self, target_date: date, entries: List[DigestEntry]) -> str:
+        """降级方案：简单拼接"""
+        lines = [f"{target_date.strftime('%Y年%m月%d日')}的一天。\n"]
+        for entry in entries:
+            lines.append(f"[{entry.time}] {entry.content}")
+        return "\n".join(lines)
+
+    def _save_digest(self, digest: DailyDigest) -> DailyDigest:
+        """保存日记到数据库"""
+        result = mentis_db.execute_returning_one(
+            """
+            INSERT INTO daily_digest (
+                user_id, date, title, summary, prose, style,
+                entry_count, emotion_trajectory, energy_curve, key_tags,
+                source_entries
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
+            ON CONFLICT (user_id, date)
+            DO UPDATE SET
+                title = EXCLUDED.title,
+                summary = EXCLUDED.summary,
+                prose = EXCLUDED.prose,
+                style = EXCLUDED.style,
+                entry_count = EXCLUDED.entry_count,
+                emotion_trajectory = EXCLUDED.emotion_trajectory,
+                energy_curve = EXCLUDED.energy_curve,
+                key_tags = EXCLUDED.key_tags,
+                source_entries = EXCLUDED.source_entries,
+                updated_at = NOW()
+            RETURNING id, created_at
+            """,
+            (
+                digest.user_id,
+                digest.date,
+                digest.title,
+                digest.summary,
+                digest.prose,
+                digest.style,
+                digest.entry_count,
+                json.dumps([p.__dict__ for p in digest.emotion_trajectory], ensure_ascii=False),
+                json.dumps([p.__dict__ for p in digest.energy_curve], ensure_ascii=False),
+                digest.key_tags,
+                digest.source_entries,
+            ),
+        )
+
+        if result:
+            digest.id = str(result.get("id"))
+            digest.created_at = result.get("created_at")
+
+        return digest
+
+    def _get_digest_by_id(self, digest_id: str) -> Optional[DailyDigest]:
+        """根据 ID 获取日记"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, user_id, date, title, summary, prose, style,
+                   entry_count, emotion_trajectory, energy_curve, key_tags,
+                   source_entries, is_shared, share_url, created_at
+            FROM daily_digest
+            WHERE id = %s
+            """,
+            (digest_id,),
+        )
+        return self._row_to_digest(row) if row else None
+
+    def _row_to_digest(self, row: Dict[str, Any]) -> DailyDigest:
+        """将数据库行转换为 DailyDigest"""
+        emotion_trajectory_data = row.get("emotion_trajectory") or []
+        if isinstance(emotion_trajectory_data, str):
+            emotion_trajectory_data = json.loads(emotion_trajectory_data)
+
+        energy_curve_data = row.get("energy_curve") or []
+        if isinstance(energy_curve_data, str):
+            energy_curve_data = json.loads(energy_curve_data)
+
+        return DailyDigest(
+            id=str(row.get("id")),
+            user_id=str(row.get("user_id")),
+            date=row.get("date"),
+            title=row.get("title"),
+            summary=row.get("summary"),
+            prose=row.get("prose") or "",
+            style=row.get("style") or "minimal",
+            entry_count=int(row.get("entry_count") or 0),
+            emotion_trajectory=[
+                EmotionPoint(
+                    time=p.get("time", ""),
+                    emotion=p.get("emotion", "calm"),
+                    intensity=int(p.get("intensity", 5)),
+                )
+                for p in emotion_trajectory_data
+            ],
+            energy_curve=[
+                EnergyPoint(
+                    time=p.get("time", ""),
+                    energy=int(p.get("energy", 50)),
+                )
+                for p in energy_curve_data
+            ],
+            key_tags=row.get("key_tags") or [],
+            source_entries=row.get("source_entries") or [],
+            is_shared=bool(row.get("is_shared")),
+            share_url=row.get("share_url"),
+            created_at=row.get("created_at"),
+        )
+
+
+# =============================================================================
+# 便捷函数
+# =============================================================================
+
+async def generate_daily_digest(
+    user_id: str,
+    target_date: Optional[date] = None,
+    style: str = "minimal",
+) -> DailyDigest:
+    """生成每日精美日记"""
+    service = DailyDigestService()
+    if target_date is None:
+        target_date = date.today()
+    return await service.generate_digest(user_id, target_date, style)
+
+
+def get_digest(user_id: str, target_date: date) -> Optional[DailyDigest]:
+    """获取指定日期的日记"""
+    service = DailyDigestService()
+    return service.get_digest_by_date(user_id, target_date)
+
+
+def list_digests(user_id: str, limit: int = 30, offset: int = 0) -> List[DailyDigest]:
+    """列出用户的日记"""
+    service = DailyDigestService()
+    return service.list_digests(user_id, limit, offset)

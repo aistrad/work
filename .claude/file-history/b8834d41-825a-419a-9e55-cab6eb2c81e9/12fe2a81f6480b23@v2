@@ -1,0 +1,360 @@
+"""
+Chat Routes V5 - Unified chat endpoint with CoreAgent
+Based on: Claude Agent SDK style architecture
+
+Features:
+- Single /chat/stream endpoint
+- CoreAgent with LLM-based skill selection
+- Quota check at entry + usage recording
+- OpenAI compatible SSE format (works with AI SDK 4.x useChat)
+- Memory integration (Insights + Portrait + Life Context)
+"""
+import json
+import logging
+import asyncio
+import time
+from typing import Optional
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from services.identity import get_optional_user, CurrentUser
+from services.agent import CoreAgent, AgentContext, QuotaTracker, create_agent, get_adapter
+from stores.profile_cache import get_cached_profile_with_skill
+from stores import message_repo, conversation_repo
+
+router = APIRouter(prefix="/chat/v5", tags=["Chat V5"])
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MessageItem(BaseModel):
+    """Single message in AI SDK format"""
+    role: str
+    content: str
+
+class ChatRequestV5(BaseModel):
+    """V5 Chat request - supports both simple and AI SDK 6 format"""
+    message: Optional[str] = Field(None, description="User message (simple format)")
+    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK 6 format)")
+    conversation_id: Optional[UUID] = Field(None, description="Conversation ID")
+    skill: Optional[str] = Field(None, description="Skill ID (bazi/zodiac/career/tarot)")
+    voice_mode: Optional[str] = Field(None, description="Voice mode (warm/sarcastic)")
+
+    def get_user_message(self) -> str:
+        """Extract user message from either format"""
+        if self.message:
+            return self.message
+        if self.messages:
+            # Get the last user message from the array
+            for msg in reversed(self.messages):
+                if msg.role == "user":
+                    return msg.content
+        return ""
+
+    def get_history(self) -> list[dict]:
+        """Extract conversation history from messages array (excluding last user message)"""
+        if not self.messages or len(self.messages) <= 1:
+            return []
+        # Return all messages except the last one (which is the current user message)
+        return [{"role": m.role, "content": m.content} for m in self.messages[:-1]]
+
+
+class GuestChatRequestV5(BaseModel):
+    """Guest chat request - supports both simple and AI SDK 6 format"""
+    message: Optional[str] = Field(None, description="User message (simple format)")
+    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK 6 format)")
+
+    def get_user_message(self) -> str:
+        """Extract user message from either format"""
+        if self.message:
+            return self.message
+        if self.messages:
+            for msg in reversed(self.messages):
+                if msg.role == "user":
+                    return msg.content
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_user_context(user_id: Optional[UUID]) -> tuple:
+    """Get user profile and skill data"""
+    if user_id:
+        try:
+            # Get merged profile with all skill data
+            result = await get_cached_profile_with_skill(user_id, "bazi")
+            return result.get("profile", {}), result.get("skill_data", {})
+        except Exception as e:
+            logger.error(f"Failed to get user context: {e}")
+    return {}, {}
+
+
+async def get_conversation_history(conversation_id: Optional[UUID], limit: int = 10) -> list:
+    """Get recent conversation history"""
+    if not conversation_id:
+        return []
+    try:
+        messages = await message_repo.get_messages_for_context(conversation_id, limit)
+        return messages
+    except Exception as e:
+        logger.error(f"Failed to get history: {e}")
+        return []
+
+
+async def ensure_conversation_exists(
+    conversation_id: UUID,
+    user_id: Optional[UUID],
+    skill: Optional[str] = None,
+    voice_mode: Optional[str] = None
+) -> None:
+    """Ensure conversation exists in database, create if not"""
+    try:
+        existing = await conversation_repo.get_conversation(conversation_id)
+        if not existing:
+            await conversation_repo.create_conversation(
+                skill=skill or "core",
+                user_id=user_id,
+                voice_mode=voice_mode or "warm",
+                conversation_id=conversation_id
+            )
+    except Exception as e:
+        logger.warning(f"Failed to ensure conversation: {e}")
+
+
+async def save_message(conversation_id: UUID, role: str, content: str) -> None:
+    """Save message to database"""
+    try:
+        await message_repo.create_message(
+            conversation_id=conversation_id,
+            role=role,
+            content=content
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save message: {e}")
+
+
+# ═════════════════════════════════���═════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/stream")
+async def chat_stream_v5(
+    request: ChatRequestV5,
+    req: Request,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """
+    V5 Chat endpoint with CoreAgent.
+
+    Features:
+    - CoreAgent decides skill via LLM (no keyword matching)
+    - Supports multi-skill fusion
+    - Quota check at entry
+    - Vercel AI SDK 6 compatible SSE
+
+    Test mode:
+    - Add header `X-Test-Tier: paid` to simulate paid user
+    - Add header `X-Test-Tier: free` to simulate free user
+    """
+    user_id = current_user.user_id if current_user else None
+    user_tier = "free"
+
+    # Test mode: allow tier override via header
+    test_tier = req.headers.get("x-test-tier")
+    if test_tier and test_tier in ("free", "paid", "guest"):
+        user_tier = test_tier
+        logger.info(f"Test mode: using tier={test_tier}")
+    elif user_id:
+        from services.entitlement import EntitlementService
+        entitlements = await EntitlementService.get_entitlements(user_id)
+        user_tier = entitlements.get("tier", "free")
+
+    # [A] Entry quota check
+    quota_ok, quota_message = await QuotaTracker.check(
+        user_id=str(user_id) if user_id else "guest",
+        tier=user_tier
+    )
+
+    if not quota_ok:
+        return EventSourceResponse(_quota_exceeded_response(quota_message, user_tier))
+
+    conversation_id = request.conversation_id or uuid4()
+
+    async def generate():
+        try:
+            perf_start = time.time()
+            perf_log = {}
+
+            # [PERF T3] Get user context
+            t3_start = time.time()
+            profile, skill_data = await get_user_context(user_id)
+            perf_log["T3_user_context_ms"] = int((time.time() - t3_start) * 1000)
+
+            # Use messages from request as history (AI SDK sends full conversation)
+            history = request.get_history()
+
+            # Build agent context (profile 已包含所有用户数据，无需额外获取)
+            context = AgentContext(
+                user_id=str(user_id) if user_id else "guest",
+                user_tier=user_tier,
+                profile=profile,
+                skill_data=skill_data,
+                history=history,
+                skill=request.skill,
+                voice_mode=request.voice_mode,
+                recent_insights=None,  # 已废弃，数据从 profile.extracted 获取
+                portrait=None,  # 已废弃，数据从 profile.extracted 获取
+                conversation_id=str(conversation_id)
+            )
+
+            # Save user message
+            user_message = request.get_user_message()
+            if not user_message:
+                # AI SDK 4.x error format: 3:"error message"
+                yield f'3:{json.dumps("No user message provided")}\n'
+                yield f'd:{json.dumps({"finishReason": "error", "usage": {"promptTokens": 0, "completionTokens": 0}})}\n'
+                return
+
+            # [PERF T4] Ensure conversation exists before saving messages
+            t4_start = time.time()
+            await ensure_conversation_exists(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                skill=request.skill,
+                voice_mode=request.voice_mode
+            )
+            perf_log["T4_ensure_conv_ms"] = int((time.time() - t4_start) * 1000)
+
+            # [PERF T5] Save user message
+            t5_start = time.time()
+            await save_message(conversation_id, "user", user_message)
+            perf_log["T5_save_msg_ms"] = int((time.time() - t5_start) * 1000)
+
+            # Create agent and adapter
+            agent = create_agent()
+            adapter = get_adapter("simple")
+
+            logger.info(f"[PERF] Pre-agent: {perf_log}")
+
+            # [PERF T6-T9] Stream through adapter (converts AgentEvent → AI SDK 4.x format)
+            t_agent_start = time.time()
+            first_token_time = None
+            full_content = ""
+            async for event in adapter.adapt(agent.run(user_message, context)):
+                # SimpleToolAdapter returns "0:\"text\"\n" format strings
+                if isinstance(event, str):
+                    # Record first token time
+                    if first_token_time is None and event.startswith('0:'):
+                        first_token_time = time.time()
+                        perf_log["TTFT_ms"] = int((first_token_time - t_agent_start) * 1000)
+                        logger.info(f"[PERF] First token: TTFT={perf_log['TTFT_ms']}ms")
+                    yield event
+                    # Extract actual content from AI SDK 4.x format: 0:"content"\n
+                    if event.startswith('0:'):
+                        try:
+                            content = json.loads(event[2:].rstrip('\n'))
+                            # Skip tool markers for saved content
+                            if not (isinstance(content, str) and content.startswith('[[TOOL:')):
+                                full_content += content
+                        except:
+                            pass
+                else:
+                    # Other adapters return dicts - convert to SSE string for StreamingResponse
+                    data_str = event.get("data", "") if isinstance(event, dict) else str(event)
+                    yield f"data: {data_str}\n\n"
+                    if '"delta"' in data_str and '"content"' in data_str:
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            full_content += delta.get("content", "")
+                        except:
+                            pass
+
+            # [PERF] Agent done
+            perf_log["agent_total_ms"] = int((time.time() - t_agent_start) * 1000)
+
+            # Save assistant message
+            if full_content:
+                await save_message(conversation_id, "assistant", full_content)
+
+            # [C] Record usage
+            await QuotaTracker.record(
+                user_id=str(user_id) if user_id else "guest",
+                usage=agent.usage
+            )
+
+            # [PERF] Total time
+            perf_log["total_ms"] = int((time.time() - perf_start) * 1000)
+            logger.info(f"[PERF] Complete: {perf_log}")
+
+            # [D] Insight generation 已废弃，用户信息通过 profile_extractor 定时抽取
+
+        except Exception as e:
+            logger.error(f"Chat error: {e}", exc_info=True)
+            yield f"\n\n❌ Error: {str(e)}"
+
+    # 使用 StreamingResponse 输出 AI SDK 4.x data stream 格式
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "X-Vercel-AI-Data-Stream": "v1"  # AI SDK 4.x 必需的 header
+        }
+    )
+
+
+@router.post("/guest/stream")
+async def guest_chat_stream_v5(request: GuestChatRequestV5):
+    """
+    Guest chat endpoint (no auth, limited functionality).
+    """
+    async def generate():
+        try:
+            context = AgentContext(
+                user_id="guest",
+                user_tier="guest",
+                profile={},
+                skill_data={}
+            )
+
+            agent = create_agent(max_iterations=5)
+            adapter = get_adapter("text")
+
+            user_message = request.get_user_message()
+            if not user_message:
+                yield {"data": json.dumps({"type": "error", "errorText": "No user message provided"})}
+                return
+
+            # Stream through adapter
+            async for event in adapter.adapt(agent.run(user_message, context)):
+                yield event
+
+        except Exception as e:
+            logger.error(f"Guest chat error: {e}")
+            yield {"data": json.dumps({"type": "error", "errorText": str(e)})}
+
+    headers = {"x-vercel-ai-ui-message-stream": "v1"}
+    return EventSourceResponse(generate(), headers=headers)
+
+
+async def _quota_exceeded_response(message: str, tier: str):
+    """Generate quota exceeded SSE response"""
+    yield {
+        "event": "error",
+        "data": json.dumps({
+            "type": "quota_exceeded",
+            "message": message,
+            "tier": tier,
+            "upgrade_url": "/membership"
+        })
+    }

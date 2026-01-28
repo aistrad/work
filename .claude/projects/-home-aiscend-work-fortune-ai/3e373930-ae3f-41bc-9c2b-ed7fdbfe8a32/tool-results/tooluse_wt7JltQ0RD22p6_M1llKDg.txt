@@ -1,0 +1,479 @@
+     1→"""
+     2→Currency System Service.
+     3→
+     4→REQ: REQ-PAY-001 ~ REQ-PAY-005
+     5→Design: §5.1.3
+     6→"""
+     7→
+     8→from __future__ import annotations
+     9→
+    10→import json
+    11→from datetime import datetime, timezone
+    12→from typing import Any, Dict, List, Optional
+    13→
+    14→from common.logging import get_logger
+    15→from models.currency import (
+    16→    CurrencyLedgerEntry,
+    17→    CurrencyType,
+    18→    EarningRule,
+    19→    LedgerCategory,
+    20→    UserBalance,
+    21→)
+    22→from stores import fortune_db
+    23→
+    24→logger = get_logger(__name__)
+    25→
+    26→
+    27→class CurrencyServiceError(Exception):
+    28→    """Base exception for currency service errors."""
+    29→    pass
+    30→
+    31→
+    32→class InsufficientBalanceError(CurrencyServiceError):
+    33→    """Insufficient balance for operation."""
+    34→    pass
+    35→
+    36→
+    37→def _now_utc() -> datetime:
+    38→    return datetime.now(timezone.utc)
+    39→
+    40→
+    41→# =============================================================================
+    42→# Earning Rules Configuration
+    43→# =============================================================================
+    44→
+    45→EARNING_RULES: List[EarningRule] = [
+    46→    EarningRule(
+    47→        rule_id="commitment_complete",
+    48→        name="完成承诺",
+    49→        description="完成一个行动承诺获得能量",
+    50→        currency_type=CurrencyType.AURA,
+    51→        amount=10,
+    52→        trigger="commitment_complete",
+    53→        daily_limit=50,
+    54→    ),
+    55→    EarningRule(
+    56→        rule_id="daily_checkin",
+    57→        name="每日打卡",
+    58→        description="每日情绪打卡获得能量",
+    59→        currency_type=CurrencyType.AURA,
+    60→        amount=5,
+    61→        trigger="checkin",
+    62→        cooldown_hours=20,
+    63→    ),
+    64→    EarningRule(
+    65→        rule_id="chain_join",
+    66→        name="参与接龙",
+    67→        description="参与好运接龙获得能量",
+    68→        currency_type=CurrencyType.AURA,
+    69→        amount=10,  # Base, actual varies by formula
+    70→        trigger="chain_join",
+    71→    ),
+    72→    EarningRule(
+    73→        rule_id="streak_bonus",
+    74→        name="连续打卡奖励",
+    75→        description="连续7天打卡额外奖励",
+    76→        currency_type=CurrencyType.AURA,
+    77→        amount=50,
+    78→        trigger="streak_7",
+    79→        cooldown_hours=168,  # 7 days
+    80→    ),
+    81→    EarningRule(
+    82→        rule_id="share_card",
+    83→        name="分享卡片",
+    84→        description="分享卡片到社交媒体获得能量",
+    85→        currency_type=CurrencyType.AURA,
+    86→        amount=5,
+    87→        trigger="share",
+    88→        daily_limit=15,
+    89→    ),
+    90→    EarningRule(
+    91→        rule_id="plan_day_complete",
+    92→        name="完成计划日",
+    93→        description="完成成长计划的一天",
+    94→        currency_type=CurrencyType.AURA,
+    95→        amount=15,
+    96→        trigger="plan_day_complete",
+    97→    ),
+    98→]
+    99→
+   100→
+   101→def get_earning_rules() -> List[EarningRule]:
+   102→    """Get all earning rules."""
+   103→    return [r for r in EARNING_RULES if r.enabled]
+   104→
+   105→
+   106→# =============================================================================
+   107→# Balance Operations
+   108→# =============================================================================
+   109→
+   110→def get_balance(user_id: int) -> UserBalance:
+   111→    """
+   112→    Get user's currency balance.
+   113→
+   114→    REQ: REQ-PAY-001
+   115→    """
+   116→    row = fortune_db.fetch_one(
+   117→        "SELECT * FROM fortune_user_balance WHERE user_id = %s",
+   118→        [user_id],
+   119→    )
+   120→
+   121→    if not row:
+   122→        # Create default balance
+   123→        fortune_db.execute(
+   124→            """
+   125→            INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+   126→            VALUES (%s, 0, 0, %s)
+   127→            ON CONFLICT (user_id) DO NOTHING
+   128→            """,
+   129→            [user_id, _now_utc()],
+   130→        )
+   131→        return UserBalance(user_id=user_id, coins=0, aura=0)
+   132→
+   133→    return UserBalance(
+   134→        user_id=row["user_id"],
+   135→        coins=row["coins"],
+   136→        aura=row["aura"],
+   137→        updated_at=row.get("updated_at"),
+   138→    )
+   139→
+   140→
+   141→def ensure_balance_exists(user_id: int) -> None:
+   142→    """Ensure user has a balance record."""
+   143→    fortune_db.execute(
+   144→        """
+   145→        INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+   146→        VALUES (%s, 0, 0, %s)
+   147→        ON CONFLICT (user_id) DO NOTHING
+   148→        """,
+   149→        [user_id, _now_utc()],
+   150→    )
+   151→
+   152→
+   153→# =============================================================================
+   154→# Add Currency (TASK-7.1.2)
+   155→# =============================================================================
+   156→
+   157→def add_currency(
+   158→    user_id: int,
+   159→    currency_type: CurrencyType,
+   160→    amount: int,
+   161→    category: LedgerCategory,
+   162→    reason: str,
+   163→    ref_type: Optional[str] = None,
+   164→    ref_id: Optional[str] = None,
+   165→    description: Optional[str] = None,
+   166→) -> CurrencyLedgerEntry:
+   167→    """
+   168→    Add currency to user's balance.
+   169→
+   170→    REQ: REQ-PAY-003
+   171→    """
+   172→    if amount <= 0:
+   173→        raise CurrencyServiceError("Amount must be positive")
+   174→
+   175→    ensure_balance_exists(user_id)
+   176→    now = _now_utc()
+   177→
+   178→    # Update balance
+   179→    column = "coins" if currency_type == CurrencyType.COINS else "aura"
+   180→    fortune_db.execute(
+   181→        f"""
+   182→        UPDATE fortune_user_balance
+   183→        SET {column} = {column} + %s, updated_at = %s
+   184→        WHERE user_id = %s
+   185→        """,
+   186→        [amount, now, user_id],
+   187→    )
+   188→
+   189→    # Get new balance
+   190→    balance = get_balance(user_id)
+   191→    new_balance = balance.coins if currency_type == CurrencyType.COINS else balance.aura
+   192→
+   193→    # Record ledger entry
+   194→    row = fortune_db.execute_returning_one(
+   195→        """
+   196→        INSERT INTO fortune_currency_ledger (
+   197→            user_id, currency_type, amount, balance_after, category, reason,
+   198→            ref_type, ref_id, description, created_at
+   199→        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+   200→        RETURNING entry_id
+   201→        """,
+   202→        [user_id, currency_type.value, amount, new_balance, category.value,
+   203→         reason, ref_type, ref_id, description, now],
+   204→    )
+   205→
+   206→    entry_id = row["entry_id"] if row else None
+   207→
+   208→    logger.info(
+   209→        "currency_add user=%s type=%s amount=%s category=%s",
+   210→        user_id, currency_type.value, amount, category.value
+   211→    )
+   212→
+   213→    return CurrencyLedgerEntry(
+   214→        entry_id=entry_id,
+   215→        user_id=user_id,
+   216→        currency_type=currency_type,
+   217→        amount=amount,
+   218→        balance_after=new_balance,
+   219→        category=category,
+   220→        reason=reason,
+   221→        ref_type=ref_type,
+   222→        ref_id=ref_id,
+   223→        description=description,
+   224→        created_at=now,
+   225→    )
+   226→
+   227→
+   228→# =============================================================================
+   229→# Deduct Currency (TASK-7.1.3)
+   230→# =============================================================================
+   231→
+   232→def deduct_currency(
+   233→    user_id: int,
+   234→    currency_type: CurrencyType,
+   235→    amount: int,
+   236→    category: LedgerCategory,
+   237→    reason: str,
+   238→    ref_type: Optional[str] = None,
+   239→    ref_id: Optional[str] = None,
+   240→    description: Optional[str] = None,
+   241→) -> CurrencyLedgerEntry:
+   242→    """
+   243→    Deduct currency from user's balance.
+   244→
+   245→    REQ: REQ-PAY-004
+   246→    """
+   247→    if amount <= 0:
+   248→        raise CurrencyServiceError("Amount must be positive")
+   249→
+   250→    # Check balance
+   251→    balance = get_balance(user_id)
+   252→    current = balance.coins if currency_type == CurrencyType.COINS else balance.aura
+   253→
+   254→    if current < amount:
+   255→        raise InsufficientBalanceError(
+   256→            f"Insufficient {currency_type.value}: have {current}, need {amount}"
+   257→        )
+   258→
+   259→    now = _now_utc()
+   260→
+   261→    # Update balance
+   262→    column = "coins" if currency_type == CurrencyType.COINS else "aura"
+   263→    fortune_db.execute(
+   264→        f"""
+   265→        UPDATE fortune_user_balance
+   266→        SET {column} = {column} - %s, updated_at = %s
+   267→        WHERE user_id = %s
+   268→        """,
+   269→        [amount, now, user_id],
+   270→    )
+   271→
+   272→    # Get new balance
+   273→    balance = get_balance(user_id)
+   274→    new_balance = balance.coins if currency_type == CurrencyType.COINS else balance.aura
+   275→
+   276→    # Record ledger entry (negative amount)
+   277→    row = fortune_db.execute_returning_one(
+   278→        """
+   279→        INSERT INTO fortune_currency_ledger (
+   280→            user_id, currency_type, amount, balance_after, category, reason,
+   281→            ref_type, ref_id, description, created_at
+   282→        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+   283→        RETURNING entry_id
+   284→        """,
+   285→        [user_id, currency_type.value, -amount, new_balance, category.value,
+   286→         reason, ref_type, ref_id, description, now],
+   287→    )
+   288→
+   289→    entry_id = row["entry_id"] if row else None
+   290→
+   291→    logger.info(
+   292→        "currency_deduct user=%s type=%s amount=%s category=%s",
+   293→        user_id, currency_type.value, amount, category.value
+   294→    )
+   295→
+   296→    return CurrencyLedgerEntry(
+   297→        entry_id=entry_id,
+   298→        user_id=user_id,
+   299→        currency_type=currency_type,
+   300→        amount=-amount,
+   301→        balance_after=new_balance,
+   302→        category=category,
+   303→        reason=reason,
+   304→        ref_type=ref_type,
+   305→        ref_id=ref_id,
+   306→        description=description,
+   307→        created_at=now,
+   308→    )
+   309→
+   310→
+   311→# =============================================================================
+   312→# Transfer Currency
+   313→# =============================================================================
+   314→
+   315→def transfer_currency(
+   316→    from_user_id: int,
+   317→    to_user_id: int,
+   318→    currency_type: CurrencyType,
+   319→    amount: int,
+   320→    reason: str,
+   321→    ref_type: Optional[str] = None,
+   322→    ref_id: Optional[str] = None,
+   323→) -> Dict[str, CurrencyLedgerEntry]:
+   324→    """
+   325→    Transfer currency between users.
+   326→
+   327→    REQ: REQ-PAY-004
+   328→    """
+   329→    if from_user_id == to_user_id:
+   330→        raise CurrencyServiceError("Cannot transfer to yourself")
+   331→
+   332→    # Deduct from sender
+   333→    sender_entry = deduct_currency(
+   334→        user_id=from_user_id,
+   335→        currency_type=currency_type,
+   336→        amount=amount,
+   337→        category=LedgerCategory.TRANSFER_OUT,
+   338→        reason=reason,
+   339→        ref_type=ref_type,
+   340→        ref_id=ref_id,
+   341→    )
+   342→
+   343→    # Add to receiver
+   344→    receiver_entry = add_currency(
+   345→        user_id=to_user_id,
+   346→        currency_type=currency_type,
+   347→        amount=amount,
+   348→        category=LedgerCategory.TRANSFER_IN,
+   349→        reason=reason,
+   350→        ref_type=ref_type,
+   351→        ref_id=ref_id,
+   352→    )
+   353→
+   354→    return {
+   355→        "sender": sender_entry,
+   356→        "receiver": receiver_entry,
+   357→    }
+   358→
+   359→
+   360→# =============================================================================
+   361→# Ledger History
+   362→# =============================================================================
+   363→
+   364→def get_ledger_history(
+   365→    user_id: int,
+   366→    currency_type: Optional[CurrencyType] = None,
+   367→    category: Optional[LedgerCategory] = None,
+   368→    limit: int = 20,
+   369→    offset: int = 0,
+   370→) -> Dict[str, Any]:
+   371→    """
+   372→    Get user's ledger history.
+   373→
+   374→    REQ: REQ-PAY-005
+   375→    """
+   376→    conditions = ["user_id = %s"]
+   377→    params: List[Any] = [user_id]
+   378→
+   379→    if currency_type:
+   380→        conditions.append("currency_type = %s")
+   381→        params.append(currency_type.value)
+   382→
+   383→    if category:
+   384→        conditions.append("category = %s")
+   385→        params.append(category.value)
+   386→
+   387→    where_clause = " AND ".join(conditions)
+   388→
+   389→    # Get total count
+   390→    count_row = fortune_db.fetch_one(
+   391→        f"SELECT COUNT(*) as cnt FROM fortune_currency_ledger WHERE {where_clause}",
+   392→        params,
+   393→    )
+   394→    total_count = count_row["cnt"] if count_row else 0
+   395→
+   396→    # Get entries
+   397→    params.extend([limit, offset])
+   398→    rows = fortune_db.fetch_all(
+   399→        f"""
+   400→        SELECT * FROM fortune_currency_ledger
+   401→        WHERE {where_clause}
+   402→        ORDER BY created_at DESC
+   403→        LIMIT %s OFFSET %s
+   404→        """,
+   405→        params,
+   406→    )
+   407→
+   408→    entries = [
+   409→        CurrencyLedgerEntry(
+   410→            entry_id=row["entry_id"],
+   411→            user_id=row["user_id"],
+   412→            currency_type=CurrencyType(row["currency_type"]),
+   413→            amount=row["amount"],
+   414→            balance_after=row["balance_after"],
+   415→            category=LedgerCategory(row["category"]),
+   416→            reason=row["reason"],
+   417→            ref_type=row.get("ref_type"),
+   418→            ref_id=row.get("ref_id"),
+   419→            description=row.get("description"),
+   420→            created_at=row.get("created_at"),
+   421→        )
+   422→        for row in rows
+   423→    ]
+   424→
+   425→    return {
+   426→        "entries": entries,
+   427→        "total_count": total_count,
+   428→        "limit": limit,
+   429→        "offset": offset,
+   430→    }
+   431→
+   432→
+   433→# =============================================================================
+   434→# Earning Triggers
+   435→# =============================================================================
+   436→
+   437→def trigger_earning(
+   438→    user_id: int,
+   439→    trigger: str,
+   440→    ref_type: Optional[str] = None,
+   441→    ref_id: Optional[str] = None,
+   442→    custom_amount: Optional[int] = None,
+   443→) -> Optional[CurrencyLedgerEntry]:
+   444→    """
+   445→    Trigger an earning event based on rules.
+   446→
+   447→    REQ: REQ-PAY-003
+   448→    """
+   449→    # Find matching rule
+   450→    rule = None
+   451→    for r in EARNING_RULES:
+   452→        if r.trigger == trigger and r.enabled:
+   453→            rule = r
+   454→            break
+   455→
+   456→    if not rule:
+   457→        return None
+   458→
+   459→    amount = custom_amount if custom_amount is not None else rule.amount
+   460→
+   461→    # TODO: Check cooldown and daily limits
+   462→
+   463→    entry = add_currency(
+   464→        user_id=user_id,
+   465→        currency_type=rule.currency_type,
+   466→        amount=amount,
+   467→        category=LedgerCategory.EARN,
+   468→        reason=rule.name,
+   469→        ref_type=ref_type,
+   470→        ref_id=ref_id,
+   471→        description=rule.description,
+   472→    )
+   473→
+   474→    return entry
+   475→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

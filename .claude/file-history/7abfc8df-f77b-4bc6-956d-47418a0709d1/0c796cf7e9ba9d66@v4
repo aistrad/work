@@ -1,0 +1,296 @@
+"""
+VibeID Service v6.0 - V7 架构对齐版
+
+核心变化:
+1. 从 unified_profiles.skill_data 读取 bazi/zodiac chart 数据
+2. 不再直接调用 bazi/zodiac 计算服务
+3. 使用内部 analyzer 计算原型
+4. 输入输出都是字典，减少 dataclass 依赖
+
+数据流:
+    skill_data.bazi.chart ──┐
+                            ├──> VibeIDService ──> skill_data.vibe_id
+    skill_data.zodiac.chart ┘
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+from uuid import UUID
+
+from .analyzers import BaziAnalyzer, ZodiacAnalyzer
+from .fusion_engine import FusionEngine
+from .explainer import Explainer
+
+logger = logging.getLogger(__name__)
+
+
+class VibeIDService:
+    """
+    VibeID 服务 v6.0
+
+    职责:
+    - 从 skill_data 读取 bazi/zodiac chart 数据
+    - 使用 analyzer 计算原型
+    - 执行融合算法
+    - 生成可解释性文本
+    - 写回 skill_data.vibe_id
+    """
+
+    def __init__(self):
+        self.bazi_analyzer = BaziAnalyzer()
+        self.zodiac_analyzer = ZodiacAnalyzer()
+        self.fusion_engine = FusionEngine()
+        self.explainer = Explainer()
+
+    async def calculate(
+        self,
+        user_id: UUID,
+        force: bool = False
+    ) -> Dict[str, Any]:
+        """
+        计算 VibeID
+
+        Args:
+            user_id: 用户 ID
+            force: 是否强制重新计算
+
+        Returns:
+            {
+                "status": "success" | "error",
+                "data": {...} | None,
+                "cached": bool,
+                "error": str | None
+            }
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        # 1. 获取 profile
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if not profile:
+            return {"status": "error", "error": "用户档案不存在"}
+
+        # v9.0: 只从 skills 读取
+        skill_data = profile.get("skills", {})
+
+        # 2. 检查缓存
+        existing = skill_data.get("vibe_id")
+        if existing and not force:
+            if not self._needs_recalculate(existing, skill_data):
+                logger.debug(f"Using cached VibeID for user {user_id}")
+                return {"status": "success", "data": existing, "cached": True}
+
+        # 3. 读取依赖数据 (chart 数据)
+        bazi_data = skill_data.get("bazi", {})
+        zodiac_data = skill_data.get("zodiac", {})
+
+        bazi_chart = bazi_data.get("chart")
+        zodiac_chart = zodiac_data.get("chart")
+
+        if not bazi_chart and not zodiac_chart:
+            return {
+                "status": "error",
+                "error": "需要先完成八字或星盘分析",
+                "hint": "请先说「帮我排八字」或「看看我的星盘」"
+            }
+
+        # 4. 使用 analyzer 分析原型
+        bazi_analysis = None
+        bazi_scores = {}
+        if bazi_chart:
+            try:
+                bazi_analysis = self.bazi_analyzer.analyze(bazi_chart)
+                bazi_scores = self._get_bazi_archetype_scores(bazi_analysis)
+                logger.debug(f"Bazi analysis: pattern={bazi_analysis.pattern}, primary={bazi_analysis.primary_archetype}")
+            except Exception as e:
+                logger.warning(f"Bazi analysis failed: {e}")
+
+        zodiac_analysis = None
+        zodiac_scores = {}
+        if zodiac_chart:
+            try:
+                zodiac_analysis = self.zodiac_analyzer.analyze(zodiac_chart)
+                zodiac_scores = self.zodiac_analyzer.calculate_archetype_scores(zodiac_chart)
+                logger.debug(f"Zodiac analysis: sun={zodiac_analysis.sun_sign}, primary={zodiac_analysis.primary_archetype}")
+            except Exception as e:
+                logger.warning(f"Zodiac analysis failed: {e}")
+
+        if not bazi_analysis and not zodiac_analysis:
+            return {
+                "status": "error",
+                "error": "无法分析命盘数据，请检查数据完整性"
+            }
+
+        # 5. 融合计算
+        fusion_result = self.fusion_engine.fuse(
+            bazi_analysis=bazi_analysis,
+            zodiac_analysis=zodiac_analysis,
+            bazi_scores=bazi_scores,
+            zodiac_scores=zodiac_scores
+        )
+
+        # 6. 生成解释
+        explanation = self.explainer.generate(
+            archetypes=fusion_result["archetypes"],
+            bazi_analysis=bazi_analysis,
+            zodiac_analysis=zodiac_analysis
+        )
+
+        # 7. 构建结果
+        vibe_id_data = {
+            "version": "6.0",
+            "calculated_at": datetime.now(timezone.utc).isoformat(),
+            "archetypes": fusion_result["archetypes"],
+            "scores": fusion_result["scores"],
+            "explanation": explanation,
+            "source_versions": {
+                "bazi": bazi_data.get("version") or bazi_data.get("calculated_at"),
+                "zodiac": zodiac_data.get("version") or zodiac_data.get("calculated_at"),
+            }
+        }
+
+        # 8. 写入 skill_data
+        try:
+            await UnifiedProfileRepository.update_skill_data(
+                user_id, "vibe_id", vibe_id_data
+            )
+            logger.info(f"Saved VibeID for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to save VibeID: {e}")
+            # 仍然返回计算结果，只是没有持久化
+            return {"status": "success", "data": vibe_id_data, "cached": False, "warning": "保存失败"}
+
+        return {"status": "success", "data": vibe_id_data, "cached": False}
+
+    async def get(self, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """
+        获取已计算的 VibeID
+
+        Args:
+            user_id: 用户 ID
+
+        Returns:
+            VibeID 数据或 None
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if not profile:
+            return None
+
+        # v9.0: 只从 skills 读取
+        return profile.get("skills", {}).get("vibe_id")
+
+    async def get_or_calculate(
+        self,
+        user_id: UUID,
+        force: bool = False
+    ) -> Dict[str, Any]:
+        """
+        获取或计算 VibeID
+
+        如果已存在且有效则返回，否则计算新的。
+
+        Args:
+            user_id: 用户 ID
+            force: 是否强制重新计算
+
+        Returns:
+            计算结果
+        """
+        if not force:
+            existing = await self.get(user_id)
+            if existing:
+                return {"status": "success", "data": existing, "cached": True}
+
+        return await self.calculate(user_id, force=force)
+
+    def _needs_recalculate(
+        self,
+        existing: Dict[str, Any],
+        skill_data: Dict[str, Any]
+    ) -> bool:
+        """
+        检查是否需要重新计算
+
+        当依赖数据更新时需要重新计算
+        """
+        source_versions = existing.get("source_versions", {})
+
+        # 检查 bazi 版本
+        bazi_data = skill_data.get("bazi", {})
+        bazi_version = bazi_data.get("version") or bazi_data.get("calculated_at")
+        if bazi_version and bazi_version != source_versions.get("bazi"):
+            logger.debug(f"Bazi version changed: {source_versions.get('bazi')} -> {bazi_version}")
+            return True
+
+        # 检查 zodiac 版本
+        zodiac_data = skill_data.get("zodiac", {})
+        zodiac_version = zodiac_data.get("version") or zodiac_data.get("calculated_at")
+        if zodiac_version and zodiac_version != source_versions.get("zodiac"):
+            logger.debug(f"Zodiac version changed: {source_versions.get('zodiac')} -> {zodiac_version}")
+            return True
+
+        return False
+
+    def _get_bazi_archetype_scores(self, bazi_analysis) -> Dict[str, float]:
+        """
+        从八字分析结果获取原型得分
+
+        Args:
+            bazi_analysis: BaziAnalysis 对象
+
+        Returns:
+            原型得分字典
+        """
+        from .fusion_engine import ArchetypeCalculator
+
+        calculator = ArchetypeCalculator()
+        return calculator.calculate_bazi_scores(bazi_analysis)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 单例和便捷函数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_service: Optional[VibeIDService] = None
+
+
+def get_vibe_id_service() -> VibeIDService:
+    """获取 VibeID 服务单例"""
+    global _service
+    if _service is None:
+        _service = VibeIDService()
+    return _service
+
+
+async def calculate_vibe_id(
+    user_id: UUID,
+    force: bool = False
+) -> Dict[str, Any]:
+    """
+    计算 VibeID（便捷函数）
+
+    Args:
+        user_id: 用户 ID
+        force: 是否强制重新计算
+
+    Returns:
+        计算结果
+    """
+    service = get_vibe_id_service()
+    return await service.calculate(user_id, force=force)
+
+
+async def get_vibe_id(user_id: UUID) -> Optional[Dict[str, Any]]:
+    """
+    获取 VibeID（便捷函数）
+
+    Args:
+        user_id: 用户 ID
+
+    Returns:
+        VibeID 数据或 None
+    """
+    service = get_vibe_id_service()
+    return await service.get(user_id)

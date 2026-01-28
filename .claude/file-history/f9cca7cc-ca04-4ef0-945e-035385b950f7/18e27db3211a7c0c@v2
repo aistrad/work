@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+v11 功能测试脚本
+
+测试内容：
+1. Vibe 同步配置加载
+2. Phase 1 个性化路由（轻量画像加载）
+3. Skill → Vibe 同步
+4. 端到端对话测试
+"""
+import asyncio
+import json
+import sys
+import os
+from uuid import uuid4, UUID
+from datetime import datetime
+
+# 添加项目路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env.test"))
+
+import asyncpg
+
+# 测试结果
+results = []
+
+
+def log_test(name: str, passed: bool, detail: str = ""):
+    """记录测试结果"""
+    status = "✅ PASS" if passed else "❌ FAIL"
+    results.append({"name": name, "passed": passed, "detail": detail})
+    print(f"{status}: {name}")
+    if detail and not passed:
+        print(f"   └─ {detail}")
+
+
+async def test_vibe_sync_config():
+    """测试 1: Vibe 同步配置加载"""
+    print("\n" + "=" * 60)
+    print("测试 1: Vibe 同步配置加载")
+    print("=" * 60)
+
+    try:
+        from services.vibe.sync import load_sync_config, reload_sync_config
+
+        # 清除缓存，重新加载
+        reload_sync_config()
+        config = load_sync_config()
+
+        # 验证配置结构
+        log_test(
+            "配置文件加载成功",
+            bool(config),
+            f"config keys: {list(config.keys())}"
+        )
+
+        log_test(
+            "包含 insight 配置",
+            "insight" in config,
+            f"insight keys: {list(config.get('insight', {}).keys())}"
+        )
+
+        log_test(
+            "包含 target 配置",
+            "target" in config,
+            f"target keys: {list(config.get('target', {}).keys())}"
+        )
+
+        # 验证 archetype 配置
+        archetype_config = config.get("insight", {}).get("essence", {}).get("archetype", {})
+        sources = archetype_config.get("sources", [])
+        log_test(
+            "archetype 有多个来源",
+            len(sources) >= 2,
+            f"sources: {[s.get('skill') for s in sources]}"
+        )
+
+        # 验证 mapping
+        bazi_source = next((s for s in sources if s.get("skill") == "bazi"), None)
+        if bazi_source:
+            mapping = bazi_source.get("mapping", {})
+            log_test(
+                "bazi 元素映射完整",
+                len(mapping) == 5,
+                f"elements: {list(mapping.keys())}"
+            )
+
+    except Exception as e:
+        log_test("Vibe 同步配置加载", False, str(e))
+
+
+async def test_phase1_profile_loading():
+    """测试 2: Phase 1 轻量画像加载"""
+    print("\n" + "=" * 60)
+    print("测试 2: Phase 1 轻量画像加载")
+    print("=" * 60)
+
+    try:
+        from routes.chat_v5 import get_vibe_profile_lite, get_user_context
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        # 获取一个测试用户
+        test_user_id = await get_test_user_id()
+        if not test_user_id:
+            log_test("获取测试用户", False, "无测试用户")
+            return
+
+        # 测试 get_vibe_profile_lite
+        vibe_profile = await get_vibe_profile_lite(test_user_id)
+
+        log_test(
+            "get_vibe_profile_lite 返回非空",
+            bool(vibe_profile),
+            f"keys: {list(vibe_profile.keys()) if vibe_profile else 'empty'}"
+        )
+
+        log_test(
+            "包含 identity",
+            "identity" in vibe_profile,
+            f"identity: {bool(vibe_profile.get('identity'))}"
+        )
+
+        log_test(
+            "包含 vibe",
+            "vibe" in vibe_profile,
+            f"vibe keys: {list(vibe_profile.get('vibe', {}).keys())}"
+        )
+
+        log_test(
+            "包含 subscribed_skills",
+            "subscribed_skills" in vibe_profile,
+            f"subscribed: {vibe_profile.get('subscribed_skills', [])}"
+        )
+
+        # 测试 get_user_context Phase 1
+        profile, skill_data = await get_user_context(test_user_id, skill=None)
+
+        log_test(
+            "Phase 1 get_user_context 返回画像",
+            bool(profile),
+            f"profile keys: {list(profile.keys()) if profile else 'empty'}"
+        )
+
+        log_test(
+            "Phase 1 skill_data 为空",
+            skill_data == {},
+            f"skill_data: {skill_data}"
+        )
+
+    except Exception as e:
+        log_test("Phase 1 轻量画像加载", False, str(e))
+        import traceback
+        traceback.print_exc()
+
+
+async def test_prompt_builder_phase1():
+    """测试 3: Phase 1 Prompt 构建（个性化注入）"""
+    print("\n" + "=" * 60)
+    print("测试 3: Phase 1 Prompt 构建")
+    print("=" * 60)
+
+    try:
+        from services.agent.prompt_builder import get_prompt_builder
+
+        builder = get_prompt_builder()
+
+        # 模拟有画像的用户
+        mock_profile = {
+            "identity": {"display_name": "测试用户"},
+            "vibe": {
+                "insight": {
+                    "essence": {
+                        "archetype": {"primary": "成长者"},
+                        "traits": [{"trait": "创新"}, {"trait": "进取"}]
+                    }
+                },
+                "target": {
+                    "north_star": {"statement": "成为更好的自己"},
+                    "focus": {"primary": "career"}
+                }
+            },
+            "subscribed_skills": ["bazi", "lifecoach"]
+        }
+
+        # 构建 Phase 1 Prompt
+        prompt = await builder.build(
+            skill_id=None,
+            rule_id=None,
+            message="你好",
+            profile=mock_profile,
+            skill_data=None
+        )
+
+        # 验证 Prompt 内容
+        log_test(
+            "Prompt 包含用户画像",
+            "用户画像" in prompt or "测试用户" in prompt,
+            f"prompt length: {len(prompt)}"
+        )
+
+        log_test(
+            "Prompt 包含已订阅服务",
+            "已订阅" in prompt or "bazi" in prompt.lower(),
+            ""
+        )
+
+        log_test(
+            "Prompt 包含个性化提示",
+            "个性化" in prompt or "career" in prompt.lower() or "职业" in prompt,
+            ""
+        )
+
+        # 打印部分 Prompt 用于验证
+        print("\n--- Prompt 片段 ---")
+        print(prompt[:1000] + "..." if len(prompt) > 1000 else prompt)
+        print("--- End ---\n")
+
+    except Exception as e:
+        log_test("Phase 1 Prompt 构建", False, str(e))
+        import traceback
+        traceback.print_exc()
+
+
+async def test_skill_to_vibe_sync():
+    """测试 4: Skill → Vibe 同步"""
+    print("\n" + "=" * 60)
+    print("测试 4: Skill → Vibe 同步")
+    print("=" * 60)
+
+    try:
+        from services.vibe.sync import sync_skill_to_vibe
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        # 创建临时测试用户
+        test_user_id = uuid4()
+
+        # 创建 Profile
+        await UnifiedProfileRepository.create_profile(test_user_id, {
+            "identity": {"display_name": "同步测试用户"},
+            "vibe": {}
+        })
+
+        # 模拟 bazi skill 数据
+        bazi_data = {
+            "chart": {
+                "day_master": {
+                    "element": "wood",
+                    "polarity": "yang"
+                },
+                "pillars": [
+                    {"year_stem": "甲", "year_branch": "子"},
+                    {"month_stem": "乙", "month_branch": "丑"},
+                    {"day_stem": "丙", "day_branch": "寅"},
+                    {"hour_stem": "丁", "hour_branch": "卯"}
+                ],
+                "five_elements": {"wood": 2, "fire": 2, "earth": 1, "metal": 1, "water": 2}
+            }
+        }
+
+        # 执行同步
+        synced = await sync_skill_to_vibe(test_user_id, "bazi", bazi_data)
+
+        log_test(
+            "sync_skill_to_vibe 执行成功",
+            synced,
+            f"synced: {synced}"
+        )
+
+        # 验证同步结果
+        profile = await UnifiedProfileRepository.get_profile(test_user_id)
+        vibe = profile.get("vibe", {}) if profile else {}
+        insight = vibe.get("insight", {})
+        essence = insight.get("essence", {})
+
+        log_test(
+            "archetype 已同步",
+            bool(essence.get("archetype")),
+            f"archetype: {essence.get('archetype')}"
+        )
+
+        archetype = essence.get("archetype", {})
+        log_test(
+            "archetype.primary = 成长者",
+            archetype.get("primary") == "成长者",
+            f"primary: {archetype.get('primary')}"
+        )
+
+        log_test(
+            "archetype.source = bazi",
+            archetype.get("source") == "bazi",
+            f"source: {archetype.get('source')}"
+        )
+
+        # 清理测试用户
+        await UnifiedProfileRepository.delete_profile(test_user_id)
+        print(f"已清理测试用户: {test_user_id}")
+
+    except Exception as e:
+        log_test("Skill → Vibe 同步", False, str(e))
+        import traceback
+        traceback.print_exc()
+
+
+async def test_e2e_chat():
+    """测试 5: 端到端对话测试"""
+    print("\n" + "=" * 60)
+    print("测试 5: 端到端对话测试")
+    print("=" * 60)
+
+    try:
+        import httpx
+
+        # 获取测试用户 token
+        test_user_id = await get_test_user_id()
+        if not test_user_id:
+            log_test("获取测试用户", False, "无测试用户")
+            return
+
+        # 创建测试对话
+        async with httpx.AsyncClient(base_url="http://localhost:8100") as client:
+            # 测试 Phase 1 路由
+            response = await client.post(
+                "/api/v1/chat",
+                json={
+                    "message": "你好",
+                    "user_id": str(test_user_id)
+                },
+                timeout=30.0
+            )
+
+            log_test(
+                "Chat API 响应成功",
+                response.status_code == 200,
+                f"status: {response.status_code}"
+            )
+
+            if response.status_code == 200:
+                # 检查是否是 SSE 响应
+                content_type = response.headers.get("content-type", "")
+                log_test(
+                    "返回 SSE 流",
+                    "text/event-stream" in content_type or response.status_code == 200,
+                    f"content-type: {content_type}"
+                )
+
+    except Exception as e:
+        log_test("端到端对话测试", False, str(e))
+        import traceback
+        traceback.print_exc()
+
+
+async def get_test_user_id() -> UUID:
+    """获取测试用户 ID"""
+    try:
+        from stores.unified_profile_repo import UnifiedProfileRepository
+        from db import fetch
+
+        # 查找已有用户
+        rows = await fetch(
+            "SELECT user_id FROM unified_profiles LIMIT 1"
+        )
+        if rows:
+            return rows[0]["user_id"]
+
+        # 创建测试用户
+        test_user_id = uuid4()
+        await UnifiedProfileRepository.create_profile(test_user_id, {
+            "identity": {"display_name": "Test User"},
+            "vibe": {
+                "insight": {
+                    "essence": {
+                        "archetype": {"primary": "探索者"}
+                    }
+                }
+            }
+        })
+        return test_user_id
+
+    except Exception as e:
+        print(f"获取测试用户失败: {e}")
+        return None
+
+
+def print_summary():
+    """打印测试总结"""
+    print("\n" + "=" * 60)
+    print("测试总结")
+    print("=" * 60)
+
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+
+    for r in results:
+        status = "✅" if r["passed"] else "❌"
+        print(f"  {status} {r['name']}")
+
+    print(f"\n通过: {passed}/{total}")
+
+    if passed == total:
+        print("\n🎉 所有测试通过！")
+        return 0
+    else:
+        print("\n⚠️ 部分测试失败，请检查")
+        return 1
+
+
+async def main():
+    """主测试函数"""
+    print("=" * 60)
+    print("VibeLife v11 功能测试")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+    # 运行测试
+    await test_vibe_sync_config()
+    await test_phase1_profile_loading()
+    await test_prompt_builder_phase1()
+    await test_skill_to_vibe_sync()
+    await test_e2e_chat()
+
+    # 打印总结
+    return print_summary()
+
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)

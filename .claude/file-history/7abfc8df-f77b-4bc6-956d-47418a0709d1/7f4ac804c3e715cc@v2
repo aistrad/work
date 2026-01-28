@@ -1,0 +1,247 @@
+"""
+Profile Cache - In-memory caching for user profiles and skill data
+Reduces DB queries during chat sessions
+
+v9.0 更新：
+- 三层架构：identity, skills, vibe
+- 只从 skills 读取，已移除 skill_data 回退
+- 缓存 key 格式：{user_id}:{skill} 或 {user_id}:all
+"""
+import asyncio
+import logging
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CacheEntry:
+    """缓存条目"""
+    data: Dict[str, Any]
+    expires_at: datetime
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now(timezone.utc) > self.expires_at
+
+
+class ProfileCache:
+    """
+    用户 Profile 缓存
+
+    缓存策略：
+    - TTL: 5 分钟（Profile 变化不频繁）
+    - 写入时更新缓存
+    - 支持手动失效
+
+    v2.0 更新：
+    - 支持自定义 key 格式（用于合并缓存）
+    - 支持按前缀失效（用于失效用户所有缓存）
+    """
+
+    DEFAULT_TTL = 300  # 5 分钟
+
+    def __init__(self):
+        self._cache: Dict[str, CacheEntry] = {}
+        self._lock = asyncio.Lock()
+        self._stats = {"hits": 0, "misses": 0}
+
+    async def get(self, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """获取缓存的 Profile（兼容旧接口）"""
+        return await self.get_by_key(str(user_id))
+
+    async def get_by_key(self, key: str) -> Optional[Dict[str, Any]]:
+        """通过自定义 key 获取缓存"""
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                self._stats["misses"] += 1
+                return None
+            if entry.is_expired:
+                del self._cache[key]
+                self._stats["misses"] += 1
+                return None
+            self._stats["hits"] += 1
+            return entry.data
+
+    async def set(self, user_id: UUID, profile: Dict[str, Any], ttl: int = None) -> None:
+        """设置 Profile 缓存（兼容旧接口）"""
+        await self.set_by_key(str(user_id), profile, ttl)
+
+    async def set_by_key(self, key: str, data: Dict[str, Any], ttl: int = None) -> None:
+        """通过自定义 key 设置缓存"""
+        ttl = ttl or self.DEFAULT_TTL
+        async with self._lock:
+            self._cache[key] = CacheEntry(
+                data=data,
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl)
+            )
+
+    async def invalidate(self, user_id: UUID) -> bool:
+        """使指定用户的缓存失效（兼容旧接口）"""
+        return await self.invalidate_by_key(str(user_id))
+
+    async def invalidate_by_key(self, key: str) -> bool:
+        """通过自定义 key 使缓存失效"""
+        async with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
+    async def invalidate_by_prefix(self, prefix: str) -> int:
+        """使所有以指定前缀开头的缓存失效"""
+        async with self._lock:
+            keys_to_delete = [k for k in self._cache.keys() if k.startswith(prefix)]
+            for key in keys_to_delete:
+                del self._cache[key]
+            return len(keys_to_delete)
+
+    async def clear(self) -> None:
+        """清空所有缓存"""
+        async with self._lock:
+            self._cache.clear()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取缓存统计"""
+        total = self._stats["hits"] + self._stats["misses"]
+        hit_rate = self._stats["hits"] / total if total > 0 else 0
+        return {
+            **self._stats,
+            "hit_rate": f"{hit_rate:.2%}",
+            "cache_size": len(self._cache)
+        }
+
+
+# 全局缓存实例
+_profile_cache: Optional[ProfileCache] = None
+
+
+def get_profile_cache() -> ProfileCache:
+    """获取 Profile 缓存实例"""
+    global _profile_cache
+    if _profile_cache is None:
+        _profile_cache = ProfileCache()
+    return _profile_cache
+
+
+async def get_cached_profile(user_id: UUID) -> Optional[Dict[str, Any]]:
+    """
+    获取用户 Profile（带缓存）
+
+    v3.0: 从 unified_profiles 获取
+    """
+    cache = get_profile_cache()
+
+    # 尝试从缓存获取
+    profile = await cache.get(user_id)
+    if profile is not None:
+        return profile
+
+    # 缓存未命中，从 DB 获取
+    try:
+        from stores.unified_profile_repo import UnifiedProfileRepository
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+
+        if profile:
+            await cache.set(user_id, profile)
+        return profile
+    except Exception as e:
+        logger.error(f"Failed to get profile for {user_id}: {e}")
+        return None
+
+
+async def invalidate_profile_cache(user_id: UUID) -> None:
+    """使用户 Profile 缓存失效（Profile 更新后调用）"""
+    cache = get_profile_cache()
+    await cache.invalidate(user_id)
+    # 同时失效所有 skill 相关缓存
+    await cache.invalidate_by_prefix(str(user_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v2.0: 合并缓存支持 (Profile + Skill Data)
+# v3.0: 从 unified_profiles 获取
+# v9.0: 只从 skills 读取
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_cached_profile_with_skill(
+    user_id: UUID,
+    skill: str = None
+) -> Dict[str, Any]:
+    """
+    获取用户 Profile 和 Skill 数据（带缓存）
+
+    返回结构：
+    {
+        "profile": {...},        # Profile 数据（完整）
+        "skill_data": {...}      # Skill 数据（当前 skill 或全部）
+    }
+
+    v9.0: 只从 skills 读取，已移除 skill_data 回退
+
+    Args:
+        user_id: 用户 ID
+        skill: Skill 标识，如 'bazi', 'zodiac'。None 表示获取所有 skill 数据
+
+    Returns:
+        profile 和 skill_data
+    """
+    cache = get_profile_cache()
+    cache_key = f"{user_id}:{skill or 'all'}"
+
+    # 尝试从缓存获取
+    cached = await cache.get_by_key(cache_key)
+    if cached is not None:
+        return cached
+
+    # 缓存未命中，从 DB 获取
+    try:
+        from stores.unified_profile_repo import UnifiedProfileRepository
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+
+        if profile:
+            # v9.0: 只从 skills 读取
+            skills_store = profile.get("skills", {})
+
+            if skill:
+                skill_data_dict = {skill: skills_store.get(skill, {})} if skills_store.get(skill) else {}
+            else:
+                skill_data_dict = skills_store
+
+            result = {
+                "profile": profile,
+                "skill_data": skill_data_dict
+            }
+        else:
+            result = {"profile": {}, "skill_data": {}}
+
+        await cache.set_by_key(cache_key, result)
+        return result
+    except Exception as e:
+        logger.error(f"Failed to get profile with skill for {user_id}: {e}")
+        return {"profile": {}, "skill_data": {}}
+
+
+async def invalidate_skill_cache(user_id: UUID, skill: str = None) -> None:
+    """
+    使 Skill 相关缓存失效
+
+    Args:
+        user_id: 用户 ID
+        skill: Skill 标识。None 表示失效所有 skill 缓存
+    """
+    cache = get_profile_cache()
+
+    if skill:
+        # 只失效特定 skill 的缓存
+        await cache.invalidate_by_key(f"{user_id}:{skill}")
+        # 也失效 all 缓存
+        await cache.invalidate_by_key(f"{user_id}:all")
+    else:
+        # 失效所有 skill 缓存
+        await cache.invalidate_by_prefix(str(user_id))

@@ -1,0 +1,202 @@
+"""
+Question Generator - Dynamic follow-up question generation
+Based on: vibelife spec v3.0, section 4.2
+
+Follow-up Questions:
+- "你提到了 [X]，能具体说说吗？"
+- "这种情况持续多久了？"
+- "之前有过类似的经历吗？"
+"""
+import json
+from typing import Optional, List, Dict, Any
+from enum import Enum
+import logging
+
+from services.vibe_engine.llm import get_llm_service, create_user_message
+
+logger = logging.getLogger(__name__)
+
+
+class QuestionType(str, Enum):
+    """Types of interview questions"""
+    CORE = "core"           # 核心问题 (必问)
+    FOLLOWUP = "followup"   # 追问问题 (基于上一个回答)
+    OPTIONAL = "optional"   # 可选问题 (补充信息)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Follow-up Question Templates
+# ═══════════════════════════════════════════════════════════════════════════
+
+FOLLOWUP_TEMPLATES = {
+    "elaborate": "你提到了「{topic}」，能具体说说吗？",
+    "duration": "这种情况持续多久了？",
+    "history": "之前有过类似的经历吗？",
+    "impact": "这对你的生活影响大吗？",
+    "feeling": "说到这个的时候，你的感受是什么？",
+    "goal": "你希望达到什么样的状态？",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Follow-up Generation Prompt
+# ═══════════════════════════════════════════════════════════════════════════
+
+GENERATE_FOLLOWUP_PROMPT = """你是一位温暖的访谈者。基于用户的回答，判断是否需要追问，并生成合适的追问问题。
+
+## 上一个问题
+{previous_question}
+
+## 用户回答
+{user_answer}
+
+## 任务
+1. 分析用户回答是否提供了足够的信息
+2. 如果需要追问，生成一个温暖、自然的追问问题
+3. 如果信息已经足够，不需要追问
+
+## 判断标准
+需要追问的情况：
+- 用户提到了具体问题但没有展开（如"工作不顺"但没说原因）
+- 用户的回答很简短，可能有更多想说的
+- 用户提到了情绪但没有具体说明
+
+不需要追问的情况：
+- 用户已经给出了详细的回答
+- 用户明确表示不想多说
+- 已经追问过同一话题
+
+## 输出格式（只输出 JSON）
+{{
+  "need_followup": true/false,
+  "reason": "为什么需要/不需要追问",
+  "followup_question": "追问问题文本（如果 need_followup=false，则为 null）",
+  "detected_topics": ["从回答中识别的话题关键词"]
+}}
+"""
+
+
+class QuestionGenerator:
+    """
+    Generate dynamic follow-up questions based on user answers.
+    """
+
+    def __init__(self):
+        self.llm = get_llm_service()
+
+    async def should_followup(
+        self,
+        previous_question: str,
+        user_answer: str,
+        followup_count: int = 0,
+        max_followups: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Determine if a follow-up question is needed.
+
+        Args:
+            previous_question: The question that was asked
+            user_answer: User's answer
+            followup_count: How many follow-ups already asked
+            max_followups: Maximum follow-up questions allowed
+
+        Returns:
+            Dict with need_followup, reason, followup_question, detected_topics
+        """
+        # Don't follow up too many times
+        if followup_count >= max_followups:
+            return {
+                "need_followup": False,
+                "reason": "已达到最大追问次数",
+                "followup_question": None,
+                "detected_topics": []
+            }
+
+        # Skip if answer is very short (likely wants to move on)
+        if len(user_answer.strip()) < 10:
+            return {
+                "need_followup": False,
+                "reason": "回答太短，可能不想多说",
+                "followup_question": None,
+                "detected_topics": []
+            }
+
+        prompt = GENERATE_FOLLOWUP_PROMPT.format(
+            previous_question=previous_question,
+            user_answer=user_answer
+        )
+
+        try:
+            response = await self.llm.chat(
+                [create_user_message(prompt)],
+                temperature=0.4,
+                max_tokens=500
+            )
+
+            content = response.content.strip()
+
+            # Parse JSON
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            result = json.loads(content)
+            return result
+
+        except Exception as e:
+            logger.warning(f"Follow-up generation failed: {e}")
+            return {
+                "need_followup": False,
+                "reason": f"生成失败: {e}",
+                "followup_question": None,
+                "detected_topics": []
+            }
+
+    def generate_simple_followup(
+        self,
+        template_key: str,
+        topic: Optional[str] = None
+    ) -> str:
+        """
+        Generate a follow-up question using templates.
+
+        Args:
+            template_key: Key from FOLLOWUP_TEMPLATES
+            topic: Topic to insert into template (for "elaborate")
+
+        Returns:
+            Formatted follow-up question
+        """
+        template = FOLLOWUP_TEMPLATES.get(template_key, FOLLOWUP_TEMPLATES["elaborate"])
+
+        if "{topic}" in template and topic:
+            return template.format(topic=topic)
+
+        return template
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Convenience Function
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def generate_follow_up_question(
+    previous_question: str,
+    user_answer: str,
+    followup_count: int = 0
+) -> Optional[str]:
+    """
+    Convenience function to generate a follow-up question.
+
+    Returns the follow-up question text or None if not needed.
+    """
+    generator = QuestionGenerator()
+    result = await generator.should_followup(
+        previous_question,
+        user_answer,
+        followup_count
+    )
+
+    if result.get("need_followup"):
+        return result.get("followup_question")
+
+    return None

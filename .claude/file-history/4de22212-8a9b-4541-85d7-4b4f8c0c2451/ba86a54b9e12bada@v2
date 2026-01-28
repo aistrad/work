@@ -1,0 +1,644 @@
+"""
+ContentGenerator - 个性化内容生成器
+
+特点:
+1. 基于 life_context 个性化
+2. 支持多种语气风格 (voice_mode)
+3. 使用 LLM 生成自然语言内容
+4. 支持复用 rules/ 架构生成内容
+5. 支持对话引导配置
+
+设计原则:
+- 从 unified_profiles 读取用户画像
+- 支持 Skill 级内容模板
+- 智能化: 基于用户关注点和目标个性化
+- 复用 rules/*.md 的分析要点和检索 Query
+"""
+
+import logging
+import re
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+from uuid import UUID
+
+from services.llm import LLMService
+from services.knowledge.retrieval import search_db
+from services.agent.skill_loader import load_rule, SKILLS_DIR
+from .engine import ReminderTask, ReminderContent
+
+logger = logging.getLogger(__name__)
+
+
+class ContentGenerator:
+    """个性化内容生成器"""
+
+    def __init__(self):
+        self._llm_service = None
+
+    @property
+    def llm_service(self):
+        """延迟加载 LLM 服务"""
+        if self._llm_service is None:
+            self._llm_service = LLMService()
+        return self._llm_service
+
+    async def generate(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """
+        生成个性化提醒内容
+
+        Args:
+            task: 提醒任务
+            profile: 用户画像 (from unified_profiles)
+            config: 提醒配置 (from reminders.yaml)
+
+        Returns:
+            ReminderContent
+        """
+        reminder_type = task.reminder_type
+        skill_id = task.skill_id
+
+        # 检查是否使用 rules/ 架构
+        content_config = config.get("content", {})
+        generator_path = content_config.get("generator", "")
+
+        if generator_path.startswith("rules/"):
+            # 使用 rules/ 架构生成内容
+            content = await self._generate_from_rule(
+                task=task,
+                profile=profile,
+                config=config,
+                generator_path=generator_path,
+            )
+        else:
+            # 根据提醒类型分发到不同生成器（旧架构）
+            generator_map = {
+                # Bazi
+                "daily_fortune": self._generate_daily_fortune,
+                "dayun_transition": self._generate_dayun_transition,
+                "fortune_alert": self._generate_fortune_alert,
+                # Zodiac
+                "daily_horoscope": self._generate_daily_horoscope,
+                "transit_alert": self._generate_transit_alert,
+                "lunar_phase": self._generate_lunar_phase,
+                "solar_term": self._generate_solar_term,
+                # Core
+                "weekly_summary": self._generate_weekly_summary,
+                "monthly_report": self._generate_monthly_report,
+                # Common
+                "birthday": self._generate_birthday,
+                "liunian": self._generate_liunian,
+            }
+
+            generator = generator_map.get(reminder_type)
+            if generator:
+                content = await generator(task, profile, config)
+            else:
+                # 默认生成器
+                content = await self._generate_default(task, profile, config)
+
+        # 附加对话引导配置
+        content.suggested_prompt = content_config.get("suggested_prompt")
+        content.quick_actions = content_config.get("quick_actions", [])
+        content.card_type = content_config.get("card_type")
+
+        return content
+
+    async def _generate_from_rule(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+        generator_path: str,
+    ) -> ReminderContent:
+        """
+        基于 Rule 文件生成内容
+
+        流程:
+        1. 加载 rule 文件
+        2. 提取分析要点和检索 Query
+        3. 执行知识检索
+        4. 调用 LLM 生成个性化内容
+        """
+        skill_id = task.skill_id
+
+        # 解析 rule 路径: rules/daily-fortune.md -> daily-fortune
+        rule_id = generator_path.replace("rules/", "").replace(".md", "")
+
+        # 加载 rule
+        rule = load_rule(skill_id, rule_id)
+        if not rule:
+            logger.warning(f"Rule not found: {skill_id}/{rule_id}, falling back to default")
+            return await self._generate_default(task, profile, config)
+
+        # 执行知识检索
+        knowledge_context = []
+        for step in rule.analysis_steps:
+            query = step.get("query", "").strip('"')
+            if query and step.get("priority") in ["必须", "推荐"]:
+                try:
+                    results = await search_db(
+                        table="knowledge_chunks",
+                        query=query,
+                        skill_id=skill_id,
+                        top_k=3,
+                    )
+                    knowledge_context.extend(results)
+                except Exception as e:
+                    logger.warning(f"Knowledge search failed for query '{query}': {e}")
+
+        # 获取用户特征
+        life_context = profile.get("life_context", {})
+        preferences = profile.get("preferences", {})
+        voice_mode = preferences.get("voice_mode", "warm")
+
+        # 构建 prompt
+        context_str = "\n".join([
+            f"- {chunk.get('content', '')[:200]}"
+            for chunk in knowledge_context[:5]
+        ]) if knowledge_context else "无相关知识"
+
+        concerns = life_context.get("concerns", [])
+        goals = life_context.get("goals", [])
+
+        # 使用 LLM 生成内容
+        llm_result = await self._generate_with_llm(
+            template_type="rule_based",
+            context={
+                "rule_name": rule.name,
+                "rule_content": rule.content[:1000],  # 截断避免过长
+                "knowledge_context": context_str,
+                "concerns": concerns[:3] if concerns else [],
+                "goals": goals[:2] if goals else [],
+                "date": date.today().strftime("%Y年%m月%d日"),
+            },
+            voice_mode=voice_mode,
+        )
+
+        return ReminderContent(
+            title=config.get("name", rule.name),
+            body=llm_result.get("greeting", f"关于{rule.name}的洞察"),
+            data={
+                "rule_id": rule_id,
+                "fortune_hint": llm_result.get("fortune_hint", ""),
+                "action_tip": llm_result.get("action_tip", ""),
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Bazi 内容生成器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_daily_fortune(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成每日运势"""
+        # 提取用户特征
+        birth_info = profile.get("birth_info", {})
+        life_context = profile.get("life_context", {})
+        preferences = profile.get("preferences", {})
+        skill_data = profile.get("skill_data", {}).get("bazi", {})
+
+        # 获取日主元素
+        chart = skill_data.get("chart", {})
+        day_master = chart.get("day_master", {})
+        day_master_element = day_master.get("element", "wood")
+
+        # 获取用户关注点
+        concerns = life_context.get("concerns", [])
+        goals = life_context.get("goals", [])
+        voice_mode = preferences.get("voice_mode", "warm")
+
+        # 计算今日运势
+        from skills.bazi.services import BaziComputer
+        computer = BaziComputer()
+        daily_fortune = await computer.calculate_daily_fortune(profile)
+
+        # 使用 LLM 生成个性化内容
+        content = await self._generate_with_llm(
+            template_type="daily_fortune",
+            context={
+                "day_master_element": day_master_element,
+                "daily_fortune": daily_fortune,
+                "concerns": concerns[:3] if concerns else [],
+                "goals": goals[:2] if goals else [],
+                "voice_mode": voice_mode,
+                "date": date.today().strftime("%Y年%m月%d日"),
+            },
+            voice_mode=voice_mode,
+        )
+
+        return ReminderContent(
+            title="今日运势",
+            body=content.get("greeting", "新的一天，新的开始！"),
+            data={
+                "fortune_hint": content.get("fortune_hint", ""),
+                "action_tip": content.get("action_tip", ""),
+                "fortune_score": daily_fortune.get("score", 60),
+                "element": day_master_element,
+            },
+        )
+
+    async def _generate_dayun_transition(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成大运交接提醒"""
+        event_info = task.metadata.get("event_info", {})
+        event_name = event_info.get("event_name", "大运交接")
+        days_until = event_info.get("days_until", 0)
+
+        life_context = profile.get("life_context", {})
+        concerns = life_context.get("concerns", [])
+
+        if days_until == 0:
+            title = "大运交接日"
+            body = f"今天是您的{event_name}，这是人生重要的转折点。新的十年周期开始，把握机遇，迎接变化。"
+        elif days_until == 7:
+            title = "大运交接倒计时"
+            body = f"还有7天，您将迎来{event_name}。这是人生的重要节点，建议提前做好心理准备。"
+        else:
+            title = "大运交接预告"
+            body = f"还有{days_until}天，您将迎来{event_name}。新的周期即将开始，是时候规划未来了。"
+
+        return ReminderContent(
+            title=title,
+            body=body,
+            data={
+                "event_name": event_name,
+                "days_until": days_until,
+                "concerns": concerns[:3] if concerns else [],
+            },
+        )
+
+    async def _generate_fortune_alert(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成运势预警"""
+        event_info = task.metadata.get("event_info", {})
+        score = event_info.get("value", 40)
+        threshold = event_info.get("threshold", 40)
+
+        life_context = profile.get("life_context", {})
+        concerns = life_context.get("concerns", [])
+
+        return ReminderContent(
+            title="运势提醒",
+            body=f"近期运势能量较低（{score}分），建议放慢脚步，避免重大决策。这是调整和积蓄能量的好时机。",
+            data={
+                "fortune_score": score,
+                "threshold": threshold,
+                "concerns": concerns[:3] if concerns else [],
+                "suggestions": ["避免冲动决策", "注意休息", "多与亲友交流"],
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Zodiac 内容生成器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_daily_horoscope(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成每日星座运势"""
+        skill_data = profile.get("skill_data", {}).get("zodiac", {})
+        chart = skill_data.get("chart", {})
+
+        sun_sign = chart.get("sun_sign", "")
+        moon_sign = chart.get("moon_sign", "")
+
+        life_context = profile.get("life_context", {})
+        concerns = life_context.get("concerns", [])
+
+        return ReminderContent(
+            title="今日星座运势",
+            body=f"作为{sun_sign}座，今天的能量适合专注内心，倾听直觉。",
+            data={
+                "sun_sign": sun_sign,
+                "moon_sign": moon_sign,
+                "concerns": concerns[:3] if concerns else [],
+            },
+        )
+
+    async def _generate_transit_alert(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成行运提醒"""
+        event_info = task.metadata.get("event_info", {})
+        event_name = event_info.get("event_name", "行星过境")
+        transit_type = event_info.get("transit_type", "")
+
+        return ReminderContent(
+            title=f"星象提醒：{event_name}",
+            body=f"今日{event_name}开始，这是一个重要的宇宙能量转换期。",
+            data={
+                "event_name": event_name,
+                "transit_type": transit_type,
+            },
+        )
+
+    async def _generate_lunar_phase(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成月相提醒"""
+        event_info = task.metadata.get("event_info", {})
+        event_name = event_info.get("event_name", "月相")
+        phase = event_info.get("phase", "")
+
+        if phase == "new_moon":
+            body = "新月是播种意图的好时机。写下你的愿望，设定新的目标。"
+        elif phase == "full_moon":
+            body = "满月是收获和释放的时刻。庆祝你的成就，放下不再需要的。"
+        else:
+            body = f"今日{event_name}，是调整能量的好时机。"
+
+        return ReminderContent(
+            title=f"月相提醒：{event_name}",
+            body=body,
+            data={
+                "event_name": event_name,
+                "phase": phase,
+            },
+        )
+
+    async def _generate_solar_term(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成节气提醒"""
+        event_info = task.metadata.get("event_info", {})
+        event_name = event_info.get("event_name", "节气")
+        description = event_info.get("description", "")
+
+        return ReminderContent(
+            title=f"节气：{event_name}",
+            body=description or f"今日{event_name}，顺应自然节律，调整生活作息。",
+            data={
+                "event_name": event_name,
+                "description": description,
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Core 内容生成器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_weekly_summary(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成每周总结"""
+        life_context = profile.get("life_context", {})
+        concerns = life_context.get("concerns", [])
+        goals = life_context.get("goals", [])
+
+        return ReminderContent(
+            title="本周运势回顾",
+            body="新的一周开始了！回顾过去，展望未来，保持积极心态。",
+            data={
+                "concerns": concerns[:3] if concerns else [],
+                "goals": goals[:2] if goals else [],
+            },
+        )
+
+    async def _generate_monthly_report(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成每月报告"""
+        today = date.today()
+        month_name = today.strftime("%Y年%m月")
+
+        return ReminderContent(
+            title=f"{month_name}运势报告",
+            body=f"新的月份开始了！{month_name}的能量主题是成长与突破。",
+            data={
+                "month": today.month,
+                "year": today.year,
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 通用内容生成器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_birthday(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成生日提醒"""
+        event_info = task.metadata.get("event_info", {})
+        days_until = event_info.get("days_until", 0)
+
+        if days_until == 0:
+            return ReminderContent(
+                title="生日快乐！",
+                body="祝您生日快乐！新的一岁，新的开始，愿您心想事成！",
+                data={"days_until": 0},
+            )
+        else:
+            return ReminderContent(
+                title="生日倒计时",
+                body=f"您的生日还有{days_until}天！新的一岁即将开始。",
+                data={"days_until": days_until},
+            )
+
+    async def _generate_liunian(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """生成流年运势"""
+        from skills.bazi.services import BaziComputer
+
+        computer = BaziComputer()
+        year = date.today().year
+        annual_fortune = await computer.calculate_annual_fortune(profile, year)
+
+        return ReminderContent(
+            title=f"{year}年运势",
+            body=f"新的一年主题：{annual_fortune.get('theme', '稳步前进')}",
+            data={
+                "year": year,
+                "theme": annual_fortune.get("theme", ""),
+                "highlights": annual_fortune.get("highlights", []),
+                "cautions": annual_fortune.get("cautions", []),
+            },
+        )
+
+    async def _generate_default(
+        self,
+        task: ReminderTask,
+        profile: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> ReminderContent:
+        """默认内容生成器"""
+        return ReminderContent(
+            title=config.get("name", "通知"),
+            body=config.get("description", "您有一条新消息"),
+            data={},
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LLM 内容生成
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _generate_with_llm(
+        self,
+        template_type: str,
+        context: Dict[str, Any],
+        voice_mode: str = "warm",
+    ) -> Dict[str, Any]:
+        """使用 LLM 生成个性化内容"""
+        import json
+        from services.llm import create_system_message, create_user_message
+
+        # 构建 prompt
+        system_prompt = self._get_system_prompt(template_type, voice_mode)
+        user_prompt = self._get_user_prompt(template_type, context)
+
+        try:
+            messages = [
+                create_system_message(system_prompt),
+                create_user_message(user_prompt),
+            ]
+            response = await self.llm_service.chat(messages=messages)
+
+            # 解析 JSON 响应
+            content = response.content.strip()
+            # 处理可能的 markdown 代码块
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+
+            return json.loads(content.strip())
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            # 返回默认内容
+            return self._get_fallback_content(template_type, context)
+
+    def _get_system_prompt(self, template_type: str, voice_mode: str) -> str:
+        """获取系统提示词"""
+        voice_styles = {
+            "warm": "你是 Vibe，一个温暖、共情、支持的 AI 知己。用温暖的语气与用户交流。",
+            "sarcastic": "你是 Vibe，一个直接、犀利但有趣的 AI 损友。用幽默的方式给出建议。",
+            "wise": "你是 Vibe，一个理性、深度、像长辈一样的 AI 导师。用睿智的方式指点迷津。",
+        }
+
+        base_prompt = voice_styles.get(voice_mode, voice_styles["warm"])
+
+        if template_type == "daily_fortune":
+            return f"""{base_prompt}
+
+现在要为用户生成一条个性化的每日运势提醒。
+
+输出 JSON 格式：
+{{
+    "greeting": "问候语（不超过50字）",
+    "fortune_hint": "今日运势提示（不超过30字）",
+    "action_tip": "具体可执行的建议（不超过30字）"
+}}"""
+
+        if template_type == "rule_based":
+            return f"""{base_prompt}
+
+现在要基于专业规则为用户生成一条个性化的洞察提醒。
+
+输出 JSON 格式：
+{{
+    "greeting": "问候语（包含核心洞察，不超过80字）",
+    "fortune_hint": "关键提示（不超过40字）",
+    "action_tip": "具体可执行的建议（不超过40字）"
+}}"""
+
+        return base_prompt
+
+    def _get_user_prompt(self, template_type: str, context: Dict[str, Any]) -> str:
+        """获取用户提示词"""
+        if template_type == "daily_fortune":
+            concerns = context.get("concerns", [])
+            goals = context.get("goals", [])
+            concerns_str = "、".join(concerns) if concerns else "无特别关注"
+            goals_str = "、".join(goals) if goals else "无特别目标"
+
+            return f"""为用户生成今日问候：
+- 日期：{context.get('date', '')}
+- 日主元素：{context.get('day_master_element', 'wood')}
+- 今日运势分数：{context.get('daily_fortune', {}).get('score', 60)}
+- 用户关注：{concerns_str}
+- 用户目标：{goals_str}"""
+
+        if template_type == "rule_based":
+            concerns = context.get("concerns", [])
+            goals = context.get("goals", [])
+            concerns_str = "、".join(concerns) if concerns else "无特别关注"
+            goals_str = "、".join(goals) if goals else "无特别目标"
+
+            return f"""基于以下规则和知识为用户生成洞察：
+
+## 规则: {context.get('rule_name', '')}
+
+{context.get('rule_content', '')[:500]}
+
+## 相关知识
+{context.get('knowledge_context', '无')}
+
+## 用户信息
+- 日期：{context.get('date', '')}
+- 用户关注：{concerns_str}
+- 用户目标：{goals_str}
+
+请基于以上信息生成个性化的洞察提醒。"""
+
+        return str(context)
+
+    def _get_fallback_content(self, template_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """获取降级内容"""
+        if template_type == "daily_fortune":
+            return {
+                "greeting": "新的一天，新的开始！愿今天一切顺利。",
+                "fortune_hint": "保持积极心态",
+                "action_tip": "专注当下，一步一步来",
+            }
+        if template_type == "rule_based":
+            rule_name = context.get("rule_name", "洞察")
+            return {
+                "greeting": f"关于{rule_name}，有一些值得关注的信息。",
+                "fortune_hint": "保持觉察，顺势而为",
+                "action_tip": "点击了解更多详情",
+            }
+        return {"message": "您有一条新消息"}

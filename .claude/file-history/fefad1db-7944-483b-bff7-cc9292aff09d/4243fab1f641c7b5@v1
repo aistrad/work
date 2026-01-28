@@ -1,0 +1,1075 @@
+"""
+运势计算服务
+- 今日运势：基于八字 + 当日干支
+- 周运势：基于本周关键日干支
+- 月运势：基于月令与八字的作用
+- 流年运势：基于流年干支与八字的作用
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+from lunar_python import Lunar, LunarYear, Solar
+
+from common.logging import get_logger
+from services import bazi_facts, kb_service
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+YUNSHI_COMPUTE_VERSION = "yunshi-v1.0"
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class Prescription:
+    """行动处方"""
+    task_id: str
+    content: str
+    estimated_minutes: int
+    priority: str  # high, medium, low
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TimeWindow:
+    """时辰窗口"""
+    hour_range: str  # e.g., "9-11点"
+    quality: str     # 吉, 平, 凶
+    suggestion: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DailyYunshi:
+    """今日运势结果"""
+    date: date
+    day_ganzhi: str
+    day_gan_relation: str
+    day_zhi_specials: List[str]
+    score: int
+    summary: str
+    highlights: List[str]
+    risks: List[str]
+    prescriptions: List[Prescription]
+    time_windows: List[TimeWindow]
+    evidence: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "date": self.date.isoformat(),
+            "day_ganzhi": self.day_ganzhi,
+            "day_gan_relation": self.day_gan_relation,
+            "day_zhi_specials": self.day_zhi_specials,
+            "score": self.score,
+            "summary": self.summary,
+            "highlights": self.highlights,
+            "risks": self.risks,
+            "prescriptions": [p.to_dict() for p in self.prescriptions],
+            "time_windows": [t.to_dict() for t in self.time_windows],
+            "evidence": self.evidence,
+        }
+
+
+@dataclass
+class AnnualYunshi:
+    """流年运势结果"""
+    year: int
+    liu_nian_ganzhi: str
+    da_yun_ganzhi: str
+    key_interactions: List[str]
+    score: int
+    summary: str
+    themes: List[str]
+    key_months: List[Dict[str, Any]]
+    prescriptions: List[Prescription]
+    evidence: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "year": self.year,
+            "liu_nian_ganzhi": self.liu_nian_ganzhi,
+            "da_yun_ganzhi": self.da_yun_ganzhi,
+            "key_interactions": self.key_interactions,
+            "score": self.score,
+            "summary": self.summary,
+            "themes": self.themes,
+            "key_months": self.key_months,
+            "prescriptions": [p.to_dict() for p in self.prescriptions],
+            "evidence": self.evidence,
+        }
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+GAN_ELEMENT = {
+    "甲": "木", "乙": "木", "丙": "火", "丁": "火",
+    "戊": "土", "己": "土", "庚": "金", "辛": "金",
+    "壬": "水", "癸": "水",
+}
+
+ZHI_ELEMENT = {
+    "子": "水", "丑": "土", "寅": "木", "卯": "木",
+    "辰": "土", "巳": "火", "午": "火", "未": "土",
+    "申": "金", "酉": "金", "戌": "土", "亥": "水",
+}
+
+ELEMENT_REL = {
+    "木": {"generator": "水", "produces": "火", "controls": "土", "controlled_by": "金"},
+    "火": {"generator": "木", "produces": "土", "controls": "金", "controlled_by": "水"},
+    "土": {"generator": "火", "produces": "金", "controls": "水", "controlled_by": "木"},
+    "金": {"generator": "土", "produces": "水", "controls": "木", "controlled_by": "火"},
+    "水": {"generator": "金", "produces": "木", "controls": "火", "controlled_by": "土"},
+}
+
+# 十二时辰对应时段
+SHICHEN_HOURS = [
+    ("子", 23, 1), ("丑", 1, 3), ("寅", 3, 5), ("卯", 5, 7),
+    ("辰", 7, 9), ("巳", 9, 11), ("午", 11, 13), ("未", 13, 15),
+    ("申", 15, 17), ("酉", 17, 19), ("戌", 19, 21), ("亥", 21, 23),
+]
+
+# 神煞触发条件 - 三合局
+SHENSHA_SANHE_GROUPS = [
+    ("申子辰", {"taohua": "酉", "yima": "寅", "huagai": "辰"}),
+    ("亥卯未", {"taohua": "子", "yima": "巳", "huagai": "未"}),
+    ("寅午戌", {"taohua": "卯", "yima": "申", "huagai": "戌"}),
+    ("巳酉丑", {"taohua": "午", "yima": "亥", "huagai": "丑"}),
+]
+
+# 天乙贵人
+TIANYI_BY_DAY_GAN = {
+    "甲": ["丑", "未"], "戊": ["丑", "未"], "庚": ["丑", "未"],
+    "乙": ["子", "申"], "己": ["子", "申"],
+    "丙": ["亥", "酉"], "丁": ["亥", "酉"],
+    "辛": ["寅", "午"],
+    "壬": ["卯", "巳"], "癸": ["卯", "巳"],
+}
+
+# 六合
+LIU_HE = {
+    "子": "丑", "丑": "子", "寅": "亥", "亥": "寅",
+    "卯": "戌", "戌": "卯", "辰": "酉", "酉": "辰",
+    "巳": "申", "申": "巳", "午": "未", "未": "午",
+}
+
+# 六冲
+LIU_CHONG = {
+    "子": "午", "午": "子", "丑": "未", "未": "丑",
+    "寅": "申", "申": "寅", "卯": "酉", "酉": "卯",
+    "辰": "戌", "戌": "辰", "巳": "亥", "亥": "巳",
+}
+
+
+# =============================================================================
+# Yunshi Service
+# =============================================================================
+
+class YunshiService:
+    """运势计算服务"""
+
+    def compute_daily_yunshi(
+        self,
+        user_id: int,
+        target_date: Optional[date] = None,
+        use_cache: bool = True,
+    ) -> DailyYunshi:
+        """
+        计算今日运势
+
+        流程：
+        1. 读取用户 bazi_snapshot (facts)
+        2. 计算目标日期的干支
+        3. 分析日干与日主的五行关系
+        4. 分析日支的特殊标记（桃花/驿马等）
+        5. 检索知识库获取解读依据
+        6. 生成综合评分与行动处方
+        """
+        target_date = target_date or date.today()
+
+        # 1. 获取八字事实
+        snapshot = bazi_facts.ensure_snapshot_for_user(user_id)
+        facts = snapshot["facts"]
+        facts_hash = snapshot["facts_hash"]
+
+        # Check cache first
+        if use_cache:
+            cached = self._get_cached_yunshi(user_id, "daily", target_date, facts_hash)
+            if cached:
+                return cached
+
+        bazi = facts.get("bazi", {})
+        day_master = bazi.get("day_master", {})
+        day_master_element = day_master.get("element", "")
+        day_master_gan = day_master.get("gan", "")
+        pillars = bazi.get("pillars", {})
+        shensha_list = bazi.get("shensha", [])
+
+        # 2. 计算当日干支
+        solar = Solar.fromDate(target_date)
+        lunar = solar.getLunar()
+        day_gan = lunar.getDayGan()
+        day_zhi = lunar.getDayZhi()
+        day_ganzhi = day_gan + day_zhi
+
+        # 3. 分析五行关系
+        relation = self._compute_gan_relation(day_master_element, day_gan)
+
+        # 4. 分析地支特殊标记
+        specials = self._check_branch_specials(day_zhi, day_master_gan, pillars, shensha_list)
+
+        # 5. 检索知识库
+        kb_refs = self._search_kb_for_ganzhi(day_ganzhi, relation["name"])
+
+        # 6. 计算评分与生成处方
+        score = self._compute_daily_score(relation, specials)
+        highlights = self._build_highlights(relation, specials)
+        risks = self._build_risks(relation, specials)
+        summary = self._build_daily_summary(day_ganzhi, relation, score)
+        prescriptions = self._generate_daily_prescriptions(relation, specials, score)
+        time_windows = self._compute_time_windows(day_ganzhi, day_master_element)
+
+        yunshi = DailyYunshi(
+            date=target_date,
+            day_ganzhi=day_ganzhi,
+            day_gan_relation=relation["name"],
+            day_zhi_specials=specials,
+            score=score,
+            summary=summary,
+            highlights=highlights,
+            risks=risks,
+            prescriptions=prescriptions,
+            time_windows=time_windows,
+            evidence={
+                "rule_ids": ["RULE-DAILY-DAYGAN-V1", "RULE-DAILY-DAYZHI-V1"],
+                "kb_refs": kb_refs,
+            },
+        )
+
+        # Cache the result
+        self._cache_yunshi(user_id, "daily", target_date, facts_hash, yunshi)
+
+        logger.info(
+            "computed daily yunshi",
+            extra={
+                "operation": "yunshi_compute",
+                "user_id": user_id,
+                "type": "daily",
+                "date": str(target_date),
+                "score": score,
+            },
+        )
+
+        return yunshi
+
+    def compute_annual_yunshi(
+        self,
+        user_id: int,
+        target_year: Optional[int] = None,
+        use_cache: bool = True,
+    ) -> AnnualYunshi:
+        """
+        计算流年运势
+
+        流程：
+        1. 读取八字事实（含大运）
+        2. 获取流年干支
+        3. 分析流年与原局的作用
+        4. 分析当前大运与流年的叠加
+        5. 确定年度主题与关键月份
+        6. 生成行动处方
+        """
+        target_year = target_year or datetime.now().year
+        target_date = date(target_year, 1, 1)
+
+        # 1. 获取八字事实
+        snapshot = bazi_facts.ensure_snapshot_for_user(user_id)
+        facts = snapshot["facts"]
+        facts_hash = snapshot["facts_hash"]
+
+        # Check cache first
+        if use_cache:
+            cached = self._get_cached_yunshi(user_id, "annual", target_date, facts_hash)
+            if cached:
+                return cached
+
+        bazi = facts.get("bazi", {})
+        luck = bazi.get("luck", {})
+        pillars = bazi.get("pillars", {})
+        day_master = bazi.get("day_master", {})
+
+        # 2. 获取流年干支
+        liu_nian_ganzhi = LunarYear.fromYear(target_year).getGanZhi()
+
+        # 3. 获取当前大运
+        da_yun = self._get_current_dayun(luck.get("da_yun", []), target_year)
+        da_yun_ganzhi = da_yun.get("gan_zhi", "") if da_yun else ""
+
+        # 4. 分析作用关系
+        interactions = self._analyze_liunian_interactions(
+            liu_nian_ganzhi=liu_nian_ganzhi,
+            pillars=pillars,
+            da_yun_ganzhi=da_yun_ganzhi,
+        )
+
+        # 5. 计算评分与主题
+        score = self._compute_annual_score(interactions)
+        themes = self._extract_annual_themes(interactions, day_master, liu_nian_ganzhi)
+        key_months = self._identify_key_months(target_year, pillars, day_master)
+        summary = self._build_annual_summary(target_year, liu_nian_ganzhi, score, themes)
+
+        # 6. 生成行动处方
+        prescriptions = self._generate_annual_prescriptions(themes, score)
+
+        yunshi = AnnualYunshi(
+            year=target_year,
+            liu_nian_ganzhi=liu_nian_ganzhi,
+            da_yun_ganzhi=da_yun_ganzhi,
+            key_interactions=interactions,
+            score=score,
+            summary=summary,
+            themes=themes,
+            key_months=key_months,
+            prescriptions=prescriptions,
+            evidence={
+                "rule_ids": ["RULE-LIUNIAN-INTERACTION-V1"],
+                "kb_refs": [],
+            },
+        )
+
+        # Cache the result
+        self._cache_yunshi(user_id, "annual", target_date, facts_hash, yunshi)
+
+        logger.info(
+            "computed annual yunshi",
+            extra={
+                "operation": "yunshi_compute",
+                "user_id": user_id,
+                "type": "annual",
+                "year": target_year,
+                "score": score,
+            },
+        )
+
+        return yunshi
+
+    # =========================================================================
+    # Helper Methods - Relation Computation
+    # =========================================================================
+
+    def _compute_gan_relation(self, day_master_element: str, target_gan: str) -> Dict[str, Any]:
+        """计算天干五行关系"""
+        target_element = GAN_ELEMENT.get(target_gan, "")
+
+        if not day_master_element or not target_element:
+            return {"name": "未知", "score": 0, "desc": "", "relation": "unknown"}
+
+        if target_element == day_master_element:
+            return {"name": "比肩", "score": 0, "desc": "平稳，宜守成", "relation": "same"}
+
+        rel = ELEMENT_REL.get(day_master_element, {})
+        if target_element == rel.get("generator"):
+            return {"name": "印绶", "score": 2, "desc": "有助力，贵人运", "relation": "generates"}
+        if target_element == rel.get("produces"):
+            return {"name": "食伤", "score": 1, "desc": "适合表达、创作", "relation": "produced"}
+        if target_element == rel.get("controls"):
+            return {"name": "财星", "score": 1, "desc": "适合财务、事业推进", "relation": "controls"}
+        if target_element == rel.get("controlled_by"):
+            return {"name": "官杀", "score": -1, "desc": "压力增大，宜谨慎", "relation": "controlled"}
+
+        return {"name": "未知", "score": 0, "desc": "", "relation": "unknown"}
+
+    def _check_branch_specials(
+        self,
+        day_zhi: str,
+        day_master_gan: str,
+        pillars: Dict[str, str],
+        shensha_list: List[Dict],
+    ) -> List[str]:
+        """检查地支特殊标记"""
+        specials = []
+
+        # 获取年支/日支用于判断
+        year_zhi = pillars.get("year", "")[1:2] if len(pillars.get("year", "")) >= 2 else ""
+        birth_day_zhi = pillars.get("day", "")[1:2] if len(pillars.get("day", "")) >= 2 else ""
+
+        # 查找三合局对应的神煞触发地支
+        for group_str, targets in SHENSHA_SANHE_GROUPS:
+            if year_zhi in group_str or birth_day_zhi in group_str:
+                if day_zhi == targets.get("taohua"):
+                    specials.append("桃花日")
+                if day_zhi == targets.get("yima"):
+                    specials.append("驿马日")
+                if day_zhi == targets.get("huagai"):
+                    specials.append("华盖日")
+
+        # 天乙贵人
+        tianyi_targets = TIANYI_BY_DAY_GAN.get(day_master_gan, [])
+        if day_zhi in tianyi_targets:
+            specials.append("贵人日")
+
+        # 六合
+        if birth_day_zhi and LIU_HE.get(birth_day_zhi) == day_zhi:
+            specials.append("六合日")
+
+        # 六冲
+        if birth_day_zhi and LIU_CHONG.get(birth_day_zhi) == day_zhi:
+            specials.append("六冲日")
+
+        return specials
+
+    # =========================================================================
+    # Helper Methods - Score & Content Building
+    # =========================================================================
+
+    def _compute_daily_score(self, relation: Dict, specials: List[str]) -> int:
+        """计算每日综合评分"""
+        score = relation.get("score", 0)
+
+        # 特殊标记加减分
+        if "贵人日" in specials:
+            score += 2
+        if "桃花日" in specials:
+            score += 1
+        if "华盖日" in specials:
+            score += 1
+        if "六合日" in specials:
+            score += 1
+        if "六冲日" in specials:
+            score -= 2
+        if "驿马日" in specials:
+            score += 0  # 中性，适合变动
+
+        return max(-10, min(10, score))
+
+    def _build_daily_summary(self, day_ganzhi: str, relation: Dict, score: int) -> str:
+        """构建每日运势一句话总结"""
+        relation_name = relation.get("name", "")
+        relation_desc = relation.get("desc", "")
+
+        if score >= 5:
+            quality = "运势极佳"
+        elif score >= 2:
+            quality = "运势良好"
+        elif score >= 0:
+            quality = "运势平稳"
+        elif score >= -2:
+            quality = "运势偏弱"
+        else:
+            quality = "运势欠佳"
+
+        return f"今日{day_ganzhi}，{relation_name}日，{quality}。{relation_desc}"
+
+    def _build_highlights(self, relation: Dict, specials: List[str]) -> List[str]:
+        """构建亮点列表"""
+        highlights = []
+
+        relation_name = relation.get("name", "")
+        if relation_name == "印绶":
+            highlights.append("贵人运佳，有助力")
+        elif relation_name == "食伤":
+            highlights.append("适合表达与创作")
+        elif relation_name == "财星":
+            highlights.append("适合财务与事业推进")
+        elif relation_name == "比肩":
+            highlights.append("适合合作与稳定发展")
+
+        if "贵人日" in specials:
+            highlights.append("天乙贵人照临，易得帮助")
+        if "桃花日" in specials:
+            highlights.append("人际与感情活跃")
+        if "华盖日" in specials:
+            highlights.append("适合学习与内省")
+        if "六合日" in specials:
+            highlights.append("人际和谐，合作顺利")
+
+        return highlights[:3]
+
+    def _build_risks(self, relation: Dict, specials: List[str]) -> List[str]:
+        """构建风险提示"""
+        risks = []
+
+        relation_name = relation.get("name", "")
+        if relation_name == "官杀":
+            risks.append("压力较大，避免冲动决策")
+
+        if "六冲日" in specials:
+            risks.append("变动较多，重要事务需谨慎")
+
+        return risks[:2]
+
+    def _generate_daily_prescriptions(
+        self,
+        relation: Dict,
+        specials: List[str],
+        score: int,
+    ) -> List[Prescription]:
+        """生成每日行动处方"""
+        prescriptions = []
+
+        relation_name = relation.get("name", "")
+
+        if relation_name == "印绶" or "贵人日" in specials:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="今日贵人运佳，主动联系一位可以帮助你的人",
+                estimated_minutes=15,
+                priority="high",
+            ))
+        elif relation_name == "官杀" or score < 0:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="今日压力较大，做 3 分钟正念呼吸再处理重要事务",
+                estimated_minutes=3,
+                priority="high",
+            ))
+        elif relation_name == "食伤":
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="今日适合表达，记录一个创意想法或完成一次分享",
+                estimated_minutes=15,
+                priority="medium",
+            ))
+        elif relation_name == "财星":
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="今日财星当值，推进一项事业相关的重要事务",
+                estimated_minutes=30,
+                priority="high",
+            ))
+
+        # 确保至少有一个处方
+        if not prescriptions:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="回顾今日目标，完成最重要的一件事",
+                estimated_minutes=10,
+                priority="medium",
+            ))
+
+        return prescriptions[:3]
+
+    def _compute_time_windows(
+        self,
+        day_ganzhi: str,
+        day_master_element: str,
+    ) -> List[TimeWindow]:
+        """计算时辰窗口"""
+        windows = []
+        day_zhi = day_ganzhi[1] if len(day_ganzhi) >= 2 else ""
+
+        for shichen, start_hour, end_hour in SHICHEN_HOURS:
+            zhi_element = ZHI_ELEMENT.get(shichen, "")
+            rel = ELEMENT_REL.get(day_master_element, {})
+
+            # 简化的时辰吉凶判断
+            if zhi_element == rel.get("generator"):
+                quality = "吉"
+                suggestion = "适合重要决策与沟通"
+            elif zhi_element == rel.get("controlled_by"):
+                quality = "凶"
+                suggestion = "避免重要决策，适合休息"
+            else:
+                quality = "平"
+                suggestion = "常规事务"
+
+            # 只添加吉时
+            if quality == "吉":
+                hour_range = f"{start_hour}-{end_hour}点" if end_hour > start_hour else f"{start_hour}-次日{end_hour}点"
+                windows.append(TimeWindow(
+                    hour_range=hour_range,
+                    quality=quality,
+                    suggestion=suggestion,
+                ))
+
+        return windows[:3]  # 最多返回3个吉时
+
+    # =========================================================================
+    # Helper Methods - Annual Yunshi
+    # =========================================================================
+
+    def _get_current_dayun(self, da_yun_list: List[Dict], target_year: int) -> Optional[Dict]:
+        """获取当前大运"""
+        for dy in da_yun_list:
+            start_year = dy.get("start_year", 0)
+            end_year = dy.get("end_year", 0)
+            if start_year <= target_year <= end_year:
+                return dy
+        return None
+
+    def _analyze_liunian_interactions(
+        self,
+        liu_nian_ganzhi: str,
+        pillars: Dict[str, str],
+        da_yun_ganzhi: str,
+    ) -> List[str]:
+        """分析流年与原局的作用关系"""
+        interactions = []
+
+        if len(liu_nian_ganzhi) < 2:
+            return interactions
+
+        ln_gan = liu_nian_ganzhi[0]
+        ln_zhi = liu_nian_ganzhi[1]
+
+        # 与日柱比较
+        day_pillar = pillars.get("day", "")
+        if len(day_pillar) >= 2:
+            day_gan = day_pillar[0]
+            day_zhi = day_pillar[1]
+
+            # 天克地冲
+            if LIU_CHONG.get(ln_zhi) == day_zhi:
+                interactions.append("天克地冲")
+            # 伏吟
+            if ln_gan == day_gan and ln_zhi == day_zhi:
+                interactions.append("伏吟")
+
+        # 与年柱比较
+        year_pillar = pillars.get("year", "")
+        if len(year_pillar) >= 2:
+            year_zhi = year_pillar[1]
+            # 六合
+            if LIU_HE.get(ln_zhi) == year_zhi:
+                interactions.append("天合地合")
+
+        return interactions
+
+    def _compute_annual_score(self, interactions: List[str]) -> int:
+        """计算流年综合评分"""
+        score = 3  # 基础分
+
+        score_map = {
+            "天克地冲": -3,
+            "天合地合": 2,
+            "伏吟": -1,
+            "反吟": -2,
+        }
+
+        for interaction in interactions:
+            score += score_map.get(interaction, 0)
+
+        return max(-10, min(10, score))
+
+    def _extract_annual_themes(
+        self,
+        interactions: List[str],
+        day_master: Dict,
+        liu_nian_ganzhi: str,
+    ) -> List[str]:
+        """提取年度主题"""
+        themes = []
+
+        ln_element = GAN_ELEMENT.get(liu_nian_ganzhi[0], "") if liu_nian_ganzhi else ""
+        dm_element = day_master.get("element", "")
+
+        if ln_element and dm_element:
+            rel = ELEMENT_REL.get(dm_element, {})
+            if ln_element == rel.get("generator"):
+                themes.append("贵人助力年")
+            elif ln_element == rel.get("produces"):
+                themes.append("表达展示年")
+            elif ln_element == rel.get("controls"):
+                themes.append("事业财运年")
+            elif ln_element == rel.get("controlled_by"):
+                themes.append("压力挑战年")
+            else:
+                themes.append("稳定发展年")
+
+        if "天克地冲" in interactions:
+            themes.append("变动调整期")
+        if "天合地合" in interactions:
+            themes.append("机遇和谐期")
+
+        return themes[:3]
+
+    def _identify_key_months(
+        self,
+        target_year: int,
+        pillars: Dict[str, str],
+        day_master: Dict,
+    ) -> List[Dict[str, Any]]:
+        """识别关键月份"""
+        key_months = []
+        dm_element = day_master.get("element", "")
+        rel = ELEMENT_REL.get(dm_element, {})
+
+        # 简化实现：基于月令五行
+        month_elements = [
+            (1, "土", "丑月"), (2, "木", "寅月"), (3, "木", "卯月"),
+            (4, "土", "辰月"), (5, "火", "巳月"), (6, "火", "午月"),
+            (7, "土", "未月"), (8, "金", "申月"), (9, "金", "酉月"),
+            (10, "土", "戌月"), (11, "水", "亥月"), (12, "水", "子月"),
+        ]
+
+        for month, element, name in month_elements:
+            if element == rel.get("generator"):
+                key_months.append({
+                    "month": month,
+                    "name": name,
+                    "theme": "贵人月",
+                    "suggestion": "适合寻求帮助与合作",
+                })
+            elif element == rel.get("controlled_by"):
+                key_months.append({
+                    "month": month,
+                    "name": name,
+                    "theme": "压力月",
+                    "suggestion": "需谨慎行事，避免冲动",
+                })
+
+        return key_months[:4]
+
+    def _build_annual_summary(
+        self,
+        year: int,
+        liu_nian_ganzhi: str,
+        score: int,
+        themes: List[str],
+    ) -> str:
+        """构建流年运势一句话总结"""
+        theme_str = "、".join(themes[:2]) if themes else "稳定发展"
+
+        if score >= 5:
+            quality = "运势极佳"
+        elif score >= 2:
+            quality = "运势良好"
+        elif score >= 0:
+            quality = "运势平稳"
+        else:
+            quality = "运势偏弱"
+
+        return f"{year}年{liu_nian_ganzhi}，{quality}，主题：{theme_str}"
+
+    def _generate_annual_prescriptions(
+        self,
+        themes: List[str],
+        score: int,
+    ) -> List[Prescription]:
+        """生成流年行动处方"""
+        prescriptions = []
+
+        if "贵人助力年" in themes:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="本年贵人运佳，主动拓展人脉，建立有价值的连接",
+                estimated_minutes=60,
+                priority="high",
+            ))
+
+        if "事业财运年" in themes:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="本年财运当值，制定清晰的事业目标并持续推进",
+                estimated_minutes=120,
+                priority="high",
+            ))
+
+        if "压力挑战年" in themes or "变动调整期" in themes:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="本年变动较多，保持稳健节奏，重要决策前多方咨询",
+                estimated_minutes=30,
+                priority="high",
+            ))
+
+        if not prescriptions:
+            prescriptions.append(Prescription(
+                task_id=str(uuid.uuid4()),
+                content="稳步推进年度目标，保持积极心态",
+                estimated_minutes=30,
+                priority="medium",
+            ))
+
+        return prescriptions[:3]
+
+    # =========================================================================
+    # Helper Methods - KB Search
+    # =========================================================================
+
+    def _search_kb_for_ganzhi(self, ganzhi: str, relation_name: str) -> List[Dict[str, Any]]:
+        """检索知识库"""
+        try:
+            query = f"{ganzhi} {relation_name} 运势"
+            hits = kb_service.search_bazi_kb(query, top_k=3)
+            return [{"kb_ref": h["kb_ref"], "preview": h["preview"]} for h in hits]
+        except Exception as e:
+            logger.warning(f"kb search failed: {e}")
+            return []
+
+    # =========================================================================
+    # Helper Methods - Caching
+    # =========================================================================
+
+    def _get_cached_yunshi(
+        self,
+        user_id: int,
+        snapshot_type: str,
+        snapshot_date: date,
+        facts_hash: str,
+    ) -> Optional[DailyYunshi]:
+        """获取缓存的运势快照"""
+        row = fortune_db.fetch_one(
+            """
+            SELECT analysis, highlights, risks, prescriptions, summary, score,
+                   day_ganzhi, period_ganzhi, time_windows, rule_ids, kb_refs
+            FROM fortune_yunshi_snapshot
+            WHERE user_id = %s
+              AND snapshot_type = %s
+              AND snapshot_date = %s
+              AND bazi_facts_hash = %s
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user_id, snapshot_type, snapshot_date, facts_hash),
+        )
+
+        if not row:
+            return None
+
+        try:
+            analysis = row.get("analysis", {})
+            if snapshot_type == "daily":
+                return DailyYunshi(
+                    date=snapshot_date,
+                    day_ganzhi=row.get("day_ganzhi", ""),
+                    day_gan_relation=analysis.get("day_gan_relation", ""),
+                    day_zhi_specials=analysis.get("day_zhi_specials", []),
+                    score=row.get("score", 0),
+                    summary=row.get("summary", ""),
+                    highlights=row.get("highlights", []),
+                    risks=row.get("risks", []),
+                    prescriptions=[
+                        Prescription(**p) for p in (row.get("prescriptions") or [])
+                    ],
+                    time_windows=[
+                        TimeWindow(**t) for t in (row.get("time_windows") or [])
+                    ],
+                    evidence={
+                        "rule_ids": row.get("rule_ids", []),
+                        "kb_refs": row.get("kb_refs", []),
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"failed to parse cached yunshi: {e}")
+            return None
+
+        return None
+
+    def _cache_yunshi(
+        self,
+        user_id: int,
+        snapshot_type: str,
+        snapshot_date: date,
+        facts_hash: str,
+        yunshi: DailyYunshi | AnnualYunshi,
+    ) -> None:
+        """缓存运势快照"""
+        try:
+            # Determine expiration
+            if snapshot_type == "daily":
+                expires_at = datetime.combine(snapshot_date + timedelta(days=1), datetime.min.time())
+            elif snapshot_type == "annual":
+                expires_at = datetime.combine(date(snapshot_date.year + 1, 1, 1), datetime.min.time())
+            else:
+                expires_at = None
+
+            yunshi_dict = yunshi.to_dict()
+
+            # Prepare prescriptions and time_windows for JSONB
+            prescriptions_json = json.dumps(yunshi_dict.get("prescriptions", []), ensure_ascii=False)
+            highlights_json = json.dumps(yunshi_dict.get("highlights", []), ensure_ascii=False)
+            risks_json = json.dumps(yunshi_dict.get("risks", []), ensure_ascii=False)
+            time_windows_json = json.dumps(yunshi_dict.get("time_windows", []), ensure_ascii=False)
+            analysis_json = json.dumps({
+                "day_gan_relation": yunshi_dict.get("day_gan_relation", ""),
+                "day_zhi_specials": yunshi_dict.get("day_zhi_specials", []),
+            }, ensure_ascii=False)
+            kb_refs_json = json.dumps(yunshi_dict.get("evidence", {}).get("kb_refs", []), ensure_ascii=False)
+            rule_ids = yunshi_dict.get("evidence", {}).get("rule_ids", [])
+
+            fortune_db.execute(
+                """
+                INSERT INTO fortune_yunshi_snapshot (
+                    user_id, snapshot_type, snapshot_date, bazi_facts_hash,
+                    day_ganzhi, summary, score, analysis,
+                    highlights, risks, prescriptions, time_windows,
+                    rule_ids, kb_refs, compute_version, expires_at
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s::jsonb,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s, %s::jsonb, %s, %s
+                )
+                ON CONFLICT (user_id, snapshot_type, snapshot_date, bazi_facts_hash)
+                DO UPDATE SET
+                    summary = EXCLUDED.summary,
+                    score = EXCLUDED.score,
+                    analysis = EXCLUDED.analysis,
+                    highlights = EXCLUDED.highlights,
+                    risks = EXCLUDED.risks,
+                    prescriptions = EXCLUDED.prescriptions,
+                    time_windows = EXCLUDED.time_windows
+                """,
+                (
+                    user_id, snapshot_type, snapshot_date, facts_hash,
+                    yunshi_dict.get("day_ganzhi", ""),
+                    yunshi_dict.get("summary", ""),
+                    yunshi_dict.get("score", 0),
+                    analysis_json,
+                    highlights_json,
+                    risks_json,
+                    prescriptions_json,
+                    time_windows_json,
+                    rule_ids,
+                    kb_refs_json,
+                    YUNSHI_COMPUTE_VERSION,
+                    expires_at,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"failed to cache yunshi: {e}")
+
+
+# =============================================================================
+# A2UI Builder
+# =============================================================================
+
+def build_daily_yunshi_a2ui(yunshi: DailyYunshi) -> Dict[str, Any]:
+    """构建今日运势 A2UI"""
+    # Score to stars
+    if yunshi.score >= 7:
+        stars = "★★★★★"
+    elif yunshi.score >= 4:
+        stars = "★★★★☆"
+    elif yunshi.score >= 1:
+        stars = "★★★☆☆"
+    elif yunshi.score >= -2:
+        stars = "★★☆☆☆"
+    else:
+        stars = "★☆☆☆☆"
+
+    # Build markdown content
+    md_parts = [
+        f"### {yunshi.date.isoformat()} · {yunshi.day_ganzhi} · {yunshi.day_gan_relation}",
+        "",
+        f"**综合评分：{stars} ({yunshi.score}/10)**",
+        "",
+    ]
+
+    if yunshi.highlights:
+        md_parts.append("#### 亮点")
+        for h in yunshi.highlights:
+            md_parts.append(f"- ✓ {h}")
+        md_parts.append("")
+
+    if yunshi.risks:
+        md_parts.append("#### 注意")
+        for r in yunshi.risks:
+            md_parts.append(f"- ! {r}")
+        md_parts.append("")
+
+    if yunshi.time_windows:
+        md_parts.append("#### 时辰提示")
+        for tw in yunshi.time_windows:
+            md_parts.append(f"- 🕐 {tw.hour_range}：{tw.suggestion}")
+
+    markdown_text = "\n".join(md_parts)
+
+    # Build action buttons
+    action_buttons = []
+    for p in yunshi.prescriptions[:2]:
+        action_buttons.append({
+            "label": p.content[:20] + ("..." if len(p.content) > 20 else ""),
+            "action": {
+                "type": "start_task",
+                "task_id": p.task_id,
+            },
+        })
+
+    action_buttons.append({
+        "label": "查看详细分析",
+        "action": {
+            "type": "open_panel",
+            "panel": "yunshi_detail",
+        },
+    })
+
+    return {
+        "meta": {
+            "summary": yunshi.summary,
+        },
+        "ui_components": [
+            {
+                "type": "markdown_text",
+                "title": "今日运势",
+                "data": markdown_text,
+            },
+            {
+                "type": "action_buttons",
+                "title": "今日行动",
+                "data": action_buttons,
+            },
+        ],
+    }
+
+
+def build_annual_yunshi_a2ui(yunshi: AnnualYunshi) -> Dict[str, Any]:
+    """构建流年运势 A2UI"""
+    md_parts = [
+        f"### {yunshi.year}年 · {yunshi.liu_nian_ganzhi}",
+        "",
+        f"**大运：{yunshi.da_yun_ganzhi}**" if yunshi.da_yun_ganzhi else "",
+        "",
+        f"**综合评分：{yunshi.score}/10**",
+        "",
+        "#### 年度主题",
+    ]
+
+    for theme in yunshi.themes:
+        md_parts.append(f"- {theme}")
+
+    md_parts.append("")
+
+    if yunshi.key_months:
+        md_parts.append("#### 关键月份")
+        for km in yunshi.key_months:
+            md_parts.append(f"- {km['month']}月（{km['name']}）：{km['theme']}")
+
+    markdown_text = "\n".join(md_parts)
+
+    return {
+        "meta": {
+            "summary": yunshi.summary,
+        },
+        "ui_components": [
+            {
+                "type": "markdown_text",
+                "title": "流年运势",
+                "data": markdown_text,
+            },
+        ],
+    }
+
+
+# =============================================================================
+# Module-level instance
+# =============================================================================
+
+yunshi_service = YunshiService()

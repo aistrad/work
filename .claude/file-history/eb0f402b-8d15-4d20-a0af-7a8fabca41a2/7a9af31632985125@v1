@@ -1,0 +1,387 @@
+"""
+Ingestion Worker - Background document processing
+
+Uses PostgreSQL SKIP LOCKED for task queue (replaces Celery)
+- Claim pending documents
+- Convert to Markdown (or use existing .converted.md)
+- Save converted Markdown to file
+- Chunk intelligently
+- Generate embeddings
+- Store in database
+"""
+import asyncio
+import logging
+import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Optional
+
+project_root = Path(__file__).resolve().parents[3]
+api_path = project_root / "apps" / "api"
+if str(api_path) not in sys.path:
+    sys.path.insert(0, str(api_path))
+
+from dotenv import load_dotenv
+load_dotenv(project_root / ".env")
+
+from stores.db import get_connection
+from services.knowledge.embedding import EmbeddingService
+from services.knowledge.term_service import TermService
+from workers.converters import DocumentConverter
+from workers.chunker import SmartChunker
+
+logger = logging.getLogger(__name__)
+
+# Worker configuration
+WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
+POLL_INTERVAL = 5  # seconds between polls when idle
+BATCH_SIZE = 10    # max embeddings per batch
+LOCK_TIMEOUT = 30  # minutes before lock expires
+
+# Converted file settings
+CONVERTED_SUFFIX = ".converted.md"
+CONVERTED_DIR = "converted"
+SOURCE_DIR = "source"
+
+# Standard knowledge base directory (use environment variable)
+KNOWLEDGE_BASE_DIR = os.getenv("VIBELIFE_KNOWLEDGE_ROOT", "/data/vibelife/knowledge")
+
+
+class IngestionWorker:
+    """
+    Background worker for document ingestion
+
+    Uses PostgreSQL's SKIP LOCKED pattern for distributed task queue
+    """
+
+    def __init__(
+        self,
+        worker_id: Optional[str] = None,
+        poll_interval: int = POLL_INTERVAL,
+    ):
+        self.worker_id = worker_id or WORKER_ID
+        self.poll_interval = poll_interval
+        self.converter = DocumentConverter()
+        self.chunker = SmartChunker()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        """Start the worker loop"""
+        if self._running:
+            logger.warning(f"Worker {self.worker_id} already running")
+            return
+
+        self._running = True
+        logger.info(f"Starting ingestion worker: {self.worker_id}")
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self):
+        """Stop the worker gracefully"""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info(f"Worker {self.worker_id} stopped")
+
+    async def _run_loop(self):
+        """Main worker loop"""
+        while self._running:
+            try:
+                # Try to claim a document
+                doc = await self._claim_document()
+
+                if doc:
+                    await self._process_document(doc)
+                else:
+                    # No work available, sleep
+                    await asyncio.sleep(self.poll_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}", exc_info=True)
+                await asyncio.sleep(self.poll_interval)
+
+    async def _claim_document(self) -> Optional[dict]:
+        """Claim a pending document using SKIP LOCKED"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM claim_pending_document($1, $2)",
+                self.worker_id,
+                LOCK_TIMEOUT
+            )
+            if row:
+                return dict(row)
+            return None
+
+    async def _process_document(self, doc: dict):
+        """Process a single document"""
+        doc_id = doc["id"]
+        file_path = doc["file_path"]
+        skill_id = doc["skill_id"]
+        use_converted = doc.get("use_converted", False)
+        converted_path = doc.get("converted_path")
+
+        logger.info(f"Processing: {doc['filename']} (skill: {skill_id})")
+
+        try:
+            # Step 1: Get Markdown content
+            md_content = None
+
+            # Check if we should use existing .converted.md file
+            if use_converted and converted_path and os.path.exists(converted_path):
+                logger.info(f"Using existing converted file: {converted_path}")
+                with open(converted_path, "r", encoding="utf-8") as f:
+                    md_content = f.read()
+            else:
+                # Convert from source file
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"File not found: {file_path}")
+
+                md_content = self.converter.convert(file_path)
+                logger.debug(f"Converted to {len(md_content)} chars of Markdown")
+
+                # Save converted content to .converted.md file
+                converted_file_path = self._get_converted_path(file_path)
+                if converted_file_path:
+                    self._save_converted_file(md_content, converted_file_path)
+                    converted_path = str(converted_file_path)
+
+            # Step 2: Chunk
+            chunks = self.chunker.chunk(md_content)
+            logger.debug(f"Split into {len(chunks)} chunks")
+
+            if not chunks:
+                logger.warning(f"No chunks generated for {doc['filename']}")
+                await self._complete_document(doc_id, 0, md_content, converted_path)
+                return
+
+            # Step 3: Generate embeddings in batches
+            chunk_data = []
+            for chunk in chunks:
+                # Preprocess for search
+                search_text = self.chunker.preprocess_for_search(chunk.content)
+
+                chunk_data.append({
+                    "content": chunk.content,
+                    "search_text_preprocessed": search_text,
+                    "section_path": chunk.section_path,
+                    "section_title": chunk.section_title,
+                    "has_table": chunk.has_table,
+                    "has_list": chunk.has_list,
+                    "char_count": chunk.char_count,
+                    "chunk_index": chunk.chunk_index,
+                })
+
+            # Generate embeddings
+            contents = [c["content"] for c in chunk_data]
+            embeddings = await self._batch_embed(contents)
+
+            for i, embedding in enumerate(embeddings):
+                chunk_data[i]["embedding"] = embedding
+
+            # Step 4: Store in database
+            await self._store_chunks(doc_id, skill_id, chunk_data)
+
+            # Step 5: Mark complete (LLM-based term extraction removed - should be done in Claude Code)
+            await self._complete_document(doc_id, len(chunks), md_content, converted_path)
+            logger.info(f"Completed: {doc['filename']} ({len(chunks)} chunks)")
+
+        except Exception as e:
+            logger.error(f"Failed to process {doc['filename']}: {e}", exc_info=True)
+            await self._fail_document(doc_id, str(e))
+
+    def _get_converted_path(self, source_path: str) -> Optional[Path]:
+        """
+        Get the path for the .converted.md file.
+
+        Returns:
+            Path to the converted file, or None if cannot determine
+        """
+        source = Path(source_path)
+
+        # If file is already in converted directory, return as-is
+        if source.parent.name == CONVERTED_DIR:
+            # Already a converted file, just ensure correct suffix
+            if source.name.endswith(CONVERTED_SUFFIX):
+                return source
+            return source.parent / f"{source.stem}{CONVERTED_SUFFIX}"
+
+        # Find the skill folder (parent of 'source' directory)
+        if source.parent.name == SOURCE_DIR:
+            skill_folder = source.parent.parent
+            converted_dir = skill_folder / CONVERTED_DIR
+            converted_dir.mkdir(exist_ok=True)
+            return converted_dir / f"{source.stem}{CONVERTED_SUFFIX}"
+
+        # Fallback: create converted dir next to source file
+        converted_dir = source.parent / CONVERTED_DIR
+        converted_dir.mkdir(exist_ok=True)
+        return converted_dir / f"{source.stem}{CONVERTED_SUFFIX}"
+
+    def _save_converted_file(self, content: str, path: Path):
+        """Save converted Markdown content to file"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info(f"Saved converted file: {path}")
+        except Exception as e:
+            logger.warning(f"Failed to save converted file {path}: {e}")
+
+    async def _batch_embed(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings in batches"""
+        embeddings = []
+
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i:i + BATCH_SIZE]
+            batch_embeddings = await EmbeddingService.embed_batch(batch)
+            embeddings.extend(batch_embeddings)
+
+        return embeddings
+
+    async def _store_chunks(
+        self,
+        doc_id: uuid.UUID,
+        skill_id: str,
+        chunks: list[dict]
+    ):
+        """Store chunks in database"""
+        async with get_connection() as conn:
+            # Delete any existing chunks for this document
+            await conn.execute(
+                "DELETE FROM knowledge_chunks WHERE document_id = $1",
+                doc_id
+            )
+
+            # Insert new chunks
+            import json
+            for chunk in chunks:
+                # Convert embedding list to vector string format for pgvector
+                embedding_str = "[" + ",".join(map(str, chunk["embedding"])) + "]"
+                await conn.execute(
+                    """
+                    INSERT INTO knowledge_chunks (
+                        document_id, skill_id, chunk_index, content,
+                        section_path, section_title,
+                        has_table, has_list, char_count,
+                        search_text_preprocessed, embedding,
+                        metadata
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12::jsonb)
+                    """,
+                    doc_id,
+                    skill_id,
+                    chunk["chunk_index"],
+                    chunk["content"],
+                    chunk["section_path"],
+                    chunk["section_title"],
+                    chunk["has_table"],
+                    chunk["has_list"],
+                    chunk["char_count"],
+                    chunk["search_text_preprocessed"],
+                    embedding_str,
+                    json.dumps({})  # metadata as JSON string
+                )
+
+    async def _complete_document(
+        self,
+        doc_id: uuid.UUID,
+        chunk_count: int,
+        md_content: Optional[str] = None,
+        converted_path: Optional[str] = None
+    ):
+        """Mark document as completed"""
+        async with get_connection() as conn:
+            await conn.execute(
+                "SELECT complete_document($1, $2, $3, $4)",
+                doc_id,
+                chunk_count,
+                md_content,
+                converted_path
+            )
+
+    async def _fail_document(self, doc_id: uuid.UUID, error_msg: str):
+        """Mark document as failed"""
+        async with get_connection() as conn:
+            await conn.execute(
+                "SELECT fail_document($1, $2)",
+                doc_id,
+                error_msg[:1000]  # Truncate long errors
+            )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Manual Processing (for CLI/scripts)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def process_file(
+        self,
+        file_path: str,
+        skill_id: str,
+    ) -> dict:
+        """
+        Process a single file directly (bypassing queue)
+
+        Returns:
+            dict with document_id and chunk_count
+        """
+        import hashlib
+        from pathlib import Path
+
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Calculate file hash
+        with open(file_path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+
+        file_type = self.converter.get_file_type(file_path)
+        if not file_type:
+            raise ValueError(f"Unsupported file type: {path.suffix}")
+
+        # Upsert document
+        async with get_connection() as conn:
+            doc_id = await conn.fetchval(
+                "SELECT upsert_document($1, $2, $3, $4, $5, $6)",
+                skill_id,
+                path.name,
+                str(path.absolute()),
+                file_hash,
+                file_type,
+                path.stat().st_size
+            )
+
+        # Process immediately
+        doc = {
+            "id": doc_id,
+            "filename": path.name,
+            "file_path": str(path.absolute()),
+            "skill_id": skill_id,
+            "file_type": file_type,
+        }
+
+        await self._process_document(doc)
+
+        # Get final chunk count
+        async with get_connection() as conn:
+            chunk_count = await conn.fetchval(
+                "SELECT chunk_count FROM knowledge_documents WHERE id = $1",
+                doc_id
+            )
+
+        return {
+            "document_id": str(doc_id),
+            "chunk_count": chunk_count,
+        }
+
+    async def get_stats(self) -> list[dict]:
+        """Get processing statistics"""
+        async with get_connection() as conn:
+            rows = await conn.fetch("SELECT * FROM knowledge_stats")
+            return [dict(row) for row in rows]

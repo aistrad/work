@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+import random
+
+from stores import mentis_db
+from services.emotion_engine import EmotionResult
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# 规格定义: 干预策略库
+INTERVENTION_STRATEGIES = {
+    "breathing": {
+        "title": "呼吸调节",
+        "title_en": "3-minute breathing",
+        "description": "深呼吸练习：吸气4秒，屏息4秒，呼气6秒。重复3次。",
+        "duration_minutes": 3,
+        "momentum_reward": 1,
+        "triggers": {"anger", "anxiety", "fear"},
+        "energy_threshold": None,
+    },
+    "grounding": {
+        "title": "5-4-3-2-1 接地",
+        "title_en": "5-4-3-2-1 Grounding",
+        "description": "环顾四周：找到5个能看到的、4个能触摸的、3个能听到的、2个能闻到的、1个能尝到的事物。",
+        "duration_minutes": 5,
+        "momentum_reward": 2,
+        "triggers": {"anxiety", "fear"},
+        "energy_threshold": None,
+    },
+    "hydration": {
+        "title": "喝杯水",
+        "title_en": "Drink water",
+        "description": "起身倒一杯水，慢慢喝下。保持身体水分对情绪稳定很重要。",
+        "duration_minutes": 2,
+        "momentum_reward": 1,
+        "triggers": set(),
+        "energy_threshold": 40,  # energy < 40 时触发
+    },
+    "movement": {
+        "title": "起身活动",
+        "title_en": "Quick stretch",
+        "description": "站起来伸展身体，转动脖子和肩膀，原地踏步30秒。",
+        "duration_minutes": 3,
+        "momentum_reward": 1,
+        "triggers": set(),
+        "energy_threshold": 35,
+    },
+    "reflection": {
+        "title": "情绪记录",
+        "title_en": "Emotion journaling",
+        "description": "写下刚才发生了什么，你的感受是什么，这种感受的根源可能是什么。",
+        "duration_minutes": 5,
+        "momentum_reward": 2,
+        "triggers": {"anger", "sadness"},
+        "energy_threshold": None,
+    },
+    "gratitude": {
+        "title": "感恩练习",
+        "title_en": "Gratitude moment",
+        "description": "想一件今天值得感恩的小事，哪怕只是一杯好喝的咖啡或一个温暖的阳光。",
+        "duration_minutes": 2,
+        "momentum_reward": 1,
+        "triggers": {"sadness"},
+        "energy_threshold": None,
+    },
+    "mindfulness": {
+        "title": "正念观察",
+        "title_en": "Mindful pause",
+        "description": "闭上眼睛，专注于当下的呼吸和身体感受，观察而不评判。",
+        "duration_minutes": 3,
+        "momentum_reward": 1,
+        "triggers": {"anxiety", "anger"},
+        "energy_threshold": None,
+    },
+    "reframe": {
+        "title": "视角转换",
+        "title_en": "Perspective shift",
+        "description": "问自己：这件事一年后还会重要吗？有没有另一种看待这件事的方式？",
+        "duration_minutes": 3,
+        "momentum_reward": 2,
+        "triggers": {"anger", "frustration"},
+        "energy_threshold": None,
+    },
+}
+
+# 情绪-干预优先级映射
+EMOTION_INTERVENTION_PRIORITY = {
+    "anger": ["breathing", "reflection", "reframe", "mindfulness"],
+    "anxiety": ["grounding", "breathing", "mindfulness"],
+    "fear": ["grounding", "breathing"],
+    "sadness": ["gratitude", "reflection", "movement"],
+    "disgust": ["breathing", "reframe"],
+}
+
+# 能量等级干预映射
+ENERGY_INTERVENTIONS = [
+    (30, ["movement", "hydration"]),  # energy < 30
+    (40, ["hydration", "movement"]),  # energy < 40
+    (50, ["mindfulness"]),            # energy < 50
+]
+
+
+def get_recent_interventions(user_id: str, hours: int = 24) -> List[str]:
+    """获取用户最近的干预类型，避免重复推荐"""
+    cutoff = _now() - timedelta(hours=hours)
+    rows = mentis_db.fetch_all(
+        """
+        SELECT DISTINCT type
+        FROM action_task
+        WHERE user_id = %s
+          AND created_at > %s
+          AND source = 'agent'
+        """,
+        (user_id, cutoff),
+    )
+    return [r["type"] for r in rows] if rows else []
+
+
+def get_user_preferences(user_id: str) -> Dict[str, Any]:
+    """获取用户偏好（用于个性化推荐）"""
+    row = mentis_db.fetch_one(
+        """
+        SELECT preferences
+        FROM user_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    if row and row.get("preferences"):
+        return row["preferences"]
+    return {}
+
+
+def select_intervention(
+    *,
+    emotion: EmotionResult,
+    energy_score: int,
+    recent_interventions: List[str],
+    preferences: Dict[str, Any],
+) -> Optional[str]:
+    """
+    智能选择干预策略
+
+    规格要求:
+    1. 基于情绪类型选择合适干预
+    2. 考虑能量水平
+    3. 避免最近已推荐的干预
+    4. 考虑用户偏好
+    """
+    candidates: List[str] = []
+
+    # 1. 基于情绪类型获取候选干预
+    if emotion.primary in EMOTION_INTERVENTION_PRIORITY:
+        candidates.extend(EMOTION_INTERVENTION_PRIORITY[emotion.primary])
+
+    # 2. 基于二级情绪补充候选
+    for secondary in emotion.secondary:
+        if secondary in EMOTION_INTERVENTION_PRIORITY:
+            for intervention in EMOTION_INTERVENTION_PRIORITY[secondary]:
+                if intervention not in candidates:
+                    candidates.append(intervention)
+
+    # 3. 基于能量水平补充候选
+    for threshold, interventions in ENERGY_INTERVENTIONS:
+        if energy_score < threshold:
+            for intervention in interventions:
+                if intervention not in candidates:
+                    candidates.append(intervention)
+            break
+
+    # 4. 如果没有候选，使用默认干预
+    if not candidates:
+        # 高强度情绪时提供默认干预
+        if emotion.intensity >= 7:
+            candidates = ["breathing", "mindfulness"]
+        else:
+            return None
+
+    # 5. 过滤最近已推荐的干预
+    available = [c for c in candidates if c not in recent_interventions]
+    if not available:
+        available = candidates  # 如果全部用过，重置
+
+    # 6. 考虑用户偏好
+    preferred = preferences.get("preferred_interventions", [])
+    disliked = preferences.get("disliked_interventions", [])
+
+    # 过滤不喜欢的
+    available = [c for c in available if c not in disliked]
+    if not available:
+        available = candidates
+
+    # 优先选择喜欢的
+    for pref in preferred:
+        if pref in available:
+            return pref
+
+    # 7. 随机选择一个
+    return random.choice(available) if available else None
+
+
+def create_action_task(
+    *,
+    user_id: str,
+    task_type: str,
+    title: str,
+    description: str,
+    momentum_reward: int = 1,
+    expires_minutes: int = 30,
+) -> Dict[str, Any]:
+    """创建行动任务"""
+    expires_at = _now() + timedelta(minutes=expires_minutes)
+    row = mentis_db.execute_returning_one(
+        """
+        INSERT INTO action_task (user_id, type, title, description, status, expires_at, momentum_reward, source)
+        VALUES (%s, %s, %s, %s, 'pending', %s, %s, 'agent')
+        RETURNING id, type, title, description, momentum_reward, expires_at
+        """,
+        (user_id, task_type, title, description, expires_at, momentum_reward),
+    )
+    return dict(row or {})
+
+
+def evaluate_intervention(
+    *,
+    user_id: str,
+    emotion: EmotionResult,
+    energy_score: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    评估并创建干预
+
+    规格要求:
+    1. 情绪强度 >= 6 或 能量 < 40 时触发干预
+    2. 选择合适的干预策略
+    3. 创建 action_task 记录
+    4. 返回干预卡片数据
+    """
+    # 判断是否需要干预
+    needs_intervention = (
+        emotion.intensity >= 6 or
+        energy_score < 40 or
+        emotion.primary in {"anger", "anxiety", "fear", "sadness"}
+    )
+
+    if not needs_intervention:
+        return None
+
+    # 获取上下文
+    recent = get_recent_interventions(user_id, hours=6)
+    preferences = get_user_preferences(user_id)
+
+    # 选择干预策略
+    intervention_type = select_intervention(
+        emotion=emotion,
+        energy_score=energy_score,
+        recent_interventions=recent,
+        preferences=preferences,
+    )
+
+    if not intervention_type:
+        return None
+
+    # 获取干预配置
+    strategy = INTERVENTION_STRATEGIES.get(intervention_type)
+    if not strategy:
+        return None
+
+    # 创建任务
+    task = create_action_task(
+        user_id=user_id,
+        task_type=intervention_type,
+        title=strategy["title"],
+        description=strategy["description"],
+        momentum_reward=strategy["momentum_reward"],
+        expires_minutes=strategy["duration_minutes"] + 30,
+    )
+
+    if not task:
+        return None
+
+    # 返回干预卡片数据
+    return {
+        "id": task.get("id"),
+        "type": intervention_type,
+        "title": strategy["title"],
+        "title_en": strategy["title_en"],
+        "description": strategy["description"],
+        "duration_minutes": strategy["duration_minutes"],
+        "momentum_reward": strategy["momentum_reward"],
+        "expires_at": task.get("expires_at"),
+    }
+
+
+def complete_intervention(*, task_id: str, user_id: str) -> Dict[str, Any]:
+    """完成干预任务"""
+    row = mentis_db.fetch_one(
+        """
+        UPDATE action_task
+        SET status = 'done',
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s AND user_id = %s AND status = 'pending'
+        RETURNING id, type, momentum_reward
+        """,
+        (task_id, user_id),
+    )
+
+    if not row:
+        return {"success": False, "error": "task_not_found_or_already_done"}
+
+    # 更新用户动量
+    mentis_db.execute(
+        """
+        UPDATE user_state
+        SET momentum = momentum + %s,
+            updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (row["momentum_reward"], user_id),
+    )
+
+    return {
+        "success": True,
+        "task_id": row["id"],
+        "type": row["type"],
+        "momentum_earned": row["momentum_reward"],
+    }
+
+
+def skip_intervention(*, task_id: str, user_id: str) -> Dict[str, Any]:
+    """跳过干预任务"""
+    row = mentis_db.execute_returning_one(
+        """
+        UPDATE action_task
+        SET status = 'skipped',
+            updated_at = NOW()
+        WHERE id = %s AND user_id = %s AND status = 'pending'
+        RETURNING id, type
+        """,
+        (task_id, user_id),
+    )
+
+    if not row:
+        return {"success": False, "error": "task_not_found_or_already_done"}
+
+    return {
+        "success": True,
+        "task_id": row["id"],
+        "type": row["type"],
+    }

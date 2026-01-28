@@ -1,0 +1,336 @@
+"""
+VibeLife Reminder Scheduler
+提醒调度器 - 扫描即将到来的事件，生成提醒任务
+"""
+
+from datetime import date, datetime, timedelta
+from typing import Optional
+from enum import Enum
+from pydantic import BaseModel
+import asyncpg
+import json
+import logging
+
+from .calendar import FortuneCalendar, EventType, FortuneEvent
+
+logger = logging.getLogger(__name__)
+
+
+class ReminderType(str, Enum):
+    BAZI_MONTH = "bazi_month"           # 八字月运交接
+    BAZI_YEAR = "bazi_year"             # 八字流年交接
+    MERCURY_RETROGRADE = "mercury_retrograde"  # 水逆
+    NEW_MOON = "new_moon"               # 新月
+    FULL_MOON = "full_moon"             # 满月
+    WEEKLY_FORTUNE = "weekly_fortune"   # 周运
+    BIRTHDAY = "birthday"               # 生日
+
+
+class ReminderTask(BaseModel):
+    """提醒任务"""
+    user_id: str
+    reminder_type: ReminderType
+    event_id: Optional[str] = None
+    event_name: str
+    event_date: date
+    scheduled_at: datetime
+    content: Optional[str] = None
+
+
+class ReminderSettings(BaseModel):
+    """用户提醒设置"""
+    user_id: str
+    bazi_month_enabled: bool = True
+    bazi_month_advance_days: int = 2
+    bazi_year_enabled: bool = True
+    bazi_year_advance_days: int = 5
+    mercury_retrograde_enabled: bool = True
+    mercury_retrograde_advance_days: int = 3
+    weekly_fortune_enabled: bool = False
+    weekly_fortune_time: str = "20:00"
+    quiet_start_time: str = "22:00"
+    quiet_end_time: str = "08:00"
+    in_app_enabled: bool = True
+    push_enabled: bool = True
+    wechat_enabled: bool = False
+
+
+class ReminderScheduler:
+    """提醒调度器"""
+
+    def __init__(self, db_pool: asyncpg.Pool):
+        self.db = db_pool
+        self.calendar = FortuneCalendar(db_pool)
+
+    async def get_user_settings(self, user_id: str) -> ReminderSettings:
+        """获取用户提醒设置"""
+        row = await self.db.fetchrow("""
+            SELECT * FROM reminder_settings WHERE user_id = $1
+        """, user_id)
+
+        if row:
+            return ReminderSettings(
+                user_id=user_id,
+                bazi_month_enabled=row["bazi_month_enabled"],
+                bazi_month_advance_days=row["bazi_month_advance_days"],
+                bazi_year_enabled=row["bazi_year_enabled"],
+                bazi_year_advance_days=row["bazi_year_advance_days"],
+                mercury_retrograde_enabled=row["mercury_retrograde_enabled"],
+                mercury_retrograde_advance_days=row["mercury_retrograde_advance_days"],
+                weekly_fortune_enabled=row["weekly_fortune_enabled"],
+                weekly_fortune_time=row["weekly_fortune_time"],
+                quiet_start_time=row["quiet_start_time"],
+                quiet_end_time=row["quiet_end_time"],
+                in_app_enabled=row["in_app_enabled"],
+                push_enabled=row["push_enabled"],
+                wechat_enabled=row["wechat_enabled"]
+            )
+
+        # 返回默认设置
+        return ReminderSettings(user_id=user_id)
+
+    async def update_user_settings(self, settings: ReminderSettings) -> bool:
+        """更新用户提醒设置"""
+        await self.db.execute("""
+            INSERT INTO reminder_settings (
+                id, user_id,
+                bazi_month_enabled, bazi_month_advance_days,
+                bazi_year_enabled, bazi_year_advance_days,
+                mercury_retrograde_enabled, mercury_retrograde_advance_days,
+                weekly_fortune_enabled, weekly_fortune_time,
+                quiet_start_time, quiet_end_time,
+                in_app_enabled, push_enabled, wechat_enabled
+            ) VALUES (
+                uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+            )
+            ON CONFLICT (user_id) DO UPDATE SET
+                bazi_month_enabled = EXCLUDED.bazi_month_enabled,
+                bazi_month_advance_days = EXCLUDED.bazi_month_advance_days,
+                bazi_year_enabled = EXCLUDED.bazi_year_enabled,
+                bazi_year_advance_days = EXCLUDED.bazi_year_advance_days,
+                mercury_retrograde_enabled = EXCLUDED.mercury_retrograde_enabled,
+                mercury_retrograde_advance_days = EXCLUDED.mercury_retrograde_advance_days,
+                weekly_fortune_enabled = EXCLUDED.weekly_fortune_enabled,
+                weekly_fortune_time = EXCLUDED.weekly_fortune_time,
+                quiet_start_time = EXCLUDED.quiet_start_time,
+                quiet_end_time = EXCLUDED.quiet_end_time,
+                in_app_enabled = EXCLUDED.in_app_enabled,
+                push_enabled = EXCLUDED.push_enabled,
+                wechat_enabled = EXCLUDED.wechat_enabled
+        """,
+            settings.user_id,
+            settings.bazi_month_enabled, settings.bazi_month_advance_days,
+            settings.bazi_year_enabled, settings.bazi_year_advance_days,
+            settings.mercury_retrograde_enabled, settings.mercury_retrograde_advance_days,
+            settings.weekly_fortune_enabled, settings.weekly_fortune_time,
+            settings.quiet_start_time, settings.quiet_end_time,
+            settings.in_app_enabled, settings.push_enabled, settings.wechat_enabled
+        )
+        return True
+
+    async def scan_and_schedule(self) -> list[ReminderTask]:
+        """
+        每日扫描任务 - 检查即将到来的事件并为用户生成提醒
+        通常由 Cron Job 触发
+        """
+        tasks = []
+        today = date.today()
+
+        # 获取所有需要发送提醒的用户
+        users = await self.db.fetch("""
+            SELECT DISTINCT u.id, u.vibe_id, r.*
+            FROM vibe_users u
+            LEFT JOIN reminder_settings r ON u.id::text = r.user_id
+            WHERE u.status = 'active'
+        """)
+
+        for user in users:
+            user_id = str(user["id"])
+            settings = await self.get_user_settings(user_id)
+
+            # 检查八字月运交接
+            if settings.bazi_month_enabled:
+                bazi_tasks = await self._check_bazi_month_events(
+                    user_id, today, settings.bazi_month_advance_days
+                )
+                tasks.extend(bazi_tasks)
+
+            # 检查水逆
+            if settings.mercury_retrograde_enabled:
+                retro_tasks = await self._check_mercury_retrograde(
+                    user_id, today, settings.mercury_retrograde_advance_days
+                )
+                tasks.extend(retro_tasks)
+
+            # 检查新月满月 (默认提前1天)
+            moon_tasks = await self._check_moon_phases(user_id, today, 1)
+            tasks.extend(moon_tasks)
+
+        logger.info(f"Scheduled {len(tasks)} reminder tasks for {len(users)} users")
+        return tasks
+
+    async def _check_bazi_month_events(
+        self,
+        user_id: str,
+        today: date,
+        advance_days: int
+    ) -> list[ReminderTask]:
+        """检查八字月运交接事件"""
+        tasks = []
+        target_date = today + timedelta(days=advance_days)
+
+        events = await self.calendar.get_events_for_date(target_date)
+        for event in events:
+            if event.event_type == EventType.BAZI_MONTH:
+                # 检查是否已发送过该提醒
+                if not await self._reminder_already_sent(user_id, event.id, ReminderType.BAZI_MONTH):
+                    tasks.append(ReminderTask(
+                        user_id=user_id,
+                        reminder_type=ReminderType.BAZI_MONTH,
+                        event_id=event.id,
+                        event_name=event.name,
+                        event_date=event.start_date,
+                        scheduled_at=datetime.now()
+                    ))
+
+        return tasks
+
+    async def _check_mercury_retrograde(
+        self,
+        user_id: str,
+        today: date,
+        advance_days: int
+    ) -> list[ReminderTask]:
+        """检查水逆事件"""
+        tasks = []
+        target_date = today + timedelta(days=advance_days)
+
+        events = await self.calendar.get_events_for_date(target_date)
+        for event in events:
+            if event.event_type == EventType.MERCURY_RETROGRADE:
+                if not await self._reminder_already_sent(user_id, event.id, ReminderType.MERCURY_RETROGRADE):
+                    tasks.append(ReminderTask(
+                        user_id=user_id,
+                        reminder_type=ReminderType.MERCURY_RETROGRADE,
+                        event_id=event.id,
+                        event_name=event.name,
+                        event_date=event.start_date,
+                        scheduled_at=datetime.now()
+                    ))
+
+        return tasks
+
+    async def _check_moon_phases(
+        self,
+        user_id: str,
+        today: date,
+        advance_days: int
+    ) -> list[ReminderTask]:
+        """检查月相事件"""
+        tasks = []
+        target_date = today + timedelta(days=advance_days)
+
+        events = await self.calendar.get_events_for_date(target_date)
+        for event in events:
+            if event.event_type in (EventType.NEW_MOON, EventType.FULL_MOON):
+                reminder_type = (
+                    ReminderType.NEW_MOON
+                    if event.event_type == EventType.NEW_MOON
+                    else ReminderType.FULL_MOON
+                )
+                if not await self._reminder_already_sent(user_id, event.id, reminder_type):
+                    tasks.append(ReminderTask(
+                        user_id=user_id,
+                        reminder_type=reminder_type,
+                        event_id=event.id,
+                        event_name=event.name,
+                        event_date=event.start_date,
+                        scheduled_at=datetime.now()
+                    ))
+
+        return tasks
+
+    async def _reminder_already_sent(
+        self,
+        user_id: str,
+        event_id: str,
+        reminder_type: ReminderType
+    ) -> bool:
+        """检查提醒是否已发送"""
+        result = await self.db.fetchrow("""
+            SELECT 1 FROM user_notifications
+            WHERE user_id = $1::uuid
+              AND notification_type = $2
+              AND content LIKE $3
+        """, user_id, reminder_type.value, f"%{event_id}%")
+
+        return result is not None
+
+    async def get_pending_reminders_for_user(
+        self,
+        user_id: str,
+        days_ahead: int = 7
+    ) -> list[ReminderTask]:
+        """获取用户未来几天的待发送提醒"""
+        settings = await self.get_user_settings(user_id)
+        today = date.today()
+        tasks = []
+
+        # 获取未来事件
+        events = await self.calendar.get_upcoming_events(days_ahead)
+
+        for event in events:
+            reminder_type = self._event_to_reminder_type(event.event_type)
+            if reminder_type and self._is_reminder_enabled(settings, reminder_type):
+                advance_days = self._get_advance_days(settings, reminder_type)
+                trigger_date = event.start_date - timedelta(days=advance_days)
+
+                if trigger_date >= today:
+                    tasks.append(ReminderTask(
+                        user_id=user_id,
+                        reminder_type=reminder_type,
+                        event_id=event.id,
+                        event_name=event.name,
+                        event_date=event.start_date,
+                        scheduled_at=datetime.combine(trigger_date, datetime.min.time())
+                    ))
+
+        return sorted(tasks, key=lambda t: t.scheduled_at)
+
+    def _event_to_reminder_type(self, event_type: EventType) -> Optional[ReminderType]:
+        """事件类型转换为提醒类型"""
+        mapping = {
+            EventType.BAZI_MONTH: ReminderType.BAZI_MONTH,
+            EventType.BAZI_YEAR: ReminderType.BAZI_YEAR,
+            EventType.MERCURY_RETROGRADE: ReminderType.MERCURY_RETROGRADE,
+            EventType.NEW_MOON: ReminderType.NEW_MOON,
+            EventType.FULL_MOON: ReminderType.FULL_MOON,
+        }
+        return mapping.get(event_type)
+
+    def _is_reminder_enabled(
+        self,
+        settings: ReminderSettings,
+        reminder_type: ReminderType
+    ) -> bool:
+        """检查提醒类型是否启用"""
+        mapping = {
+            ReminderType.BAZI_MONTH: settings.bazi_month_enabled,
+            ReminderType.BAZI_YEAR: settings.bazi_year_enabled,
+            ReminderType.MERCURY_RETROGRADE: settings.mercury_retrograde_enabled,
+            ReminderType.WEEKLY_FORTUNE: settings.weekly_fortune_enabled,
+        }
+        return mapping.get(reminder_type, True)
+
+    def _get_advance_days(
+        self,
+        settings: ReminderSettings,
+        reminder_type: ReminderType
+    ) -> int:
+        """获取提前提醒天数"""
+        mapping = {
+            ReminderType.BAZI_MONTH: settings.bazi_month_advance_days,
+            ReminderType.BAZI_YEAR: settings.bazi_year_advance_days,
+            ReminderType.MERCURY_RETROGRADE: settings.mercury_retrograde_advance_days,
+        }
+        return mapping.get(reminder_type, 1)

@@ -1,0 +1,348 @@
+"""
+模型配置加载器
+
+从 YAML 配置文件加载模型定义、提供商配置和路由规则。
+支持环境变量替换和自动同步。
+"""
+
+import os
+import re
+import yaml
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 已同步的环境变量（用于清理）
+_synced_env_vars: set = set()
+
+# 配置文件路径
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "models.yaml"
+
+
+@dataclass
+class ProviderConfig:
+    """提供商配置"""
+    name: str
+    base_url: str
+    api_key_env: str
+    enabled: bool = True
+    backup_urls: List[str] = field(default_factory=list)
+    backup_key_env: Optional[str] = None
+    backup_url: Optional[str] = None
+
+    def get_api_key(self) -> Optional[str]:
+        """获取 API Key"""
+        return os.getenv(self.api_key_env)
+
+    def get_backup_key(self) -> Optional[str]:
+        """获取备用 API Key"""
+        if self.backup_key_env:
+            return os.getenv(self.backup_key_env)
+        return self.get_api_key()
+
+
+@dataclass
+class ModelDefinition:
+    """模型定义"""
+    id: str
+    provider: str
+    model_name: str
+    capabilities: List[str]
+    tier: str = "standard"
+    description: str = ""
+
+
+@dataclass
+class DefaultRoute:
+    """默认路由配置"""
+    primary: str
+    fallback: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FallbackConfig:
+    """Fallback 配置"""
+    on_api_error: bool = True
+    on_quota_exceeded: bool = True
+    timeout: int = 30
+    max_retries: int = 2
+
+
+@dataclass
+class ModelConfig:
+    """完整的模型配置"""
+    providers: Dict[str, ProviderConfig]
+    models: Dict[str, ModelDefinition]
+    defaults: Dict[str, DefaultRoute]
+    global_fallback: str
+    fallback_config: FallbackConfig
+    tier_overrides: Dict[str, Dict[str, DefaultRoute]] = field(default_factory=dict)
+
+    def get_model(self, model_id: str) -> Optional[ModelDefinition]:
+        """获取模型定义"""
+        return self.models.get(model_id)
+
+    def get_provider(self, provider_id: str) -> Optional[ProviderConfig]:
+        """获取提供商配置"""
+        return self.providers.get(provider_id)
+
+    def get_default_route(self, capability: str, user_tier: Optional[str] = None) -> DefaultRoute:
+        """获取默认路由，支持用户层级覆盖"""
+        # 检查用户层级覆盖
+        if user_tier and user_tier in self.tier_overrides:
+            tier_routes = self.tier_overrides[user_tier]
+            if capability in tier_routes:
+                return tier_routes[capability]
+
+        # 返回默认路由
+        if capability in self.defaults:
+            return self.defaults[capability]
+
+        # 兜底：返回 chat 路由
+        return self.defaults.get("chat", DefaultRoute(primary=self.global_fallback, fallback=[]))
+
+    def get_fallback_chain(self, capability: str, user_tier: Optional[str] = None) -> List[str]:
+        """获取完整的 fallback 链（包括 primary）"""
+        route = self.get_default_route(capability, user_tier)
+        chain = [route.primary] + route.fallback
+
+        # 确保 global_fallback 在链中
+        if self.global_fallback not in chain:
+            chain.append(self.global_fallback)
+
+        return chain
+
+
+# 全局配置实例
+_config: Optional[ModelConfig] = None
+
+
+def _substitute_env_vars(value: Any) -> Any:
+    """递归替换环境变量"""
+    if isinstance(value, str):
+        # 匹配 ${VAR_NAME:default_value} 或 ${VAR_NAME}
+        pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
+
+        def replacer(match):
+            var_name = match.group(1)
+            default_value = match.group(2) if match.group(2) is not None else ""
+            return os.getenv(var_name, default_value)
+
+        return re.sub(pattern, replacer, value)
+    elif isinstance(value, dict):
+        return {k: _substitute_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_substitute_env_vars(item) for item in value]
+    return value
+
+
+def sync_env_vars_from_mapping(env_mapping: Dict[str, str]) -> None:
+    """
+    根据 env_mapping 同步环境变量
+
+    将实际存在的环境变量值复制到配置期望的变量名。
+    例如: GLM_API_KEY: ZAI_GLM_KEY 表示将 ZAI_GLM_KEY 的值设置到 GLM_API_KEY
+
+    Args:
+        env_mapping: 映射字典 {期望变量名: 实际变量名}
+    """
+    global _synced_env_vars
+
+    # 清理之前同步的环境变量
+    for var in _synced_env_vars:
+        if var in os.environ:
+            del os.environ[var]
+            logger.debug(f"清理环境变量: {var}")
+    _synced_env_vars.clear()
+
+    # 同步新的环境变量
+    for target_var, source_var in env_mapping.items():
+        source_value = os.getenv(source_var)
+        if source_value:
+            os.environ[target_var] = source_value
+            _synced_env_vars.add(target_var)
+            logger.debug(f"同步环境变量: {target_var} <- {source_var}")
+        else:
+            logger.debug(f"跳过环境变量同步: {source_var} 未设置")
+
+
+def load_model_config(config_path: Optional[str] = None, force_reload: bool = False) -> ModelConfig:
+    """
+    加载模型配置
+
+    Args:
+        config_path: 配置文件路径，默认为 config/models.yaml
+        force_reload: 是否强制重新加载
+
+    Returns:
+        ModelConfig 实例
+    """
+    global _config
+
+    if _config is not None and not force_reload:
+        return _config
+
+    path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+
+    if not path.exists():
+        logger.warning(f"配置文件不存在: {path}，使用默认配置")
+        _config = _get_default_config()
+        return _config
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw_config = yaml.safe_load(f)
+
+        # 先同步环境变量映射（在替换之前）
+        env_mapping = raw_config.get("env_mapping", {})
+        if env_mapping:
+            sync_env_vars_from_mapping(env_mapping)
+            logger.info(f"已同步 {len(env_mapping)} 个环境变量映射")
+
+        # 替换环境变量
+        config_data = _substitute_env_vars(raw_config)
+
+        # 解析 providers
+        providers = {}
+        for pid, pdata in config_data.get("providers", {}).items():
+            providers[pid] = ProviderConfig(
+                name=pdata.get("name", pid),
+                base_url=pdata.get("base_url", ""),
+                api_key_env=pdata.get("api_key_env", f"{pid.upper()}_API_KEY"),
+                enabled=pdata.get("enabled", True),
+                backup_urls=pdata.get("backup_urls", []),
+                backup_key_env=pdata.get("backup_key_env"),
+                backup_url=pdata.get("backup_url"),
+            )
+
+        # 解析 models
+        models = {}
+        for mid, mdata in config_data.get("models", {}).items():
+            models[mid] = ModelDefinition(
+                id=mid,
+                provider=mdata.get("provider", ""),
+                model_name=mdata.get("model_name", mid),
+                capabilities=mdata.get("capabilities", ["chat"]),
+                tier=mdata.get("tier", "standard"),
+                description=mdata.get("description", ""),
+            )
+
+        # 解析 defaults
+        defaults = {}
+        for cap, route_data in config_data.get("defaults", {}).items():
+            defaults[cap] = DefaultRoute(
+                primary=route_data.get("primary", ""),
+                fallback=route_data.get("fallback", []),
+            )
+
+        # 解析 fallback_triggers
+        fb_data = config_data.get("fallback_triggers", {})
+        fallback_config = FallbackConfig(
+            on_api_error=fb_data.get("on_api_error", True),
+            on_quota_exceeded=fb_data.get("on_quota_exceeded", True),
+            timeout=fb_data.get("timeout", 30),
+            max_retries=fb_data.get("max_retries", 2),
+        )
+
+        # 解析 tier_overrides
+        tier_overrides = {}
+        for tier, tier_routes in config_data.get("tier_overrides", {}).items():
+            tier_overrides[tier] = {}
+            for cap, route_data in tier_routes.items():
+                tier_overrides[tier][cap] = DefaultRoute(
+                    primary=route_data.get("primary", ""),
+                    fallback=route_data.get("fallback", []),
+                )
+
+        _config = ModelConfig(
+            providers=providers,
+            models=models,
+            defaults=defaults,
+            global_fallback=config_data.get("global_fallback"),  # 从 models.yaml 读取，不硬编码默认值
+            fallback_config=fallback_config,
+            tier_overrides=tier_overrides,
+        )
+
+        logger.info(f"已加载模型配置: {len(providers)} 个提供商, {len(models)} 个模型")
+        return _config
+
+    except Exception as e:
+        logger.error(f"加载配置文件失败: {e}")
+        _config = _get_default_config()
+        return _config
+
+
+def _get_default_config() -> ModelConfig:
+    """
+    获取默认配置（当配置文件不存在时使用）
+
+    注意: 这些值应与 config/models.yaml 保持一致
+    models.yaml 是唯一配置源，此处仅作为极端情况的兜底
+    """
+    # 统一顺序: deepseek → glm → opus
+    return ModelConfig(
+        providers={
+            "deepseek": ProviderConfig(
+                name="DeepSeek V3",
+                base_url="https://api.deepseek.com/anthropic",
+                api_key_env="DEEPSEEK_API_KEY",
+            ),
+            "glm": ProviderConfig(
+                name="智谱 GLM",
+                base_url="https://open.bigmodel.cn/api/anthropic/v1",
+                api_key_env="GLM_API_KEY",
+            ),
+            "claude": ProviderConfig(
+                name="Anthropic Claude",
+                base_url="https://uapi.chat",
+                api_key_env="CLAUDE_API_KEY",
+            ),
+            "gemini": ProviderConfig(
+                name="Google Gemini",
+                base_url="https://new.12ai.org/v1",
+                api_key_env="GEMINI_API_KEY",
+            ),
+        },
+        models={
+            "deepseek-v3": ModelDefinition(
+                id="deepseek-v3",
+                provider="deepseek",
+                model_name="deepseek-chat",
+                capabilities=["chat", "analysis", "tools"],
+            ),
+            "glm-4.7": ModelDefinition(
+                id="glm-4.7",
+                provider="glm",
+                model_name="glm-4.7",
+                capabilities=["chat", "analysis", "tools"],
+            ),
+            "claude-opus": ModelDefinition(
+                id="claude-opus",
+                provider="claude",
+                model_name="claude-opus-4-5-20251101",
+                capabilities=["chat", "analysis", "tools"],
+            ),
+        },
+        defaults={
+            "chat": DefaultRoute(primary="deepseek-v3", fallback=["glm-4.7", "claude-opus"]),
+            "tools": DefaultRoute(primary="deepseek-v3", fallback=["glm-4.7", "claude-opus"]),
+        },
+        global_fallback="glm-4.7",
+        fallback_config=FallbackConfig(),
+    )
+
+
+def get_model_config() -> ModelConfig:
+    """获取当前配置（懒加载）"""
+    global _config
+    if _config is None:
+        return load_model_config()
+    return _config
+
+
+def reload_config() -> ModelConfig:
+    """重新加载配置"""
+    return load_model_config(force_reload=True)

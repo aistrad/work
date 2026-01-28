@@ -1,0 +1,484 @@
+     1→"""
+     2→VibeLife Subscription Service
+     3→订阅管理服务 - 支持双轨制 (payment-design v2.0)
+     4→"""
+     5→
+     6→from datetime import datetime, timedelta
+     7→from typing import Optional
+     8→from pydantic import BaseModel
+     9→from enum import Enum
+    10→import asyncpg
+    11→import json
+    12→import logging
+    13→
+    14→from .stripe_service import StripeService
+    15→
+    16→logger = logging.getLogger(__name__)
+    17→
+    18→
+    19→class SubscriptionTier(str, Enum):
+    20→    FREE = "free"
+    21→    PAID = "paid"
+    22→
+    23→
+    24→class SubscriptionStatus(str, Enum):
+    25→    ACTIVE = "active"
+    26→    TRIALING = "trialing"
+    27→    PAST_DUE = "past_due"
+    28→    CANCELED = "canceled"
+    29→    EXPIRED = "expired"
+    30→    SUSPENDED = "suspended"
+    31→
+    32→
+    33→class VipType(str, Enum):
+    34→    """双轨制类型"""
+    35→    PREPAID = "prepaid"      # 预付（大陆/香港）
+    36→    SUBSCRIPTION = "subscription"  # 订阅（海外）
+    37→
+    38→
+    39→class SubscriptionPlan(BaseModel):
+    40→    """订阅计划"""
+    41→    id: str
+    42→    name: str
+    43→    plan_type: SubscriptionTier
+    44→    skill_ids: list[str]
+    45→    price_monthly: int  # 分
+    46→    price_yearly: int   # 分
+    47→    currency: str = "CNY"
+    48→    features: list[str]
+    49→    is_active: bool = True
+    50→
+    51→
+    52→class UserSubscription(BaseModel):
+    53→    """用户订阅"""
+    54→    id: str
+    55→    user_id: str
+    56→    plan_id: str
+    57→    status: SubscriptionStatus
+    58→    started_at: datetime
+    59→    current_period_end: Optional[datetime] = None
+    60→    cancelled_at: Optional[datetime] = None
+    61→    payment_provider: str = "stripe"
+    62→    payment_subscription_id: Optional[str] = None
+    63→    # 双轨制字段
+    64→    vip_type: VipType = VipType.SUBSCRIPTION
+    65→    region: str = "GLOBAL"
+    66→    stripe_customer_id: Optional[str] = None
+    67→    payment_failed_count: int = 0
+    68→
+    69→
+    70→# 预定义订阅计划 - 两档制
+    71→SUBSCRIPTION_PLANS = [
+    72→    SubscriptionPlan(
+    73→        id="free",
+    74→        name="免费版",
+    75→        plan_type=SubscriptionTier.FREE,
+    76→        skill_ids=[],
+    77→        price_monthly=0,
+    78→        price_yearly=0,
+    79→        features=["每天3次对话", "基础功能"]
+    80→    ),
+    81→    SubscriptionPlan(
+    82→        id="paid",
+    83→        name="付费会员",
+    84→        plan_type=SubscriptionTier.PAID,
+    85→        skill_ids=["bazi", "zodiac", "mbti"],
+    86→        price_monthly=2990,  # ¥29.9
+    87→        price_yearly=29900,  # ¥299
+    88→        features=["每天30次对话", "所有功能"]
+    89→    ),
+    90→]
+    91→
+    92→
+    93→class SubscriptionService:
+    94→    """订阅管理服务"""
+    95→
+    96→    def __init__(self, db_pool: asyncpg.Pool, stripe: StripeService = None):
+    97→        self.db = db_pool
+    98→        self.stripe = stripe or StripeService()
+    99→
+   100→    async def get_all_plans(self) -> list[SubscriptionPlan]:
+   101→        """获取所有订阅计划"""
+   102→        return SUBSCRIPTION_PLANS
+   103→
+   104→    async def get_plan(self, plan_id: str) -> Optional[SubscriptionPlan]:
+   105→        """获取指定订阅计划"""
+   106→        for plan in SUBSCRIPTION_PLANS:
+   107→            if plan.id == plan_id:
+   108→                return plan
+   109→        return None
+   110→
+   111→    async def get_user_subscription(self, user_id: str) -> Optional[UserSubscription]:
+   112→        """获取用户当前订阅"""
+   113→        row = await self.db.fetchrow("""
+   114→            SELECT id, user_id::text, plan_id, status, started_at,
+   115→                   current_period_end, cancelled_at, payment_provider,
+   116→                   payment_subscription_id
+   117→            FROM user_subscriptions
+   118→            WHERE user_id = $1::uuid AND status IN ('active', 'trialing')
+   119→            ORDER BY created_at DESC
+   120→            LIMIT 1
+   121→        """, user_id)
+   122→
+   123→        if row:
+   124→            return UserSubscription(
+   125→                id=str(row["id"]),
+   126→                user_id=row["user_id"],
+   127→                plan_id=row["plan_id"],
+   128→                status=SubscriptionStatus(row["status"]),
+   129→                started_at=row["started_at"],
+   130→                current_period_end=row["current_period_end"],
+   131→                cancelled_at=row["cancelled_at"],
+   132→                payment_provider=row["payment_provider"] or "stripe",
+   133→                payment_subscription_id=row["payment_subscription_id"]
+   134→            )
+   135→        return None
+   136→
+   137→    async def get_user_subscription_history(
+   138→        self,
+   139→        user_id: str,
+   140→        limit: int = 10
+   141→    ) -> list[UserSubscription]:
+   142→        """获取用户订阅历史"""
+   143→        rows = await self.db.fetch("""
+   144→            SELECT id, user_id::text, plan_id, status, started_at,
+   145→                   current_period_end, cancelled_at, payment_provider,
+   146→                   payment_subscription_id
+   147→            FROM user_subscriptions
+   148→            WHERE user_id = $1::uuid
+   149→            ORDER BY started_at DESC
+   150→            LIMIT $2
+   151→        """, user_id, limit)
+   152→
+   153→        return [
+   154→            UserSubscription(
+   155→                id=str(row["id"]),
+   156→                user_id=row["user_id"],
+   157→                plan_id=row["plan_id"],
+   158→                status=SubscriptionStatus(row["status"]),
+   159→                started_at=row["started_at"],
+   160→                current_period_end=row["current_period_end"],
+   161→                cancelled_at=row["cancelled_at"],
+   162→                payment_provider=row["payment_provider"] or "stripe",
+   163→                payment_subscription_id=row["payment_subscription_id"]
+   164→            )
+   165→            for row in rows
+   166→        ]
+   167→
+   168→    async def create_subscription(
+   169→        self,
+   170→        user_id: str,
+   171→        plan_id: str,
+   172→        payment_subscription_id: str,
+   173→        current_period_end: datetime
+   174→    ) -> str:
+   175→        """创建订阅记录"""
+   176→        result = await self.db.fetchrow("""
+   177→            INSERT INTO user_subscriptions (
+   178→                id, user_id, plan_id, status, started_at,
+   179→                current_period_end, payment_provider, payment_subscription_id
+   180→            ) VALUES (
+   181→                uuid_generate_v4(), $1::uuid, $2, 'active', NOW(),
+   182→                $3, 'stripe', $4
+   183→            )
+   184→            RETURNING id
+   185→        """, user_id, plan_id, current_period_end, payment_subscription_id)
+   186→
+   187→        return str(result["id"])
+   188→
+   189→    async def update_subscription_status(
+   190→        self,
+   191→        payment_subscription_id: str,
+   192→        status: SubscriptionStatus,
+   193→        current_period_end: Optional[datetime] = None
+   194→    ) -> bool:
+   195→        """更新订阅状态"""
+   196→        if current_period_end:
+   197→            result = await self.db.execute("""
+   198→                UPDATE user_subscriptions
+   199→                SET status = $1, current_period_end = $2
+   200→                WHERE payment_subscription_id = $3
+   201→            """, status.value, current_period_end, payment_subscription_id)
+   202→        else:
+   203→            result = await self.db.execute("""
+   204→                UPDATE user_subscriptions
+   205→                SET status = $1
+   206→                WHERE payment_subscription_id = $2
+   207→            """, status.value, payment_subscription_id)
+   208→
+   209→        return "UPDATE" in result
+   210→
+   211→    async def cancel_subscription(self, user_id: str) -> bool:
+   212→        """取消用户订阅"""
+   213→        subscription = await self.get_user_subscription(user_id)
+   214→        if not subscription:
+   215→            return False
+   216→
+   217→        # 在 Stripe 取消
+   218→        if subscription.payment_subscription_id:
+   219→            success = await self.stripe.cancel_subscription(
+   220→                subscription.payment_subscription_id,
+   221→                cancel_immediately=False
+   222→            )
+   223→            if not success:
+   224→                return False
+   225→
+   226→        # 更新数据库
+   227→        await self.db.execute("""
+   228→            UPDATE user_subscriptions
+   229→            SET cancelled_at = NOW()
+   230→            WHERE id = $1::uuid
+   231→        """, subscription.id)
+   232→
+   233→        return True
+   234→
+   235→    async def check_feature_access(
+   236→        self,
+   237→        user_id: str,
+   238→        feature: str,
+   239→        skill_id: str = None
+   240→    ) -> bool:
+   241→        """检查用户是否有权访问某功能"""
+   242→        subscription = await self.get_user_subscription(user_id)
+   243→
+   244→        # 检查订阅是否有效
+   245→        if not subscription or subscription.status != SubscriptionStatus.ACTIVE:
+   246→            return self._check_free_tier_access(feature)
+   247→
+   248→        # 获取计划
+   249→        plan = await self.get_plan(subscription.plan_id)
+   250→        if not plan:
+   251→            return self._check_free_tier_access(feature)
+   252→
+   253→        # 付费用户可访问所有功能
+   254→        if plan.plan_type == SubscriptionTier.PAID:
+   255→            return True
+   256→
+   257→        return self._check_free_tier_access(feature)
+   258→
+   259→    def _check_free_tier_access(self, feature: str) -> bool:
+   260→        """检查免费层是否可访问"""
+   261→        free_features = [
+   262→            "basic_chat",
+   263→            "basic_chart",
+   264→            "daily_fortune",
+   265→        ]
+   266→        return feature in free_features
+   267→
+   268→    async def get_user_usage(self, user_id: str) -> dict:
+   269→        """获取用户使用量"""
+   270→        # 今日对话次数
+   271→        today_messages = await self.db.fetchval("""
+   272→            SELECT COUNT(*) FROM skill_messages sm
+   273→            JOIN skill_conversations sc ON sm.conversation_id = sc.id
+   274→            WHERE sc.user_id = $1::uuid
+   275→              AND sm.role = 'user'
+   276→              AND sm.created_at >= CURRENT_DATE
+   277→        """, user_id)
+   278→
+   279→        # 本月对话次数
+   280→        month_messages = await self.db.fetchval("""
+   281→            SELECT COUNT(*) FROM skill_messages sm
+   282→            JOIN skill_conversations sc ON sm.conversation_id = sc.id
+   283→            WHERE sc.user_id = $1::uuid
+   284→              AND sm.role = 'user'
+   285→              AND sm.created_at >= DATE_TRUNC('month', CURRENT_DATE)
+   286→        """, user_id)
+   287→
+   288→        return {
+   289→            "today_messages": today_messages or 0,
+   290→            "month_messages": month_messages or 0,
+   291→            "daily_limit": 3,  # 免费用户每日限制
+   292→            "remaining_today": max(0, 3 - (today_messages or 0))
+   293→        }
+   294→
+   295→    async def sync_stripe_subscription(self, payment_subscription_id: str):
+   296→        """同步 Stripe 订阅状态"""
+   297→        stripe_sub = await self.stripe.get_subscription(payment_subscription_id)
+   298→        if not stripe_sub:
+   299→            return
+   300→
+   301→        status_map = {
+   302→            "active": SubscriptionStatus.ACTIVE,
+   303→            "trialing": SubscriptionStatus.TRIALING,
+   304→            "past_due": SubscriptionStatus.PAST_DUE,
+   305→            "canceled": SubscriptionStatus.CANCELED,
+   306→            "unpaid": SubscriptionStatus.EXPIRED,
+   307→        }
+   308→
+   309→        status = status_map.get(stripe_sub["status"], SubscriptionStatus.EXPIRED)
+   310→        current_period_end = stripe_sub.get("current_period_end")
+   311→
+   312→        await self.update_subscription_status(
+   313→            payment_subscription_id,
+   314→            status,
+   315→            current_period_end
+   316→        )
+   317→
+   318→    # ═══════════════════════════════════════════════════════════════════════
+   319→    # 双轨制到期检查 (payment-design v2.0)
+   320→    # ═══════════════════════════════════════════════════════════════════════
+   321→
+   322→    async def check_expiring_subscriptions(self) -> dict:
+   323→        """
+   324→        检查即将到期的预付用户（定时任务调用）
+   325→        返回各时间段的用户数量
+   326→        """
+   327→        now = datetime.now()
+   328→        results = {"7d": 0, "3d": 0, "1d": 0, "expired": 0}
+   329→
+   330→        # 7天内到期
+   331→        rows_7d = await self.db.fetch("""
+   332→            SELECT id, user_id::text, expires_at
+   333→            FROM subscriptions
+   334→            WHERE vip_type = 'prepaid'
+   335→              AND status = 'active'
+   336→              AND expires_at <= $1
+   337→              AND expires_at > $2
+   338→        """, now + timedelta(days=7), now + timedelta(days=3))
+   339→        results["7d"] = len(rows_7d)
+   340→
+   341→        # 3天内到期
+   342→        rows_3d = await self.db.fetch("""
+   343→            SELECT id, user_id::text, expires_at
+   344→            FROM subscriptions
+   345→            WHERE vip_type = 'prepaid'
+   346→              AND status = 'active'
+   347→              AND expires_at <= $1
+   348→              AND expires_at > $2
+   349→        """, now + timedelta(days=3), now + timedelta(days=1))
+   350→        results["3d"] = len(rows_3d)
+   351→
+   352→        # 1天内到期
+   353→        rows_1d = await self.db.fetch("""
+   354→            SELECT id, user_id::text, expires_at
+   355→            FROM subscriptions
+   356→            WHERE vip_type = 'prepaid'
+   357→              AND status = 'active'
+   358→              AND expires_at <= $1
+   359→              AND expires_at > $2
+   360→        """, now + timedelta(days=1), now)
+   361→        results["1d"] = len(rows_1d)
+   362→
+   363→        logger.info(f"Expiring subscriptions: 7d={results['7d']}, 3d={results['3d']}, 1d={results['1d']}")
+   364→        return results
+   365→
+   366→    async def expire_overdue_subscriptions(self) -> int:
+   367→        """
+   368→        将已过期的订阅标记为 expired（定时任务调用）
+   369→        返回处理的数量
+   370→        """
+   371→        result = await self.db.execute("""
+   372→            UPDATE subscriptions
+   373→            SET status = 'expired', updated_at = NOW()
+   374→            WHERE vip_type = 'prepaid'
+   375→              AND status = 'active'
+   376→              AND expires_at <= NOW()
+   377→        """)
+   378→
+   379→        count = int(result.split()[-1]) if result else 0
+   380→        if count > 0:
+   381→            logger.info(f"Expired {count} overdue prepaid subscriptions")
+   382→        return count
+   383→
+   384→    async def create_prepaid_subscription(
+   385→        self,
+   386→        user_id: str,
+   387→        plan_code: str,
+   388→        service_days: int,
+   389→        payment_session_id: str,
+   390→        region: str = "CN"
+   391→    ) -> str:
+   392→        """创建预付订阅（大陆/香港用户）"""
+   393→        expires_at = datetime.now() + timedelta(days=service_days)
+   394→
+   395→        # 检查是否有现有活跃订阅，如果有则延长
+   396→        existing = await self.db.fetchrow("""
+   397→            SELECT id, expires_at FROM subscriptions
+   398→            WHERE user_id = $1::uuid AND status = 'active'
+   399→            ORDER BY expires_at DESC LIMIT 1
+   400→        """, user_id)
+   401→
+   402→        if existing and existing["expires_at"] > datetime.now():
+   403→            # 延长现有订阅
+   404→            new_expires = existing["expires_at"] + timedelta(days=service_days)
+   405→            await self.db.execute("""
+   406→                UPDATE subscriptions
+   407→                SET expires_at = $1, updated_at = NOW()
+   408→                WHERE id = $2
+   409→            """, new_expires, existing["id"])
+   410→            logger.info(f"Extended prepaid subscription for user {user_id} to {new_expires}")
+   411→            return str(existing["id"])
+   412→
+   413→        # 创建新订阅
+   414→        result = await self.db.fetchrow("""
+   415→            INSERT INTO subscriptions (
+   416→                id, user_id, plan_code, status, vip_type, region,
+   417→                started_at, expires_at, source
+   418→            ) VALUES (
+   419→                gen_random_uuid(), $1::uuid, $2, 'active', 'prepaid', $3,
+   420→                NOW(), $4, 'payment'
+   421→            )
+   422→            RETURNING id
+   423→        """, user_id, plan_code, region, expires_at)
+   424→
+   425→        logger.info(f"Created prepaid subscription for user {user_id}, expires {expires_at}")
+   426→        return str(result["id"])
+   427→
+   428→    async def create_stripe_subscription(
+   429→        self,
+   430→        user_id: str,
+   431→        plan_code: str,
+   432→        stripe_subscription_id: str,
+   433→        stripe_customer_id: str,
+   434→        current_period_end: datetime
+   435→    ) -> str:
+   436→        """创建 Stripe 订阅（海外用户）"""
+   437→        result = await self.db.fetchrow("""
+   438→            INSERT INTO subscriptions (
+   439→                id, user_id, plan_code, status, vip_type, region,
+   440→                started_at, expires_at, stripe_subscription_id, stripe_customer_id, source
+   441→            ) VALUES (
+   442→                gen_random_uuid(), $1::uuid, $2, 'active', 'subscription', 'GLOBAL',
+   443→                NOW(), $3, $4, $5, 'payment'
+   444→            )
+   445→            RETURNING id
+   446→        """, user_id, plan_code, current_period_end, stripe_subscription_id, stripe_customer_id)
+   447→
+   448→        logger.info(f"Created Stripe subscription for user {user_id}, sub_id={stripe_subscription_id}")
+   449→        return str(result["id"])
+   450→
+   451→    async def increment_payment_failed_count(self, stripe_subscription_id: str) -> int:
+   452→        """增加支付失败计数，返回新的计数"""
+   453→        result = await self.db.fetchrow("""
+   454→            UPDATE subscriptions
+   455→            SET payment_failed_count = payment_failed_count + 1, updated_at = NOW()
+   456→            WHERE stripe_subscription_id = $1
+   457→            RETURNING payment_failed_count
+   458→        """, stripe_subscription_id)
+   459→
+   460→        count = result["payment_failed_count"] if result else 0
+   461→
+   462→        # 如果失败次数 >= 3，暂停订阅
+   463→        if count >= 3:
+   464→            await self.db.execute("""
+   465→                UPDATE subscriptions
+   466→                SET status = 'suspended', updated_at = NOW()
+   467→                WHERE stripe_subscription_id = $1
+   468→            """, stripe_subscription_id)
+   469→            logger.warning(f"Suspended subscription {stripe_subscription_id} after {count} payment failures")
+   470→
+   471→        return count
+   472→
+   473→    async def reset_payment_failed_count(self, stripe_subscription_id: str):
+   474→        """重置支付失败计数（支付成功后调用）"""
+   475→        await self.db.execute("""
+   476→            UPDATE subscriptions
+   477→            SET payment_failed_count = 0, updated_at = NOW()
+   478→            WHERE stripe_subscription_id = $1
+   479→        """, stripe_subscription_id)
+   480→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

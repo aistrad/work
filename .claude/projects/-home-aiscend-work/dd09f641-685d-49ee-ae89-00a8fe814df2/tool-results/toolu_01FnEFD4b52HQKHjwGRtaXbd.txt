@@ -1,0 +1,1556 @@
+     1→# Fortune AI 八字报告与运势模块设计 v1
+     2→
+     3→**文档类型**：Module Design Specification
+     4→**版本**：v1.0
+     5→**日期**：2026-01-01
+     6→**模块定位**：跑通八字报告生成与运势分析的完整闭环
+     7→**工程边界**：对齐 `system_design_final_mvp.md`，前端对齐 `frontend_final_v1.md`
+     8→
+     9→---
+    10→
+    11→## 0. 设计目标与北极星
+    12→
+    13→### 0.1 核心目标
+    14→
+    15→在 Fortune AI 现有架构上，实现用户从「出生信息输入」到「八字报告生成」到「运势分析输出」到「行动处方」的完整闭环。
+    16→
+    17→```
+    18→用户输入出生信息 → 真太阳时八字计算 → 知识库检索 → 深度报告生成 → 今日/周/月运势 → 行动处方 → 用户闭环
+    19→```
+    20→
+    21→### 0.2 模块边界
+    22→
+    23→本模块聚焦以下功能：
+    24→
+    25→| 功能 | 描述 | 入口 |
+    26→|-----|------|-----|
+    27→| **八字排盘** | 基于真太阳时计算四柱、十神、神煞、大运流年 | 注册 / Profile 更新 |
+    28→| **八字报告** | 深度分析报告（异步生成，支持 `backend=cli\|gemini`） | 工具 Tab / Chat |
+    29→| **今日运势** | 基于八字 + 当日干支的每日指引 | Dashboard 概览 / Chat |
+    30→| **周/月运势** | 周期性运势分析与建议 | Dashboard 概览 / 探索 Tab |
+    31→| **流年运势** | 年度运势预测与关键节点提示 | 探索 Tab / 深度报告 |
+    32→
+    33→### 0.3 与现有系统的关系
+    34→
+    35→```
+    36→┌─────────────────────────────────────────────────────────────────────────────┐
+    37→│                        Fortune AI 系统架构                                    │
+    38→├─────────────────────────────────────────────────────────────────────────────┤
+    39→│                                                                              │
+    40→│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                   │
+    41→│  │   注册流程   │────▶│  八字计算    │────▶│  facts 存储  │                   │
+    42→│  │ /api/auth/  │     │ bazi_facts  │     │  snapshot   │                   │
+    43→│  └─────────────┘     └─────────────┘     └──────┬──────┘                   │
+    44→│                                                  │                          │
+    45→│                    ┌─────────────────────────────┴───────────────────────┐  │
+    46→│                    │                                                      │  │
+    47→│                    ▼                                                      │  │
+    48→│  ┌─────────────────────────────┐     ┌────────────────────────────────┐  │
+    49→│  │     八字报告模块（新增）       │     │       运势分析模块（新增）       │  │
+    50→│  │  • 深度报告生成               │     │  • 今日运势                     │  │
+    51→│  │  • CLI/Gemini Backend        │     │  • 周/月运势                    │  │
+    52→│  │  • A2UI 输出                 │     │  • 流年运势                     │  │
+    53→│  └───────────────┬─────────────┘     └──────────────┬─────────────────┘  │
+    54→│                  │                                   │                    │
+    55→│                  └───────────────┬───────────────────┘                    │
+    56→│                                  │                                        │
+    57→│                                  ▼                                        │
+    58→│  ┌───────────────────────────────────────────────────────────────────────┐│
+    59→│  │                          Chat Agent (GLM/Vercel)                              ││
+    60→│  │            facts + kb_refs + rule_ids → A2UI + Guidance Card           ││
+    61→│  └───────────────────────────────────────────────────────────────────────┘│
+    62→│                                  │                                        │
+    63→│                                  ▼                                        │
+    64→│  ┌───────────────────────────────────────────────────────────────────────┐│
+    65→│  │                    前端渲染（Zone A Chat + Zone B Dashboard）          ││
+    66→│  └───────────────────────────────────────────────────────────────────────┘│
+    67→└─────────────────────────────────────────────────────────────────────────────┘
+    68→```
+    69→
+    70→---
+    71→
+    72→## 1. 数据模型设计
+    73→
+    74→### 1.1 现有表复用
+    75→
+    76→| 表名 | 用途 | 本模块使用方式 |
+    77→|-----|------|--------------|
+    78→| `fortune_user` | 用户信息 | 读取出生信息（birthday_local, tz_offset_hours, location, gender） |
+    79→| `fortune_bazi_snapshot` | 八字事实快照 | 读取 facts JSON，作为分析基础 |
+    80→| `fortune_daily_guidance` | 每日指引 | 存储今日运势卡片 |
+    81→| `fortune_external_job` | 外部任务映射 | 跟踪报告生成任务状态 |
+    82→| `bazi_kb_chunk` | 知识库 | 检索八字解读依据 |
+    83→| `fortune_rule` | 规则库 | 存储运势计算规则 |
+    84→
+    85→### 1.2 新增表：运势快照
+    86→
+    87→```sql
+    88→-- 运势快照表（缓存计算结果，避免重复计算）
+    89→CREATE TABLE IF NOT EXISTS fortune_yunshi_snapshot (
+    90→    snapshot_id BIGSERIAL PRIMARY KEY,
+    91→    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+    92→    snapshot_type TEXT NOT NULL CHECK (snapshot_type IN ('daily', 'weekly', 'monthly', 'annual')),
+    93→    snapshot_date DATE NOT NULL,          -- 运势所属日期/周一/月一/年初
+    94→    bazi_facts_hash TEXT NOT NULL,        -- 关联的八字事实 hash（确保一致性）
+    95→
+    96→    -- 运势分析结果
+    97→    analysis JSONB NOT NULL,              -- 完整分析结果
+    98→    highlights JSONB NOT NULL DEFAULT '[]', -- 关键亮点（用于概览展示）
+    99→    risks JSONB NOT NULL DEFAULT '[]',    -- 风险提示
+   100→    prescriptions JSONB NOT NULL DEFAULT '[]', -- 行动处方（≤3 条）
+   101→
+   102→    -- 元数据
+   103→    compute_version TEXT NOT NULL,
+   104→    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+   105→    expires_at TIMESTAMPTZ,               -- 过期时间（daily 次日过期）
+   106→
+   107→    UNIQUE (user_id, snapshot_type, snapshot_date, bazi_facts_hash)
+   108→);
+   109→
+   110→CREATE INDEX IF NOT EXISTS idx_yunshi_user_type_date ON fortune_yunshi_snapshot
+   111→    (user_id, snapshot_type, snapshot_date DESC);
+   112→CREATE INDEX IF NOT EXISTS idx_yunshi_expires ON fortune_yunshi_snapshot
+   113→    (expires_at) WHERE expires_at IS NOT NULL;
+   114→```
+   115→
+   116→### 1.3 新增表：八字报告
+   117→
+   118→```sql
+   119→-- 八字深度报告表（独立于 fortune_external_job，存储报告内容）
+   120→CREATE TABLE IF NOT EXISTS fortune_bazi_report (
+   121→    report_id BIGSERIAL PRIMARY KEY,
+   122→    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+   123→    external_job_id BIGINT REFERENCES fortune_external_job(id) ON DELETE SET NULL,
+   124→
+   125→    -- 报告类型与配置
+   126→    report_type TEXT NOT NULL DEFAULT 'full' CHECK (report_type IN ('full', 'summary', 'career', 'relationship', 'health')),
+   127→    backend TEXT NOT NULL CHECK (backend IN ('cli', 'gemini', 'glm')),
+   128→    model TEXT,                           -- 使用的模型
+   129→    system_prompt TEXT,                   -- 使用的 system prompt
+   130→
+   131→    -- 输入快照
+   132→    bazi_facts_hash TEXT NOT NULL,
+   133→    input_context JSONB NOT NULL DEFAULT '{}',  -- 用户额外输入的上下文
+   134→
+   135→    -- 输出内容
+   136→    status TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'error')),
+   137→    output_markdown TEXT,                 -- Markdown 格式报告
+   138→    output_a2ui JSONB,                    -- A2UI 格式输出
+   139→    output_summary TEXT,                  -- 一句话摘要
+   140→
+   141→    -- 关键提取（便于检索与展示）
+   142→    key_findings JSONB DEFAULT '[]',      -- 核心发现
+   143→    prescriptions JSONB DEFAULT '[]',     -- 行动处方
+   144→
+   145→    -- 元数据
+   146→    error_message TEXT DEFAULT '',
+   147→    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+   148→    completed_at TIMESTAMPTZ,
+   149→
+   150→    -- 版本追溯
+   151→    compute_version TEXT NOT NULL
+   152→);
+   153→
+   154→CREATE INDEX IF NOT EXISTS idx_bazi_report_user_time ON fortune_bazi_report
+   155→    (user_id, created_at DESC);
+   156→CREATE INDEX IF NOT EXISTS idx_bazi_report_status ON fortune_bazi_report
+   157→    (status, created_at DESC);
+   158→```
+   159→
+   160→### 1.4 规则库扩展
+   161→
+   162→```sql
+   163→-- 运势计算规则
+   164→INSERT INTO fortune_rule (rule_id, category, name, body) VALUES
+   165→
+   166→-- 日干支与日主的关系规则
+   167→('RULE-DAILY-DAYGAN-V1', 'yunshi_daily', '日干与日主关系', '{
+   168→  "description": "当日天干与日主的五行生克关系",
+   169→  "relations": {
+   170→    "same": {"name": "比肩", "score": 0, "desc": "平稳，宜守成"},
+   171→    "generates": {"name": "印绶", "score": 2, "desc": "有助力，贵人运"},
+   172→    "generated": {"name": "食伤", "score": 1, "desc": "适合表达、创作"},
+   173→    "controls": {"name": "财星", "score": 1, "desc": "适合财务、事业推进"},
+   174→    "controlled": {"name": "官杀", "score": -1, "desc": "压力增大，宜谨慎"}
+   175→  }
+   176→}'::jsonb),
+   177→
+   178→-- 日支与日主的关系规则
+   179→('RULE-DAILY-DAYZHI-V1', 'yunshi_daily', '日支与日主关系', '{
+   180→  "description": "当日地支与日主的影响",
+   181→  "special_branches": {
+   182→    "taohua": "桃花日，人际与感情活跃",
+   183→    "yima": "驿马日，适合出行与变动",
+   184→    "huagai": "华盖日，适合学习与内省",
+   185→    "tianyi": "贵人日，易得助力"
+   186→  }
+   187→}'::jsonb),
+   188→
+   189→-- 流年运势规则
+   190→('RULE-LIUNIAN-INTERACTION-V1', 'yunshi_annual', '流年与八字作用', '{
+   191→  "description": "流年干支与原局的作用关系",
+   192→  "key_interactions": ["天克地冲", "天合地合", "伏吟", "反吟"],
+   193→  "scoring": {
+   194→    "天克地冲": {"score": -3, "desc": "动荡年份，需谨慎"},
+   195→    "天合地合": {"score": 2, "desc": "和谐年份，机遇多"},
+   196→    "伏吟": {"score": -1, "desc": "重复模式，易有压力"},
+   197→    "反吟": {"score": -2, "desc": "反复变化，不宜大动"}
+   198→  }
+   199→}'::jsonb)
+   200→
+   201→ON CONFLICT (rule_id) DO UPDATE SET
+   202→  category = EXCLUDED.category,
+   203→  name = EXCLUDED.name,
+   204→  body = EXCLUDED.body,
+   205→  updated_at = now();
+   206→```
+   207→
+   208→---
+   209→
+   210→## 2. 核心服务设计
+   211→
+   212→### 2.1 运势计算服务 (`services/yunshi_service.py`)
+   213→
+   214→```python
+   215→"""
+   216→运势计算服务
+   217→- 今日运势：基于八字 + 当日干支
+   218→- 周运势：基于本周关键日干支
+   219→- 月运势：基于月令与八字的作用
+   220→- 流年运势：基于流年干支与八字的作用
+   221→"""
+   222→
+   223→from __future__ import annotations
+   224→from dataclasses import dataclass
+   225→from datetime import date, datetime, timedelta
+   226→from typing import Any, Dict, List, Optional
+   227→from lunar_python import Lunar, Solar
+   228→
+   229→@dataclass
+   230→class DailyYunshi:
+   231→    """今日运势结果"""
+   232→    date: date
+   233→    day_ganzhi: str              # 当日干支
+   234→    day_gan_relation: str        # 日干与日主关系（比肩/印绶/食伤/财星/官杀）
+   235→    day_zhi_specials: List[str]  # 日支特殊标记（桃花/驿马等）
+   236→    score: int                   # 综合评分 (-10 ~ +10)
+   237→    highlights: List[str]        # 亮点（≤3 条）
+   238→    risks: List[str]             # 风险提示（≤2 条）
+   239→    prescriptions: List[Dict]    # 行动处方（≤3 条，含 task_id）
+   240→    time_windows: List[Dict]     # 时辰窗口（吉时/凶时）
+   241→    evidence: Dict               # 证据（rule_ids + kb_refs）
+   242→
+   243→@dataclass
+   244→class AnnualYunshi:
+   245→    """流年运势结果"""
+   246→    year: int
+   247→    liu_nian_ganzhi: str
+   248→    da_yun_ganzhi: str           # 当前大运
+   249→    key_interactions: List[str]  # 关键作用（天合/天冲等）
+   250→    score: int
+   251→    themes: List[str]            # 年度主题
+   252→    key_months: List[Dict]       # 关键月份提示
+   253→    prescriptions: List[Dict]
+   254→    evidence: Dict
+   255→
+   256→
+   257→class YunshiService:
+   258→    """运势计算服务"""
+   259→
+   260→    def __init__(self, db_conn, kb_service, rule_store):
+   261→        self.db = db_conn
+   262→        self.kb = kb_service
+   263→        self.rules = rule_store
+   264→
+   265→    def compute_daily_yunshi(
+   266→        self,
+   267→        user_id: int,
+   268→        target_date: Optional[date] = None,
+   269→    ) -> DailyYunshi:
+   270→        """
+   271→        计算今日运势
+   272→
+   273→        流程：
+   274→        1. 读取用户 bazi_snapshot (facts)
+   275→        2. 计算目标日期的干支
+   276→        3. 分析日干与日主的五行关系
+   277→        4. 分析日支的特殊标记（桃花/驿马等）
+   278→        5. 检索知识库获取解读依据
+   279→        6. 生成综合评分与行动处方
+   280→        """
+   281→        target_date = target_date or date.today()
+   282→
+   283→        # 1. 获取八字事实
+   284→        facts = self._get_user_facts(user_id)
+   285→        day_master = facts["bazi"]["day_master"]
+   286→        shensha = facts["bazi"]["shensha"]
+   287→
+   288→        # 2. 计算当日干支
+   289→        solar = Solar.fromDate(target_date)
+   290→        lunar = solar.getLunar()
+   291→        day_gan = lunar.getDayGan()
+   292→        day_zhi = lunar.getDayZhi()
+   293→        day_ganzhi = day_gan + day_zhi
+   294→
+   295→        # 3. 分析五行关系
+   296→        relation = self._compute_gan_relation(day_master["element"], day_gan)
+   297→
+   298→        # 4. 分析地支特殊标记
+   299→        specials = self._check_branch_specials(day_zhi, facts)
+   300→
+   301→        # 5. 检索知识库
+   302→        kb_refs = self.kb.search_by_ganzhi(day_ganzhi, limit=5)
+   303→
+   304→        # 6. 计算评分与生成处方
+   305→        score = self._compute_daily_score(relation, specials)
+   306→        prescriptions = self._generate_daily_prescriptions(
+   307→            relation=relation,
+   308→            specials=specials,
+   309→            score=score,
+   310→            user_id=user_id,
+   311→        )
+   312→
+   313→        return DailyYunshi(
+   314→            date=target_date,
+   315→            day_ganzhi=day_ganzhi,
+   316→            day_gan_relation=relation["name"],
+   317→            day_zhi_specials=specials,
+   318→            score=score,
+   319→            highlights=self._build_highlights(relation, specials),
+   320→            risks=self._build_risks(relation, specials),
+   321→            prescriptions=prescriptions,
+   322→            time_windows=self._compute_time_windows(day_ganzhi, day_master),
+   323→            evidence={
+   324→                "rule_ids": ["RULE-DAILY-DAYGAN-V1", "RULE-DAILY-DAYZHI-V1"],
+   325→                "kb_refs": kb_refs,
+   326→            },
+   327→        )
+   328→
+   329→    def compute_annual_yunshi(
+   330→        self,
+   331→        user_id: int,
+   332→        target_year: Optional[int] = None,
+   333→    ) -> AnnualYunshi:
+   334→        """
+   335→        计算流年运势
+   336→
+   337→        流程：
+   338→        1. 读取八字事实（含大运）
+   339→        2. 获取流年干支
+   340→        3. 分析流年与原局的作用
+   341→        4. 分析当前大运与流年的叠加
+   342→        5. 确定年度主题与关键月份
+   343→        6. 生成行动处方
+   344→        """
+   345→        target_year = target_year or datetime.now().year
+   346→
+   347→        facts = self._get_user_facts(user_id)
+   348→        luck = facts["bazi"]["luck"]
+   349→
+   350→        # 获取流年干支
+   351→        liu_nian_ganzhi = self._get_liunian_ganzhi(target_year)
+   352→
+   353→        # 获取当前大运
+   354→        da_yun = self._get_current_dayun(luck["da_yun"], target_year)
+   355→
+   356→        # 分析作用关系
+   357→        interactions = self._analyze_liunian_interactions(
+   358→            liu_nian_ganzhi=liu_nian_ganzhi,
+   359→            pillars=facts["bazi"]["pillars"],
+   360→            da_yun_ganzhi=da_yun["gan_zhi"] if da_yun else "",
+   361→        )
+   362→
+   363→        # 计算评分与主题
+   364→        score = self._compute_annual_score(interactions)
+   365→        themes = self._extract_annual_themes(interactions, facts)
+   366→
+   367→        return AnnualYunshi(
+   368→            year=target_year,
+   369→            liu_nian_ganzhi=liu_nian_ganzhi,
+   370→            da_yun_ganzhi=da_yun["gan_zhi"] if da_yun else "",
+   371→            key_interactions=interactions,
+   372→            score=score,
+   373→            themes=themes,
+   374→            key_months=self._identify_key_months(target_year, facts),
+   375→            prescriptions=self._generate_annual_prescriptions(themes, score),
+   376→            evidence={
+   377→                "rule_ids": ["RULE-LIUNIAN-INTERACTION-V1"],
+   378→                "kb_refs": [],
+   379→            },
+   380→        )
+   381→
+   382→    # === 辅助方法 ===
+   383→
+   384→    def _get_user_facts(self, user_id: int) -> Dict[str, Any]:
+   385→        """获取用户八字事实快照"""
+   386→        from services.bazi_facts import ensure_snapshot_for_user
+   387→        snapshot = ensure_snapshot_for_user(user_id)
+   388→        return snapshot["facts"]
+   389→
+   390→    def _compute_gan_relation(self, day_master_element: str, target_gan: str) -> Dict:
+   391→        """计算天干五行关系"""
+   392→        GAN_ELEMENT = {
+   393→            "甲": "木", "乙": "木", "丙": "火", "丁": "火",
+   394→            "戊": "土", "己": "土", "庚": "金", "辛": "金",
+   395→            "壬": "水", "癸": "水",
+   396→        }
+   397→        ELEMENT_REL = {
+   398→            "木": {"generator": "水", "produces": "火", "controls": "土", "controlled_by": "金"},
+   399→            "火": {"generator": "木", "produces": "土", "controls": "金", "controlled_by": "水"},
+   400→            "土": {"generator": "火", "produces": "金", "controls": "水", "controlled_by": "木"},
+   401→            "金": {"generator": "土", "produces": "水", "controls": "木", "controlled_by": "火"},
+   402→            "水": {"generator": "金", "produces": "木", "controls": "火", "controlled_by": "土"},
+   403→        }
+   404→
+   405→        target_element = GAN_ELEMENT.get(target_gan, "")
+   406→        if target_element == day_master_element:
+   407→            return {"name": "比肩", "score": 0, "desc": "平稳，宜守成"}
+   408→
+   409→        rel = ELEMENT_REL[day_master_element]
+   410→        if target_element == rel["generator"]:
+   411→            return {"name": "印绶", "score": 2, "desc": "有助力，贵人运"}
+   412→        if target_element == rel["produces"]:
+   413→            return {"name": "食伤", "score": 1, "desc": "适合表达、创作"}
+   414→        if target_element == rel["controls"]:
+   415→            return {"name": "财星", "score": 1, "desc": "适合财务、事业推进"}
+   416→        if target_element == rel["controlled_by"]:
+   417→            return {"name": "官杀", "score": -1, "desc": "压力增大，宜谨慎"}
+   418→
+   419→        return {"name": "未知", "score": 0, "desc": ""}
+   420→
+   421→    def _check_branch_specials(self, day_zhi: str, facts: Dict) -> List[str]:
+   422→        """检查地支特殊标记"""
+   423→        specials = []
+   424→        shensha = facts["bazi"].get("shensha", [])
+   425→
+   426→        for ss in shensha:
+   427→            # 检查当日地支是否命中神煞的触发条件
+   428→            # 这里需要根据神煞规则判断
+   429→            pass
+   430→
+   431→        return specials
+   432→
+   433→    def _compute_daily_score(self, relation: Dict, specials: List[str]) -> int:
+   434→        """计算每日综合评分"""
+   435→        score = relation.get("score", 0)
+   436→
+   437→        # 特殊标记加分
+   438→        if "贵人日" in specials:
+   439→            score += 2
+   440→        if "桃花日" in specials:
+   441→            score += 1
+   442→
+   443→        return max(-10, min(10, score))
+   444→
+   445→    def _generate_daily_prescriptions(
+   446→        self,
+   447→        relation: Dict,
+   448→        specials: List[str],
+   449→        score: int,
+   450→        user_id: int,
+   451→    ) -> List[Dict]:
+   452→        """生成每日行动处方"""
+   453→        prescriptions = []
+   454→
+   455→        if relation["name"] == "印绶":
+   456→            prescriptions.append({
+   457→                "content": "今日贵人运佳，可主动寻求帮助或建立新连接",
+   458→                "estimated_minutes": 15,
+   459→                "priority": "high",
+   460→            })
+   461→        elif relation["name"] == "官杀":
+   462→            prescriptions.append({
+   463→                "content": "今日压力较大，做 3 分钟正念呼吸再处理重要事务",
+   464→                "estimated_minutes": 3,
+   465→                "priority": "high",
+   466→            })
+   467→
+   468→        # 保证至少有一个处方
+   469→        if not prescriptions:
+   470→            prescriptions.append({
+   471→                "content": "回顾今日目标，完成最重要的一件事",
+   472→                "estimated_minutes": 5,
+   473→                "priority": "medium",
+   474→            })
+   475→
+   476→        return prescriptions[:3]  # 最多 3 条
+   477→```
+   478→
+   479→### 2.2 八字报告服务 (`services/bazi_report_service.py`)
+   480→
+   481→```python
+   482→"""
+   483→八字深度报告服务
+   484→- 支持 backend=cli|gemini|glm
+   485→- 异步生成，轮询状态
+   486→- 输出 Markdown + A2UI
+   487→"""
+   488→
+   489→from __future__ import annotations
+   490→from dataclasses import dataclass
+   491→from datetime import datetime
+   492→from typing import Any, Dict, Optional
+   493→from enum import Enum
+   494→
+   495→class ReportBackend(Enum):
+   496→    CLI = "cli"
+   497→    GEMINI = "gemini"
+   498→    GLM = "glm"
+   499→
+   500→class ReportType(Enum):
+   501→    FULL = "full"           # 完整八字报告
+   502→    SUMMARY = "summary"     # 摘要版
+   503→    CAREER = "career"       # 事业方向
+   504→    RELATIONSHIP = "relationship"  # 感情婚姻
+   505→    HEALTH = "health"       # 健康养生
+   506→
+   507→
+   508→@dataclass
+   509→class ReportRequest:
+   510→    user_id: int
+   511→    report_type: ReportType
+   512→    backend: ReportBackend
+   513→    model: Optional[str] = None
+   514→    system_prompt: Optional[str] = None
+   515→    extra_context: Optional[Dict] = None
+   516→
+   517→
+   518→@dataclass
+   519→class ReportResult:
+   520→    report_id: int
+   521→    status: str  # processing | completed | error
+   522→    output_markdown: Optional[str] = None
+   523→    output_a2ui: Optional[Dict] = None
+   524→    output_summary: Optional[str] = None
+   525→    key_findings: Optional[list] = None
+   526→    prescriptions: Optional[list] = None
+   527→    error_message: Optional[str] = None
+   528→    created_at: Optional[datetime] = None
+   529→    completed_at: Optional[datetime] = None
+   530→
+   531→
+   532→class BaziReportService:
+   533→    """八字深度报告服务"""
+   534→
+   535→    # 报告生成 System Prompt
+   536→    REPORT_SYSTEM_PROMPT = """你是 Fortune AI 的八字分析师，基于积极心理学与绩效教练框架，为用户提供建设性、可执行的八字分析报告。
+   537→
+   538→【产品定位】
+   539→人生导航 / 陪伴 / 提升。你的分析应当：
+   540→1. 提供清晰的性格特质与潜能分析
+   541→2. 识别发展优势与成长机会
+   542→3. 给出具体可执行的行动建议
+   543→4. 避免宿命论断言，强调"可调整"与"可发展"
+   544→
+   545→【分析框架】
+   546→1. 命局概述：四柱结构、五行分布、日主状态
+   547→2. 性格画像：核心特质、优势能力、潜在挑战
+   548→3. 发展方向：适合的发展领域与路径
+   549→4. 流年提示：近期关键节点与机遇
+   550→5. 行动处方：当下最重要的 3 个行动建议
+   551→
+   552→【输出要求】
+   553→- 使用积极心理学话术，不恐吓、不定性
+   554→- 负面信息必须紧跟"你可以做什么"
+   555→- 行动建议必须具体、可执行、有时间边界
+   556→
+   557→【禁止事项】
+   558→- 禁止输出确定性宿命论断言（如"一生注定"）
+   559→- 禁止编造经典出处
+   560→- 禁止涉及医疗/法律/投资具体建议"""
+   561→
+   562→    def __init__(self, db_conn, backend_router, kb_service):
+   563→        self.db = db_conn
+   564→        self.backend_router = backend_router
+   565→        self.kb = kb_service
+   566→
+   567→    async def submit_report(self, request: ReportRequest) -> int:
+   568→        """
+   569→        提交报告生成任务
+   570→
+   571→        流程：
+   572→        1. 获取用户八字事实
+   573→        2. 检索相关知识库内容
+   574→        3. 构建报告生成 Prompt
+   575→        4. 根据 backend 提交任务
+   576→        5. 写入 fortune_bazi_report 记录
+   577→        6. 返回 report_id
+   578→        """
+   579→        from services.bazi_facts import ensure_snapshot_for_user
+   580→
+   581→        # 1. 获取八字事实
+   582→        snapshot = ensure_snapshot_for_user(request.user_id)
+   583→        facts = snapshot["facts"]
+   584→        facts_hash = snapshot["facts_hash"]
+   585→
+   586→        # 2. 检索知识库
+   587→        kb_refs = await self._search_relevant_kb(facts)
+   588→
+   589→        # 3. 构建 Prompt
+   590→        user_prompt = self._build_report_prompt(
+   591→            facts=facts,
+   592→            report_type=request.report_type,
+   593→            kb_refs=kb_refs,
+   594→            extra_context=request.extra_context,
+   595→        )
+   596→
+   597→        system_prompt = request.system_prompt or self.REPORT_SYSTEM_PROMPT
+   598→
+   599→        # 4. 提交到后端
+   600→        if request.backend == ReportBackend.GLM:
+   601→            # 同步生成（适用于短报告）
+   602→            result = await self._generate_with_glm(
+   603→                system_prompt=system_prompt,
+   604→                user_prompt=user_prompt,
+   605→                model=request.model or "glm-4.7",
+   606→            )
+   607→            status = "completed"
+   608→            external_job_id = None
+   609→        else:
+   610→            # 异步生成（CLI / Gemini）
+   611→            external_job_id = await self.backend_router.submit(
+   612→                backend=request.backend.value,
+   613→                system_prompt=system_prompt,
+   614→                user_prompt=user_prompt,
+   615→                model=request.model,
+   616→            )
+   617→            result = None
+   618→            status = "processing"
+   619→
+   620→        # 5. 写入记录
+   621→        report_id = await self._create_report_record(
+   622→            user_id=request.user_id,
+   623→            report_type=request.report_type.value,
+   624→            backend=request.backend.value,
+   625→            model=request.model,
+   626→            system_prompt=system_prompt,
+   627→            bazi_facts_hash=facts_hash,
+   628→            input_context=request.extra_context or {},
+   629→            external_job_id=external_job_id,
+   630→            status=status,
+   631→            result=result,
+   632→        )
+   633→
+   634→        return report_id
+   635→
+   636→    async def get_report(self, report_id: int, user_id: int) -> ReportResult:
+   637→        """
+   638→        获取报告结果
+   639→
+   640→        - 如果是异步任务且未完成，轮询后端状态
+   641→        - 完成后更新数据库记录
+   642→        """
+   643→        record = await self._get_report_record(report_id, user_id)
+   644→        if not record:
+   645→            raise ValueError("report_not_found")
+   646→
+   647→        if record["status"] == "processing" and record.get("external_job_id"):
+   648→            # 轮询后端状态
+   649→            backend_status = await self.backend_router.get_status(
+   650→                backend=record["backend"],
+   651→                job_id=record["external_job_id"],
+   652→            )
+   653→
+   654→            if backend_status["status"] == "completed":
+   655→                # 更新记录
+   656→                await self._update_report_completed(
+   657→                    report_id=report_id,
+   658→                    output=backend_status["output"],
+   659→                )
+   660→                record["status"] = "completed"
+   661→                record["output_markdown"] = backend_status["output"].get("markdown")
+   662→                record["output_a2ui"] = backend_status["output"].get("a2ui")
+   663→            elif backend_status["status"] == "error":
+   664→                await self._update_report_error(
+   665→                    report_id=report_id,
+   666→                    error=backend_status.get("error", "unknown_error"),
+   667→                )
+   668→                record["status"] = "error"
+   669→                record["error_message"] = backend_status.get("error")
+   670→
+   671→        return ReportResult(
+   672→            report_id=report_id,
+   673→            status=record["status"],
+   674→            output_markdown=record.get("output_markdown"),
+   675→            output_a2ui=record.get("output_a2ui"),
+   676→            output_summary=record.get("output_summary"),
+   677→            key_findings=record.get("key_findings"),
+   678→            prescriptions=record.get("prescriptions"),
+   679→            error_message=record.get("error_message"),
+   680→            created_at=record.get("created_at"),
+   681→            completed_at=record.get("completed_at"),
+   682→        )
+   683→
+   684→    def _build_report_prompt(
+   685→        self,
+   686→        facts: Dict,
+   687→        report_type: ReportType,
+   688→        kb_refs: list,
+   689→        extra_context: Optional[Dict],
+   690→    ) -> str:
+   691→        """构建报告生成 Prompt"""
+   692→
+   693→        profile = facts.get("profile", {})
+   694→        bazi = facts.get("bazi", {})
+   695→
+   696→        prompt_parts = [
+   697→            "## 用户八字信息",
+   698→            f"- 性别：{profile.get('gender', '')}",
+   699→            f"- 出生时间（真太阳时）：{facts.get('solar_time', {}).get('true_solar_time_local', '')}",
+   700→            f"- 出生地：{profile.get('location', {}).get('name', '')}",
+   701→            "",
+   702→            "## 四柱",
+   703→            f"- 年柱：{bazi.get('pillars', {}).get('year', '')}",
+   704→            f"- 月柱：{bazi.get('pillars', {}).get('month', '')}",
+   705→            f"- 日柱：{bazi.get('pillars', {}).get('day', '')}",
+   706→            f"- 时柱：{bazi.get('pillars', {}).get('hour', '')}",
+   707→            "",
+   708→            "## 日主",
+   709→            f"- 天干：{bazi.get('day_master', {}).get('gan', '')}",
+   710→            f"- 五行：{bazi.get('day_master', {}).get('element', '')}",
+   711→            "",
+   712→            "## 五行分布",
+   713→            str(bazi.get("wuxing_count", {})),
+   714→            "",
+   715→            "## 旺衰分析",
+   716→            f"- 状态：{bazi.get('strength', {}).get('status', '')}",
+   717→            f"- 喜用神：{bazi.get('strength', {}).get('favorable_elements', [])}",
+   718→            "",
+   719→            "## 神煞",
+   720→        ]
+   721→
+   722→        for ss in bazi.get("shensha", []):
+   723→            prompt_parts.append(f"- {ss.get('name', '')}: {'命中' if ss.get('hit') else '未命中'}")
+   724→
+   725→        prompt_parts.extend([
+   726→            "",
+   727→            "## 大运",
+   728→        ])
+   729→
+   730→        for dy in bazi.get("luck", {}).get("da_yun", [])[:5]:
+   731→            prompt_parts.append(
+   732→                f"- {dy.get('start_age', '')}-{dy.get('end_age', '')}岁 "
+   733→                f"({dy.get('start_year', '')}-{dy.get('end_year', '')}): {dy.get('gan_zhi', '')}"
+   734→            )
+   735→
+   736→        # 添加知识库引用
+   737→        if kb_refs:
+   738→            prompt_parts.extend([
+   739→                "",
+   740→                "## 相关命理知识参考",
+   741→            ])
+   742→            for ref in kb_refs[:5]:
+   743→                prompt_parts.append(f"- {ref.get('content', '')[:200]}...")
+   744→
+   745→        # 添加用户额外上下文
+   746→        if extra_context:
+   747→            prompt_parts.extend([
+   748→                "",
+   749→                "## 用户关注点",
+   750→                str(extra_context.get("question", "")),
+   751→            ])
+   752→
+   753→        # 根据报告类型添加指引
+   754→        type_instructions = {
+   755→            ReportType.FULL: "请生成完整的八字分析报告，涵盖性格、事业、感情、健康各方面。",
+   756→            ReportType.SUMMARY: "请生成精简的八字摘要，重点突出核心特质与近期建议。",
+   757→            ReportType.CAREER: "请重点分析事业发展方向与职业建议。",
+   758→            ReportType.RELATIONSHIP: "请重点分析感情婚姻与人际关系。",
+   759→            ReportType.HEALTH: "请重点分析健康养生与生活方式建议。",
+   760→        }
+   761→
+   762→        prompt_parts.extend([
+   763→            "",
+   764→            "## 报告要求",
+   765→            type_instructions.get(report_type, type_instructions[ReportType.FULL]),
+   766→            "",
+   767→            "请按以下结构输出报告：",
+   768→            "1. 一句话总结（≤50字）",
+   769→            "2. 命局概述",
+   770→            "3. 核心分析（按报告类型聚焦）",
+   771→            "4. 流年提示",
+   772→            "5. 行动处方（≤3条，具体可执行）",
+   773→        ])
+   774→
+   775→        return "\n".join(prompt_parts)
+   776→```
+   777→
+   778→---
+   779→
+   780→## 3. API 设计
+   781→
+   782→### 3.1 今日运势 API
+   783→
+   784→```yaml
+   785→# GET /api/yunshi/today
+   786→# 获取今日运势
+   787→
+   788→Response:
+   789→  ok: true
+   790→  data:
+   791→    date: "2026-01-01"
+   792→    day_ganzhi: "甲子"
+   793→    summary: "今日印绶日，贵人运佳，适合寻求帮助与建立连接"
+   794→    score: 7
+   795→    highlights:
+   796→      - "贵人运佳，有助力"
+   797→      - "适合学习与交流"
+   798→    risks:
+   799→      - "避免冲动决策"
+   800→    prescriptions:
+   801→      - task_id: "uuid"
+   802→        content: "主动联系一位可以帮助你的人"
+   803→        estimated_minutes: 15
+   804→        priority: "high"
+   805→    time_windows:
+   806→      - hour: "9-11点"
+   807→        quality: "吉"
+   808→        suggestion: "适合重要沟通"
+   809→    a2ui:
+   810→      meta:
+   811→        summary: "今日贵人运佳"
+   812→      ui_components:
+   813→        - type: "markdown_text"
+   814→          title: "今日运势"
+   815→          data: "### 甲子日 · 印绶\n\n今日贵人运佳..."
+   816→        - type: "action_buttons"
+   817→          title: "行动"
+   818→          data:
+   819→            - label: "开始今日任务"
+   820→              action:
+   821→                type: "start_task"
+   822→                task_id: "uuid"
+   823→```
+   824→
+   825→### 3.2 八字报告 API
+   826→
+   827→```yaml
+   828→# POST /api/report/bazi/submit
+   829→# 提交八字报告生成任务
+   830→
+   831→Request:
+   832→  backend: "glm"  # cli | gemini | glm
+   833→  report_type: "full"  # full | summary | career | relationship | health
+   834→  model: "glm-4.7"  # 可选
+   835→  system_prompt: ""  # 可选，自定义 system prompt
+   836→  extra_context:
+   837→    question: "我想了解事业发展方向"  # 用户额外关注点
+   838→
+   839→Response:
+   840→  ok: true
+   841→  data:
+   842→    report_id: 101
+   843→    backend: "glm"
+   844→    status: "processing"  # processing | completed
+   845→
+   846→---
+   847→
+   848→# GET /api/report/bazi/{report_id}
+   849→# 获取报告结果
+   850→
+   851→Response (processing):
+   852→  ok: true
+   853→  data:
+   854→    report_id: 101
+   855→    status: "processing"
+   856→    created_at: "2026-01-01T10:00:00Z"
+   857→
+   858→Response (completed):
+   859→  ok: true
+   860→  data:
+   861→    report_id: 101
+   862→    status: "completed"
+   863→    output_summary: "日主丁火，身弱喜木火，适合创意与表达领域发展"
+   864→    output_markdown: "# 八字分析报告\n\n## 命局概述..."
+   865→    output_a2ui:
+   866→      meta:
+   867→        summary: "八字深度报告"
+   868→      ui_components:
+   869→        - type: "markdown_text"
+   870→          title: "报告内容"
+   871→          data: "..."
+   872→        - type: "action_buttons"
+   873→          title: "下一步"
+   874→          data:
+   875→            - label: "保存为资产页"
+   876→              action:
+   877→                type: "save_as_page"
+   878→            - label: "分享报告"
+   879→              action:
+   880→                type: "share"
+   881→    key_findings:
+   882→      - "日主丁火，身弱需要生扶"
+   883→      - "适合创意、表达、教育领域"
+   884→    prescriptions:
+   885→      - content: "每周安排 2 小时深度学习时间"
+   886→        estimated_minutes: 120
+   887→      - content: "本月尝试一次公开表达（分享/演讲）"
+   888→        estimated_minutes: 30
+   889→    completed_at: "2026-01-01T10:05:00Z"
+   890→```
+   891→
+   892→### 3.3 流年运势 API
+   893→
+   894→```yaml
+   895→# GET /api/yunshi/annual?year=2026
+   896→# 获取流年运势
+   897→
+   898→Response:
+   899→  ok: true
+   900→  data:
+   901→    year: 2026
+   902→    liu_nian_ganzhi: "丙午"
+   903→    da_yun_ganzhi: "癸未"
+   904→    summary: "丙午流年，火旺之年，适合表达与行动"
+   905→    score: 6
+   906→    themes:
+   907→      - "表达与展示"
+   908→      - "人际拓展"
+   909→      - "事业突破"
+   910→    key_months:
+   911→      - month: 3
+   912→        theme: "贵人月，适合求助"
+   913→      - month: 7
+   914→        theme: "压力月，宜谨慎"
+   915→    prescriptions:
+   916→      - content: "上半年重点突破，下半年收尾沉淀"
+   917→      - content: "注意情绪管理，避免冲动决策"
+   918→    a2ui:
+   919→      meta:
+   920→        summary: "2026 流年运势"
+   921→      ui_components:
+   922→        - type: "markdown_text"
+   923→          title: "流年概览"
+   924→          data: "..."
+   925→```
+   926→
+   927→---
+   928→
+   929→## 4. 前端集成设计
+   930→
+   931→### 4.1 入口与交互流程
+   932→
+   933→```
+   934→┌─────────────────────────────────────────────────────────────────────────────┐
+   935→│                        用户交互流程                                          │
+   936→├─────────────────────────────────────────────────────────────────────────────┤
+   937→│                                                                              │
+   938→│  入口 1：Dashboard 概览 Tab                                                  │
+   939→│  ┌────────────────────────────────────────────────────────────────────────┐ │
+   940→│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐     │ │
+   941→│  │  │   今日指引卡      │  │   运势卡片        │  │   流年提示        │     │ │
+   942→│  │  │   (daily_guidance)│  │   (daily_yunshi) │  │   (annual_hint)  │     │ │
+   943→│  │  │                   │  │                   │  │                   │     │ │
+   944→│  │  │ 一句话结论        │  │ 今日干支:甲子     │  │ 2026 丙午年      │     │ │
+   945→│  │  │ + 行动按钮        │  │ 评分:⭐⭐⭐⭐     │  │ 主题:表达与行动  │     │ │
+   946→│  │  │                   │  │ 亮点/风险        │  │                   │     │ │
+   947→│  │  │ [查看详情]        │  │ [展开详情]       │  │ [查看流年]       │     │ │
+   948→│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘     │ │
+   949→│  └────────────────────────────────────────────────────────────────────────┘ │
+   950→│                                                                              │
+   951→│  入口 2：探索 Tab - 玄学探索区                                               │
+   952→│  ┌────────────────────────────────────────────────────────────────────────┐ │
+   953→│  │  ┌──────────────────┐  ┌──────────────────┐                           │ │
+   954→│  │  │   八字运势        │  │   深度报告        │                           │ │
+   955→│  │  │   (bazi_yunshi)   │  │   (bazi_report)   │                           │ │
+   956→│  │  │                   │  │                   │                           │ │
+   957→│  │  │ 今日/周/月运势    │  │ 生成深度八字报告  │                           │ │
+   958→│  │  │                   │  │ ≈5分钟           │                           │ │
+   959→│  │  │ [立即查看]        │  │ [开始生成]        │                           │ │
+   960→│  │  └──────────────────┘  └──────────────────┘                           │ │
+   961→│  └────────────────────────────────────────────────────────────────────────┘ │
+   962→│                                                                              │
+   963→│  入口 3：Chat 对话                                                           │
+   964→│  ┌────────────────────────────────────────────────────────────────────────┐ │
+   965→│  │  用户: "我想看看今天的运势"                                             │ │
+   966→│  │  ↓                                                                      │ │
+   967→│  │  助手: [返回 A2UI 运势卡 + 行动按钮]                                    │ │
+   968→│  │  ↓                                                                      │ │
+   969→│  │  用户: "帮我生成一份八字报告"                                           │ │
+   970→│  │  ↓                                                                      │ │
+   971→│  │  助手: [触发报告生成 + 返回进度提示 + 完成后推送]                        │ │
+   972→│  └────────────────────────────────────────────────────────────────────────┘ │
+   973→│                                                                              │
+   974→└─────────────────────────────────────────────────────────────────────────────┘
+   975→```
+   976→
+   977→### 4.2 组件设计
+   978→
+   979→#### 4.2.1 今日运势卡片
+   980→
+   981→```tsx
+   982→// components/yunshi/DailyYunshiCard.tsx
+   983→
+   984→interface DailyYunshiCardProps {
+   985→  date: string;
+   986→  dayGanzhi: string;
+   987→  summary: string;
+   988→  score: number;
+   989→  highlights: string[];
+   990→  risks: string[];
+   991→  prescriptions: Prescription[];
+   992→  onPrescriptionClick: (taskId: string) => void;
+   993→}
+   994→
+   995→export function DailyYunshiCard({
+   996→  date,
+   997→  dayGanzhi,
+   998→  summary,
+   999→  score,
+  1000→  highlights,
+  1001→  risks,
+  1002→  prescriptions,
+  1003→  onPrescriptionClick,
+  1004→}: DailyYunshiCardProps) {
+  1005→  return (
+  1006→    <Card className="bg-sidebar hover:shadow-hover transition-shadow">
+  1007→      {/* 标题区 */}
+  1008→      <CardHeader className="pb-2">
+  1009→        <div className="flex items-center justify-between">
+  1010→          <div className="flex items-center gap-2">
+  1011→            <span className="text-2xl">🌟</span>
+  1012→            <div>
+  1013→              <CardTitle className="text-base">今日运势</CardTitle>
+  1014→              <p className="text-xs text-muted-foreground">
+  1015→                {date} · {dayGanzhi}
+  1016→              </p>
+  1017→            </div>
+  1018→          </div>
+  1019→          <ScoreBadge score={score} />
+  1020→        </div>
+  1021→      </CardHeader>
+  1022→
+  1023→      {/* 内容区 */}
+  1024→      <CardContent className="space-y-3">
+  1025→        {/* 一句话总结 */}
+  1026→        <p className="text-sm">{summary}</p>
+  1027→
+  1028→        {/* 亮点 */}
+  1029→        {highlights.length > 0 && (
+  1030→          <div className="space-y-1">
+  1031→            <p className="text-xs text-muted-foreground">亮点</p>
+  1032→            <ul className="text-sm space-y-1">
+  1033→              {highlights.map((h, i) => (
+  1034→                <li key={i} className="flex items-center gap-1">
+  1035→                  <span className="text-status">✓</span> {h}
+  1036→                </li>
+  1037→              ))}
+  1038→            </ul>
+  1039→          </div>
+  1040→        )}
+  1041→
+  1042→        {/* 风险提示 */}
+  1043→        {risks.length > 0 && (
+  1044→          <div className="space-y-1">
+  1045→            <p className="text-xs text-muted-foreground">注意</p>
+  1046→            <ul className="text-sm space-y-1">
+  1047→              {risks.map((r, i) => (
+  1048→                <li key={i} className="flex items-center gap-1">
+  1049→                  <span className="text-alert">!</span> {r}
+  1050→                </li>
+  1051→              ))}
+  1052→            </ul>
+  1053→          </div>
+  1054→        )}
+  1055→
+  1056→        {/* 行动处方 */}
+  1057→        {prescriptions.length > 0 && (
+  1058→          <div className="pt-2 border-t border-border">
+  1059→            <p className="text-xs text-muted-foreground mb-2">今日行动</p>
+  1060→            <div className="space-y-2">
+  1061→              {prescriptions.map((p) => (
+  1062→                <Button
+  1063→                  key={p.task_id}
+  1064→                  variant="outline"
+  1065→                  size="sm"
+  1066→                  className="w-full justify-start text-left h-auto py-2"
+  1067→                  onClick={() => onPrescriptionClick(p.task_id)}
+  1068→                >
+  1069→                  <div>
+  1070→                    <p className="text-sm">{p.content}</p>
+  1071→                    <p className="text-xs text-muted-foreground">
+  1072→                      约 {p.estimated_minutes} 分钟
+  1073→                    </p>
+  1074→                  </div>
+  1075→                </Button>
+  1076→              ))}
+  1077→            </div>
+  1078→          </div>
+  1079→        )}
+  1080→      </CardContent>
+  1081→    </Card>
+  1082→  );
+  1083→}
+  1084→```
+  1085→
+  1086→#### 4.2.2 八字报告生成面板
+  1087→
+  1088→```tsx
+  1089→// components/report/BaziReportPanel.tsx
+  1090→
+  1091→interface BaziReportPanelProps {
+  1092→  onClose: () => void;
+  1093→}
+  1094→
+  1095→export function BaziReportPanel({ onClose }: BaziReportPanelProps) {
+  1096→  const [reportType, setReportType] = useState<ReportType>('full');
+  1097→  const [backend, setBackend] = useState<ReportBackend>('glm');
+  1098→  const [question, setQuestion] = useState('');
+  1099→  const [status, setStatus] = useState<'idle' | 'loading' | 'completed' | 'error'>('idle');
+  1100→  const [report, setReport] = useState<ReportResult | null>(null);
+  1101→
+  1102→  const handleSubmit = async () => {
+  1103→    setStatus('loading');
+  1104→    try {
+  1105→      const { report_id } = await api.post('/api/report/bazi/submit', {
+  1106→        report_type: reportType,
+  1107→        backend,
+  1108→        extra_context: question ? { question } : undefined,
+  1109→      });
+  1110→
+  1111→      // 轮询结果
+  1112→      const result = await pollReportStatus(report_id);
+  1113→      setReport(result);
+  1114→      setStatus('completed');
+  1115→    } catch (error) {
+  1116→      setStatus('error');
+  1117→      toast.error('报告生成失败，请重试');
+  1118→    }
+  1119→  };
+  1120→
+  1121→  return (
+  1122→    <Sheet open onOpenChange={onClose}>
+  1123→      <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
+  1124→        <SheetHeader>
+  1125→          <SheetTitle>生成八字报告</SheetTitle>
+  1126→          <SheetDescription>
+  1127→            基于你的八字，生成个性化分析报告
+  1128→          </SheetDescription>
+  1129→        </SheetHeader>
+  1130→
+  1131→        {status === 'idle' && (
+  1132→          <div className="space-y-6 py-4">
+  1133→            {/* 报告类型选择 */}
+  1134→            <div className="space-y-2">
+  1135→              <Label>报告类型</Label>
+  1136→              <RadioGroup value={reportType} onValueChange={setReportType}>
+  1137→                <div className="grid grid-cols-2 gap-2">
+  1138→                  <RadioItem value="full" label="完整报告" desc="全面分析" />
+  1139→                  <RadioItem value="summary" label="精简版" desc="核心要点" />
+  1140→                  <RadioItem value="career" label="事业方向" desc="职业发展" />
+  1141→                  <RadioItem value="relationship" label="感情婚姻" desc="人际关系" />
+  1142→                </div>
+  1143→              </RadioGroup>
+  1144→            </div>
+  1145→
+  1146→            {/* 额外问题 */}
+  1147→            <div className="space-y-2">
+  1148→              <Label>你想了解什么？（可选）</Label>
+  1149→              <Textarea
+  1150→                placeholder="例如：我想了解事业发展方向..."
+  1151→                value={question}
+  1152→                onChange={(e) => setQuestion(e.target.value)}
+  1153→                rows={3}
+  1154→              />
+  1155→            </div>
+  1156→
+  1157→            {/* 生成按钮 */}
+  1158→            <Button onClick={handleSubmit} className="w-full">
+  1159→              开始生成
+  1160→            </Button>
+  1161→
+  1162→            <p className="text-xs text-muted-foreground text-center">
+  1163→              预计需要 3-5 分钟
+  1164→            </p>
+  1165→          </div>
+  1166→        )}
+  1167→
+  1168→        {status === 'loading' && (
+  1169→          <div className="py-12 text-center space-y-4">
+  1170→            <Loader className="animate-spin mx-auto h-8 w-8" />
+  1171→            <p>正在生成报告...</p>
+  1172→            <p className="text-sm text-muted-foreground">
+  1173→              正在分析八字信息，请稍候
+  1174→            </p>
+  1175→          </div>
+  1176→        )}
+  1177→
+  1178→        {status === 'completed' && report && (
+  1179→          <div className="py-4 space-y-4">
+  1180→            {/* 报告摘要 */}
+  1181→            <div className="p-4 bg-advice rounded-lg">
+  1182→              <p className="text-sm font-medium">{report.output_summary}</p>
+  1183→            </div>
+  1184→
+  1185→            {/* 报告内容 */}
+  1186→            <div className="prose prose-sm max-w-none">
+  1187→              <ReactMarkdown>{report.output_markdown}</ReactMarkdown>
+  1188→            </div>
+  1189→
+  1190→            {/* 行动处方 */}
+  1191→            {report.prescriptions && (
+  1192→              <div className="space-y-2">
+  1193→                <h4 className="font-medium">行动处方</h4>
+  1194→                {report.prescriptions.map((p, i) => (
+  1195→                  <div key={i} className="p-3 bg-sidebar rounded-lg">
+  1196→                    <p className="text-sm">{p.content}</p>
+  1197→                  </div>
+  1198→                ))}
+  1199→              </div>
+  1200→            )}
+  1201→
+  1202→            {/* 操作按钮 */}
+  1203→            <div className="flex gap-2">
+  1204→              <Button variant="outline" onClick={() => saveAsPage(report)}>
+  1205→                保存为资产页
+  1206→              </Button>
+  1207→              <Button variant="outline" onClick={() => shareReport(report)}>
+  1208→                分享
+  1209→              </Button>
+  1210→            </div>
+  1211→          </div>
+  1212→        )}
+  1213→      </SheetContent>
+  1214→    </Sheet>
+  1215→  );
+  1216→}
+  1217→```
+  1218→
+  1219→### 4.3 Dashboard 探索 Tab 集成
+  1220→
+  1221→```tsx
+  1222→// app/(main)/dashboard/explore/page.tsx
+  1223→
+  1224→export default function ExplorePage() {
+  1225→  return (
+  1226→    <div className="space-y-6">
+  1227→      {/* 玄学探索区 */}
+  1228→      <section>
+  1229→        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+  1230→          <span>✨</span> 玄学探索
+  1231→        </h2>
+  1232→        <div className="grid grid-cols-2 gap-4">
+  1233→          {/* 八字运势卡片 */}
+  1234→          <ExploreCard
+  1235→            icon="🌟"
+  1236→            title="八字运势"
+  1237→            description="今日运势详解"
+  1238→            onClick={() => router.push('/dashboard/explore/yunshi')}
+  1239→          />
+  1240→
+  1241→          {/* 深度报告卡片 */}
+  1242→          <ExploreCard
+  1243→            icon="📊"
+  1244→            title="深度报告"
+  1245→            description="生成八字分析报告"
+  1246→            onClick={() => setShowReportPanel(true)}
+  1247→          />
+  1248→
+  1249→          {/* 塔罗占卜 */}
+  1250→          <ExploreCard
+  1251→            icon="🎴"
+  1252→            title="塔罗占卜"
+  1253→            description="今日运势指引"
+  1254→            onClick={() => router.push('/dashboard/explore/tarot')}
+  1255→          />
+  1256→
+  1257→          {/* 星盘解读 */}
+  1258→          <ExploreCard
+  1259→            icon="⭐"
+  1260→            title="星盘解读"
+  1261→            description="本周星象分析"
+  1262→            onClick={() => router.push('/dashboard/explore/astro')}
+  1263→          />
+  1264→        </div>
+  1265→      </section>
+  1266→
+  1267→      {/* 修习课程区 */}
+  1268→      <section>
+  1269→        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+  1270→          <span>📚</span> 修习课程
+  1271→        </h2>
+  1272→        <PlanList />
+  1273→      </section>
+  1274→
+  1275→      {/* 报告生成面板 */}
+  1276→      {showReportPanel && (
+  1277→        <BaziReportPanel onClose={() => setShowReportPanel(false)} />
+  1278→      )}
+  1279→    </div>
+  1280→  );
+  1281→}
+  1282→```
+  1283→
+  1284→---
+  1285→
+  1286→## 5. Chat 集成设计
+  1287→
+  1288→### 5.1 意图识别与路由
+  1289→
+  1290→```python
+  1291→# services/chat_service.py 扩展
+  1292→
+  1293→YUNSHI_INTENTS = [
+  1294→    r"今[天日].*运势",
+  1295→    r"运势.*怎么样",
+  1296→    r"今[天日].*适合",
+  1297→    r"看[看一]下?运势",
+  1298→    r"本[周月年].*运势",
+  1299→    r"流年.*运势",
+  1300→]
+  1301→
+  1302→REPORT_INTENTS = [
+  1303→    r"八字.*报告",
+  1304→    r"生成.*报告",
+  1305→    r"分析.*八字",
+  1306→    r"详细.*分析",
+  1307→    r"深度.*报告",
+  1308→]
+  1309→
+  1310→def detect_yunshi_intent(message: str) -> Optional[str]:
+  1311→    """检测运势相关意图"""
+  1312→    import re
+  1313→    for pattern in YUNSHI_INTENTS:
+  1314→        if re.search(pattern, message):
+  1315→            if "周" in message:
+  1316→                return "weekly"
+  1317→            if "月" in message:
+  1318→                return "monthly"
+  1319→            if "年" in message or "流年" in message:
+  1320→                return "annual"
+  1321→            return "daily"
+  1322→    return None
+  1323→
+  1324→def detect_report_intent(message: str) -> bool:
+  1325→    """检测报告生成意图"""
+  1326→    import re
+  1327→    return any(re.search(p, message) for p in REPORT_INTENTS)
+  1328→```
+  1329→
+  1330→### 5.2 Chat 处理流程
+  1331→
+  1332→```python
+  1333→async def handle_chat_message(
+  1334→    user_id: int,
+  1335→    session_id: str,
+  1336→    message: str,
+  1337→) -> Dict:
+  1338→    """处理聊天消息"""
+  1339→
+  1340→    # 1. 检测运势意图
+  1341→    yunshi_intent = detect_yunshi_intent(message)
+  1342→    if yunshi_intent:
+  1343→        return await handle_yunshi_query(user_id, yunshi_intent)
+  1344→
+  1345→    # 2. 检测报告意图
+  1346→    if detect_report_intent(message):
+  1347→        return await handle_report_query(user_id, session_id)
+  1348→
+  1349→    # 3. 默认 GLM 对话
+  1350→    return await handle_general_chat(user_id, session_id, message)
+  1351→
+  1352→
+  1353→async def handle_yunshi_query(user_id: int, intent: str) -> Dict:
+  1354→    """处理运势查询"""
+  1355→    yunshi_service = YunshiService(...)
+  1356→
+  1357→    if intent == "daily":
+  1358→        yunshi = yunshi_service.compute_daily_yunshi(user_id)
+  1359→        return {
+  1360→            "type": "yunshi",
+  1361→            "a2ui": build_yunshi_a2ui(yunshi),
+  1362→            "suggested_tasks": [
+  1363→                {"task_id": str(uuid4()), **p} for p in yunshi.prescriptions
+  1364→            ],
+  1365→        }
+  1366→    elif intent == "annual":
+  1367→        yunshi = yunshi_service.compute_annual_yunshi(user_id)
+  1368→        return {
+  1369→            "type": "yunshi",
+  1370→            "a2ui": build_annual_yunshi_a2ui(yunshi),
+  1371→            "suggested_tasks": [],
+  1372→        }
+  1373→    # ... 其他类型
+  1374→
+  1375→
+  1376→async def handle_report_query(user_id: int, session_id: str) -> Dict:
+  1377→    """处理报告生成请求"""
+  1378→    return {
+  1379→        "type": "report_prompt",
+  1380→        "a2ui": {
+  1381→            "meta": {"summary": "生成八字报告"},
+  1382→            "ui_components": [
+  1383→                {
+  1384→                    "type": "markdown_text",
+  1385→                    "title": "八字报告",
+  1386→                    "data": "我可以为你生成一份详细的八字分析报告。报告包括：\n\n"
+  1387→                           "1. 命局概述与性格画像\n"
+  1388→                           "2. 发展方向与优势分析\n"
+  1389→                           "3. 流年运势与关键节点\n"
+  1390→                           "4. 个性化行动建议\n\n"
+  1391→                           "预计需要 3-5 分钟生成。",
+  1392→                },
+  1393→                {
+  1394→                    "type": "action_buttons",
+  1395→                    "title": "选择",
+  1396→                    "data": [
+  1397→                        {"label": "生成完整报告", "action": {"type": "open_panel", "panel": "bazi_report"}},
+  1398→                        {"label": "生成精简版", "action": {"type": "submit_report", "report_type": "summary"}},
+  1399→                        {"label": "暂不需要", "action": {"type": "opt_out"}},
+  1400→                    ],
+  1401→                },
+  1402→            ],
+  1403→        },
+  1404→    }
+  1405→```
+  1406→
+  1407→---
+  1408→
+  1409→## 6. 实施计划
+  1410→
+  1411→### Phase 1：核心数据与 API（1 周）
+  1412→
+  1413→| 任务 | 描述 | 交付物 |
+  1414→|-----|------|-------|
+  1415→| 数据库迁移 | 创建 `fortune_yunshi_snapshot`、`fortune_bazi_report` 表 | DDL 脚本 |
+  1416→| 规则库扩展 | 添加运势计算规则 | SQL Insert |
+  1417→| 运势计算服务 | 实现 `YunshiService` 核心方法 | `yunshi_service.py` |
+  1418→| 今日运势 API | `GET /api/yunshi/today` | 可测试 API |
+  1419→
+  1420→### Phase 2：报告生成（1 周）
+  1421→
+  1422→| 任务 | 描述 | 交付物 |
+  1423→|-----|------|-------|
+  1424→| 报告服务 | 实现 `BaziReportService` | `bazi_report_service.py` |
+  1425→| GLM 报告生成 | 支持 `backend=glm` 同步生成 | 集成测试 |
+  1426→| CLI/Gemini 集成 | 支持异步报告生成 | backend_router 扩展 |
+  1427→| 报告 API | `POST/GET /api/report/bazi/*` | 可测试 API |
+  1428→
+  1429→### Phase 3：前端集成（1 周）
+  1430→
+  1431→| 任务 | 描述 | 交付物 |
+  1432→|-----|------|-------|
+  1433→| 今日运势卡片 | Dashboard 概览 Tab 集成 | React 组件 |
+  1434→| 探索 Tab 改造 | 玄学探索区 + 报告入口 | 页面改造 |
+  1435→| 报告生成面板 | Sheet 组件 + 轮询逻辑 | React 组件 |
+  1436→| A2UI 渲染增强 | 支持运势相关 A2UI | 渲染器扩展 |
+  1437→
+  1438→### Phase 4：Chat 集成与优化（1 周）
+  1439→
+  1440→| 任务 | 描述 | 交付物 |
+  1441→|-----|------|-------|
+  1442→| 意图识别 | 运势/报告意图检测 | chat_service 扩展 |
+  1443→| Chat 路由 | 运势查询→运势卡片 | 处理流程 |
+  1444→| 报告触发 | Chat 中触发报告生成 | 集成测试 |
+  1445→| 端到端测试 | 完整闭环验证 | 测试报告 |
+  1446→
+  1447→---
+  1448→
+  1449→## 7. 验收标准
+  1450→
+  1451→### 7.1 功能验收
+  1452→
+  1453→| 场景 | 预期结果 |
+  1454→|-----|---------|
+  1455→| 用户查看今日运势 | 显示当日干支、评分、亮点、风险、行动处方 |
+  1456→| 用户在 Chat 问"今天运势" | 返回今日运势 A2UI 卡片 + 可点击按钮 |
+  1457→| 用户生成八字报告 | 3-5 分钟内生成完整 Markdown 报告 + 处方 |
+  1458→| 用户点击处方按钮 | 处方转为任务并可跟踪完成 |
+  1459→| 用户查看流年运势 | 显示年度主题、关键月份、行动建议 |
+  1460→
+  1461→### 7.2 技术验收
+  1462→
+  1463→| 指标 | 标准 |
+  1464→|-----|------|
+  1465→| 今日运势 API 响应时间 | ≤ 500ms |
+  1466→| 报告生成时间（GLM） | ≤ 60s |
+  1467→| A2UI action_buttons 渲染 | 100% 可点击 |
+  1468→| 缓存命中率 | ≥ 80%（同日同用户） |
+  1469→
+  1470→### 7.3 闭环验收
+  1471→
+  1472→```sql
+  1473→-- 运势→行动闭环完成率
+  1474→SELECT
+  1475→  COUNT(DISTINCT c.user_id) AS users_with_yunshi_task_done,
+  1476→  COUNT(DISTINCT y.user_id) AS users_viewed_yunshi
+  1477→FROM fortune_yunshi_snapshot y
+  1478→LEFT JOIN fortune_commitment c ON
+  1479→  c.user_id = y.user_id
+  1480→  AND c.source = 'yunshi'
+  1481→  AND c.status = 'done'
+  1482→  AND c.created_at::date = y.snapshot_date
+  1483→WHERE y.snapshot_type = 'daily'
+  1484→  AND y.snapshot_date >= CURRENT_DATE - INTERVAL '7 days';
+  1485→```
+  1486→
+  1487→---
+  1488→
+  1489→## 附录 A：A2UI 输出示例
+  1490→
+  1491→### 今日运势 A2UI
+  1492→
+  1493→```json
+  1494→{
+  1495→  "meta": {
+  1496→    "summary": "今日印绶日，贵人运佳"
+  1497→  },
+  1498→  "ui_components": [
+  1499→    {
+  1500→      "type": "markdown_text",
+  1501→      "title": "今日运势",
+  1502→      "data": "### 2026年1月1日 · 甲子日 · 印绶\n\n**综合评分：⭐⭐⭐⭐ (7/10)**\n\n#### 亮点\n- ✓ 贵人运佳，有助力\n- ✓ 适合学习与交流\n\n#### 注意\n- ! 避免冲动决策\n\n#### 时辰提示\n- 🕘 9-11点：适合重要沟通\n- 🕑 13-15点：适合学习思考"
+  1503→    },
+  1504→    {
+  1505→      "type": "action_buttons",
+  1506→      "title": "今日行动",
+  1507→      "data": [
+  1508→        {
+  1509→          "label": "主动联系一位贵人",
+  1510→          "action": {
+  1511→            "type": "start_task",
+  1512→            "task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1"
+  1513→          }
+  1514→        },
+  1515→        {
+  1516→          "label": "加入今日计划",
+  1517→          "action": {
+  1518→            "type": "schedule_task",
+  1519→            "task_id": "4aa0f0e2-acde-4e2f-acde-0c3c0d9610e1"
+  1520→          }
+  1521→        },
+  1522→        {
+  1523→          "label": "查看详细分析",
+  1524→          "action": {
+  1525→            "type": "open_panel",
+  1526→            "panel": "yunshi_detail"
+  1527→          }
+  1528→        }
+  1529→      ]
+  1530→    }
+  1531→  ]
+  1532→}
+  1533→```
+  1534→
+  1535→---
+  1536→
+  1537→## 附录 B：与现有代码的对接点
+  1538→
+  1539→| 现有文件 | 对接方式 |
+  1540→|---------|---------|
+  1541→| `services/bazi_facts.py` | 直接调用 `ensure_snapshot_for_user()` 获取八字事实 |
+  1542→| `services/kb_service.py` | 调用知识库检索获取解读依据 |
+  1543→| `services/chat_service.py` | 扩展意图识别与路由逻辑 |
+  1544→| `services/task_service.py` | 将处方写入 `fortune_commitment` |
+  1545→| `integrations/backend_router.py` | 调用异步报告生成 |
+  1546→| `api/dashboard_routes.py` | 新增 `/api/yunshi/*` 路由 |
+  1547→| `api/bazi_routes.py` | 扩展 `/api/report/bazi/*` 路由 |
+  1548→
+  1549→---
+  1550→
+  1551→*本文档为 Fortune AI 八字报告与运势模块的完整设计，对齐 `system_design_final_mvp.md` 架构与 `frontend_final_v1.md` 前端规范。*
+  1552→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,623 @@
+"""
+LLM Client - Unified LLM interface with simplified routing
+V5 Architecture: Single entry point for all LLM calls
+"""
+import os
+import json
+import logging
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from dataclasses import dataclass
+import httpx
+
+from .config import LLMConfig, ModelSelection
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMMessage:
+    """Standard message format"""
+    role: str
+    content: str
+    tool_call_id: Optional[str] = None  # For tool result messages
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # For assistant messages with tool calls
+
+
+@dataclass
+class ToolCall:
+    """Tool call from LLM response"""
+    id: str
+    name: str
+    arguments: str  # JSON string
+
+
+@dataclass
+class LLMResponse:
+    """Standard LLM response"""
+    content: str
+    model: str
+    provider: str
+    tool_calls: Optional[List[ToolCall]] = None
+    usage: Optional[Dict[str, int]] = None
+
+
+class LLMClient:
+    """
+    Unified LLM client with automatic routing and fallback.
+
+    Features:
+    - Automatic model selection based on tier
+    - Single fallback chain
+    - Streaming support with tool calling
+    """
+
+    def __init__(self, timeout: float = 120.0):
+        self.timeout = timeout
+        self._usage = {"calls": 0, "tokens": 0}
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        """Get accumulated usage for this session"""
+        return self._usage
+
+    async def chat(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        user_tier: str = "free",
+        task: str = "chat",
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        """
+        Chat with LLM (non-streaming).
+
+        Args:
+            messages: Conversation messages
+            tools: Tool definitions (OpenAI format)
+            user_tier: User tier for model selection
+            task: Task type for model selection
+            model: Override model (optional)
+            temperature: Sampling temperature
+            max_tokens: Max tokens to generate
+        """
+        selection = ModelConfig.resolve(user_tier, task)
+        model = model or selection.model
+        provider = selection.provider
+
+        # Try primary, then fallback chain
+        providers_to_try = [provider] + [
+            ModelConfig.load().get("models", {}).get(m, {}).get("provider", "zhipu")
+            for m in selection.fallback_chain
+        ]
+        models_to_try = [model] + [
+            ModelConfig.load().get("models", {}).get(m, {}).get("model_name", m)
+            for m in selection.fallback_chain
+        ]
+
+        last_error = None
+        for p, m in zip(providers_to_try, models_to_try):
+            try:
+                response = await self._call_provider(
+                    provider=p,
+                    model=m,
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=False
+                )
+                self._record_usage(response)
+                return response
+            except Exception as e:
+                logger.warning(f"Provider {p} failed: {e}")
+                last_error = e
+                continue
+
+        raise last_error or Exception("All providers failed")
+
+    async def stream(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        user_tier: str = "free",
+        task: str = "chat",
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream chat with LLM.
+
+        Yields:
+            dict with type: "content" | "tool_call"
+        """
+        selection = ModelConfig.resolve(user_tier, task)
+        model = model or selection.model
+        provider = selection.provider
+
+        async for chunk in self._stream_provider(
+            provider=provider,
+            model=model,
+            messages=messages,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens
+        ):
+            yield chunk
+
+    async def _call_provider(
+        self,
+        provider: str,
+        model: str,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]],
+        temperature: float,
+        max_tokens: int,
+        stream: bool = False
+    ) -> LLMResponse:
+        """Call specific provider"""
+        # Use Claude-specific method for anthropic/claude providers
+        if provider in ("claude", "anthropic"):
+            return await self._call_claude(model, messages, tools, temperature, max_tokens)
+
+        api_key = self._get_api_key(provider)
+        base_url = self._get_base_url(provider)
+
+        # Format messages for OpenAI-compatible API
+        formatted_messages = []
+        for m in messages:
+            msg = {"role": m.role, "content": m.content}
+            if m.tool_call_id:
+                msg["tool_call_id"] = m.tool_call_id
+            if m.tool_calls:
+                msg["tool_calls"] = m.tool_calls
+            formatted_messages.append(msg)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream
+        }
+        if tools:
+            payload["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        message = data["choices"][0]["message"]
+        content = message.get("content", "") or ""
+
+        # Parse tool calls
+        tool_calls = None
+        if "tool_calls" in message and message["tool_calls"]:
+            tool_calls = [
+                ToolCall(
+                    id=tc["id"],
+                    name=tc["function"]["name"],
+                    arguments=tc["function"]["arguments"]
+                )
+                for tc in message["tool_calls"]
+            ]
+
+        return LLMResponse(
+            content=content,
+            model=model,
+            provider=provider,
+            tool_calls=tool_calls,
+            usage=data.get("usage")
+        )
+
+    async def _call_claude(
+        self,
+        model: str,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]],
+        temperature: float,
+        max_tokens: int
+    ) -> LLMResponse:
+        """Call Claude API (Anthropic format)"""
+        api_key = self._get_api_key("claude")
+        base_url = self._get_base_url("claude")
+
+        # Extract system message and convert to Anthropic format
+        system_content = ""
+        anthropic_messages = []
+
+        for m in messages:
+            if m.role == "system":
+                system_content = m.content
+            elif m.role == "tool":
+                # Convert tool result to Anthropic format
+                # Tool results must follow an assistant message with tool_use
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id,
+                        "content": m.content
+                    }]
+                })
+            elif m.role == "assistant" and m.tool_calls:
+                # Assistant message with tool calls - convert to Anthropic format
+                content_blocks = []
+                if m.content:
+                    content_blocks.append({"type": "text", "text": m.content})
+                for tc in m.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "input": json.loads(tc.get("function", {}).get("arguments", "{}"))
+                    })
+                anthropic_messages.append({
+                    "role": "assistant",
+                    "content": content_blocks
+                })
+            else:
+                anthropic_messages.append({
+                    "role": m.role,
+                    "content": m.content
+                })
+
+        # Convert OpenAI tools format to Anthropic format
+        anthropic_tools = None
+        if tools:
+            anthropic_tools = []
+            for t in tools:
+                if t.get("type") == "function":
+                    func = t["function"]
+                    anthropic_tools.append({
+                        "name": func["name"],
+                        "description": func.get("description", ""),
+                        "input_schema": func.get("parameters", {"type": "object", "properties": {}})
+                    })
+
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": anthropic_messages,
+        }
+        if system_content:
+            payload["system"] = system_content
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{base_url}/messages",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Parse Claude response
+        content = ""
+        tool_calls = []
+
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                content += block.get("text", "")
+            elif block.get("type") == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block.get("id", ""),
+                    name=block.get("name", ""),
+                    arguments=json.dumps(block.get("input", {}))
+                ))
+
+        return LLMResponse(
+            content=content,
+            model=model,
+            provider="claude",
+            tool_calls=tool_calls if tool_calls else None,
+            usage=data.get("usage")
+        )
+
+    async def _stream_provider(
+        self,
+        provider: str,
+        model: str,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]],
+        temperature: float,
+        max_tokens: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from specific provider"""
+        logger.info(f"_stream_provider called with provider={provider}, model={model}")
+
+        # Use Claude-specific streaming for anthropic/claude/deepseek/glm providers
+        if provider in ("claude", "anthropic", "deepseek", "glm", "zhipu"):
+            logger.info(f"Using Claude/Anthropic streaming for provider={provider}")
+            async for chunk in self._stream_claude(model, messages, tools, max_tokens, provider=provider):
+                yield chunk
+            return
+
+        logger.info(f"Using OpenAI-compatible streaming for provider={provider}")
+
+        api_key = self._get_api_key(provider)
+        base_url = self._get_base_url(provider)
+
+        # Debug: log messages
+        for i, m in enumerate(messages):
+            logger.debug(f"Message {i}: role={m.role}, content={m.content[:100] if m.content else None}..., tool_call_id={m.tool_call_id}, tool_calls={m.tool_calls}")
+
+        # Format messages for OpenAI-compatible API
+        formatted_messages = []
+        for m in messages:
+            msg = {"role": m.role, "content": m.content}
+            if m.tool_call_id:
+                msg["tool_call_id"] = m.tool_call_id
+            if m.tool_calls:
+                msg["tool_calls"] = m.tool_calls
+            formatted_messages.append(msg)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+        if tools:
+            payload["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        tool_call_chunks = {}
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data["choices"][0].get("delta", {})
+
+                            # Content chunks
+                            content = delta.get("content", "")
+                            if content:
+                                yield {"type": "content", "content": content}
+
+                            # Tool call chunks
+                            if "tool_calls" in delta:
+                                for tc_delta in delta["tool_calls"]:
+                                    index = tc_delta.get("index", 0)
+                                    if index not in tool_call_chunks:
+                                        tool_call_chunks[index] = {
+                                            "id": "",
+                                            "name": "",
+                                            "arguments": ""
+                                        }
+                                    if "id" in tc_delta:
+                                        tool_call_chunks[index]["id"] = tc_delta["id"]
+                                    if "function" in tc_delta:
+                                        func = tc_delta["function"]
+                                        if "name" in func:
+                                            tool_call_chunks[index]["name"] += func["name"]
+                                        if "arguments" in func:
+                                            tool_call_chunks[index]["arguments"] += func["arguments"]
+                        except json.JSONDecodeError:
+                            continue
+
+        # Emit complete tool calls
+        for tc in tool_call_chunks.values():
+            if tc["name"]:
+                yield {
+                    "type": "tool_call",
+                    "tool_call_id": tc["id"],
+                    "tool_name": tc["name"],
+                    "tool_args": tc["arguments"]
+                }
+
+    async def _stream_claude(
+        self,
+        model: str,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int,
+        provider: str = "claude"
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream from Claude/Anthropic-compatible API"""
+        api_key = self._get_api_key(provider)
+        base_url = self._get_base_url(provider)
+
+        # Extract system message and convert to Anthropic format
+        system_content = ""
+        anthropic_messages = []
+
+        for m in messages:
+            if m.role == "system":
+                system_content = m.content
+            elif m.role == "tool":
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id,
+                        "content": m.content
+                    }]
+                })
+            elif m.role == "assistant" and m.tool_calls:
+                # Assistant message with tool calls - convert to Anthropic format
+                content_blocks = []
+                if m.content:
+                    content_blocks.append({"type": "text", "text": m.content})
+                for tc in m.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "input": json.loads(tc.get("function", {}).get("arguments", "{}"))
+                    })
+                anthropic_messages.append({
+                    "role": "assistant",
+                    "content": content_blocks
+                })
+            else:
+                anthropic_messages.append({
+                    "role": m.role,
+                    "content": m.content
+                })
+
+        # Convert OpenAI tools format to Anthropic format
+        anthropic_tools = None
+        if tools:
+            anthropic_tools = []
+            for t in tools:
+                if t.get("type") == "function":
+                    func = t["function"]
+                    anthropic_tools.append({
+                        "name": func["name"],
+                        "description": func.get("description", ""),
+                        "input_schema": func.get("parameters", {"type": "object", "properties": {}})
+                    })
+
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": anthropic_messages,
+            "stream": True
+        }
+        if system_content:
+            payload["system"] = system_content
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+
+        # Track tool use blocks being built
+        current_tool_use = {}
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{base_url}/messages",
+                json=payload,
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        try:
+                            data = json.loads(data_str)
+                            event_type = data.get("type", "")
+
+                            if event_type == "content_block_start":
+                                block = data.get("content_block", {})
+                                if block.get("type") == "tool_use":
+                                    current_tool_use = {
+                                        "id": block.get("id", ""),
+                                        "name": block.get("name", ""),
+                                        "input_json": ""
+                                    }
+
+                            elif event_type == "content_block_delta":
+                                delta = data.get("delta", {})
+                                if delta.get("type") == "text_delta":
+                                    text = delta.get("text", "")
+                                    if text:
+                                        yield {"type": "content", "content": text}
+                                elif delta.get("type") == "input_json_delta":
+                                    if current_tool_use:
+                                        current_tool_use["input_json"] += delta.get("partial_json", "")
+
+                            elif event_type == "content_block_stop":
+                                if current_tool_use and current_tool_use.get("name"):
+                                    yield {
+                                        "type": "tool_call",
+                                        "tool_call_id": current_tool_use["id"],
+                                        "tool_name": current_tool_use["name"],
+                                        "tool_args": current_tool_use["input_json"]
+                                    }
+                                    current_tool_use = {}
+
+                            elif event_type == "message_stop":
+                                break
+
+                        except json.JSONDecodeError:
+                            continue
+
+    def _get_api_key(self, provider: str) -> str:
+        """Get API key for provider"""
+        key_map = {
+            "zhipu": os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY") or os.getenv("ZAI_GLM_KEY", ""),
+            "glm": os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY") or os.getenv("ZAI_GLM_KEY", ""),
+            "deepseek": os.getenv("DEEPSEEK_API_KEY") or os.getenv("ARK_API_KEY", ""),
+            "gemini": os.getenv("GEMINI_API_KEY", ""),
+            "claude": os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY", ""),
+            "anthropic": os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY", ""),
+            "openai": os.getenv("OPENAI_API_KEY", ""),
+        }
+        return key_map.get(provider, "")
+
+    def _get_base_url(self, provider: str) -> str:
+        """Get base URL for provider"""
+        url_map = {
+            "zhipu": os.getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/anthropic/v1"),
+            "glm": os.getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/anthropic/v1"),
+            "deepseek": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+            "gemini": os.getenv("GEMINI_BASE_URL", "https://new.12ai.org/v1"),
+            "claude": os.getenv("CLAUDE_BASE_URL", "https://www.zz166.cn/api/v1"),
+            "anthropic": os.getenv("CLAUDE_BASE_URL", "https://www.zz166.cn/api/v1"),
+        }
+        return url_map.get(provider, "")
+
+    def _record_usage(self, response: LLMResponse):
+        """Record usage for quota tracking"""
+        self._usage["calls"] += 1
+        if response.usage:
+            tokens = (
+                response.usage.get("total_tokens", 0) or
+                response.usage.get("prompt_tokens", 0) + response.usage.get("completion_tokens", 0)
+            )
+            self._usage["tokens"] += tokens
+
+
+# Global instance
+_llm_client: Optional[LLMClient] = None
+
+
+def get_llm_client() -> LLMClient:
+    """Get or create global LLM client"""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = LLMClient()
+    return _llm_client

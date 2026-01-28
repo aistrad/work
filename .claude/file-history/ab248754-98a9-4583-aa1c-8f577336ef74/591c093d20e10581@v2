@@ -1,0 +1,357 @@
+"""
+Validators v2.0 - 数据验证与跨技能契约校验
+
+v2.0 更新：
+- 新增 Provider/Consumer 契约校验
+- imports ⊆ exports 验证
+- 版本兼容性检查
+- 循环依赖检测
+"""
+import re
+import logging
+from typing import Dict, Any, Tuple, List, Optional, Set
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+# LLM-FIRST: 路径白名单（统一 save/read）
+SAVE_PATH_WHITELIST = [
+    r"^identity\.birth_info$",
+    r"^state\.[A-Za-z0-9_\.]+$",
+    r"^preferences\.[A-Za-z0-9_\.]+$",
+    r"^skills\.[A-Za-z0-9_]+(\.[A-Za-z0-9_\.]+)*$",
+    r"^goals(\.[A-Za-z0-9_\.]+)*$",
+]
+
+
+def validate_save_path(path: str) -> bool:
+    return any(re.match(p, path) for p in SAVE_PATH_WHITELIST)
+
+
+def validate_show_args(args: Dict[str, Any]) -> Tuple[bool, str]:
+    show_type = args.get("type")
+    if show_type not in {"skill_list", "recommendation", "card", "insight"}:
+        return False, "show.type 必须是 skill_list|recommendation|card|insight"
+    if show_type == "card" and not args.get("card_type"):
+        return False, "type=card 时必须提供 card_type"
+    if show_type == "recommendation":
+        data = args.get("data", {})
+        if not isinstance(data, dict) or not data.get("skill_id"):
+            return False, "recommendation 需要 data.skill_id"
+    return True, ""
+
+
+def validate_remind_args(args: Dict[str, Any]) -> Tuple[bool, str]:
+    action = args.get("action")
+    if action not in {"set", "list", "cancel"}:
+        return False, "remind.action 必须是 set|list|cancel"
+    if action == "set":
+        if not args.get("title"):
+            return False, "创建提醒需要 title"
+        if not args.get("schedule"):
+            return False, "创建提醒需要 schedule"
+        st = args.get("schedule_type", "daily")
+        if st not in {"once", "daily", "weekly"}:
+            return False, "schedule_type 必须是 once|daily|weekly"
+    if action == "cancel" and not args.get("id"):
+        return False, "取消提醒需要 id"
+    return True, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 跨技能契约校验 (v2.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ContractValidationError:
+    """契约校验错误"""
+    consumer_id: str
+    error_type: str  # tool_not_exported | provider_not_found | version_mismatch | cycle_detected
+    message: str
+    provider_id: Optional[str] = None
+    tool_name: Optional[str] = None
+
+
+@dataclass
+class ContractValidationResult:
+    """契约校验结果"""
+    valid: bool
+    errors: List[ContractValidationError] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def add_error(self, error: ContractValidationError):
+        self.errors.append(error)
+        self.valid = False
+
+    def add_warning(self, warning: str):
+        self.warnings.append(warning)
+
+
+def compare_versions(v1: str, v2: str) -> int:
+    """比较语义化版本
+
+    Returns:
+        -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+        -1 if versions are invalid (fail-safe: treat as incompatible)
+    """
+    def parse_version(v: str) -> Tuple[int, int, int]:
+        parts = v.split(".")
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2]) if len(parts) > 2 else 0
+        return (major, minor, patch)
+
+    try:
+        v1_parts = parse_version(v1)
+        v2_parts = parse_version(v2)
+
+        if v1_parts < v2_parts:
+            return -1
+        elif v1_parts > v2_parts:
+            return 1
+        return 0
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Invalid version format: v1={v1}, v2={v2}: {e}")
+        return -1  # Fail-safe: treat invalid versions as incompatible
+
+
+def _build_dependency_graph(contracts: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """构建依赖图
+
+    Args:
+        contracts: {skill_id: SkillContract}
+
+    Returns:
+        {skill_id: {dependent_skill_ids}}
+    """
+    graph: Dict[str, Set[str]] = {}
+
+    for skill_id, contract in contracts.items():
+        if skill_id not in graph:
+            graph[skill_id] = set()
+
+        # 添加 imports 依赖
+        for imp in contract.imports:
+            graph[skill_id].add(imp.from_skill)
+
+    return graph
+
+
+def _detect_cycle(graph: Dict[str, Set[str]]) -> Optional[List[str]]:
+    """检测循环依赖
+
+    Args:
+        graph: 依赖图 {skill_id: {dependent_skill_ids}}
+
+    Returns:
+        循环路径列表，如果没有循环则返回 None
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: Dict[str, int] = {node: WHITE for node in graph}
+    parent: Dict[str, Optional[str]] = {node: None for node in graph}
+
+    def dfs(node: str) -> Optional[List[str]]:
+        color[node] = GRAY
+
+        for neighbor in graph.get(node, set()):
+            if neighbor not in color:
+                # 未知节点（可能是未加载的 skill），跳过
+                continue
+
+            if color[neighbor] == GRAY:
+                # 找到循环，回溯路径
+                cycle = [neighbor, node]
+                current = node
+                while parent[current] and parent[current] != neighbor:
+                    cycle.append(parent[current])
+                    current = parent[current]
+                cycle.reverse()
+                return cycle
+
+            if color[neighbor] == WHITE:
+                parent[neighbor] = node
+                result = dfs(neighbor)
+                if result:
+                    return result
+
+        color[node] = BLACK
+        return None
+
+    for node in graph:
+        if color[node] == WHITE:
+            result = dfs(node)
+            if result:
+                return result
+
+    return None
+
+
+def validate_skill_contracts(contracts: Dict[str, Any]) -> ContractValidationResult:
+    """校验所有 Skill 的 imports/exports 契约
+
+    校验内容：
+    1. Provider 是否存在
+    2. 工具是否在 Provider 的 exports 中
+    3. 版本兼容性
+    4. 循环依赖检测
+
+    Args:
+        contracts: {skill_id: SkillContract}
+
+    Returns:
+        ContractValidationResult
+    """
+    result = ContractValidationResult(valid=True)
+
+    for consumer_id, consumer_contract in contracts.items():
+        for imp in consumer_contract.imports:
+            provider_id = imp.from_skill
+
+            # 1. Provider 是否存在
+            if provider_id not in contracts:
+                result.add_error(ContractValidationError(
+                    consumer_id=consumer_id,
+                    error_type="provider_not_found",
+                    message=f"{consumer_id}: 引用的 {provider_id} 不存在",
+                    provider_id=provider_id,
+                ))
+                continue
+
+            provider_contract = contracts[provider_id]
+
+            # 2. Provider 是否有 exports
+            if not provider_contract.exports:
+                result.add_warning(
+                    f"{consumer_id}: {provider_id} 没有 exports 声明，跳过工具校验（兼容期）"
+                )
+                continue
+
+            # 3. 工具是否在 exports 中
+            for tool_name in imp.tools:
+                if not provider_contract.exports.has_tool(tool_name):
+                    result.add_error(ContractValidationError(
+                        consumer_id=consumer_id,
+                        error_type="tool_not_exported",
+                        message=f"{consumer_id}: {tool_name} 未在 {provider_id}.exports.tools 中",
+                        provider_id=provider_id,
+                        tool_name=tool_name,
+                    ))
+
+            # 4. 版本兼容性
+            if imp.min_version and provider_contract.exports.api_version:
+                if compare_versions(provider_contract.exports.api_version, imp.min_version) < 0:
+                    result.add_error(ContractValidationError(
+                        consumer_id=consumer_id,
+                        error_type="version_mismatch",
+                        message=f"{consumer_id}: 要求 {provider_id} >= {imp.min_version}，实际 {provider_contract.exports.api_version}",
+                        provider_id=provider_id,
+                    ))
+
+    # 6. Provider 导出工具 Schema 完整性校验（Schema 必填 + 结构基本正确）
+    for provider_id, provider_contract in contracts.items():
+        if not provider_contract.exports:
+            continue
+        for exported in provider_contract.exports.tools:
+            # 必须提供 input_schema 与 output_schema
+            if exported.input_schema is None or exported.output_schema is None:
+                result.add_error(ContractValidationError(
+                    consumer_id=provider_id,
+                    error_type="schema_missing",
+                    message=f"{provider_id}: 导出工具 {exported.name} 必须提供 input_schema 与 output_schema",
+                    provider_id=provider_id,
+                    tool_name=exported.name,
+                ))
+                continue
+            # 结构基本校验
+            for which, schema in (("input_schema", exported.input_schema), ("output_schema", exported.output_schema)):
+                if getattr(schema, 'type', 'object') != 'object':
+                    result.add_error(ContractValidationError(
+                        consumer_id=provider_id,
+                        error_type="schema_invalid",
+                        message=f"{provider_id}: {exported.name}.{which}.type 必须为 'object'",
+                        provider_id=provider_id,
+                        tool_name=exported.name,
+                    ))
+                if not isinstance(getattr(schema, 'properties', {}), dict):
+                    result.add_error(ContractValidationError(
+                        consumer_id=provider_id,
+                        error_type="schema_invalid",
+                        message=f"{provider_id}: {exported.name}.{which}.properties 必须为对象",
+                        provider_id=provider_id,
+                        tool_name=exported.name,
+                    ))
+
+    # 5. 循环依赖检测
+    graph = _build_dependency_graph(contracts)
+    cycle = _detect_cycle(graph)
+    if cycle:
+        result.add_error(ContractValidationError(
+            consumer_id=cycle[0],
+            error_type="cycle_detected",
+            message=f"检测到循环依赖: {' -> '.join(cycle)}",
+        ))
+
+    return result
+
+
+def validate_cross_skill_tool_access(
+    consumer_skill_id: str,
+    provider_skill_id: str,
+    tool_name: str,
+    consumer_contract: Any,
+    provider_contract: Any,
+) -> Tuple[bool, str]:
+    """运行时校验跨技能工具访问
+
+    Args:
+        consumer_skill_id: 调用方 Skill ID
+        provider_skill_id: 被调用方 Skill ID
+        tool_name: 工具名
+        consumer_contract: 调用方契约
+        provider_contract: 被调用方契约
+
+    Returns:
+        (是否允许, 错误信息)
+    """
+    # 1. 检查 consumer 是否声明了 import
+    imp = consumer_contract.imports_from(provider_skill_id)
+    if not imp:
+        return False, f"{tool_name} 未在 {consumer_skill_id} 的 imports 中声明"
+
+    if tool_name not in imp.tools:
+        return False, f"{tool_name} 未在 {consumer_skill_id}.imports[{provider_skill_id}].tools 中"
+
+    # 2. 检查 provider 是否导出了该工具
+    if provider_contract.exports and not provider_contract.exports.has_tool(tool_name):
+        return False, f"{tool_name} 未在 {provider_skill_id}.exports.tools 中"
+
+    return True, ""
+
+
+def is_tool_imported(
+    consumer_skill_id: str,
+    provider_skill_id: str,
+    tool_name: str,
+    contracts: Dict[str, Any],
+) -> bool:
+    """检查工具是否被正确导入
+
+    Args:
+        consumer_skill_id: 调用方 Skill ID
+        provider_skill_id: 被调用方 Skill ID
+        tool_name: 工具名
+        contracts: 所有契约 {skill_id: SkillContract}
+
+    Returns:
+        是否允许访问
+    """
+    consumer_contract = contracts.get(consumer_skill_id)
+    if not consumer_contract:
+        return False
+
+    imp = consumer_contract.imports_from(provider_skill_id)
+    if not imp:
+        return False
+
+    return tool_name in imp.tools

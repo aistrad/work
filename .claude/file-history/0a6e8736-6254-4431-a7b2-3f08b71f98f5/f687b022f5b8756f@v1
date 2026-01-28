@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+Real User Scenario Tests - Post Migration 021-023
+Tests real-world user flows after data architecture refactoring
+"""
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stores.db import get_connection
+from stores.user_repo import UserRepository
+from stores.unified_profile_repo import UnifiedProfileRepository
+from stores.conversation_repo import ConversationRepository
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
+
+class ScenarioTester:
+    """Real user scenario tester"""
+
+    def __init__(self):
+        self.test_users = []
+        self.results = []
+
+    async def cleanup(self):
+        """Cleanup test users"""
+        async with get_connection() as conn:
+            for user_id in self.test_users:
+                await conn.execute("DELETE FROM unified_profiles WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM vibe_users WHERE id = $1", user_id)
+
+    def log_result(self, scenario: str, status: str, details: str = ""):
+        """Log test result"""
+        result = {
+            "scenario": scenario,
+            "status": status,
+            "details": details,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.results.append(result)
+        emoji = "✅" if status == "PASS" else "❌"
+        logger.info(f"{emoji} {scenario}: {status}")
+        if details:
+            logger.info(f"   {details}")
+
+    # ========================================================================
+    # Scenario 1: 新用户完整注册流程
+    # ========================================================================
+    async def scenario_new_user_onboarding(self):
+        """
+        场景1: 新用户完整注册流程
+        - 创建账户
+        - 设置个人资料
+        - 订阅默认 Skills
+        - 验证数据一致性
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 1: 新用户完整注册流程")
+        logger.info("=" * 70)
+
+        try:
+            # Step 1: 创建用户
+            user = await UserRepository.create(
+                display_name="测试用户-张三",
+                birth_datetime=datetime(1990, 6, 15, 14, 30),
+                birth_location="北京市",
+                gender="male",
+                timezone="Asia/Shanghai",
+                language="zh-CN"
+            )
+            user_id = user['id']
+            self.test_users.append(user_id)
+
+            self.log_result(
+                "1.1 创建新用户",
+                "PASS",
+                f"用户ID: {user['vibe_id']}, 姓名: 测试用户-张三"
+            )
+
+            # Step 2: 验证 vibe_users 记录
+            async with get_connection() as conn:
+                vu = await conn.fetchrow("SELECT * FROM vibe_users WHERE id = $1", user_id)
+                assert vu['vibe_id'] == user['vibe_id']
+                assert vu['status'] == 'active'
+                assert vu['tier'] == 'free'
+
+                self.log_result("1.2 vibe_users 记录验证", "PASS", "核心字段正确")
+
+                # Step 3: 验证 unified_profiles 记录
+                up = await conn.fetchrow("SELECT profile FROM unified_profiles WHERE user_id = $1", user_id)
+                profile = json.loads(up['profile']) if isinstance(up['profile'], str) else up['profile']
+
+                # 验证 account
+                assert profile['account']['vibe_id'] == user['vibe_id']
+                assert profile['account']['display_name'] == "测试用户-张三"
+                assert profile['account']['status'] == 'active'
+
+                # 验证 birth_info
+                assert profile['birth_info']['date'] == "1990-06-15"
+                assert profile['birth_info']['time'] == "14:30"
+                assert profile['birth_info']['place'] == "北京市"
+                assert profile['birth_info']['gender'] == "male"
+
+                # 验证 preferences
+                assert profile['preferences']['timezone'] == "Asia/Shanghai"
+                assert profile['preferences']['language'] == "zh-CN"
+
+                self.log_result(
+                    "1.3 unified_profiles 记录验证",
+                    "PASS",
+                    "account, birth_info, preferences 全部正确"
+                )
+
+                # Step 4: 验证默认 Skill 订阅
+                if 'subscribed_skills' in profile.get('preferences', {}):
+                    skills = profile['preferences']['subscribed_skills']
+                    default_skills = ['core', 'lifecoach', 'mindfulness']
+                    subscribed = [s for s in default_skills if s in skills]
+
+                    self.log_result(
+                        "1.4 默认 Skill 订阅",
+                        "PASS",
+                        f"已订阅: {subscribed}"
+                    )
+                else:
+                    self.log_result(
+                        "1.4 默认 Skill 订阅",
+                        "WARN",
+                        "subscribed_skills 不存在（可能是触发器未执行）"
+                    )
+
+                return True
+
+        except Exception as e:
+            self.log_result("场景 1: 新用户注册", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Scenario 2: 用户更新个人资料
+    # ========================================================================
+    async def scenario_update_profile(self):
+        """
+        场景2: 用户更新个人资料
+        - 更新显示名称
+        - 更新头像
+        - 验证触发器同步
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 2: 用户更新个人资料")
+        logger.info("=" * 70)
+
+        try:
+            # 使用场景1创建的用户
+            if not self.test_users:
+                await self.scenario_new_user_onboarding()
+
+            user_id = self.test_users[0]
+
+            # Step 1: 更新显示名称
+            await UnifiedProfileRepository.update_account_info(
+                user_id,
+                display_name="张三-已更新",
+                avatar_url="https://example.com/avatar.jpg"
+            )
+
+            # Step 2: 验证更新
+            async with get_connection() as conn:
+                up = await conn.fetchrow("SELECT profile FROM unified_profiles WHERE user_id = $1", user_id)
+                profile = json.loads(up['profile']) if isinstance(up['profile'], str) else up['profile']
+
+                assert profile['account']['display_name'] == "张三-已更新"
+                assert profile['account']['avatar_url'] == "https://example.com/avatar.jpg"
+
+                self.log_result(
+                    "2.1 更新显示名称和头像",
+                    "PASS",
+                    "unified_profiles 已更新"
+                )
+
+                # Step 3: 验证缓存失效
+                # (这里应该测试 Redis 缓存，暂时跳过)
+
+                return True
+
+        except Exception as e:
+            self.log_result("场景 2: 更新个人资料", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Scenario 3: 跨 Skill 数据一致性
+    # ========================================================================
+    async def scenario_cross_skill_data_consistency(self):
+        """
+        场景3: 跨 Skill 数据一致性
+        - 用户使用八字 Skill（需要出生信息）
+        - 用户使用星座 Skill（需要出生信息）
+        - 验证两个 Skill 获取的出生信息一致
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 3: 跨 Skill 数据一致性")
+        logger.info("=" * 70)
+
+        try:
+            if not self.test_users:
+                await self.scenario_new_user_onboarding()
+
+            user_id = self.test_users[0]
+
+            # Step 1: 获取 Profile
+            profile_repo = UnifiedProfileRepository()
+            profile = await profile_repo.get_profile(user_id)
+
+            # Step 2: 验证八字 Skill 获取的出生信息
+            birth_info = profile.profile.get('birth_info', {})
+            assert birth_info.get('date') == "1990-06-15"
+            assert birth_info.get('time') == "14:30"
+            assert birth_info.get('place') == "北京市"
+
+            self.log_result(
+                "3.1 八字 Skill 出生信息",
+                "PASS",
+                f"出生: {birth_info.get('date')} {birth_info.get('time')} @{birth_info.get('place')}"
+            )
+
+            # Step 3: 验证星座 Skill 获取的出生信息（应该一致）
+            # 星座只需要日期，但应该从同一个 birth_info 读取
+            zodiac_date = birth_info.get('date')
+            assert zodiac_date == "1990-06-15"
+
+            self.log_result(
+                "3.2 星座 Skill 出生信息",
+                "PASS",
+                f"出生日期: {zodiac_date}（与八字一致）"
+            )
+
+            # Step 4: 验证数据只存储一次（不重复）
+            assert 'bazi' not in profile.profile.get('skill_data', {}).keys() or \
+                   'birth_datetime' not in profile.profile.get('skill_data', {}).get('bazi', {})
+
+            self.log_result(
+                "3.3 数据不重复存储",
+                "PASS",
+                "birth_info 只存储在 profile.birth_info，未在 skill_data 中重复"
+            )
+
+            return True
+
+        except Exception as e:
+            self.log_result("场景 3: 跨 Skill 数据一致性", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Scenario 4: 触发器双向同步
+    # ========================================================================
+    async def scenario_trigger_bidirectional_sync(self):
+        """
+        场景4: 触发器双向同步
+        - 更新 vibe_users.status → 验证同步到 unified_profiles
+        - 更新 unified_profiles.status → 验证同步到 vibe_users
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 4: 触发器双向同步")
+        logger.info("=" * 70)
+
+        try:
+            if not self.test_users:
+                await self.scenario_new_user_onboarding()
+
+            user_id = self.test_users[0]
+
+            async with get_connection() as conn:
+                # Step 1: 正向同步测试（vibe_users → unified_profiles）
+                await conn.execute("UPDATE vibe_users SET status = 'pending_deletion' WHERE id = $1", user_id)
+
+                up_status = await conn.fetchval(
+                    "SELECT profile->'account'->>'status' FROM unified_profiles WHERE user_id = $1",
+                    user_id
+                )
+
+                if up_status == 'pending_deletion':
+                    self.log_result(
+                        "4.1 正向同步 (vibe_users → unified_profiles)",
+                        "PASS",
+                        "status 同步成功"
+                    )
+                else:
+                    self.log_result(
+                        "4.1 正向同步 (vibe_users → unified_profiles)",
+                        "FAIL",
+                        f"Expected: pending_deletion, Got: {up_status}"
+                    )
+
+                # Step 2: 反向同步测试（unified_profiles → vibe_users）
+                await conn.execute(
+                    """
+                    UPDATE unified_profiles
+                    SET profile = jsonb_set(profile, '{account, status}', to_jsonb('active'::text))
+                    WHERE user_id = $1
+                    """,
+                    user_id
+                )
+
+                vu_status = await conn.fetchval("SELECT status FROM vibe_users WHERE id = $1", user_id)
+
+                if vu_status == 'active':
+                    self.log_result(
+                        "4.2 反向同步 (unified_profiles → vibe_users)",
+                        "PASS",
+                        "status 反向同步成功"
+                    )
+                else:
+                    self.log_result(
+                        "4.2 反向同步 (unified_profiles → vibe_users)",
+                        "FAIL",
+                        f"Expected: active, Got: {vu_status}"
+                    )
+
+                return True
+
+        except Exception as e:
+            self.log_result("场景 4: 触发器双向同步", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Scenario 5: 账户删除流程
+    # ========================================================================
+    async def scenario_account_deletion(self):
+        """
+        场景5: 账户删除流程
+        - 用户请求删除账户
+        - 验证 30 天宽限期
+        - 执行硬删除
+        - 验证数据清理
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 5: 账户删除流程")
+        logger.info("=" * 70)
+
+        try:
+            # 创建一个专门用于删除测试的用户
+            user = await UserRepository.create(
+                display_name="待删除用户",
+                timezone="Asia/Shanghai"
+            )
+            delete_user_id = user['id']
+
+            # Step 1: 请求删除
+            await UnifiedProfileRepository.update_deletion_status(
+                delete_user_id,
+                status='pending_deletion',
+                deletion_requested_at=datetime.now(),
+                deletion_scheduled_at=datetime.now() + timedelta(days=30)
+            )
+
+            async with get_connection() as conn:
+                # 验证状态
+                vu = await conn.fetchrow("SELECT status FROM vibe_users WHERE id = $1", delete_user_id)
+                assert vu['status'] == 'pending_deletion'
+
+                up = await conn.fetchrow("SELECT profile FROM unified_profiles WHERE user_id = $1", delete_user_id)
+                profile = json.loads(up['profile']) if isinstance(up['profile'], str) else up['profile']
+                assert profile['account']['deletion_requested_at'] is not None
+
+                self.log_result(
+                    "5.1 请求删除账户",
+                    "PASS",
+                    "status = pending_deletion, deletion_requested_at 已设置"
+                )
+
+                # Step 2: 硬删除（清理数据）
+                await conn.execute("DELETE FROM unified_profiles WHERE user_id = $1", delete_user_id)
+                await conn.execute("UPDATE vibe_users SET status = 'deleted', daily_quota = 0 WHERE id = $1", delete_user_id)
+
+                # 验证删除
+                vu_after = await conn.fetchrow("SELECT status, daily_quota FROM vibe_users WHERE id = $1", delete_user_id)
+                assert vu_after['status'] == 'deleted'
+                assert vu_after['daily_quota'] == 0
+
+                up_after = await conn.fetchrow("SELECT * FROM unified_profiles WHERE user_id = $1", delete_user_id)
+                assert up_after is None
+
+                self.log_result(
+                    "5.2 硬删除执行",
+                    "PASS",
+                    "unified_profiles 已删除, vibe_users 标记为 deleted（tombstone）"
+                )
+
+                # 清理
+                await conn.execute("DELETE FROM vibe_users WHERE id = $1", delete_user_id)
+
+                return True
+
+        except Exception as e:
+            self.log_result("场景 5: 账户删除流程", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Scenario 6: 并发更新测试
+    # ========================================================================
+    async def scenario_concurrent_updates(self):
+        """
+        场景6: 并发更新测试
+        - 同时更新 vibe_users 和 unified_profiles
+        - 验证最终一致性
+        """
+        logger.info("\n" + "=" * 70)
+        logger.info("场景 6: 并发更新测试")
+        logger.info("=" * 70)
+
+        try:
+            if not self.test_users:
+                await self.scenario_new_user_onboarding()
+
+            user_id = self.test_users[0]
+
+            async with get_connection() as conn:
+                # 并发更新
+                await asyncio.gather(
+                    conn.execute("UPDATE vibe_users SET tier = 'pro' WHERE id = $1", user_id),
+                    conn.execute(
+                        """
+                        UPDATE unified_profiles
+                        SET profile = jsonb_set(profile, '{account, display_name}', to_jsonb('并发更新测试'::text))
+                        WHERE user_id = $1
+                        """,
+                        user_id
+                    )
+                )
+
+                # 等待触发器执行
+                await asyncio.sleep(0.1)
+
+                # 验证一致性
+                vu = await conn.fetchrow("SELECT tier FROM vibe_users WHERE id = $1", user_id)
+                up = await conn.fetchrow("SELECT profile FROM unified_profiles WHERE user_id = $1", user_id)
+                profile = json.loads(up['profile']) if isinstance(up['profile'], str) else up['profile']
+
+                assert vu['tier'] == 'pro'
+                assert profile['account']['tier'] == 'pro'  # 触发器应该同步
+                assert profile['account']['display_name'] == '并发更新测试'
+
+                self.log_result(
+                    "6.1 并发更新一致性",
+                    "PASS",
+                    "tier 同步正确, display_name 更新正确"
+                )
+
+                return True
+
+        except Exception as e:
+            self.log_result("场景 6: 并发更新测试", "FAIL", str(e))
+            return False
+
+    # ========================================================================
+    # Main Test Runner
+    # ========================================================================
+    async def run_all_scenarios(self):
+        """Run all scenarios"""
+        logger.info("\n" + "="* 70)
+        logger.info("🚀 真实用户场景测试 - Post Migration 021-023")
+        logger.info("=" * 70)
+        logger.info(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 70)
+
+        scenarios = [
+            ("场景 1: 新用户完整注册流程", self.scenario_new_user_onboarding()),
+            ("场景 2: 用户更新个人资料", self.scenario_update_profile()),
+            ("场景 3: 跨 Skill 数据一致性", self.scenario_cross_skill_data_consistency()),
+            ("场景 4: 触发器双向同步", self.scenario_trigger_bidirectional_sync()),
+            ("场景 5: 账户删除流程", self.scenario_account_deletion()),
+            ("场景 6: 并发更新测试", self.scenario_concurrent_updates()),
+        ]
+
+        for name, scenario in scenarios:
+            try:
+                await scenario
+            except Exception as e:
+                logger.exception(f"Scenario failed: {name}")
+
+        # Cleanup
+        await self.cleanup()
+
+        # Summary Report
+        self.print_summary()
+
+    def print_summary(self):
+        """Print test summary"""
+        logger.info("\n" + "=" * 70)
+        logger.info("📊 测试摘要")
+        logger.info("=" * 70)
+
+        passed = sum(1 for r in self.results if r['status'] == 'PASS')
+        failed = sum(1 for r in self.results if r['status'] == 'FAIL')
+        warned = sum(1 for r in self.results if r['status'] == 'WARN')
+
+        logger.info(f"总计: {len(self.results)} 项测试")
+        logger.info(f"✅ 通过: {passed}")
+        logger.info(f"❌ 失败: {failed}")
+        logger.info(f"⚠️  警告: {warned}")
+
+        if failed == 0:
+            logger.info("\n🎉 所有测试通过!")
+        else:
+            logger.info("\n⚠️  存在失败的测试:")
+            for r in self.results:
+                if r['status'] == 'FAIL':
+                    logger.info(f"   ❌ {r['scenario']}: {r['details']}")
+
+        # Save results to file
+        report_file = Path(__file__).parent.parent / "docs" / "real-user-scenario-test-report.json"
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'summary': {
+                    'total': len(self.results),
+                    'passed': passed,
+                    'failed': failed,
+                    'warned': warned
+                },
+                'results': self.results
+            }, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"\n📄 详细报告已保存: {report_file}")
+
+
+async def main():
+    """Main entry point"""
+    tester = ScenarioTester()
+    await tester.run_all_scenarios()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

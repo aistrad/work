@@ -1,0 +1,716 @@
+"""
+JungAstro Skill 工具执行器
+
+架构说明：
+- 复用 zodiac skill 的计算服务 (calculate_zodiac)
+- 添加荣格心理学解读层 (JungianInterpreter)
+- 定义独立的卡片类型 (jungastro_*)
+
+数据获取方式：
+- 从 context.profile 获取用户出生信息
+- 从 context.skill_data 获取已计算的星盘数据
+- 调用 zodiac 的计算函数进行实时计算
+"""
+
+import logging
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+from services.agent.tool_registry import tool_handler, ToolContext
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 服务层导入 - 复用 zodiac 计算能力
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def get_zodiac_chart(context: ToolContext) -> Optional[Dict[str, Any]]:
+    """
+    从 context 获取用户星盘数据
+
+    优先级：
+    1. context.skill_data["zodiac"]["chart"] - 已计算的完整星盘
+    2. 使用 birth_info 实时计算
+    """
+    profile = context.profile or {}
+    skill_data = context.skill_data or {}
+
+    # 优先从 skill_data 读取已计算的星盘
+    zodiac_data = skill_data.get("zodiac", {})
+    if zodiac_data.get("chart"):
+        return zodiac_data["chart"]
+
+    # 否则尝试实时计算
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+    birth_date = birth_info.get("date")
+
+    if not birth_date:
+        return None
+
+    try:
+        # Phase 2: 统一通过 ToolRegistry 跨技能调用（受契约/订阅/配额治理）
+        from services.agent.tool_registry import ToolRegistry
+        result = await ToolRegistry.execute(
+            "calculate_zodiac",
+            {
+                "birth_date": birth_date,
+                "birth_time": birth_info.get("time", "12:00"),
+                "birth_place": birth_info.get("place", "Shanghai"),
+            },
+            context,
+        )
+        # 订阅限制
+        if result.get("error") == "subscription_required":
+            return None
+        # 正常分支：handlers/calculate_zodiac 返回的是 show_card 结果或内嵌 chart
+        chart = result.get("_chart") or result.get("chart") or {}
+        return chart if chart else None
+    except Exception as e:
+        logger.error(f"Failed to calculate zodiac chart via tool: {e}")
+        return None
+
+
+def get_jungian_interpreter():
+    """获取荣格心理解读器"""
+    try:
+        from skills.jungastro.services.interpreter import JungianInterpreter
+        return JungianInterpreter()
+    except ImportError:
+        logger.warning("JungianInterpreter not available")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 工具执行器
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@tool_handler("collect_birth_info")
+async def handle_collect_birth_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """收集用户出生信息用于荣格心理占星分析"""
+    fields = [
+        {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+        {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+        {"id": "birthPlace", "label": "出生地点", "type": "location", "required": True, "placeholder": "城市名"},
+    ]
+
+    return {
+        "status": "collecting",
+        "cardType": "collect_form",
+        "formType": "birth_info",
+        "title": "请填写出生信息",
+        "description": "准确的出生信息是进行荣格心理占星分析的基础",
+        "fields": fields,
+    }
+
+
+@tool_handler("show_psychological_portrait")
+async def handle_show_psychological_portrait(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示心理画像 - V7 委托模式
+
+    复用 zodiac 计算器获取星盘数据，
+    然后用 JungianInterpreter 进行心理学解读。
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    focus = args.get("focus", "full")
+
+    # 1. 获取用户星盘数据
+    chart_data = get_zodiac_chart(context)
+
+    if not chart_data:
+        return {
+            "status": "error",
+            "error": "需要出生信息才能进行心理画像分析",
+            "action": "collect_birth_info"
+        }
+
+    # 2. 荣格心理解读
+    portrait = {
+        "ego": _analyze_ego(chart_data),           # 太阳分析
+        "unconscious": _analyze_unconscious(chart_data),  # 月亮分析
+        "persona": _analyze_persona(chart_data),   # 上升分析
+        "functions": _analyze_functions(chart_data),  # 功能分布
+    }
+
+    # 3. 如果有解读器，使用更深度的分析
+    interpreter = get_jungian_interpreter()
+    if interpreter:
+        portrait = interpreter.analyze_psychological_portrait(chart_data, focus)
+
+    logger.info(f"Showing psychological portrait via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": portrait},
+            "options": {"componentId": "jungastro_portrait"}
+        },
+        context
+    )
+
+
+@tool_handler("show_shadow_analysis")
+async def handle_show_shadow_analysis(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示阴影分析 - V7 委托模式
+
+    分析困难相位、冥王星配置、12宫内容等。
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    chart_data = get_zodiac_chart(context)
+
+    if not chart_data:
+        return {
+            "status": "error",
+            "error": "需要出生信息才能进行阴影分析",
+            "action": "collect_birth_info"
+        }
+
+    shadow = {
+        "difficult_aspects": _find_difficult_aspects(chart_data),
+        "pluto_analysis": _analyze_pluto(chart_data),
+        "twelfth_house": _analyze_twelfth_house(chart_data),
+        "saturn_analysis": _analyze_saturn(chart_data),
+        "shadow_patterns": [],
+        "integration_path": ""
+    }
+
+    logger.info(f"Showing shadow analysis via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": shadow},
+            "options": {"componentId": "jungastro_shadow"}
+        },
+        context
+    )
+
+
+@tool_handler("show_individuation_path")
+async def handle_show_individuation_path(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示个体化路径 - V7 委托模式
+
+    分析土星周期、外行星行运、成长方向。
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    chart_data = get_zodiac_chart(context)
+
+    if not chart_data:
+        return {
+            "status": "error",
+            "error": "需要出生信息才能分析个体化路径",
+            "action": "collect_birth_info"
+        }
+
+    # 从 profile 获取出生日期计算年龄
+    profile = context.profile or {}
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+    birth_date = birth_info.get("date")
+    age = _calculate_age(birth_date) if birth_date else None
+
+    individuation = {
+        "current_stage": _determine_life_stage(age),
+        "saturn_cycle": _analyze_saturn_cycle(chart_data, age),
+        "outer_planet_transits": [],  # 简化实现
+        "growth_direction": "",
+        "integration_tasks": []
+    }
+
+    logger.info(f"Showing individuation path via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": individuation},
+            "options": {"componentId": "jungastro_individuation"}
+        },
+        context
+    )
+
+
+@tool_handler("show_psychological_functions")
+async def handle_show_psychological_functions(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示心理功能分布 - V7 委托模式
+
+    分析元素分布、模式分布、主导/劣势功能。
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    chart_data = get_zodiac_chart(context)
+
+    if not chart_data:
+        return {
+            "status": "error",
+            "error": "需要出生信息才能分析心理功能",
+            "action": "collect_birth_info"
+        }
+
+    functions = _analyze_functions(chart_data)
+
+    logger.info(f"Showing psychological functions via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": functions},
+            "options": {"componentId": "jungastro_functions"}
+        },
+        context
+    )
+
+
+@tool_handler("show_relationship_dynamics")
+async def handle_show_relationship_dynamics(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示关系动力学 - V7 委托模式
+
+    分析7宫、金星火星配置、投射模式。
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    partner_birth_date = args.get("partner_birth_date")
+    partner_birth_time = args.get("partner_birth_time")
+    partner_birth_location = args.get("partner_birth_location")
+
+    chart_data = get_zodiac_chart(context)
+
+    if not chart_data:
+        return {
+            "status": "error",
+            "error": "需要出生信息才能分析关系动力学",
+            "action": "collect_birth_info"
+        }
+
+    # 如果有对方信息，计算合盘
+    partner_chart = None
+    if partner_birth_date:
+        try:
+            from services.agent.tool_registry import ToolRegistry
+            res = await ToolRegistry.execute(
+                "calculate_zodiac",
+                {
+                    "birth_date": partner_birth_date,
+                    "birth_time": partner_birth_time or "12:00",
+                    "birth_place": partner_birth_location or "Shanghai",
+                },
+                context,
+            )
+            if res.get("error") != "subscription_required":
+                partner_chart = res.get("_chart") or res.get("chart") or None
+        except Exception as e:
+            logger.warning(f"Failed to calculate partner chart via tool: {e}")
+
+    dynamics = {
+        "seventh_house": _analyze_seventh_house(chart_data),
+        "venus_mars": _analyze_venus_mars(chart_data),
+        "projection_patterns": _identify_projections(chart_data),
+        "synastry": _analyze_synastry(chart_data, partner_chart) if partner_chart else None
+    }
+
+    logger.info(f"Showing relationship dynamics via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": dynamics},
+            "options": {"componentId": "jungastro_relationship"}
+        },
+        context
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 辅助函数 - 心理学分析
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _analyze_ego(chart_data: Dict) -> Dict:
+    """分析核心自我 (太阳)"""
+    sun_sign = chart_data.get("sun_sign", "")
+    planets = chart_data.get("planets", [])
+
+    sun_house = None
+    for planet in planets:
+        if planet.get("planet", "").lower() == "sun":
+            sun_house = planet.get("house")
+            break
+
+    return {
+        "planet": "sun",
+        "sign": sun_sign,
+        "house": sun_house,
+        "psychological_meaning": "核心自我认同、意识中心、人生目的感",
+        "expression": "",  # 由 LLM 填充
+        "integration_state": "",
+        "blocked_state": ""
+    }
+
+
+def _analyze_unconscious(chart_data: Dict) -> Dict:
+    """分析情感需求 (月亮)"""
+    moon_sign = chart_data.get("moon_sign", "")
+    planets = chart_data.get("planets", [])
+
+    moon_house = None
+    for planet in planets:
+        if planet.get("planet", "").lower() == "moon":
+            moon_house = planet.get("house")
+            break
+
+    return {
+        "planet": "moon",
+        "sign": moon_sign,
+        "house": moon_house,
+        "psychological_meaning": "情感本能、无意识模式、安全需求",
+        "expression": "",
+        "nurturing_needs": ""
+    }
+
+
+def _analyze_persona(chart_data: Dict) -> Dict:
+    """分析人格面具 (上升)"""
+    rising_sign = chart_data.get("rising_sign", "")
+    return {
+        "sign": rising_sign,
+        "psychological_meaning": "面对世界的方式、第一印象、适应策略",
+        "expression": "",
+        "relationship_to_ego": ""
+    }
+
+
+def _analyze_functions(chart_data: Dict) -> Dict:
+    """分析心理功能分布"""
+    planets = chart_data.get("planets", [])
+
+    # 元素计数
+    elements = {"fire": 0, "earth": 0, "air": 0, "water": 0}
+    modalities = {"cardinal": 0, "fixed": 0, "mutable": 0}
+
+    element_map = {
+        "aries": "fire", "leo": "fire", "sagittarius": "fire",
+        "taurus": "earth", "virgo": "earth", "capricorn": "earth",
+        "gemini": "air", "libra": "air", "aquarius": "air",
+        "cancer": "water", "scorpio": "water", "pisces": "water",
+        # 中文映射
+        "白羊座": "fire", "狮子座": "fire", "射手座": "fire",
+        "金牛座": "earth", "处女座": "earth", "摩羯座": "earth",
+        "双子座": "air", "天秤座": "air", "水瓶座": "air",
+        "巨蟹座": "water", "天蝎座": "water", "双鱼座": "water"
+    }
+
+    modality_map = {
+        "aries": "cardinal", "cancer": "cardinal", "libra": "cardinal", "capricorn": "cardinal",
+        "taurus": "fixed", "leo": "fixed", "scorpio": "fixed", "aquarius": "fixed",
+        "gemini": "mutable", "virgo": "mutable", "sagittarius": "mutable", "pisces": "mutable",
+        # 中文映射
+        "白羊座": "cardinal", "巨蟹座": "cardinal", "天秤座": "cardinal", "摩羯座": "cardinal",
+        "金牛座": "fixed", "狮子座": "fixed", "天蝎座": "fixed", "水瓶座": "fixed",
+        "双子座": "mutable", "处女座": "mutable", "射手座": "mutable", "双鱼座": "mutable"
+    }
+
+    for planet in planets:
+        sign = planet.get("sign", "").lower()
+        if sign in element_map:
+            elements[element_map[sign]] += 1
+        if sign in modality_map:
+            modalities[modality_map[sign]] += 1
+
+    # 确定主导和劣势功能
+    dominant_element = max(elements, key=elements.get) if any(elements.values()) else "unknown"
+    inferior_element = min(elements, key=elements.get) if any(elements.values()) else "unknown"
+
+    return {
+        "elements": elements,
+        "modalities": modalities,
+        "dominant_function": dominant_element,
+        "inferior_function": inferior_element,
+        "balance_suggestions": []
+    }
+
+
+def _find_difficult_aspects(chart_data: Dict) -> list:
+    """找出困难相位 (刑相、对冲)"""
+    aspects = chart_data.get("aspects", [])
+    difficult = []
+
+    for aspect in aspects:
+        aspect_type = aspect.get("type", "").lower()
+        if aspect_type in ["square", "opposition", "刑相", "冲相"]:
+            difficult.append({
+                "planet1": aspect.get("planet1"),
+                "planet2": aspect.get("planet2"),
+                "type": aspect_type,
+                "orb": aspect.get("orb"),
+                "psychological_tension": ""
+            })
+
+    return difficult
+
+
+def _analyze_pluto(chart_data: Dict) -> Dict:
+    """分析冥王星配置"""
+    planets = chart_data.get("planets", [])
+    pluto = None
+
+    for planet in planets:
+        name = planet.get("planet", "").lower()
+        if name in ["pluto", "冥王星"]:
+            pluto = planet
+            break
+
+    if not pluto:
+        return {}
+
+    return {
+        "sign": pluto.get("sign"),
+        "house": pluto.get("house"),
+        "shadow_domain": "",
+        "deep_fear": "",
+        "transformation_potential": "",
+        "integration_suggestions": []
+    }
+
+
+def _analyze_saturn(chart_data: Dict) -> Dict:
+    """分析土星配置"""
+    planets = chart_data.get("planets", [])
+    saturn = None
+
+    for planet in planets:
+        name = planet.get("planet", "").lower()
+        if name in ["saturn", "土星"]:
+            saturn = planet
+            break
+
+    if not saturn:
+        return {}
+
+    return {
+        "sign": saturn.get("sign"),
+        "house": saturn.get("house"),
+        "fear_domain": "",
+        "inner_authority": "",
+        "maturation_task": "",
+        "integration_suggestions": []
+    }
+
+
+def _analyze_twelfth_house(chart_data: Dict) -> Dict:
+    """分析12宫内容"""
+    planets = chart_data.get("planets", [])
+    planets_in_12th = []
+
+    for planet in planets:
+        if planet.get("house") == 12:
+            planets_in_12th.append(planet.get("planet"))
+
+    return {
+        "planets": planets_in_12th,
+        "hidden_energies": "",
+        "unconscious_patterns": "",
+        "integration_direction": ""
+    }
+
+
+def _calculate_age(birth_date: str) -> Optional[int]:
+    """计算年龄"""
+    try:
+        birth = datetime.strptime(birth_date, "%Y-%m-%d")
+        today = datetime.now()
+        age = today.year - birth.year
+        if (today.month, today.day) < (birth.month, birth.day):
+            age -= 1
+        return age
+    except:
+        return None
+
+
+def _determine_life_stage(age: Optional[int]) -> Dict:
+    """确定人生阶段"""
+    if age is None:
+        return {"name": "unknown", "description": ""}
+
+    if age < 29:
+        return {
+            "name": "pre_saturn_return",
+            "description": "探索身份期",
+            "key_task": "探索自我、建立身份认同"
+        }
+    elif 28 <= age <= 30:
+        return {
+            "name": "first_saturn_return",
+            "description": "第一次土星回归",
+            "key_task": "承担责任、成为真正的成年人"
+        }
+    elif 30 < age < 40:
+        return {
+            "name": "building_phase",
+            "description": "建设期",
+            "key_task": "建立事业和家庭"
+        }
+    elif 40 <= age <= 44:
+        return {
+            "name": "uranus_opposition",
+            "description": "中年觉醒期",
+            "key_task": "重新评估人生、打破旧模式"
+        }
+    elif 44 < age < 50:
+        return {
+            "name": "integration_phase",
+            "description": "整合期",
+            "key_task": "整合人生经验"
+        }
+    elif 49 <= age <= 51:
+        return {
+            "name": "chiron_return",
+            "description": "凯龙回归",
+            "key_task": "接受伤痛、成为疗愈者"
+        }
+    elif 57 <= age <= 60:
+        return {
+            "name": "second_saturn_return",
+            "description": "第二次土星回归",
+            "key_task": "传承智慧、成为长者"
+        }
+    else:
+        return {
+            "name": "elder_phase",
+            "description": "智慧长者期",
+            "key_task": "灵性深化、传承"
+        }
+
+
+def _analyze_saturn_cycle(chart_data: Dict, age: Optional[int]) -> Dict:
+    """分析土星周期"""
+    saturn = _analyze_saturn(chart_data)
+    return {
+        "natal_saturn": saturn,
+        "current_age": age,
+        "cycle_phase": _determine_life_stage(age).get("name"),
+        "life_lesson": ""
+    }
+
+
+def _analyze_seventh_house(chart_data: Dict) -> Dict:
+    """分析7宫"""
+    planets = chart_data.get("planets", [])
+    planets_in_7th = []
+
+    for planet in planets:
+        if planet.get("house") == 7:
+            planets_in_7th.append(planet.get("planet"))
+
+    return {
+        "sign": "",  # 需要从 houses 数据获取
+        "planets": planets_in_7th,
+        "relationship_seeking": "",
+        "projection_tendency": "",
+        "integration_direction": ""
+    }
+
+
+def _analyze_venus_mars(chart_data: Dict) -> Dict:
+    """分析金星火星配置"""
+    planets = chart_data.get("planets", [])
+    venus = None
+    mars = None
+
+    for planet in planets:
+        name = planet.get("planet", "").lower()
+        if name in ["venus", "金星"]:
+            venus = planet
+        elif name in ["mars", "火星"]:
+            mars = planet
+
+    return {
+        "venus": {
+            "sign": venus.get("sign") if venus else None,
+            "house": venus.get("house") if venus else None,
+            "love_style": ""
+        },
+        "mars": {
+            "sign": mars.get("sign") if mars else None,
+            "house": mars.get("house") if mars else None,
+            "desire_style": ""
+        },
+        "venus_mars_aspect": None,  # 需要从 aspects 中查找
+        "dynamics": ""
+    }
+
+
+def _identify_projections(chart_data: Dict) -> list:
+    """识别投射模式"""
+    projections = []
+
+    # 下降点分析 (7宫头)
+    # 简化实现：基于上升星座推断下降星座
+    rising_sign = chart_data.get("rising_sign", "")
+
+    opposite_signs = {
+        "aries": "libra", "libra": "aries",
+        "taurus": "scorpio", "scorpio": "taurus",
+        "gemini": "sagittarius", "sagittarius": "gemini",
+        "cancer": "capricorn", "capricorn": "cancer",
+        "leo": "aquarius", "aquarius": "leo",
+        "virgo": "pisces", "pisces": "virgo",
+        # 中文
+        "白羊座": "天秤座", "天秤座": "白羊座",
+        "金牛座": "天蝎座", "天蝎座": "金牛座",
+        "双子座": "射手座", "射手座": "双子座",
+        "巨蟹座": "摩羯座", "摩羯座": "巨蟹座",
+        "狮子座": "水瓶座", "水瓶座": "狮子座",
+        "处女座": "双鱼座", "双鱼座": "处女座"
+    }
+
+    descendant_sign = opposite_signs.get(rising_sign.lower(), "")
+
+    if descendant_sign:
+        projections.append({
+            "source": "descendant",
+            "sign": descendant_sign,
+            "projected_qualities": "",
+            "integration_suggestion": ""
+        })
+
+    return projections
+
+
+def _analyze_synastry(chart1: Dict, chart2: Dict) -> Dict:
+    """分析合盘心理动力"""
+    if not chart2:
+        return None
+
+    return {
+        "attraction_sources": [],
+        "growth_opportunities": [],
+        "potential_challenges": [],
+        "suggestions": []
+    }

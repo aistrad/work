@@ -1,0 +1,602 @@
+"""
+Lifecoach Skill - Tool Handlers V3
+
+简化的卡片系统：
+- 公用卡片：ActionPlanCard, ProgressStreakCard
+- 方法论专属卡片（与 rule 名一一对应）：
+  - dankoe: DanKoeCard
+  - covey: CoveyCard
+  - yangming: YangmingCard
+  - liaofan: LiaofanCard
+"""
+
+import uuid
+from typing import Any, Dict, List, Optional
+from datetime import datetime, date
+
+from services.agent.tool_registry import tool_handler, ToolContext
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+
+VALID_SECTIONS = ["system", "north_star", "goals", "roadmap", "current", "identity", "progress", "journal"]
+
+
+def deep_merge(base: Dict, update: Dict) -> Dict:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif value is not None:
+            result[key] = value
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 数据工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("read_lifecoach_state")
+async def read_lifecoach_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """读取用户的人生地图状态"""
+    sections = args.get("sections", ["system", "north_star", "current", "progress"])
+
+    try:
+        data = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        if not data or not data.content:
+            return {
+                "status": "empty",
+                "message": "尚未建立人生地图，让我们开始吧！",
+                "data": {}
+            }
+
+        result = {}
+        content = data.content
+        for section in sections:
+            if section in content:
+                result[section] = content[section]
+
+        return {
+            "status": "success",
+            "data": result,
+            "version": data.version,
+            "updated_at": data.updated_at.isoformat() if data.updated_at else None
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"读取状态失败: {str(e)}",
+            "data": {}
+        }
+
+
+@tool_handler("write_lifecoach_state")
+async def write_lifecoach_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """写入用户的人生地图状态"""
+    section = args.get("section")
+    data = args.get("data")
+
+    if not section or not data:
+        return {"status": "error", "message": "缺少必要参数: section 和 data"}
+
+    if section not in VALID_SECTIONS:
+        return {"status": "error", "message": f"无效的 section: {section}"}
+
+    try:
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        content = existing.content if existing else {}
+
+        if section in content and isinstance(content[section], dict) and isinstance(data, dict):
+            content[section] = deep_merge(content[section], data)
+        else:
+            content[section] = data
+
+        content["_last_updated"] = datetime.utcnow().isoformat()
+        content["_last_section"] = section
+
+        result = await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            content
+        )
+
+        return {"status": "success", "message": f"已保存 {section}", "version": result.version}
+
+    except Exception as e:
+        return {"status": "error", "message": f"保存失败: {str(e)}"}
+
+
+@tool_handler("add_journal_entry")
+async def add_journal_entry(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """添加日志条目"""
+    entry_type = args.get("entry_type")
+
+    if not entry_type:
+        return {"status": "error", "message": "缺少必要参数: entry_type"}
+
+    try:
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        lifecoach_data = existing.content if existing else {}
+        journal = lifecoach_data.get("journal", [])
+        if isinstance(journal, dict):
+            journal = journal.get("entries", [])
+
+        today = date.today().isoformat()
+
+        entry = {
+            "date": args.get("date", today),
+            "type": entry_type,
+            "content": args.get("content"),
+            "wins": args.get("wins", []),
+            "struggles": args.get("struggles", []),
+            "merits": args.get("merits", []),
+            "demerits": args.get("demerits", []),
+            "_created_at": datetime.utcnow().isoformat(),
+        }
+
+        entry = {k: v for k, v in entry.items() if v is not None and v != []}
+
+        journal = [entry] + journal[:99]
+        lifecoach_data["journal"] = journal
+
+        await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            lifecoach_data
+        )
+
+        return {"status": "success", "message": "日志已记录", "date": entry["date"], "type": entry_type}
+
+    except Exception as e:
+        return {"status": "error", "message": f"记录失败: {str(e)}"}
+
+
+@tool_handler("update_progress")
+async def update_progress(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """更新进度/签到"""
+    action_type = args.get("action_type")
+
+    if not action_type:
+        return {"status": "error", "message": "缺少必要参数: action_type"}
+
+    try:
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        lifecoach_data = existing.content if existing else {}
+        progress = lifecoach_data.get("progress", {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "total_checkins": 0,
+            "last_checkin_date": None,
+        })
+
+        today = date.today().isoformat()
+        now = datetime.utcnow().isoformat()
+
+        if action_type == "daily_checkin":
+            if progress.get("last_checkin_date") == today:
+                return {
+                    "status": "already_checked_in",
+                    "message": "今天已经签到过了！",
+                    "current_streak": progress["current_streak"]
+                }
+
+            last_date = progress.get("last_checkin_date")
+            days_since_last = (date.today() - date.fromisoformat(last_date)).days if last_date else None
+            old_streak = progress.get("current_streak", 0)
+            new_streak = old_streak + 1 if days_since_last == 1 else 1
+
+            progress["longest_streak"] = max(old_streak, new_streak, progress.get("longest_streak", 0))
+            progress["current_streak"] = new_streak
+            progress["total_checkins"] = progress.get("total_checkins", 0) + 1
+            progress["last_checkin_date"] = today
+
+        elif action_type == "task_complete":
+            completed = progress.get("tasks_completed", 0)
+            progress["tasks_completed"] = completed + 1
+
+        elif action_type == "milestone_reached":
+            milestones = progress.get("milestones", [])
+            milestones.append({"reached_at": now, "notes": args.get("notes")})
+            progress["milestones"] = milestones
+
+        lifecoach_data["progress"] = progress
+        await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            lifecoach_data
+        )
+
+        return {
+            "status": "success",
+            "message": "进度已更新",
+            "current_streak": progress.get("current_streak", 0),
+            "longest_streak": progress.get("longest_streak", 0),
+            "total_checkins": progress.get("total_checkins", 0)
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": f"更新失败: {str(e)}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 公用卡片
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_skill_intro")
+async def show_skill_intro(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示 Skill 介绍卡片"""
+    return {
+        "card_type": "skill_intro",
+        "data": {
+            "skill_id": "lifecoach",
+            "variant": args.get("variant", "compact"),
+            "reason": args.get("reason"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_action_plan")
+async def show_action_plan(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示行动计划卡片（公用）"""
+    return {
+        "card_type": "action_plan",
+        "data": {
+            "long_term_goal": args.get("long_term_goal"),
+            "medium_term_goal": args.get("medium_term_goal"),
+            "daily_actions": args.get("daily_actions", []),
+            "first_step": args.get("first_step"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_progress_streak")
+async def show_progress_streak(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示进度统计卡片（公用）"""
+    current_streak = args.get("current_streak", 0)
+
+    if current_streak >= 30:
+        motivation = "太棒了！一个月的坚持，你正在重塑自己！"
+    elif current_streak >= 14:
+        motivation = "两周了！习惯正在形成，继续保持！"
+    elif current_streak >= 7:
+        motivation = "一周连续签到！你已经超越了大多数人！"
+    elif current_streak >= 3:
+        motivation = "连续三天，好的开始！"
+    elif current_streak >= 1:
+        motivation = "今天是新的开始！"
+    else:
+        motivation = "准备好开始你的旅程了吗？"
+
+    return {
+        "card_type": "progress_streak",
+        "data": {
+            "current_streak": current_streak,
+            "longest_streak": args.get("longest_streak", current_streak),
+            "total_checkins": args.get("total_checkins", 0),
+            "completion_rate": args.get("completion_rate", 0),
+            "framework_stats": args.get("framework_stats", {}),
+            "motivation": motivation,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Protocol 内联卡片
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_protocol_progress")
+async def show_protocol_progress(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示 Protocol 进度卡片（内联嵌入对话流）"""
+    return {
+        "card_type": "protocol_progress",
+        "data": {
+            "protocol_id": args.get("protocol_id"),
+            "protocol_name": args.get("protocol_name"),
+            "step": args.get("step"),
+            "total": args.get("total"),
+            "phase": args.get("phase"),
+            "phase_name": args.get("phase_name"),
+            "is_completed": args.get("is_completed", False),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_protocol_step")
+async def show_protocol_step(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示 Protocol 步骤内容卡片（内联嵌入对话流）"""
+    return {
+        "card_type": "protocol_step",
+        "data": {
+            "step_number": args.get("step_number"),
+            "step_name": args.get("step_name"),
+            "content": args.get("content"),
+            "is_question": args.get("is_question", False),
+            "options": args.get("options", []),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_protocol_completion")
+async def show_protocol_completion(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示 Protocol 完成卡片（内联嵌入对话流）"""
+    return {
+        "card_type": "protocol_completion",
+        "data": {
+            "protocol_name": args.get("protocol_name"),
+            "completed_steps": args.get("completed_steps"),
+            "total_steps": args.get("total_steps"),
+            "summary": args.get("summary"),
+            "next_actions": args.get("next_actions", []),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 方法论专属卡片
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_dankoe")
+async def show_dankoe(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示 Dan Koe 方法论卡片
+    整合：愿景、反愿景、身份、目标层级、游戏化框架
+    """
+    vision = args.get("vision", {})
+    anti_vision = args.get("anti_vision", {})
+    game_elements = args.get("game_elements", {})
+
+    return {
+        "card_type": "dankoe",
+        "data": {
+            "vision": {
+                "statement": vision.get("statement", ""),
+                "scene": vision.get("scene", ""),
+                "identity": vision.get("identity", "")
+            },
+            "anti_vision": {
+                "statement": anti_vision.get("statement", ""),
+                "scene": anti_vision.get("scene", "")
+            },
+            "game": {
+                "win_condition": vision.get("statement", ""),
+                "lose_condition": anti_vision.get("statement", ""),
+                "main_mission": game_elements.get("main_mission", ""),
+                "current_boss": game_elements.get("current_boss", ""),
+                "daily_quests": game_elements.get("daily_quests", []),
+                "rules": game_elements.get("rules", [])
+            },
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_covey")
+async def show_covey(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示 Covey 方法论卡片
+    整合：使命宣言、角色目标、大石头、平衡度
+    """
+    roles = args.get("roles", [])
+
+    # 计算平衡分数
+    if roles:
+        scores = [r.get("score", 0) for r in roles if r.get("score") is not None]
+        if scores:
+            avg = sum(scores) / len(scores)
+            variance = sum((s - avg) ** 2 for s in scores) / len(scores)
+            balance_score = min(100, max(0, avg * 10 - variance * 2))
+        else:
+            balance_score = 0
+    else:
+        balance_score = args.get("balance_score", 0)
+
+    return {
+        "card_type": "covey",
+        "data": {
+            "mission": args.get("mission", ""),
+            "principles": args.get("principles", []),
+            "roles": roles,
+            "balance_score": round(balance_score, 1),
+            "insight": args.get("insight", ""),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_yangming")
+async def show_yangming(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示王阳明方法论卡片
+    整合：良知、私欲、知行差距、日课
+    """
+    daily_practice = args.get("daily_practice", {})
+
+    return {
+        "card_type": "yangming",
+        "data": {
+            "aspiration": args.get("aspiration", ""),
+            "conscience_voice": args.get("conscience_voice", ""),
+            "desire_obstacles": args.get("desire_obstacles", []),
+            "daily_practice": {
+                "morning_intention": daily_practice.get("morning_intention", ""),
+                "practice_focus": daily_practice.get("practice_focus", ""),
+                "evening_reflection": daily_practice.get("evening_reflection", "")
+            },
+            "recent_reflections": args.get("recent_reflections", []),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_liaofan")
+async def show_liaofan(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示了凡四训方法论卡片
+    整合：立命志向、功过统计、改命进度
+    """
+    fate_transform = args.get("fate_transform", {})
+    merit_stats = args.get("merit_stats", {})
+
+    return {
+        "card_type": "liaofan",
+        "data": {
+            "fate_transform": {
+                "original_fate": fate_transform.get("original_fate", ""),
+                "new_fate": fate_transform.get("new_fate", "")
+            },
+            "merit_stats": {
+                "total_merits": merit_stats.get("total_merits", 0),
+                "total_demerits": merit_stats.get("total_demerits", 0),
+                "net_karma": merit_stats.get("net_karma", 0),
+                "trend": merit_stats.get("trend", "stable")
+            },
+            "category_breakdown": args.get("category_breakdown", {}),
+            "recent_entries": args.get("recent_entries", []),
+            "milestones": args.get("milestones", []),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 协议管理工具 - REFACTOR_PLAN.md Phase 2
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_protocol_invitation")
+async def show_protocol_invitation(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """显示协议邀请卡片"""
+    return {
+        "cardType": "protocol_invitation",
+        "protocol_id": args["protocol_id"],
+        "title": args["title"],
+        "description": args["description"],
+        "estimated_time": args.get("estimated_time"),
+        "actions": args["actions"],
+    }
+
+
+@tool_handler("advance_protocol_step")
+async def advance_protocol_step(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    完成当前协议步骤，保存数据并进入下一步
+
+    注意：步骤推进由 chat_v5.py 路由层处理
+    这里只负责保存数据
+    """
+    step_data = args.get("step_data", {})
+    step_summary = args.get("step_summary")
+
+    # 读取当前协议状态
+    try:
+        lifecoach_state = await UnifiedProfileRepository.get_skill_state(
+            context.user_id, "lifecoach"
+        )
+        protocol = lifecoach_state.get("protocol", {})
+
+        if not protocol.get("id"):
+            return {
+                "status": "error",
+                "message": "没有进行中的协议"
+            }
+
+        current_step = protocol.get("step", 1)
+
+        # 保存步骤数据
+        protocol_data = protocol.get("data", {})
+        protocol_data[f"step_{current_step}"] = {
+            **step_data,
+            "summary": step_summary,
+            "completed_at": datetime.utcnow().isoformat()
+        }
+
+        # 更新协议状态
+        await UnifiedProfileRepository.update_skill_state(
+            context.user_id,
+            "lifecoach",
+            "protocol",
+            {
+                "data": protocol_data,
+                "last_step_completed": current_step
+            }
+        )
+
+        return {
+            "status": "success",
+            "message": f"已保存第 {current_step} 步数据",
+            "step": current_step,
+            "data_saved": step_data
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"保存步骤数据失败: {str(e)}"
+        }
+
+
+@tool_handler("cancel_protocol")
+async def cancel_protocol(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """取消当前协议"""
+    reason = args.get("reason")
+
+    try:
+        # 读取当前协议状态
+        lifecoach_state = await UnifiedProfileRepository.get_skill_state(
+            context.user_id, "lifecoach"
+        )
+        protocol = lifecoach_state.get("protocol", {})
+
+        if not protocol.get("id"):
+            return {
+                "status": "error",
+                "message": "没有进行中的协议"
+            }
+
+        # 标记为已取消
+        await UnifiedProfileRepository.update_skill_state(
+            context.user_id,
+            "lifecoach",
+            "protocol",
+            {
+                "completed": True,
+                "cancelled": True,
+                "cancelled_at": datetime.utcnow().isoformat(),
+                "cancel_reason": reason
+            }
+        )
+
+        return {
+            "status": "success",
+            "message": "已取消协议",
+            "protocol_id": protocol["id"]
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"取消协议失败: {str(e)}"
+        }
+

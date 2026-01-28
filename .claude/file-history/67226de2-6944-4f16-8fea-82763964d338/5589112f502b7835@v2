@@ -1,0 +1,497 @@
+"use client";
+
+/**
+ * ProtocolContainer - 协议执行容器
+ *
+ * 管理协议的完整流程：
+ * 1. 加载协议配置
+ * 2. 显示当前步骤
+ * 3. 处理用户回答
+ * 4. 显示 AI 回应
+ * 5. 控制步骤流转
+ */
+
+import { memo, useState, useCallback, useRef, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { cn } from "@/lib/utils";
+import { ProtocolProgress } from "./ProtocolProgress";
+import { ProtocolStep, type StepConfig } from "./ProtocolStep";
+
+// UUID 生成函数（兼容不支持 crypto.randomUUID 的环境）
+function generateUUID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback: 使用 crypto.getRandomValues
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (crypto.getRandomValues(new Uint8Array(1))[0] & 15) >> (c === "x" ? 0 : 3);
+      return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+  // Fallback: Math.random (不推荐，但作为最后手段)
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+// 协议配置（从后端同步）
+const PROTOCOL_CONFIGS: Record<string, {
+  id: string;
+  name: string;
+  description: string;
+  totalSteps: number;
+  estimatedTime: string;
+  welcomeMessage: string;
+  steps: Record<number, StepConfig>;
+}> = {
+  dankoe: {
+    id: "dankoe",
+    name: "Dan Koe 快速重置",
+    description: "10分钟完成人生重置，通过反愿景驱动和身份转换实现快速转变",
+    totalSteps: 6,
+    estimatedTime: "10分钟",
+    welcomeMessage: "好的，我们来做一次 Dan Koe 的快速重置。\n整个过程大约10分钟，我会问你6个问题。\n核心是：先看清你不想要的人生，再设计你想要的。\n\n准备好了吗？",
+    steps: {
+      1: {
+        phase: "Phase 1: 觉醒",
+        name: "持续的不满",
+        question: "过去一年，你学会忍受的、持续的不满是什么？\n不是深层痛苦，而是你已经习惯的不舒服。",
+        placeholder: "描述那些你已经麻木但其实很不爽的事...",
+        minLength: 30,
+        hints: ["工作上的...", "人际关系中的...", "对自己的..."],
+      },
+      2: {
+        phase: "Phase 1: 觉醒",
+        name: "反愿景场景",
+        question: "如果接下来5年什么都不改变，描述一个普通的周二：\n- 你在哪里醒来？\n- 身体感觉如何？\n- 9点到6点在做什么？\n- 晚上10点的感觉是什么？",
+        placeholder: "用第一人称描述，越具体越有力量...",
+        minLength: 50,
+      },
+      3: {
+        phase: "Phase 1: 觉醒",
+        name: "愿景场景",
+        question: "忘记可行性。如果3年后你过上完全不同的生活，\n一个普通的周二会是什么样？同样的细节：\n- 在哪里醒来？\n- 身体感觉如何？\n- 一天怎么度过？\n- 晚上的感觉是什么？",
+        placeholder: "大胆想象，不要自我设限...",
+        minLength: 50,
+      },
+      4: {
+        phase: "Phase 2: 设计",
+        name: "放弃的身份",
+        question: `要真正改变，你必须放弃什么身份？
+用"我是那种会..."来描述。
+
+比如：
+- "我是那种会拖延的人"
+- "我是那种不敢冒险的人"
+- "我是那种总是照顾别人的人"`,
+        placeholder: "我是那种会...",
+        minLength: 20,
+        hints: ["我是那种会拖延的人", "我是那种害怕失败的人", "我是那种不够自信的人"],
+      },
+      5: {
+        phase: "Phase 2: 设计",
+        name: "新身份宣言",
+        question: `你想成为什么样的人？
+用"我是那种..."来填空。
+
+这不是你"应该"成为的人，
+而是过着你刚才描述的那种生活的人，
+他会怎么描述自己？`,
+        placeholder: "我是那种...",
+        minLength: 20,
+        hints: ["我是那种敢于行动的人", "我是那种相信自己的人", "我是那种创造价值的人"],
+      },
+      6: {
+        phase: "Phase 3: 启动",
+        name: "本周行动",
+        question: `如果你已经是那个人，这周你会做什么？
+不是"应该做"，而是那个人"自然会做"的事。
+1-3件具体的事就够了。`,
+        placeholder: "1. ...\n2. ...\n3. ...",
+        minLength: 30,
+      },
+    },
+  },
+};
+
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface ProtocolState {
+  protocol_id: string;
+  step: number;
+  next_step: number | null;
+  progress: string;
+  is_completed: boolean;
+  data_saved: boolean;
+}
+
+export interface ProtocolContainerProps {
+  protocolId: string;
+  conversationId?: string;
+  className?: string;
+}
+
+export const ProtocolContainer = memo(function ProtocolContainer({
+  protocolId,
+  conversationId,
+  className,
+}: ProtocolContainerProps) {
+  const router = useRouter();
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // 协议配置
+  const config = PROTOCOL_CONFIGS[protocolId];
+
+  // 状态
+  const [currentStep, setCurrentStep] = useState(0); // 0 = 欢迎页
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isCompleted, setIsCompleted] = useState(false);
+  const [convId, setConvId] = useState(conversationId || "");
+  const [answers, setAnswers] = useState<Record<number, string>>({}); // 保存每步回答
+
+  // localStorage key
+  const storageKey = `protocol_${protocolId}_progress`;
+
+  // 滚动到底部
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, []);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
+
+  // 从 localStorage 恢复进度
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const data = JSON.parse(saved);
+        if (data.protocolId === protocolId && !data.isCompleted) {
+          setCurrentStep(data.currentStep || 0);
+          setMessages(data.messages || []);
+          setConvId(data.convId || "");
+          setAnswers(data.answers || {});
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to restore protocol progress:", e);
+    }
+  }, [protocolId, storageKey]);
+
+  // 保存进度到 localStorage
+  useEffect(() => {
+    if (currentStep > 0 && !isCompleted) {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify({
+          protocolId,
+          currentStep,
+          messages,
+          convId,
+          answers,
+          savedAt: Date.now(),
+        }));
+      } catch (e) {
+        console.warn("Failed to save protocol progress:", e);
+      }
+    }
+  }, [protocolId, currentStep, messages, convId, answers, isCompleted, storageKey]);
+
+  // 完成后清除进度
+  useEffect(() => {
+    if (isCompleted) {
+      localStorage.removeItem(storageKey);
+    }
+  }, [isCompleted, storageKey]);
+
+  // 生成 conversation ID
+  useEffect(() => {
+    if (!convId) {
+      setConvId(generateUUID());
+    }
+  }, [convId]);
+
+  // 开始协议
+  const handleStart = useCallback(() => {
+    setCurrentStep(1);
+  }, []);
+
+  // 提交回答
+  const handleSubmit = useCallback(async (answer: string) => {
+    if (isLoading || !config) return;
+
+    setIsLoading(true);
+
+    // 保存当前步骤的回答
+    setAnswers((prev) => ({ ...prev, [currentStep]: answer }));
+
+    // 添加用户消息
+    setMessages((prev) => [...prev, { role: "user", content: answer }]);
+
+    try {
+      // 调用后端 API
+      const response = await fetch("/api/chat/v5/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: answer,
+          conversation_id: convId,
+          skill: "lifecoach",
+          protocol: {
+            id: protocolId,
+            step: currentStep,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("API request failed");
+      }
+
+      // 解析 SSE 流
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let assistantContent = "";
+      let protocolState: ProtocolState | null = null;
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value);
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (line.startsWith("0:")) {
+              // 文本内容
+              try {
+                const content = JSON.parse(line.slice(2));
+                if (typeof content === "string" && !content.startsWith("[[TOOL:")) {
+                  assistantContent += content;
+                  // 实时更新消息
+                  setMessages((prev) => {
+                    const newMessages = [...prev];
+                    const lastMsg = newMessages[newMessages.length - 1];
+                    if (lastMsg?.role === "assistant") {
+                      lastMsg.content = assistantContent;
+                    } else {
+                      newMessages.push({ role: "assistant", content: assistantContent });
+                    }
+                    return newMessages;
+                  });
+                }
+              } catch {
+                // 忽略解析错误
+              }
+            } else if (line.startsWith("2:")) {
+              // 数据部分（protocol_state）
+              try {
+                const data = JSON.parse(line.slice(2));
+                if (Array.isArray(data) && data[0] === "protocol_state") {
+                  protocolState = data[1] as ProtocolState;
+                }
+              } catch {
+                // 忽略解析错误
+              }
+            }
+          }
+        }
+      }
+
+      // 处理协议状态
+      if (protocolState) {
+        if (protocolState.is_completed) {
+          setIsCompleted(true);
+        } else if (protocolState.next_step) {
+          setCurrentStep(protocolState.next_step);
+        }
+      } else {
+        // 如果没有收到 protocol_state，手动递增
+        if (currentStep < config.totalSteps) {
+          setCurrentStep(currentStep + 1);
+        } else {
+          setIsCompleted(true);
+        }
+      }
+    } catch (error) {
+      console.error("Protocol API error:", error);
+      // 添加错误消息
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "抱歉，出现了一些问题。请稍后重试。" },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [isLoading, config, convId, protocolId, currentStep]);
+
+  // 完成后返回
+  const handleComplete = useCallback(() => {
+    router.push("/chat?skill=lifecoach");
+  }, [router]);
+
+  // 协议不存在
+  if (!config) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-8">
+        <p className="text-muted-foreground">协议不存在: {protocolId}</p>
+        <button
+          onClick={() => router.back()}
+          className="mt-4 text-sm text-emerald-500 hover:underline"
+        >
+          返回
+        </button>
+      </div>
+    );
+  }
+
+  const currentStepConfig = config.steps[currentStep];
+
+  return (
+    <div className={cn("flex flex-col h-full", className)}>
+      {/* Header */}
+      <header className="flex-shrink-0 px-4 py-4 border-b border-border bg-background/80 backdrop-blur-sm">
+        <div className="max-w-2xl mx-auto">
+          <div className="flex items-center justify-between mb-3">
+            <h1 className="text-lg font-semibold text-foreground">
+              {config.name}
+            </h1>
+            <span className="text-xs text-muted-foreground">
+              约 {config.estimatedTime}
+            </span>
+          </div>
+          {currentStep > 0 && (
+            <ProtocolProgress
+              currentStep={currentStep}
+              totalSteps={config.totalSteps}
+              phaseName={currentStepConfig?.phase}
+            />
+          )}
+        </div>
+      </header>
+
+      {/* Content */}
+      <main className="flex-1 overflow-y-auto">
+        <div className="max-w-2xl mx-auto px-4 py-6">
+          {/* 欢迎页 */}
+          {currentStep === 0 && (
+            <div className="text-center py-8">
+              <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center">
+                <span className="text-3xl">🧭</span>
+              </div>
+              <h2 className="text-xl font-semibold text-foreground mb-2">
+                {config.name}
+              </h2>
+              <p className="text-muted-foreground mb-6 max-w-md mx-auto">
+                {config.description}
+              </p>
+              <div className="bg-muted/50 rounded-xl p-4 mb-6 text-left">
+                <p className="text-sm text-foreground whitespace-pre-line">
+                  {config.welcomeMessage}
+                </p>
+              </div>
+              <button
+                onClick={handleStart}
+                className={cn(
+                  "px-8 py-3 rounded-xl font-medium",
+                  "bg-gradient-to-r from-emerald-500 to-teal-500",
+                  "text-white shadow-lg shadow-emerald-500/25",
+                  "hover:shadow-xl hover:shadow-emerald-500/30",
+                  "active:scale-[0.98] transition-all duration-200"
+                )}
+              >
+                准备好了，开始 →
+              </button>
+            </div>
+          )}
+
+          {/* 协议步骤 */}
+          {currentStep > 0 && !isCompleted && (
+            <>
+              {/* 历史消息 */}
+              {messages.length > 0 && (
+                <div className="space-y-4 mb-6">
+                  {messages.map((msg, idx) => (
+                    <div
+                      key={idx}
+                      className={cn(
+                        "p-4 rounded-xl",
+                        msg.role === "user"
+                          ? "bg-emerald-500/10 ml-8"
+                          : "bg-muted mr-8"
+                      )}
+                    >
+                      <p className="text-sm text-foreground whitespace-pre-line">
+                        {msg.content}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 当前步骤 */}
+              {currentStepConfig && (
+                <ProtocolStep
+                  step={currentStep}
+                  config={currentStepConfig}
+                  isLoading={isLoading}
+                  onSubmit={handleSubmit}
+                />
+              )}
+
+              <div ref={messagesEndRef} />
+            </>
+          )}
+
+          {/* 完成页 */}
+          {isCompleted && (
+            <div className="text-center py-8">
+              <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center">
+                <span className="text-3xl">🎉</span>
+              </div>
+              <h2 className="text-xl font-semibold text-foreground mb-2">
+                协议完成！
+              </h2>
+              <p className="text-muted-foreground mb-6">
+                你的人生游戏已经设定好了。记住，你不是在&ldquo;努力成为&rdquo;那个人，你已经是了。
+              </p>
+
+              {/* 最后的 AI 回应 */}
+              {messages.length > 0 && (
+                <div className="bg-muted rounded-xl p-4 mb-6 text-left max-w-md mx-auto">
+                  <p className="text-sm text-foreground whitespace-pre-line">
+                    {messages[messages.length - 1]?.content}
+                  </p>
+                </div>
+              )}
+
+              <button
+                onClick={handleComplete}
+                className={cn(
+                  "px-8 py-3 rounded-xl font-medium",
+                  "bg-gradient-to-r from-emerald-500 to-teal-500",
+                  "text-white shadow-lg shadow-emerald-500/25",
+                  "hover:shadow-xl hover:shadow-emerald-500/30",
+                  "active:scale-[0.98] transition-all duration-200"
+                )}
+              >
+                开始新的对话 →
+              </button>
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+});
+
+export default ProtocolContainer;

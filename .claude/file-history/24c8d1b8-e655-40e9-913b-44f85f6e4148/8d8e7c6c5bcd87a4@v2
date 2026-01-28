@@ -1,0 +1,674 @@
+"""
+Unified Skill Gateway - 统一 Skill API 入口
+
+所有 Skill 数据服务通过此路由访问:
+- POST /api/v1/skills/{skill_id}/{action}
+- GET /api/v1/skills/{skill_id}/services
+- GET /api/v1/skills
+
+v7.4 新增订阅管理端点:
+- GET /api/v1/skills/subscriptions
+- POST /api/v1/skills/{skill_id}/subscribe
+- POST /api/v1/skills/{skill_id}/unsubscribe
+- POST /api/v1/skills/{skill_id}/push
+- GET /api/v1/skills/recommendations
+- GET /api/v1/skills/featured
+
+示例:
+- POST /api/v1/skills/bazi/chart
+- POST /api/v1/skills/zodiac/fortune
+- POST /api/v1/skills/tarot/draw
+"""
+import logging
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from pydantic import BaseModel, Field
+
+from services.identity import get_optional_user, get_current_user, CurrentUser
+from services.agent.skill_service_registry import (
+    SkillServiceRegistry, ServiceContext
+)
+from services.agent.skill_loader import (
+    load_skill_metadata, get_all_skill_metadata, get_skills_by_category
+)
+from stores.profile_cache import get_cached_profile_with_skill
+from stores.skill_subscription_repo import (
+    SkillSubscriptionRepository, SkillUsageRepository, SkillRecommendationBlockRepository
+)
+
+router = APIRouter(prefix="/skills", tags=["Skills"])
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SkillRequest(BaseModel):
+    """通用 Skill 请求"""
+    args: Dict[str, Any] = Field(default_factory=dict, description="服务参数")
+
+
+class SkillResponse(BaseModel):
+    """通用 Skill 响应"""
+    status: str = "success"
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class ServiceInfo(BaseModel):
+    """服务信息"""
+    skill_id: str
+    action: str
+    description: str = ""
+    auth_required: bool = True
+    entitlement: Optional[str] = None
+
+
+# v7.4: 订阅管理相关模型
+class SubscribeRequest(BaseModel):
+    """订阅请求"""
+    push_enabled: bool = True
+
+
+class PushToggleRequest(BaseModel):
+    """推送开关请求"""
+    enabled: bool
+
+
+class SkillUserStatus(BaseModel):
+    """用户对 Skill 的状态"""
+    subscribed: bool = False
+    push_enabled: bool = False
+    trial_messages_used: int = 0
+    trial_messages_remaining: Optional[int] = None
+
+
+class SkillWithStatus(BaseModel):
+    """带用户状态的 Skill 信息"""
+    id: str
+    name: str
+    description: str
+    icon: str = "💡"
+    color: str = "#6B7280"
+    category: str
+    pricing: Dict[str, Any]
+    features: List[Dict[str, Any]] = []
+    showcase: Dict[str, Any] = {}
+    triggers: List[str] = []
+    user_status: Optional[SkillUserStatus] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def build_service_context(
+    user_id: Optional[UUID],
+    skill_id: str,
+    user_tier: str = "free"
+) -> ServiceContext:
+    """构建服务上下文"""
+    profile = {}
+    skill_data = {}
+
+    if user_id:
+        try:
+            result = await get_cached_profile_with_skill(user_id, skill_id)
+            profile = result.get("profile", {})
+            skill_data = result.get("skill_data", {})
+        except Exception as e:
+            logger.warning(f"Failed to get user context: {e}")
+
+    return ServiceContext(
+        user_id=str(user_id) if user_id else None,
+        user_tier=user_tier,
+        profile=profile,
+        skill_data=skill_data
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("")
+async def list_skills(
+    category: Optional[str] = Query(None, description="按分类筛选: core, default, professional"),
+    subscribed: Optional[bool] = Query(None, description="只返回已订阅的 Skill"),
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """
+    获取所有 Skill 列表（带元数据和订阅状态）
+
+    Args:
+        category: 按分类筛选 (core/default/professional)
+        subscribed: 只返回已订阅的 Skill
+
+    Returns:
+        skills: Skill 列表，包含元数据和用户订阅状态
+        categories: 分类统计
+        total: 总数
+    """
+    # 获取所有 Skill 元数据
+    if category:
+        all_metadata = get_skills_by_category(category)
+    else:
+        all_metadata = get_all_skill_metadata()
+
+    # 获取用户订阅状态
+    user_statuses = {}
+    if current_user:
+        subscriptions = await SkillSubscriptionRepository.get_user_subscriptions(current_user.user_id)
+        user_statuses = {s.skill_id: s for s in subscriptions}
+
+    # 构建响应
+    skills = []
+    for metadata in all_metadata:
+        skill_dict = metadata.to_dict()
+        sub = user_statuses.get(metadata.id)
+
+        # 计算试用剩余次数
+        trial_limit = metadata.pricing.trial_messages if metadata.pricing.type != "free" else None
+        trial_used = sub.trial_messages_used if sub else 0
+
+        skill_dict["user_status"] = {
+            "subscribed": sub.status == "subscribed" if sub else False,
+            "push_enabled": sub.push_enabled if sub else False,
+            "trial_messages_used": trial_used,
+            "trial_messages_remaining": (trial_limit - trial_used) if trial_limit else None,
+        }
+
+        # 筛选已订阅
+        if subscribed is not None:
+            is_subscribed = skill_dict["user_status"]["subscribed"]
+            if subscribed and not is_subscribed:
+                continue
+            if not subscribed and is_subscribed:
+                continue
+
+        skills.append(skill_dict)
+
+    # 分类统计
+    all_skills = get_all_skill_metadata()
+    categories = {
+        "core": {
+            "name": "核心能力",
+            "description": "始终激活的基础能力",
+            "count": len([s for s in all_skills if s.category == "core"])
+        },
+        "default": {
+            "name": "基础功能",
+            "description": "默认激活，免费使用",
+            "count": len([s for s in all_skills if s.category == "default"])
+        },
+        "professional": {
+            "name": "专业技能",
+            "description": "需要订阅的高级功能",
+            "count": len([s for s in all_skills if s.category == "professional"])
+        },
+    }
+
+    return {"skills": skills, "categories": categories, "total": len(skills)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 订阅管理端点 (v7.4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/subscriptions")
+async def get_subscriptions(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    获取用户订阅列表
+
+    Returns:
+        subscriptions: 所有 Skill 的订阅状态列表
+        summary: 统计摘要
+    """
+    subscriptions = await SkillSubscriptionRepository.get_user_subscriptions(current_user.user_id)
+    all_skills = get_all_skill_metadata()
+    skill_map = {s.id: s for s in all_skills}
+
+    result = []
+    for skill in all_skills:
+        sub = next((s for s in subscriptions if s.skill_id == skill.id), None)
+        result.append({
+            "skill_id": skill.id,
+            "skill_name": skill.name,
+            "status": sub.status if sub else "not_subscribed",
+            "push_enabled": sub.push_enabled if sub else False,
+            "subscribed_at": sub.subscribed_at.isoformat() if sub and sub.subscribed_at else None,
+            "can_unsubscribe": skill.subscription.can_unsubscribe,
+            "trial_messages_used": sub.trial_messages_used if sub else 0,
+        })
+
+    return {
+        "subscriptions": result,
+        "summary": {
+            "total_subscribed": len([s for s in result if s["status"] == "subscribed"]),
+            "total_available": len(all_skills),
+            "push_enabled_count": len([s for s in result if s["push_enabled"]]),
+        }
+    }
+
+
+@router.get("/recommendations")
+async def get_recommendations(
+    limit: int = Query(default=3, le=10, description="返回数量"),
+    context: Optional[str] = Query(None, description="当前对话上下文"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    获取推荐 Skill
+
+    基于用户档案、使用历史和对话上下文推荐 Skill。
+
+    Args:
+        limit: 返回数量，默认 3，最大 10
+        context: 当前对话上下文（关键词）
+
+    Returns:
+        recommendations: 推荐 Skill 列表
+    """
+    # 获取用户已订阅和已屏蔽的 Skill
+    subscribed_ids = await SkillSubscriptionRepository.get_subscribed_skill_ids(current_user.user_id)
+    blocked_ids = await SkillRecommendationBlockRepository.get_blocked_skills(current_user.user_id)
+
+    # 获取所有 Skill
+    all_skills = get_all_skill_metadata()
+
+    # 过滤：未订阅 + 未屏蔽 + 非 core
+    candidates = [
+        s for s in all_skills
+        if s.id not in subscribed_ids
+        and s.id not in blocked_ids
+        and s.category != "core"
+    ]
+
+    recommendations = []
+    for skill in candidates[:limit]:
+        # 简单推荐逻辑：基于触发词匹配
+        reason = "featured"
+        context_text = f"试试「{skill.name}」，{skill.showcase.tagline or skill.description}"
+
+        if context:
+            # 检查上下文是否匹配触发词
+            for trigger in skill.triggers:
+                if trigger in context:
+                    reason = "based_on_conversation"
+                    context_text = f"你提到了「{trigger}」，{skill.name} 可以帮助你。"
+                    break
+
+        # 获取试用次数
+        trial_used = await SkillSubscriptionRepository.get_trial_usage(current_user.user_id, skill.id)
+        trial_remaining = skill.pricing.trial_messages - trial_used if skill.pricing.type != "free" else None
+
+        recommendations.append({
+            "skill_id": skill.id,
+            "skill": {
+                "id": skill.id,
+                "name": skill.name,
+                "icon": skill.icon,
+                "color": skill.color,
+                "tagline": skill.showcase.tagline,
+            },
+            "reason": reason,
+            "context": context_text,
+            "score": 0.8,
+            "trial_messages_remaining": trial_remaining,
+        })
+
+    return {
+        "recommendations": recommendations,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/featured")
+async def get_featured():
+    """
+    获取精选 Skill（用于首页轮播等）
+
+    Returns:
+        featured: 精选 Skill 列表
+    """
+    # 硬编码精选列表，后续可从数据库读取
+    featured_config = [
+        {"skill_id": "bazi", "position": 1, "campaign": None},
+        {"skill_id": "zodiac", "position": 2, "campaign": None},
+        {"skill_id": "tarot", "position": 3, "campaign": None},
+    ]
+
+    featured = []
+    for item in featured_config:
+        metadata = load_skill_metadata(item["skill_id"])
+        if metadata:
+            featured.append({
+                "skill_id": item["skill_id"],
+                "skill": {
+                    "id": metadata.id,
+                    "name": metadata.name,
+                    "icon": metadata.icon,
+                    "color": metadata.color,
+                    "tagline": metadata.showcase.tagline,
+                    "preview_image": metadata.showcase.preview_image,
+                },
+                "position": item["position"],
+                "campaign": item.get("campaign"),
+            })
+
+    return {"featured": featured}
+
+
+@router.get("/{skill_id}")
+async def get_skill_detail(
+    skill_id: str,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """
+    获取单个 Skill 详情
+
+    Args:
+        skill_id: Skill ID
+
+    Returns:
+        skill: Skill 完整详情
+        user_status: 用户订阅状态（如已登录）
+    """
+    metadata = load_skill_metadata(skill_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    skill_dict = metadata.to_dict()
+
+    # 获取服务列表
+    services = SkillServiceRegistry.list_services(skill_id)
+    skill_dict["services"] = services or []
+
+    # 获取用户状态
+    user_status = None
+    if current_user:
+        sub = await SkillSubscriptionRepository.get(current_user.user_id, skill_id)
+        if sub:
+            trial_limit = metadata.pricing.trial_messages if metadata.pricing.type != "free" else None
+            user_status = {
+                "subscribed": sub.status == "subscribed",
+                "push_enabled": sub.push_enabled,
+                "subscribed_at": sub.subscribed_at.isoformat() if sub.subscribed_at else None,
+                "trial_messages_used": sub.trial_messages_used,
+                "trial_messages_remaining": (trial_limit - sub.trial_messages_used) if trial_limit else None,
+            }
+
+    return {"skill": skill_dict, "user_status": user_status}
+
+
+@router.post("/{skill_id}/subscribe")
+async def subscribe_skill(
+    skill_id: str,
+    request: SubscribeRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    订阅 Skill
+
+    Args:
+        skill_id: Skill ID
+        request: 订阅请求（push_enabled）
+
+    Returns:
+        success: 是否成功
+        subscription: 订阅状态
+        message: 提示消息
+    """
+    metadata = load_skill_metadata(skill_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    # 检查是否已订阅
+    existing = await SkillSubscriptionRepository.get(current_user.user_id, skill_id)
+    if existing and existing.status == "subscribed":
+        raise HTTPException(status_code=400, detail="Already subscribed")
+
+    # 检查是否需要 Premium（目前简化处理，不检查 Premium 状态）
+    # TODO: 集成 EntitlementService 检查用户是否有 Premium
+
+    # 创建/更新订阅
+    subscription = await SkillSubscriptionRepository.subscribe(
+        user_id=current_user.user_id,
+        skill_id=skill_id,
+        push_enabled=request.push_enabled,
+    )
+
+    # 记录使用日志
+    await SkillUsageRepository.log_usage(
+        user_id=current_user.user_id,
+        skill_id=skill_id,
+        action="subscribe",
+    )
+
+    return {
+        "success": True,
+        "subscription": subscription.to_dict(),
+        "message": f"已成功订阅「{metadata.name}」",
+    }
+
+
+@router.post("/{skill_id}/unsubscribe")
+async def unsubscribe_skill(
+    skill_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    取消订阅 Skill
+
+    Args:
+        skill_id: Skill ID
+
+    Returns:
+        success: 是否成功
+        subscription: 订阅状态
+        message: 提示消息
+    """
+    metadata = load_skill_metadata(skill_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    # Core Skill 不可取消
+    if not metadata.subscription.can_unsubscribe:
+        raise HTTPException(status_code=400, detail="This skill cannot be unsubscribed")
+
+    # 检查是否已订阅
+    existing = await SkillSubscriptionRepository.get(current_user.user_id, skill_id)
+    if not existing or existing.status != "subscribed":
+        raise HTTPException(status_code=400, detail="Not subscribed")
+
+    # 取消订阅
+    subscription = await SkillSubscriptionRepository.unsubscribe(current_user.user_id, skill_id)
+
+    # 记录使用日志
+    await SkillUsageRepository.log_usage(
+        user_id=current_user.user_id,
+        skill_id=skill_id,
+        action="unsubscribe",
+    )
+
+    return {
+        "success": True,
+        "subscription": subscription.to_dict(),
+        "message": f"已取消订阅「{metadata.name}」",
+    }
+
+
+@router.post("/{skill_id}/push")
+async def toggle_push(
+    skill_id: str,
+    request: PushToggleRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    切换推送开关
+
+    Args:
+        skill_id: Skill ID
+        request: 推送开关请求
+
+    Returns:
+        success: 是否成功
+        subscription: 订阅状态
+        message: 提示消息
+    """
+    metadata = load_skill_metadata(skill_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    # 检查是否已订阅
+    existing = await SkillSubscriptionRepository.get(current_user.user_id, skill_id)
+    if not existing or existing.status != "subscribed":
+        raise HTTPException(status_code=400, detail="Not subscribed")
+
+    # 更新推送状态
+    subscription = await SkillSubscriptionRepository.update_push(
+        user_id=current_user.user_id,
+        skill_id=skill_id,
+        enabled=request.enabled,
+    )
+
+    action = "开启" if request.enabled else "关闭"
+    return {
+        "success": True,
+        "subscription": subscription.to_dict() if subscription else None,
+        "message": f"已{action}「{metadata.name}」的推送通知",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 原有服务端点
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/{skill_id}/services")
+async def list_skill_services(skill_id: str):
+    """
+    列出 Skill 的所有服务
+
+    Args:
+        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+
+    Returns:
+        services: 服务列表
+    """
+    services = SkillServiceRegistry.list_services(skill_id)
+    if not services:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No services found for skill: {skill_id}"
+        )
+    return {"skill_id": skill_id, "services": services}
+
+
+@router.post("/{skill_id}/{action}")
+async def execute_skill_service(
+    skill_id: str,
+    action: str,
+    request: SkillRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+    x_test_tier: Optional[str] = Header(None, alias="x-test-tier")
+):
+    """
+    执行 Skill 服务
+
+    Args:
+        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+        action: 服务动作 (chart, fortune, draw, etc.)
+        request: 请求参数
+
+    Returns:
+        服务执行结果
+
+    Examples:
+        POST /api/v1/skills/bazi/chart
+        {"args": {"birth_date": "1990-01-01", "birth_time": "12:00"}}
+
+        POST /api/v1/skills/zodiac/fortune
+        {"args": {"date": "2026-01-15"}}
+    """
+    # 检查服务是否存在
+    if not SkillServiceRegistry.has_service(skill_id, action):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service not found: {skill_id}/{action}"
+        )
+
+    # 获取服务定义
+    service_def = SkillServiceRegistry.get_service(skill_id, action)
+
+    # 检查认证要求
+    if service_def.auth_required and not current_user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+
+    # 确定用户等级
+    user_id = current_user.user_id if current_user else None
+    user_tier = "free"
+
+    # 测试模式: 允许通过 header 覆盖 tier
+    if x_test_tier and x_test_tier in ("free", "paid", "vip", "guest"):
+        user_tier = x_test_tier
+        logger.info(f"Test mode: using tier={x_test_tier}")
+    elif user_id:
+        try:
+            from services.entitlement import EntitlementService
+            entitlements = await EntitlementService.get_entitlements(user_id)
+            user_tier = entitlements.get("tier", "free")
+        except Exception as e:
+            logger.warning(f"Failed to get entitlements: {e}")
+
+    # 检查权益要求
+    if service_def.entitlement:
+        # TODO: 实现权益检查
+        pass
+
+    # 构建上下文
+    context = await build_service_context(user_id, skill_id, user_tier)
+
+    # 执行服务
+    result = await SkillServiceRegistry.execute(skill_id, action, request.args, context)
+
+    # 检查错误
+    if "error" in result and result.get("status") in ("error", "not_found"):
+        status_code = 404 if result.get("status") == "not_found" else 400
+        raise HTTPException(status_code=status_code, detail=result["error"])
+
+    return result
+
+
+@router.get("/{skill_id}/{action}")
+async def get_skill_service_info(skill_id: str, action: str):
+    """
+    获取服务信息
+
+    Args:
+        skill_id: Skill 标识
+        action: 服务动作
+
+    Returns:
+        服务定义信息
+    """
+    service_def = SkillServiceRegistry.get_service(skill_id, action)
+    if not service_def:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Service not found: {skill_id}/{action}"
+        )
+
+    return {
+        "skill_id": service_def.skill_id,
+        "action": service_def.action,
+        "description": service_def.description,
+        "auth_required": service_def.auth_required,
+        "entitlement": service_def.entitlement
+    }

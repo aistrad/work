@@ -1,0 +1,822 @@
+"""
+Core Skill Tool Handlers - V9 原子工具执行器
+
+V9 架构：7 个原子工具，内部路由到原有实现
+- activate_skills: 多 Skill 激活
+- ask: 收集信息（合并 request_info + ask_user_question）
+- save: 保存数据（合并 save_birth_info + write_state + save_skill_data）
+- read: 读取数据（合并 read_state + read_user_data）
+- search: 检索知识（从 search_db 简化）
+- show: 展示内容（合并 show_card + show_all_skills + recommend_skill）
+- remind: 管理提醒（合并 create/list/cancel_trigger）
+
+使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+"""
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any
+
+from services.agent.tool_registry import tool_handler, ToolContext
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. 路由工具 - activate_skills
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("activate_skills")
+async def execute_activate_skills(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    激活一个或多个 Skill（V9 核心路由工具）
+
+    返回 should_reload_context=True 触发上下文重载
+    """
+    skills = args.get("skills", [])
+    rule = args.get("rule")
+
+    if not skills:
+        return {
+            "status": "error",
+            "error": "skills 参数不能为空"
+        }
+
+    # 取第一个作为主 Skill（V9 过渡期兼容）
+    primary_skill = skills[0] if isinstance(skills, list) else skills
+
+    logger.info(f"[activate_skills] Activating: {skills}, rule: {rule}")
+
+    return {
+        "status": "success",
+        "skill": primary_skill,
+        "skills": skills,
+        "rule": rule,
+        "message": f"已激活 {', '.join(skills) if isinstance(skills, list) else skills}",
+        "_should_reload_context": True  # 标记需要重载上下文
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. 收集工具 - ask
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("ask")
+async def execute_ask(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    向用户提问或请求信息
+
+    根据 form_type 路由到不同表单：
+    - birth: 出生信息表单
+    - text: 文本输入框
+    - select: 选择器
+    - custom: 自定义表单
+    """
+    question = args.get("question", "")
+    form_type = args.get("form_type", "text")
+    options = args.get("options", [])
+    fields = args.get("fields", [])
+
+    # 根据 form_type 构建表单字段
+    if form_type == "birth":
+        form_fields = [
+            {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+            {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+            {"id": "birthPlace", "label": "出生地点", "type": "text", "required": False, "placeholder": "城市名"},
+            {"id": "gender", "label": "性别", "type": "select", "required": True, "options": [
+                {"value": "male", "label": "男"},
+                {"value": "female", "label": "女"},
+            ]},
+        ]
+        return {
+            "status": "collecting",
+            "cardType": "collect_form",
+            "infoType": "birth",
+            "question": question,
+            "fields": form_fields,
+        }
+
+    elif form_type == "select":
+        return {
+            "status": "asking",
+            "cardType": "question_card",
+            "question": question,
+            "options": options[:4] if options else [],
+        }
+
+    elif form_type == "custom":
+        return {
+            "status": "collecting",
+            "cardType": "collect_form",
+            "infoType": "custom",
+            "question": question,
+            "fields": fields,
+        }
+
+    else:  # text
+        return {
+            "status": "collecting",
+            "cardType": "collect_form",
+            "infoType": "text",
+            "question": question,
+            "fields": [
+                {"id": "text", "label": "回答", "type": "textarea", "required": True, "placeholder": "请输入..."},
+            ],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. 保存工具 - save
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("save")
+async def execute_save(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    保存数据到用户档案
+
+    根据 path 前缀路由到不同存储：
+    - identity.birth_info: 出生信息
+    - state.*: 运行时状态
+    - skills.{skill_id}.*: Skill 专属数据
+    - goals.*: 目标数据
+    - triggers.*: 触发器数据
+    """
+    from uuid import UUID
+    from stores.unified_profile_repo import UnifiedProfileRepository, deep_merge
+    from stores.profile_cache import invalidate_profile_cache
+
+    path = args.get("path", "")
+    data = args.get("data")
+    merge = args.get("merge", True)
+
+    if not path:
+        return {"status": "error", "error": "path 参数不能为空"}
+
+    if not context.user_id or context.user_id == "guest":
+        return {"status": "error", "error": "需要登录才能保存数据"}
+
+    try:
+        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+        path_parts = path.split(".")
+
+        # 路由到不同存储
+        if path.startswith("identity.birth_info"):
+            # 保存出生信息
+            if data is None:
+                return {"status": "error", "error": "不能删除出生信息"}
+
+            # 检查是否已有出生信息
+            profile = context.profile or {}
+            identity = profile.get("identity", {})
+            existing_birth = identity.get("birth_info", {})
+            if existing_birth.get("date"):
+                return {
+                    "status": "error",
+                    "error": "用户已有出生信息，不能覆盖。如需修改，请使用设置页面。",
+                    "existing_birth_info": existing_birth,
+                }
+
+            await UnifiedProfileRepository.update_birth_info(user_uuid, data)
+            await invalidate_profile_cache(user_uuid)
+
+            return {
+                "status": "success",
+                "message": "出生信息已保存",
+                "path": path,
+            }
+
+        elif path.startswith("skills."):
+            # 保存 Skill 数据
+            # path: skills.{skill_id}.{section}
+            if len(path_parts) < 2:
+                return {"status": "error", "error": "Skill path 格式错误，需要 skills.{skill_id}.*"}
+
+            skill_id = path_parts[1]
+            section = ".".join(path_parts[2:]) if len(path_parts) > 2 else None
+
+            if data is None:
+                # 删除数据
+                await UnifiedProfileRepository.delete_skill_section(user_uuid, skill_id, section)
+                return {"status": "success", "message": f"已删除 {path}", "path": path}
+
+            if section:
+                await UnifiedProfileRepository.update_skill_state(user_uuid, skill_id, section, data)
+            else:
+                await UnifiedProfileRepository.update_skill_data(user_uuid, skill_id, data)
+
+            return {
+                "status": "success",
+                "message": f"已保存到 {path}",
+                "path": path,
+                "skill_id": skill_id,
+            }
+
+        elif path.startswith("state."):
+            # 保存运行时状态
+            section = ".".join(path_parts[1:])
+            skill_id = context.skill_id or "core"
+
+            if data is None:
+                await UnifiedProfileRepository.delete_skill_section(user_uuid, skill_id, section)
+                return {"status": "success", "message": f"已删除 {path}", "path": path}
+
+            await UnifiedProfileRepository.update_skill_state(user_uuid, skill_id, section, data)
+            return {"status": "success", "message": f"已保存到 {path}", "path": path}
+
+        elif path.startswith("goals.") or path.startswith("triggers."):
+            # 保存目标/触发器数据（使用 user_data_store）
+            from stores.user_data_store import UserDataStoreRepository
+
+            if data is None:
+                await UserDataStoreRepository.delete(user_uuid, path)
+                return {"status": "success", "message": f"已删除 {path}", "path": path}
+
+            await UserDataStoreRepository.write(user_uuid, path, data)
+            return {"status": "success", "message": f"已保存到 {path}", "path": path}
+
+        else:
+            return {"status": "error", "error": f"未知的路径前缀: {path}"}
+
+    except Exception as e:
+        logger.error(f"save failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. 读取工具 - read
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("read")
+async def execute_read(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    读取用户数据
+
+    根据 path 前缀路由到不同存储：
+    - identity: 身份信息
+    - state: 运行时状态
+    - skills.{skill_id}: Skill 专属数据
+    - goals: 目标数据
+    - triggers: 触发器数据
+    """
+    from uuid import UUID
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    path = args.get("path", "")
+    sections = args.get("sections")
+
+    if not path:
+        return {"status": "error", "error": "path 参数不能为空"}
+
+    if not context.user_id or context.user_id == "guest":
+        return {"status": "error", "error": "需要登录才能读取数据"}
+
+    try:
+        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+        path_parts = path.split(".")
+
+        # 路由到不同存储
+        if path == "identity" or path.startswith("identity."):
+            # 读取身份信息
+            profile = context.profile or {}
+            identity = profile.get("identity", {})
+
+            if path == "identity":
+                return {"status": "success", "data": identity, "path": path}
+            elif path == "identity.birth_info":
+                return {"status": "success", "data": identity.get("birth_info", {}), "path": path}
+            else:
+                # 深层路径
+                data = identity
+                for part in path_parts[1:]:
+                    data = data.get(part, {}) if isinstance(data, dict) else {}
+                return {"status": "success", "data": data, "path": path}
+
+        elif path.startswith("skills."):
+            # 读取 Skill 数据
+            if len(path_parts) < 2:
+                return {"status": "error", "error": "Skill path 格式错误"}
+
+            skill_id = path_parts[1]
+            data = await UnifiedProfileRepository.get_skill_data(user_uuid, skill_id)
+
+            if not data:
+                return {"status": "empty", "message": f"尚未建立 {skill_id} 数据", "data": {}, "path": path}
+
+            # 如果有更深的路径，提取子数据
+            if len(path_parts) > 2:
+                for part in path_parts[2:]:
+                    data = data.get(part, {}) if isinstance(data, dict) else {}
+
+            # 过滤指定部分
+            if sections and isinstance(data, dict):
+                data = {k: v for k, v in data.items() if k in sections}
+
+            return {"status": "success", "data": data, "path": path, "skill_id": skill_id}
+
+        elif path == "state" or path.startswith("state."):
+            # 读取运行时状态
+            skill_id = context.skill_id or "core"
+            data = await UnifiedProfileRepository.get_skill_state(user_uuid, skill_id)
+
+            if not data:
+                return {"status": "empty", "data": {}, "path": path}
+
+            if path.startswith("state."):
+                for part in path_parts[1:]:
+                    data = data.get(part, {}) if isinstance(data, dict) else {}
+
+            return {"status": "success", "data": data, "path": path}
+
+        elif path.startswith("goals.") or path.startswith("triggers.") or path in ("goals", "triggers"):
+            # 读取目标/触发器数据
+            from stores.user_data_store import UserDataStoreRepository
+
+            if path in ("goals", "triggers"):
+                # 列出所有
+                items = await UserDataStoreRepository.query(user_uuid, path_prefix=path)
+                return {"status": "success", "data": items, "path": path, "count": len(items)}
+            else:
+                data = await UserDataStoreRepository.read(user_uuid, path)
+                if not data:
+                    return {"status": "empty", "data": {}, "path": path}
+                return {"status": "success", "data": data, "path": path}
+
+        else:
+            return {"status": "error", "error": f"未知的路径前缀: {path}"}
+
+    except Exception as e:
+        logger.error(f"read failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. 检索工具 - search
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("search")
+async def execute_search(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """检索知识库"""
+    from services.knowledge.repository import get_knowledge_repository
+
+    query = args.get("query", "")
+    table = args.get("table", "knowledge_chunks")
+    top_k = args.get("top_k", 5)
+    filters = args.get("filters", {})
+
+    if not query:
+        return {"status": "error", "error": "query 参数不能为空"}
+
+    # 自动添加当前 skill_id 到 filters
+    if context.skill_id and "skill_id" not in filters:
+        filters["skill_id"] = context.skill_id
+
+    try:
+        repo = get_knowledge_repository()
+        results = await repo.search_db(
+            table=table,
+            query=query,
+            filters=filters,
+            top_k=top_k
+        )
+
+        return {
+            "status": "success",
+            "query": query,
+            "count": len(results),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"search failed: {e}")
+        return {"status": "error", "error": str(e), "results": []}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. 展示工具 - show
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show")
+async def execute_show(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    统一展示工具
+
+    根据 type 路由到不同展示：
+    - card: 展示数据卡片
+    - skill_list: 展示所有 Skill 列表
+    - recommendation: 推荐 Skill
+    - insight: 展示洞察
+    """
+    show_type = args.get("type", "card")
+    card_type = args.get("card_type", "list")
+    component_id = args.get("component_id")
+    data = args.get("data", {})
+    message = args.get("message", "")
+
+    if show_type == "skill_list":
+        # 展示所有 Skill
+        from services.agent.skill_loader import get_all_skill_metadata
+
+        try:
+            all_skills = get_all_skill_metadata()
+            # 排除 core skill
+            all_skills = [s for s in all_skills if s.id != "core"]
+
+            skill_cards = []
+            for skill in all_skills:
+                card = {
+                    "id": skill.id,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "icon": skill.icon,
+                    "color": skill.color,
+                    "category": skill.category,
+                    "triggers": skill.triggers[:3] if skill.triggers else [],
+                    "tagline": skill.showcase.tagline if skill.showcase else "",
+                }
+                skill_cards.append(card)
+
+            # 按分类排序
+            category_order = {"default": 0, "professional": 1}
+            skill_cards.sort(key=lambda x: category_order.get(x["category"], 2))
+
+            return {
+                "status": "success",
+                "cardType": "skill_list",
+                "message": message or "以下是我能帮你的领域，看看有没有你需要的？",
+                "skills": skill_cards,
+                "count": len(skill_cards),
+            }
+        except Exception as e:
+            logger.error(f"show skill_list failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    elif show_type == "recommendation":
+        # 推荐 Skill
+        from services.agent.skill_loader import load_skill_metadata
+
+        skill_id = data.get("skill_id") if isinstance(data, dict) else None
+        reason = data.get("reason", message) if isinstance(data, dict) else message
+
+        if not skill_id:
+            return {"status": "error", "error": "recommendation 需要 data.skill_id"}
+
+        metadata = load_skill_metadata(skill_id)
+        if not metadata:
+            return {"status": "error", "error": f"Skill not found: {skill_id}"}
+
+        return {
+            "status": "success",
+            "cardType": "skill_recommendation",
+            "skill_id": skill_id,
+            "skill": {
+                "id": metadata.id,
+                "name": metadata.name,
+                "description": metadata.description,
+                "icon": metadata.icon,
+                "color": metadata.color,
+                "tagline": metadata.showcase.tagline if metadata.showcase else "",
+                "trial_messages": metadata.pricing.trial_messages if metadata.pricing else 3,
+            },
+            "reason": reason,
+        }
+
+    elif show_type == "insight":
+        # 展示洞察
+        return {
+            "status": "success",
+            "cardType": "insight_card",
+            "insightType": data.get("insight_type", "general") if isinstance(data, dict) else "general",
+            "title": data.get("title", "关键洞察") if isinstance(data, dict) else "关键洞察",
+            "content": data.get("content", message) if isinstance(data, dict) else message,
+        }
+
+    else:  # card
+        # 展示数据卡片
+        from skills.core.services.card import get_card_service
+
+        try:
+            service = get_card_service()
+            result = await service.render(
+                card_type=card_type,
+                data_source={"type": "inline", "data": data} if data else {},
+                options={"componentId": component_id} if component_id else {},
+                context={
+                    "user_id": context.user_id,
+                    "skill_id": context.skill_id,
+                    "scenario_id": context.scenario_id,
+                },
+            )
+            return result
+        except Exception as e:
+            logger.error(f"show card failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. 提醒工具 - remind
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("remind")
+async def execute_remind(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    管理提醒
+
+    根据 action 路由到不同操作：
+    - set: 创建提醒
+    - list: 列出提醒
+    - cancel: 取消提醒
+    """
+    from uuid import UUID
+    from skills.core.services.trigger import get_trigger_service
+
+    action = args.get("action", "list")
+    reminder_id = args.get("id")
+    title = args.get("title")
+    schedule = args.get("schedule")
+    schedule_type = args.get("schedule_type", "daily")
+    status = args.get("status", "active")
+
+    if not context.user_id or context.user_id == "guest":
+        return {"status": "error", "error": "需要登录才能管理提醒"}
+
+    try:
+        service = get_trigger_service()
+        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+
+        if action == "set":
+            # 创建提醒
+            if not title:
+                return {"status": "error", "error": "创建提醒需要 title 参数"}
+            if not schedule:
+                return {"status": "error", "error": "创建提醒需要 schedule 参数"}
+
+            trigger = await service.create(
+                user_id=user_uuid,
+                trigger_type="reminder",
+                title=title,
+                schedule=schedule,
+                schedule_type=schedule_type,
+                trigger_subtype="custom",
+            )
+
+            return {
+                "status": "success",
+                "action": "set",
+                "reminder": trigger.to_dict(),
+                "message": f"已创建提醒: {title}",
+            }
+
+        elif action == "list":
+            # 列出提醒
+            triggers = await service.list(
+                user_uuid,
+                trigger_type="reminder",
+                status=status,
+            )
+
+            return {
+                "status": "success",
+                "action": "list",
+                "count": len(triggers),
+                "reminders": [t.to_dict() for t in triggers],
+            }
+
+        elif action == "cancel":
+            # 取消提醒
+            if not reminder_id:
+                return {"status": "error", "error": "取消提醒需要 id 参数"}
+
+            trigger_uuid = UUID(reminder_id)
+            cancelled = await service.cancel(user_uuid, trigger_uuid)
+
+            if cancelled:
+                return {"status": "success", "action": "cancel", "message": "提醒已取消"}
+            else:
+                return {"status": "not_found", "message": "未找到该提醒或已取消"}
+
+        else:
+            return {"status": "error", "error": f"未知的 action: {action}"}
+
+    except Exception as e:
+        logger.error(f"remind failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 向后兼容：保留旧工具名（映射到新工具）
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("activate_skill")
+async def execute_activate_skill(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版单 Skill 激活，映射到 activate_skills"""
+    skill = args.get("skill")
+    rule = args.get("rule")
+    return await execute_activate_skills({"skills": [skill], "rule": rule}, context)
+
+
+@tool_handler("request_info")
+async def execute_request_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版收集信息，映射到 ask"""
+    info_type = args.get("info_type", "birth")
+    question = args.get("question")
+
+    form_type_map = {
+        "birth": "birth",
+        "context": "text",
+        "goals": "text",
+        "concerns": "text",
+    }
+
+    return await execute_ask({
+        "question": question or "",
+        "form_type": form_type_map.get(info_type, "text"),
+    }, context)
+
+
+@tool_handler("ask_user_question")
+async def execute_ask_user_question(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版提问，映射到 ask"""
+    question = args.get("question", "")
+    options = args.get("options", [])
+
+    return await execute_ask({
+        "question": question,
+        "form_type": "select" if options else "text",
+        "options": options,
+    }, context)
+
+
+@tool_handler("search_db")
+async def execute_search_db(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版检索，映射到 search"""
+    return await execute_search(args, context)
+
+
+@tool_handler("show_all_skills")
+async def execute_show_all_skills(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版展示所有 Skill，映射到 show"""
+    return await execute_show({
+        "type": "skill_list",
+        "message": args.get("message"),
+    }, context)
+
+
+@tool_handler("show_card")
+async def execute_show_card(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版展示卡片，映射到 show"""
+    return await execute_show({
+        "type": "card",
+        "card_type": args.get("card_type", "list"),
+        "data": args.get("data_source", {}).get("data") if args.get("data_source") else {},
+    }, context)
+
+
+@tool_handler("recommend_skill")
+async def execute_recommend_skill(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版推荐 Skill，映射到 show"""
+    return await execute_show({
+        "type": "recommendation",
+        "data": {
+            "skill_id": args.get("skill_id"),
+            "reason": args.get("reason"),
+        },
+    }, context)
+
+
+@tool_handler("create_trigger")
+async def execute_create_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版创建触发器，映射到 remind"""
+    return await execute_remind({
+        "action": "set",
+        "title": args.get("title"),
+        "schedule": args.get("schedule"),
+        "schedule_type": args.get("schedule_type", "daily"),
+    }, context)
+
+
+@tool_handler("list_triggers")
+async def execute_list_triggers(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版列出触发器，映射到 remind"""
+    return await execute_remind({
+        "action": "list",
+        "status": args.get("status", "active"),
+    }, context)
+
+
+@tool_handler("cancel_trigger")
+async def execute_cancel_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版取消触发器，映射到 remind"""
+    return await execute_remind({
+        "action": "cancel",
+        "id": args.get("trigger_id"),
+    }, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 其他向后兼容工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("read_state")
+async def execute_read_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版读取状态，映射到 read"""
+    skill_id = context.skill_id or "core"
+    sections = args.get("sections")
+    return await execute_read({
+        "path": f"skills.{skill_id}",
+        "sections": sections,
+    }, context)
+
+
+@tool_handler("write_state")
+async def execute_write_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版写入状态，映射到 save"""
+    skill_id = context.skill_id or "core"
+    section = args.get("section", "")
+    data = args.get("data", {})
+    return await execute_save({
+        "path": f"skills.{skill_id}.{section}",
+        "data": data,
+    }, context)
+
+
+@tool_handler("save_skill_data")
+async def execute_save_skill_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版保存 Skill 数据，映射到 save"""
+    skill_id = context.skill_id or "core"
+    data = args.get("data", {})
+    return await execute_save({
+        "path": f"skills.{skill_id}",
+        "data": data,
+    }, context)
+
+
+@tool_handler("save_birth_info")
+async def execute_save_birth_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版保存出生信息，映射到 save"""
+    birth_data = {
+        "date": args.get("birth_date"),
+        "time": args.get("birth_time"),
+        "gender": args.get("gender"),
+        "place": args.get("place"),
+    }
+    return await execute_save({
+        "path": "identity.birth_info",
+        "data": birth_data,
+    }, context)
+
+
+@tool_handler("read_user_data")
+async def execute_read_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版读取用户数据，映射到 read"""
+    path = args.get("path", "")
+    return await execute_read({"path": path}, context)
+
+
+@tool_handler("write_user_data")
+async def execute_write_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版写入用户数据，映射到 save"""
+    path = args.get("path", "")
+    content = args.get("content", {})
+    return await execute_save({"path": path, "data": content}, context)
+
+
+@tool_handler("delete_user_data")
+async def execute_delete_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版删除用户数据，映射到 save"""
+    path = args.get("path", "")
+    return await execute_save({"path": path, "data": None}, context)
+
+
+@tool_handler("query_user_data")
+async def execute_query_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版查询用户数据，映射到 read"""
+    path_prefix = args.get("path_prefix", "")
+    return await execute_read({"path": path_prefix}, context)
+
+
+# 旧版提醒工具别名
+@tool_handler("schedule_reminder")
+async def execute_schedule_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版设置提醒，映射到 remind"""
+    return await execute_remind({
+        "action": "set",
+        "title": args.get("title"),
+        "schedule": args.get("schedule"),
+        "schedule_type": args.get("schedule_type", "daily"),
+    }, context)
+
+
+@tool_handler("list_reminders")
+async def execute_list_reminders(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版列出提醒，映射到 remind"""
+    return await execute_remind({
+        "action": "list",
+        "status": args.get("status", "active"),
+    }, context)
+
+
+@tool_handler("cancel_reminder")
+async def execute_cancel_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """旧版取消提醒，映射到 remind"""
+    return await execute_remind({
+        "action": "cancel",
+        "id": args.get("reminder_id"),
+    }, context)

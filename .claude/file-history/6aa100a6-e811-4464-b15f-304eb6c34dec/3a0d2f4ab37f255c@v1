@@ -1,0 +1,255 @@
+"""
+Google Drive Uploader Service - 文件上传服务
+
+功能:
+- 使用 Service Account 认证
+- 上传文件到指定共享文件夹
+- 自动创建月度子文件夹
+- 支持 Markdown 文件上传
+
+使用前提:
+1. 在 Google Cloud Console 创建 Service Account
+2. 下载 JSON 密钥文件
+3. 创建 Google Drive 文件夹并与 Service Account 邮箱共享
+4. 配置环境变量 GDRIVE_SERVICE_ACCOUNT_FILE 和 GDRIVE_FOLDER_ID
+
+使用:
+    uploader = GDriveUploader()
+    file_id = await uploader.upload_file("content.md", "2026-01/content.md")
+"""
+
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Google Drive API scopes
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+
+class GDriveUploader:
+    """Google Drive 文件上传器"""
+
+    def __init__(
+        self,
+        service_account_file: Optional[str] = None,
+        folder_id: Optional[str] = None,
+    ):
+        """
+        初始化上传器
+
+        Args:
+            service_account_file: Service Account JSON 文件路径
+            folder_id: Google Drive 目标文件夹 ID
+        """
+        self.service_account_file = service_account_file or os.getenv(
+            "GDRIVE_SERVICE_ACCOUNT_FILE"
+        )
+        self.folder_id = folder_id or os.getenv("GDRIVE_FOLDER_ID")
+        self._service = None
+        self._folder_cache: dict[str, str] = {}
+
+    @property
+    def is_enabled(self) -> bool:
+        """检查是否启用 Google Drive 上传"""
+        enabled = os.getenv("GDRIVE_ENABLED", "0") == "1"
+        has_config = bool(self.service_account_file and self.folder_id)
+        return enabled and has_config
+
+    def _get_service(self):
+        """获取 Google Drive API 服务（懒加载）"""
+        if self._service is not None:
+            return self._service
+
+        if not self.is_enabled:
+            raise RuntimeError("Google Drive upload is not enabled")
+
+        try:
+            from google.oauth2 import service_account
+            from googleapiclient.discovery import build
+
+            credentials = service_account.Credentials.from_service_account_file(
+                self.service_account_file, scopes=SCOPES
+            )
+            self._service = build("drive", "v3", credentials=credentials)
+            return self._service
+        except ImportError:
+            raise RuntimeError(
+                "google-api-python-client not installed. "
+                "Run: pip install google-api-python-client google-auth"
+            )
+
+    def _get_or_create_folder(
+        self, folder_name: str, parent_id: Optional[str] = None
+    ) -> str:
+        """获取或创建文件夹"""
+        parent_id = parent_id or self.folder_id
+        cache_key = f"{parent_id}/{folder_name}"
+
+        if cache_key in self._folder_cache:
+            return self._folder_cache[cache_key]
+
+        service = self._get_service()
+
+        # 搜索现有文件夹
+        query = (
+            f"name='{folder_name}' and "
+            f"mimeType='application/vnd.google-apps.folder' and "
+            f"'{parent_id}' in parents and "
+            f"trashed=false"
+        )
+        results = (
+            service.files()
+            .list(q=query, spaces="drive", fields="files(id, name)")
+            .execute()
+        )
+        files = results.get("files", [])
+
+        if files:
+            folder_id = files[0]["id"]
+            logger.debug(f"Found existing folder: {folder_name} ({folder_id})")
+        else:
+            # 创建新文件夹
+            file_metadata = {
+                "name": folder_name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id],
+            }
+            folder = (
+                service.files().create(body=file_metadata, fields="id").execute()
+            )
+            folder_id = folder["id"]
+            logger.info(f"Created new folder: {folder_name} ({folder_id})")
+
+        self._folder_cache[cache_key] = folder_id
+        return folder_id
+
+    def upload_file(
+        self,
+        local_path: str | Path,
+        remote_path: Optional[str] = None,
+        mime_type: str = "text/markdown",
+    ) -> Optional[str]:
+        """
+        上传文件到 Google Drive
+
+        Args:
+            local_path: 本地文件路径
+            remote_path: 远程路径（相对于根文件夹），如 "2026-01/content.md"
+            mime_type: 文件 MIME 类型
+
+        Returns:
+            上传后的文件 ID，失败返回 None
+        """
+        if not self.is_enabled:
+            logger.warning("Google Drive upload is disabled")
+            return None
+
+        local_path = Path(local_path)
+        if not local_path.exists():
+            logger.error(f"File not found: {local_path}")
+            return None
+
+        # 解析远程路径
+        if remote_path:
+            parts = remote_path.split("/")
+            filename = parts[-1]
+            folders = parts[:-1]
+        else:
+            filename = local_path.name
+            folders = []
+
+        # 创建文件夹层级
+        parent_id = self.folder_id
+        for folder_name in folders:
+            parent_id = self._get_or_create_folder(folder_name, parent_id)
+
+        try:
+            from googleapiclient.http import MediaFileUpload
+
+            service = self._get_service()
+
+            # 检查是否已存在同名文件
+            query = (
+                f"name='{filename}' and "
+                f"'{parent_id}' in parents and "
+                f"trashed=false"
+            )
+            results = (
+                service.files()
+                .list(q=query, spaces="drive", fields="files(id, name)")
+                .execute()
+            )
+            existing_files = results.get("files", [])
+
+            file_metadata = {"name": filename, "parents": [parent_id]}
+            media = MediaFileUpload(str(local_path), mimetype=mime_type)
+
+            if existing_files:
+                # 更新现有文件
+                file_id = existing_files[0]["id"]
+                file = (
+                    service.files()
+                    .update(fileId=file_id, media_body=media)
+                    .execute()
+                )
+                logger.info(f"Updated file: {filename} ({file_id})")
+            else:
+                # 创建新文件
+                file = (
+                    service.files()
+                    .create(body=file_metadata, media_body=media, fields="id")
+                    .execute()
+                )
+                file_id = file["id"]
+                logger.info(f"Uploaded file: {filename} ({file_id})")
+
+            return file_id
+
+        except Exception as e:
+            logger.error(f"Failed to upload {local_path}: {e}")
+            return None
+
+    def upload_content(
+        self,
+        content: str,
+        filename: str,
+        folder: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        直接上传内容（不需要本地文件）
+
+        Args:
+            content: 文件内容
+            filename: 文件名
+            folder: 子文件夹名（可选）
+
+        Returns:
+            上传后的文件 ID
+        """
+        if not self.is_enabled:
+            logger.warning("Google Drive upload is disabled")
+            return None
+
+        import tempfile
+
+        # 写入临时文件
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(content)
+            temp_path = f.name
+
+        try:
+            remote_path = f"{folder}/{filename}" if folder else filename
+            return self.upload_file(temp_path, remote_path)
+        finally:
+            # 清理临时文件
+            Path(temp_path).unlink(missing_ok=True)
+
+    def get_month_folder(self) -> str:
+        """获取当前月份文件夹名（格式：2026-01）"""
+        return datetime.now().strftime("%Y-%m")

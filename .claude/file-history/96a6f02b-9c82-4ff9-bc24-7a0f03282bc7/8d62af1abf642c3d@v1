@@ -1,0 +1,495 @@
+"""
+Zodiac Skill API Services - 星座对外 API 服务
+
+使用 @skill_service 装饰器自动注册到 SkillServiceRegistry
+通过 /api/v1/skills/zodiac/{action} 访问
+
+端点:
+- chart: 星盘计算
+- transit: 行运分析
+- daily: 每日运势
+- events: 星象事件
+- synastry: 星座配对
+"""
+import asyncio
+import logging
+from typing import Dict, Any, Optional
+from datetime import date
+
+from services.agent.skill_service_registry import skill_service, ServiceContext
+from stores.unified_profile_repo import UnifiedProfileRepository
+from stores.profile_cache import invalidate_skill_cache
+
+from .calculator import ZodiacCalculator, calculate_zodiac, calculate_transit
+from .computer import ZodiacComputer
+
+logger = logging.getLogger(__name__)
+
+# Singleton instances
+_calculator: Optional[ZodiacCalculator] = None
+_computer: Optional[ZodiacComputer] = None
+
+
+def get_calculator() -> ZodiacCalculator:
+    global _calculator
+    if _calculator is None:
+        _calculator = ZodiacCalculator()
+    return _calculator
+
+
+def get_computer() -> ZodiacComputer:
+    global _computer
+    if _computer is None:
+        _computer = ZodiacComputer()
+    return _computer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Chart Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "chart", description="计算星盘", auth_required=False)
+async def get_zodiac_chart(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    计算星盘 (本命盘)
+
+    Args:
+        birth_date: 出生日期 (YYYY-MM-DD)
+        birth_time: 出生时间 (HH:MM)，默认 12:00
+        birth_place: 出生地点，默认 Shanghai
+        save: 是否保存到用户档案，默认 True
+
+    Returns:
+        chart: 完整星盘数据
+    """
+    birth_date = args.get("birth_date")
+    birth_time = args.get("birth_time", "12:00")
+    birth_place = args.get("birth_place", "Shanghai")
+    save = args.get("save", True)
+
+    # 尝试从 context 获取出生信息
+    if not birth_date and context.profile:
+        identity = context.profile.get("identity", {})
+        birth_info = identity.get("birth_info", {})
+        birth_date = birth_info.get("date")
+        birth_time = birth_info.get("time", birth_time)
+        birth_place = birth_info.get("place", birth_place)
+
+    if not birth_date:
+        return {"error": "birth_date is required", "status": "error"}
+
+    try:
+        # 检查缓存
+        if context.user_id and save:
+            existing = context.skill_data.get("zodiac", {})
+            if existing.get("chart"):
+                logger.info(f"Using cached zodiac chart for user {context.user_id}")
+                return {"status": "success", "chart": existing["chart"], "cached": True}
+
+        # 计算星盘
+        chart = calculate_zodiac(
+            birth_date=birth_date,
+            birth_time=birth_time,
+            birth_place=birth_place,
+        )
+
+        # 保存到用户档案
+        if context.user_id and save:
+            from uuid import UUID
+            user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+            await UnifiedProfileRepository.update_skill_data(
+                user_uuid, "zodiac", {"chart": chart}
+            )
+            # 失效缓存
+            asyncio.create_task(invalidate_skill_cache(user_uuid, "zodiac"))
+
+        return {"status": "success", "chart": chart}
+
+    except Exception as e:
+        logger.error(f"Zodiac chart calculation failed: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Transit Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "transit", description="行运分析", auth_required=True)
+async def get_zodiac_transit(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    计算行运分析
+
+    Args:
+        transit_date: 行运日期 (YYYY-MM-DD)，默认今天
+
+    Returns:
+        transits: 行运数据列表
+    """
+    transit_date = args.get("transit_date", str(date.today()))
+
+    # 获取星盘数据
+    zodiac_data = context.skill_data.get("zodiac", {})
+    if not zodiac_data.get("chart"):
+        return {"error": "No zodiac chart found, please calculate chart first", "status": "error"}
+
+    try:
+        chart = zodiac_data["chart"]
+        birth_date = chart.get("birth_date", "")
+        birth_time = chart.get("birth_time", "12:00")
+        birth_place = chart.get("birth_place", "Shanghai")
+
+        transits = calculate_transit(
+            birth_date=birth_date,
+            birth_time=birth_time,
+            birth_place=birth_place,
+            transit_date=transit_date,
+        )
+
+        return {
+            "status": "success",
+            "transit_date": transit_date,
+            "transits": transits,
+        }
+
+    except Exception as e:
+        logger.error(f"Zodiac transit calculation failed: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Daily Horoscope Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "daily", description="每日星座运势", auth_required=True)
+async def get_zodiac_daily(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取每日星座运势
+
+    Args:
+        date: 日期 (YYYY-MM-DD)，默认今天
+
+    Returns:
+        daily: 每日运势数据
+    """
+    target_date = args.get("date", str(date.today()))
+
+    # 获取星盘数据
+    zodiac_data = context.skill_data.get("zodiac", {})
+    if not zodiac_data.get("chart"):
+        return {"error": "No zodiac chart found, please calculate chart first", "status": "error"}
+
+    try:
+        computer = get_computer()
+        profile = {
+            "skill_data": {"zodiac": zodiac_data}
+        }
+        daily = await computer.calculate_daily_horoscope(profile)
+
+        return {
+            "status": "success",
+            "date": target_date,
+            "daily": daily,
+        }
+
+    except Exception as e:
+        logger.error(f"Zodiac daily horoscope failed: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Events Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "events", description="星象事件", auth_required=False)
+async def get_zodiac_events(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取即将到来的星象事件
+
+    Args:
+        days: 查询天数，默认 7
+
+    Returns:
+        events: 星象事件列表
+    """
+    days = args.get("days", 7)
+
+    try:
+        computer = get_computer()
+        events = await computer.get_upcoming_events(days=days)
+
+        return {
+            "status": "success",
+            "days": days,
+            "events": events,
+        }
+
+    except Exception as e:
+        logger.error(f"Zodiac events query failed: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Synastry Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "synastry", description="星座配对", auth_required=False)
+async def get_zodiac_synastry(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    计算星座配对 (合盘)
+
+    Args:
+        person1: 第一人信息 {birth_date, birth_time, birth_place}
+        person2: 第二人信息 {birth_date, birth_time, birth_place}
+
+    Returns:
+        compatibility: 配对结果
+    """
+    person1 = args.get("person1", {})
+    person2 = args.get("person2", {})
+
+    if not person1.get("birth_date") or not person2.get("birth_date"):
+        return {"error": "Both person1 and person2 birth_date are required", "status": "error"}
+
+    try:
+        calculator = get_calculator()
+
+        # 计算两人星盘
+        chart1 = calculator.calculate(
+            birth_date=person1["birth_date"],
+            birth_time=person1.get("birth_time", "12:00"),
+            birth_place=person1.get("birth_place", "Shanghai"),
+        )
+
+        chart2 = calculator.calculate(
+            birth_date=person2["birth_date"],
+            birth_time=person2.get("birth_time", "12:00"),
+            birth_place=person2.get("birth_place", "Shanghai"),
+        )
+
+        # 计算配对
+        compatibility = _calculate_compatibility(chart1, chart2)
+
+        return {
+            "status": "success",
+            "compatibility": compatibility,
+        }
+
+    except Exception as e:
+        logger.error(f"Zodiac synastry calculation failed: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Insights Service (Phase 2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("zodiac", "insights", description="获取星座分析历史", auth_required=True)
+async def get_zodiac_insights(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取用户的星座分析历史
+
+    Args:
+        limit: 返回数量限制，默认 20
+        insight_type: 筛选类型，默认 chart_analysis
+
+    Returns:
+        insights: 分析历史列表
+    """
+    from stores.skill_repo import SkillRepository
+    from uuid import UUID
+
+    limit = args.get("limit", 20)
+    insight_type = args.get("insight_type", "chart_analysis")
+
+    try:
+        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+        insights = await SkillRepository.get_user_insights(
+            user_id=user_uuid,
+            skill_id="zodiac",
+            insight_type=insight_type,
+            limit=limit
+        )
+
+        # Format insights for frontend
+        formatted = []
+        for insight in insights:
+            formatted.append({
+                "id": str(insight["id"]),
+                "title": insight.get("title", "星盘分析"),
+                "content": insight.get("content", "")[:200] + "..." if len(insight.get("content", "")) > 200 else insight.get("content", ""),
+                "fullContent": insight.get("content", ""),
+                "evidence": insight.get("evidence", {}),
+                "createdAt": insight["created_at"].isoformat() if insight.get("created_at") else None,
+                "userReaction": insight.get("user_reaction"),
+            })
+
+        return {
+            "status": "success",
+            "insights": formatted,
+            "total": len(formatted)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get zodiac insights: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+@skill_service("zodiac", "insight", description="获取单个分析详情", auth_required=True)
+async def get_zodiac_insight_detail(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取单个星座分析详情
+
+    Args:
+        insight_id: 分析记录 ID
+
+    Returns:
+        insight: 分析详情
+    """
+    from stores.skill_repo import SkillRepository
+    from uuid import UUID
+
+    insight_id = args.get("insight_id")
+    if not insight_id:
+        return {"error": "insight_id is required", "status": "error"}
+
+    try:
+        insight_uuid = UUID(insight_id) if isinstance(insight_id, str) else insight_id
+        insight = await SkillRepository.get_insight(insight_uuid)
+
+        if not insight:
+            return {"error": "Insight not found", "status": "not_found"}
+
+        # Verify ownership
+        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+        if str(insight.get("user_id")) != str(user_uuid):
+            return {"error": "Unauthorized", "status": "error"}
+
+        return {
+            "status": "success",
+            "insight": {
+                "id": str(insight["id"]),
+                "title": insight.get("title", "星盘分析"),
+                "content": insight.get("content", ""),
+                "evidence": insight.get("evidence", {}),
+                "createdAt": insight["created_at"].isoformat() if insight.get("created_at") else None,
+                "userReaction": insight.get("user_reaction"),
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get zodiac insight detail: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+def _calculate_compatibility(chart1, chart2) -> dict:
+    """
+    计算两人星盘配对
+
+    Returns format expected by frontend show_synastry.tsx:
+    - person1/person2: { name, sunSign }
+    - overallScore: number
+    - categories: [{name, score, description}]
+    - strengths: string[]
+    - challenges: string[]
+    - advice: string
+    """
+    from .calculator import SIGN_ELEMENT, SIGN_CHINESE
+
+    # Element compatibility matrix
+    element_compat = {
+        ("fire", "fire"): 80,
+        ("fire", "air"): 85,
+        ("fire", "earth"): 50,
+        ("fire", "water"): 45,
+        ("earth", "earth"): 75,
+        ("earth", "water"): 80,
+        ("earth", "air"): 55,
+        ("air", "air"): 70,
+        ("air", "water"): 60,
+        ("water", "water"): 75,
+    }
+
+    # Get elements
+    elem1 = SIGN_ELEMENT.get(chart1.sun_sign, "fire").value
+    elem2 = SIGN_ELEMENT.get(chart2.sun_sign, "fire").value
+
+    # Look up compatibility (order doesn't matter)
+    key = (elem1, elem2) if (elem1, elem2) in element_compat else (elem2, elem1)
+    sun_score = element_compat.get(key, 65)
+
+    # Moon compatibility
+    moon_elem1 = SIGN_ELEMENT.get(chart1.moon_sign, "water").value
+    moon_elem2 = SIGN_ELEMENT.get(chart2.moon_sign, "water").value
+    moon_key = (moon_elem1, moon_elem2) if (moon_elem1, moon_elem2) in element_compat else (moon_elem2, moon_elem1)
+    moon_score = element_compat.get(moon_key, 65)
+
+    # Communication score
+    comm_score = 70 + (sun_score - 65) // 2
+
+    # Emotional connection
+    emotional_score = moon_score
+    if chart1.sun_sign == chart2.moon_sign or chart2.sun_sign == chart1.moon_sign:
+        emotional_score = min(100, emotional_score + 15)
+
+    # Calculate overall score
+    overall_score = round((sun_score * 0.3 + moon_score * 0.3 + comm_score * 0.2 + emotional_score * 0.2))
+
+    # Get Chinese sign names
+    sun1_cn = SIGN_CHINESE.get(chart1.sun_sign, chart1.sun_sign)
+    sun2_cn = SIGN_CHINESE.get(chart2.sun_sign, chart2.sun_sign)
+    moon1_cn = SIGN_CHINESE.get(chart1.moon_sign, chart1.moon_sign)
+    moon2_cn = SIGN_CHINESE.get(chart2.moon_sign, chart2.moon_sign)
+
+    # Element names in Chinese
+    elem_cn = {"fire": "火", "earth": "土", "air": "风", "water": "水"}
+
+    # Generate strengths
+    strengths = []
+    if sun_score >= 75:
+        strengths.append("太阳星座相合，性格自然吸引")
+    if moon_score >= 75:
+        strengths.append("月亮星座协调，情感共鸣强")
+    if emotional_score >= 80:
+        strengths.append("日月交互相位，深层默契")
+    if elem1 == elem2:
+        strengths.append(f"同为{elem_cn.get(elem1, elem1)}象星座，价值观一致")
+    if not strengths:
+        strengths.append("互补性强，可以相互学习成长")
+
+    # Generate challenges
+    challenges = []
+    if sun_score < 60:
+        challenges.append("性格差异需要更多理解和包容")
+    if moon_score < 60:
+        challenges.append("情感表达方式不同，需要耐心沟通")
+    if elem1 != elem2:
+        e1_cn = elem_cn.get(elem1, elem1)
+        e2_cn = elem_cn.get(elem2, elem2)
+        challenges.append(f"{e1_cn}象与{e2_cn}象的处事方式有差异")
+    if not challenges:
+        challenges.append("保持开放心态，避免过度依赖")
+
+    # Generate advice
+    if overall_score >= 80:
+        advice = "你们天生默契，珍惜��份缘分。保持真诚沟通，让关系持续升温。"
+    elif overall_score >= 65:
+        advice = "你们有很好的基础，多关注彼此的情感需求，用行动表达爱意。"
+    elif overall_score >= 50:
+        advice = "差异是成长的契机。学习对方的优点，用包容化解分歧。"
+    else:
+        advice = "关系需要更多努力经营。专注于共同目标，建立相互理解的桥梁。"
+
+    return {
+        "person1": {"name": "你", "sunSign": sun1_cn},
+        "person2": {"name": "TA", "sunSign": sun2_cn},
+        "overallScore": overall_score,
+        "categories": [
+            {"name": "性格契合", "score": sun_score, "description": f"{sun1_cn}与{sun2_cn}的能量互动"},
+            {"name": "情感连接", "score": emotional_score, "description": f"{moon1_cn}与{moon2_cn}的情感共鸣"},
+            {"name": "沟通默契", "score": comm_score, "description": "思维方式与表达习惯的匹配度"},
+            {"name": "长期稳定", "score": round((sun_score + moon_score) / 2), "description": "关系的持久性与成长潜力"}
+        ],
+        "strengths": strengths[:3],
+        "challenges": challenges[:3],
+        "advice": advice,
+    }

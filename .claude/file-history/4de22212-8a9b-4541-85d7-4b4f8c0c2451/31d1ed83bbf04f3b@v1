@@ -1,0 +1,205 @@
+"""
+Notification Service - Store and query user notifications
+
+v2.0 更新：移除对旧 scheduler.py 的依赖，支持新的 ProactiveEngine
+"""
+import json
+import logging
+from datetime import date, datetime
+from typing import List, Dict, Any, Optional
+from uuid import UUID
+
+# asyncpg is optional in test environments. Avoid hard import failure.
+try:  # pragma: no cover
+    import asyncpg  # type: ignore
+except Exception:  # pragma: no cover
+    asyncpg = None  # type: ignore
+
+from stores.db import get_connection, fetchrow, fetch, execute
+
+logger = logging.getLogger(__name__)
+
+
+from typing import TYPE_CHECKING
+
+
+class NotificationService:
+    """Store and query user notifications"""
+
+    if TYPE_CHECKING:
+        from asyncpg import Pool as _Pool  # for type-checkers only
+
+    def __init__(self, pool=None):
+        self._pool = pool
+
+    async def save(
+        self,
+        user_id: UUID,
+        notification_type: str,
+        title: str,
+        content: Dict[str, Any],
+        trigger_date: date = None,
+    ) -> bool:
+        """Save a notification"""
+        if trigger_date is None:
+            trigger_date = date.today()
+
+        query = """
+            INSERT INTO user_notifications (user_id, type, title, content, trigger_date)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, type, trigger_date) DO UPDATE
+            SET title = $3, content = $4, created_at = NOW()
+            RETURNING id
+        """
+        try:
+            async with get_connection() as conn:
+                result = await conn.fetchval(
+                    query, user_id, notification_type, title, json.dumps(content), trigger_date
+                )
+                return result is not None
+        except Exception as e:
+            logger.error(f"Failed to save notification: {e}")
+            return False
+
+    async def send_notification(
+        self,
+        user_id: UUID,
+        notification_type: str,
+        title: str,
+        content: Any,
+        trigger_date: date = None,
+    ) -> bool:
+        """
+        Send notification (save to DB for web app)
+
+        Args:
+            user_id: 用户 ID
+            notification_type: 通知类型 (daily_fortune, dayun_transition, etc.)
+            title: 通知标题
+            content: 通知内容 (可以是 str 或 dict)
+            trigger_date: 触发日期
+        """
+        # 处理 content 格式
+        if isinstance(content, str):
+            content_dict = {"body": content}
+        elif isinstance(content, dict):
+            content_dict = content
+        else:
+            content_dict = {"body": str(content)}
+
+        return await self.save(
+            user_id=user_id,
+            notification_type=notification_type,
+            title=title,
+            content=content_dict,
+            trigger_date=trigger_date,
+        )
+
+    async def get_unread(self, user_id: UUID, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get unread notifications for a user"""
+        query = """
+            SELECT id, type, title, content, trigger_date, created_at
+            FROM user_notifications
+            WHERE user_id = $1 AND is_read = false
+            ORDER BY created_at DESC
+            LIMIT $2
+        """
+        rows = await fetch(query, user_id, limit)
+        return [self._row_to_dict(row) for row in rows]
+
+    async def get_all(self, user_id: UUID, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get all notifications for a user"""
+        query = """
+            SELECT id, type, title, content, trigger_date, is_read, read_at, created_at
+            FROM user_notifications
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        """
+        rows = await fetch(query, user_id, limit)
+        return [self._row_to_dict(row) for row in rows]
+
+    async def mark_read(self, notification_id: UUID) -> bool:
+        """Mark a notification as read"""
+        query = """
+            UPDATE user_notifications
+            SET is_read = true, read_at = NOW()
+            WHERE id = $1
+        """
+        try:
+            result = await execute(query, notification_id)
+            return "UPDATE" in result
+        except Exception as e:
+            logger.error(f"Failed to mark notification read: {e}")
+            return False
+
+    async def get_today_daily(self, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """Get today's daily fortune notification"""
+        query = """
+            SELECT id, type, title, content, trigger_date, is_read, created_at
+            FROM user_notifications
+            WHERE user_id = $1 AND type = 'daily' AND trigger_date = $2
+        """
+        row = await fetchrow(query, user_id, date.today())
+        return self._row_to_dict(row) if row else None
+
+    async def get_last_sent_time(
+        self,
+        user_id: UUID,
+        notification_type: str,
+    ) -> Optional[datetime]:
+        """
+        获取某类型通知的最后发送时间
+
+        用于 cooldown 检查
+        """
+        query = """
+            SELECT created_at
+            FROM user_notifications
+            WHERE user_id = $1 AND type = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+        """
+        row = await fetchrow(query, user_id, notification_type)
+        return row["created_at"] if row else None
+
+    async def check_cooldown(
+        self,
+        user_id: UUID,
+        notification_type: str,
+        cooldown_hours: int,
+    ) -> bool:
+        """
+        检查是否在冷却期内
+
+        Returns:
+            True 如果可以发送（冷却期已过或从未发送）
+            False 如果仍在冷却期内
+        """
+        if cooldown_hours <= 0:
+            return True
+
+        last_sent = await self.get_last_sent_time(user_id, notification_type)
+        if not last_sent:
+            return True
+
+        from datetime import timedelta
+        cooldown_threshold = datetime.now() - timedelta(hours=cooldown_hours)
+        return last_sent < cooldown_threshold
+
+    def _row_to_dict(self, row) -> Dict[str, Any]:
+        """Convert DB row to dict"""
+        content = row["content"]
+        if isinstance(content, str):
+            content = json.loads(content)
+
+        return {
+            "id": str(row["id"]),
+            "type": row["type"],
+            "title": row["title"],
+            "content": content,
+            "trigger_date": str(row["trigger_date"]),
+            "is_read": row.get("is_read", False),
+            "read_at": row["read_at"].isoformat() if row.get("read_at") else None,
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        }

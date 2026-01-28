@@ -1,0 +1,207 @@
+/**
+ * Next.js API Route for Chat - AI SDK 6 UI Message Stream
+ *
+ * Proxies to Python backend and converts SSE events into AI SDK v6 UIMessageChunk format.
+ *
+ * Supported backend event types:
+ * - chunk: Text content chunks (streaming)
+ * - done: Conversation complete with metadata
+ * - error: Error messages
+ * - tool_call: Tool invocation requests (for Generative UI)
+ * - tool_result: Tool execution results (for Generative UI)
+ */
+
+import { NextRequest, NextResponse } from 'next/server';
+import { createUIMessageStreamResponse, type UIMessageChunk } from 'ai';
+
+// 服务端使用内部地址直接访问后端 API
+// VIBELIFE_API_INTERNAL 是服务端环境变量（非 NEXT_PUBLIC_）
+const API_BASE = process.env.VIBELIFE_API_INTERNAL
+  ? `${process.env.VIBELIFE_API_INTERNAL}/api/v1`
+  : "http://127.0.0.1:8000/api/v1";
+
+export const runtime = 'edge';
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const { messages, skill, voice_mode, conversation_id } = body;
+
+  // Extract the latest user message
+  const lastMessage = messages?.[messages.length - 1];
+  const userMessage = typeof lastMessage === 'string'
+    ? lastMessage
+    : lastMessage?.content || lastMessage?.parts?.[0]?.text || body.message || '';
+
+  // Get auth token from header
+  const authHeader = req.headers.get('authorization');
+
+  // Prepare request to Python backend
+  const chatRequest = {
+    message: userMessage,
+    skill: skill || 'bazi',
+    voice_mode: voice_mode || 'warm',
+    conversation_id: conversation_id,
+  };
+
+  try {
+    // Call Python backend SSE endpoint
+    const response = await fetch(`${API_BASE}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authHeader && { Authorization: authHeader }),
+      },
+      body: JSON.stringify(chatRequest),
+      signal: req.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      const errorText = await response.text().catch(() => 'Chat failed');
+      const errorStream = new ReadableStream<UIMessageChunk>({
+        start(controller) {
+          controller.enqueue({ type: 'error', errorText: errorText || 'Chat failed' });
+          controller.close();
+        },
+      });
+      return createUIMessageStreamResponse({ stream: errorStream, status: response.status });
+    }
+
+    const textPartId = `text-${Date.now()}`;
+    const assistantMessageId = `msg-${Date.now()}`;
+
+    const stream = new ReadableStream<UIMessageChunk>({
+      async start(controller) {
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (!reader) {
+          controller.close();
+          return;
+        }
+
+        let buffer = '';
+        let textStarted = false;
+        let finished = false;
+        let shouldStop = false;
+
+        // Initialize message + text part early so UI can stream instantly.
+        controller.enqueue({ type: 'start', messageId: assistantMessageId });
+        controller.enqueue({ type: 'text-start', id: textPartId });
+        textStarted = true;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6).trim();
+                if (!dataStr) continue;
+
+                try {
+                  const data = JSON.parse(dataStr);
+
+                  if (data.type === 'chunk') {
+                    controller.enqueue({
+                      type: 'text-delta',
+                      id: textPartId,
+                      delta: String(data.content ?? ''),
+                    });
+                  } else if (data.type === 'tool_call') {
+                    // AI SDK 6: Tool call event from backend
+                    // Format: { type: 'tool_call', tool_name: string, tool_call_id: string, args: object }
+                    if (textStarted) {
+                      controller.enqueue({ type: 'text-end', id: textPartId });
+                      textStarted = false;
+                    }
+                    // Use tool-input-available for tool calls in AI SDK 6
+                    const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
+                    controller.enqueue({
+                      type: 'tool-input-available',
+                      toolCallId,
+                      toolName: data.tool_name,
+                      input: data.args || {},
+                    });
+                  } else if (data.type === 'tool_result') {
+                    // AI SDK 6: Tool result event from backend
+                    // Format: { type: 'tool_result', tool_call_id: string, result: any }
+                    // Use tool-output-available for tool results in AI SDK 6
+                    controller.enqueue({
+                      type: 'tool-output-available',
+                      toolCallId: data.tool_call_id,
+                      output: data.result,
+                    });
+                    // Start new text part after tool result if needed
+                    if (!textStarted) {
+                      const newTextPartId = `text-${Date.now()}`;
+                      controller.enqueue({ type: 'text-start', id: newTextPartId });
+                      textStarted = true;
+                    }
+                  } else if (data.type === 'done') {
+                    if (textStarted) {
+                      controller.enqueue({ type: 'text-end', id: textPartId });
+                    }
+                    controller.enqueue({
+                      type: 'finish',
+                      finishReason: 'stop',
+                      messageMetadata: {
+                        ...(data.conversation_id ? { conversation_id: data.conversation_id } : {}),
+                        ...(data.skill ? { skill: data.skill } : {}),
+                        ...(data.voice_mode ? { voice_mode: data.voice_mode } : {}),
+                      },
+                    });
+                    finished = true;
+                    shouldStop = true;
+                    break;
+                  } else if (data.type === 'error') {
+                    controller.enqueue({
+                      type: 'error',
+                      errorText: String(data.message ?? 'Chat error'),
+                    });
+                    finished = true;
+                    shouldStop = true;
+                    break;
+                  }
+                } catch {
+                  // Skip malformed JSON
+                }
+              }
+            }
+
+            if (shouldStop) break;
+          }
+
+          // If backend ended without a done marker, close gracefully.
+          if (!finished) {
+            if (textStarted) controller.enqueue({ type: 'text-end', id: textPartId });
+            controller.enqueue({ type: 'finish', finishReason: 'stop' });
+          }
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+          controller.enqueue({ type: 'error', errorText: errorMsg });
+          finished = true;
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return createUIMessageStreamResponse({ stream });
+  } catch (error) {
+    const errorStream = new ReadableStream<UIMessageChunk>({
+      start(controller) {
+        controller.enqueue({
+          type: 'error',
+          errorText: error instanceof Error ? error.message : 'Unknown error',
+        });
+        controller.close();
+      },
+    });
+    return createUIMessageStreamResponse({ stream: errorStream, status: 500 });
+  }
+}

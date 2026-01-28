@@ -1,0 +1,494 @@
+"""
+Tool Executor v10 - 工具执行器
+
+从 core.py 拆分出来的工具执行逻辑，支持：
+- 统一工具执行
+- 自动 checkpoint 保存
+- Phase 1 路由工具处理
+- 工具结果处理
+
+与 ContextManager 协作：
+- 工具执行后自动保存 checkpoint
+- 收集工具数据自动累积
+"""
+import json
+import logging
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Callable, Awaitable
+
+from .tool_registry import ToolRegistry, ToolContext
+from .skill_loader import load_skill, get_skill_rules, load_rule
+from .routing_config import get_protocol_meta
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolResult:
+    """工具执行结果"""
+    data: Dict[str, Any]
+    should_checkpoint: bool = False
+    checkpoint_data: Optional[Dict[str, Any]] = None
+    should_reload_context: bool = False  # 是否需要重新加载上下文
+
+
+class ToolExecutor:
+    """
+    工具执行器
+
+    职责：
+    1. 执行工具调用
+    2. 处理 Phase 1 路由工具
+    3. 判断是否需要保存 checkpoint
+    4. 返回执行结果
+    """
+
+    # 需要保存 checkpoint 的工具
+    CHECKPOINT_TOOLS = {
+        "save_checkpoint",
+        "write_state",
+        "append_to_list",
+        "save_skill_data",
+        "request_info",  # 收集工具
+    }
+
+    # 收集型工具（返回的数据需要累积）
+    COLLECT_TOOLS = {
+        "request_info",
+        "ask_user_question",
+    }
+
+    def __init__(self):
+        from .context_manager import get_context_manager
+        self.context_manager = get_context_manager()
+
+    async def execute(
+        self,
+        tool_name: str,
+        tool_args: str,
+        context: ToolContext,
+        current_message: str = "",
+        reload_callback: Optional[Callable[[], Awaitable[None]]] = None
+    ) -> ToolResult:
+        """
+        执行工具调用
+
+        Args:
+            tool_name: 工具名称
+            tool_args: 工具参数（JSON 字符串）
+            context: 工具上下文
+            current_message: 当前用户消息（用于路由）
+            reload_callback: 上下文重载回调（用于 activate_skill 后重新构建 prompt）
+
+        Returns:
+            ToolResult 包含执行结果和 checkpoint 信息
+        """
+        try:
+            args = json.loads(tool_args) if tool_args else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        # ═══════════════════════════════════════════════════════════════
+        # Phase 1 路由工具
+        # ═══════════════════════════════════════════════════════════════
+
+        if tool_name == "activate_skill":
+            return await self._handle_activate_skill(args, context, current_message, reload_callback)
+
+        if tool_name == "show_protocol_invitation":
+            return await self._handle_show_protocol_invitation(args, context)
+
+        if tool_name == "show_skill_intro":
+            return await self._handle_show_skill_intro(args, context)
+
+        if tool_name == "recommend_skills":
+            return await self._handle_recommend_skills(args, context)
+
+        # 兼容旧的 use_skill
+        if tool_name == "use_skill":
+            new_args = {
+                "skill": args.get("skill"),
+                "rule": args.get("scenario"),
+            }
+            return await self._handle_activate_skill(new_args, context, current_message, reload_callback)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Session 管理工具（v10 新增）
+        # ═══════════════════════════════════════════════════════════════
+
+        if tool_name == "save_checkpoint":
+            return await self._handle_save_checkpoint(args, context)
+
+        if tool_name == "read_session_context":
+            return await self._handle_read_session_context(args, context)
+
+        if tool_name == "add_finding":
+            return await self._handle_add_finding(args, context)
+
+        if tool_name == "complete_session":
+            return await self._handle_complete_session(args, context)
+
+        # ═══════════════════════════════════════════════════════════════
+        # 通用工具执行
+        # ═══════════════════════════════════════════════════════════════
+
+        if ToolRegistry.has_handler(tool_name):
+            result = await ToolRegistry.execute(tool_name, args, context)
+
+            # 判断是否需要保存 checkpoint
+            should_checkpoint = tool_name in self.CHECKPOINT_TOOLS
+            checkpoint_data = None
+
+            if tool_name in self.COLLECT_TOOLS and result.get("status") == "success":
+                # 收集工具的数据需要累积
+                checkpoint_data = {
+                    "tool": tool_name,
+                    "data": result
+                }
+
+            return ToolResult(
+                data=result,
+                should_checkpoint=should_checkpoint,
+                checkpoint_data=checkpoint_data
+            )
+
+        # 未知工具
+        logger.warning(f"[ToolExecutor] Unknown tool: {tool_name}")
+        return ToolResult(
+            data={
+                "status": "unknown_tool",
+                "tool": tool_name,
+                "message": f"工具 {tool_name} 暂未实现"
+            }
+        )
+
+    async def _handle_activate_skill(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext,
+        current_message: str,
+        reload_callback: Optional[Callable[[], Awaitable[None]]]
+    ) -> ToolResult:
+        """处理 activate_skill 工具"""
+        skill = args.get("skill")
+        rule = args.get("rule")
+
+        if not skill:
+            return ToolResult(
+                data={"status": "error", "message": "No skill specified"}
+            )
+
+        # 如果没有指定 rule，尝试自动匹配
+        if not rule and current_message:
+            rule = await self._route_rule(skill, current_message)
+            if rule:
+                logger.info(f"[ToolExecutor] Auto-routed rule: {rule}")
+
+        # 同步 skill 到数据库
+        if context.conversation_id:
+            try:
+                from stores.conversation_repo import update_conversation_skill
+                from uuid import UUID
+                conv_id = UUID(context.conversation_id)
+                await update_conversation_skill(conv_id, skill)
+            except Exception as e:
+                logger.warning(f"[ToolExecutor] Failed to sync skill to DB: {e}")
+
+        result = {
+            "status": "activated",
+            "skill": skill,
+            "rule": rule,
+            "message": f"已激活 {skill} 技能" + (f"，规则: {rule}" if rule else "")
+        }
+
+        # 触发上下文重载
+        if reload_callback:
+            await reload_callback()
+
+        return ToolResult(
+            data=result,
+            should_reload_context=True
+        )
+
+    async def _route_rule(self, skill_id: str, message: str) -> Optional[str]:
+        """自动路由规则"""
+        skill = load_skill(skill_id)
+        if not skill:
+            return None
+
+        rules = get_skill_rules(skill_id)
+        if not rules:
+            return skill.default_scenario
+
+        # v10.1: 让 LLM 选择，这里返回 None
+        return None
+
+    async def _handle_show_protocol_invitation(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 show_protocol_invitation 工具"""
+        protocol_id = args.get("protocol_id")
+
+        if not protocol_id:
+            return ToolResult(
+                data={"status": "error", "message": "No protocol_id specified"}
+            )
+
+        meta = get_protocol_meta(protocol_id) or {}
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "card_type": "protocol_invitation",
+                "protocol_id": protocol_id,
+                "title": meta.get("name", protocol_id),
+                "description": meta.get("description", ""),
+                "estimated_time": meta.get("estimated_time", "10分钟"),
+                "total_steps": meta.get("total_steps", 6),
+            }
+        )
+
+    async def _handle_show_skill_intro(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 show_skill_intro 工具"""
+        skill_id = args.get("skill")
+        reason = args.get("reason", "功能介绍")
+
+        if not skill_id:
+            return ToolResult(
+                data={"status": "error", "message": "No skill specified"}
+            )
+
+        skill = load_skill(skill_id)
+        if not skill:
+            return ToolResult(
+                data={"status": "error", "message": f"Skill {skill_id} not found"}
+            )
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "card_type": "skill_intro",
+                "skill_id": skill_id,
+                "name": skill.name,
+                "description": skill.description,
+                "triggers": skill.triggers[:5] if skill.triggers else [],
+                "reason": reason,
+                "action": {
+                    "type": "activate_skill",
+                    "skill": skill_id,
+                    "label": "开始使用"
+                }
+            }
+        )
+
+    async def _handle_recommend_skills(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 recommend_skills 工具"""
+        skills = args.get("skills", [])
+        reason = args.get("reason", "")
+
+        if not skills:
+            return ToolResult(
+                data={"status": "error", "message": "No skills specified"}
+            )
+
+        skill_infos = []
+        for skill_id in skills:
+            skill = load_skill(skill_id)
+            if skill:
+                desc = skill.description
+                if "触发词" in desc:
+                    desc = desc.split("触发词")[0].strip().rstrip("。")
+                skill_infos.append({
+                    "id": skill_id,
+                    "name": skill.name,
+                    "description": desc[:100] if len(desc) > 100 else desc,
+                    "icon": skill.icon if hasattr(skill, 'icon') else None,
+                    "action": {
+                        "type": "activate_skill",
+                        "skill": skill_id
+                    }
+                })
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "card_type": "skill_recommendations",
+                "skills": skill_infos,
+                "reason": reason,
+            }
+        )
+
+    async def _handle_save_checkpoint(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 save_checkpoint 工具（v10 新增）"""
+        step = args.get("step", 0)
+        phase = args.get("phase")
+        collected_data = args.get("collected_data", {})
+
+        if not context.user_id or context.user_id == "guest":
+            return ToolResult(
+                data={"status": "error", "message": "需要登录才能保存进度"}
+            )
+
+        if not context.skill_id:
+            return ToolResult(
+                data={"status": "error", "message": "No active skill"}
+            )
+
+        await self.context_manager.save_checkpoint(
+            user_id=context.user_id,
+            skill_id=context.skill_id,
+            step=step,
+            phase=phase,
+            collected_data=collected_data
+        )
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "message": f"进度已保存：第 {step} 步",
+                "step": step,
+                "skill_id": context.skill_id
+            },
+            should_checkpoint=False  # 已经保存了
+        )
+
+    async def _handle_read_session_context(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 read_session_context 工具（v10 新增）"""
+        if not context.user_id or context.user_id == "guest":
+            return ToolResult(
+                data={"status": "error", "message": "需要登录才能读取会话"}
+            )
+
+        if not context.skill_id:
+            return ToolResult(
+                data={"status": "error", "message": "No active skill"}
+            )
+
+        session_context = await self.context_manager.load_session_context(
+            user_id=context.user_id,
+            skill_id=context.skill_id
+        )
+
+        result = {
+            "status": "success",
+            "has_checkpoint": session_context.has_checkpoint,
+            "skill_id": session_context.skill_id,
+            "rule_id": session_context.rule_id,
+        }
+
+        if session_context.session:
+            result["session"] = session_context.session.to_dict()
+
+        if session_context.checkpoint:
+            result["checkpoint"] = session_context.checkpoint.to_dict()
+
+        if session_context.findings:
+            result["findings"] = [f.to_dict() for f in session_context.findings[-5:]]
+
+        return ToolResult(data=result)
+
+    async def _handle_add_finding(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 add_finding 工具（v10 新增）"""
+        finding_type = args.get("type", "insight")
+        content = args.get("content", "")
+
+        if not content:
+            return ToolResult(
+                data={"status": "error", "message": "content 不能为空"}
+            )
+
+        if not context.user_id or context.user_id == "guest":
+            return ToolResult(
+                data={"status": "error", "message": "需要登录才能记录发现"}
+            )
+
+        if not context.skill_id:
+            return ToolResult(
+                data={"status": "error", "message": "No active skill"}
+            )
+
+        await self.context_manager.add_finding(
+            user_id=context.user_id,
+            skill_id=context.skill_id,
+            finding_type=finding_type,
+            content=content,
+            rule_id=context.scenario_id
+        )
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "message": f"已记录发现：[{finding_type}] {content[:50]}...",
+                "type": finding_type
+            }
+        )
+
+    async def _handle_complete_session(
+        self,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> ToolResult:
+        """处理 complete_session 工具（v10 新增）"""
+        summary = args.get("summary", "")
+
+        if not context.user_id or context.user_id == "guest":
+            return ToolResult(
+                data={"status": "error", "message": "需要登录才能完成会话"}
+            )
+
+        if not context.skill_id:
+            return ToolResult(
+                data={"status": "error", "message": "No active skill"}
+            )
+
+        await self.context_manager.complete_session(
+            user_id=context.user_id,
+            skill_id=context.skill_id,
+            summary=summary
+        )
+
+        return ToolResult(
+            data={
+                "status": "success",
+                "message": "会话已完成",
+                "skill_id": context.skill_id,
+                "summary": summary
+            }
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_tool_executor: Optional[ToolExecutor] = None
+
+
+def get_tool_executor() -> ToolExecutor:
+    """获取 ToolExecutor 单例"""
+    global _tool_executor
+    if _tool_executor is None:
+        _tool_executor = ToolExecutor()
+    return _tool_executor

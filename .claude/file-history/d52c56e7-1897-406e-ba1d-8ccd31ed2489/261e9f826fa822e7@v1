@@ -1,0 +1,931 @@
+"""
+Payment API Routes
+Based on: vibelife spec v3.0 + payment-design v2.0 + Stripe Best Practices (2026)
+
+Endpoints:
+- POST /api/v1/payment/create-checkout - Create checkout session (dual-track)
+- POST /api/v1/payment/create-payment-intent - Create PaymentIntent (custom flow)
+- POST /api/v1/payment/verify - Verify payment completion
+- GET /api/v1/payment/products - Get available products
+- GET /api/v1/payment/config - Get Stripe publishable key
+- POST /api/v1/payment/unlock-report - Unlock a report after payment
+- GET /api/v1/payment/subscription - Get user's subscription status
+- GET /api/v1/payment/detect-region - Detect user region for pricing
+
+Payment Provider: Stripe (dual-track mode)
+- Global users: USD subscription (recurring)
+- CN/HK users: HKD prepaid (one-time)
+
+参考: https://docs.stripe.com/payments/quickstart
+"""
+
+import os
+import json
+import logging
+from typing import Optional
+from uuid import UUID
+from datetime import datetime, timedelta
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/payment", tags=["payment"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Product(BaseModel):
+    """Product for purchase"""
+    id: str
+    name: str
+    description: str
+    price: float
+    currency: str = "CNY"
+    type: str  # "report", "subscription", "relationship_card"
+
+
+class CreateCheckoutRequest(BaseModel):
+    """Request to create checkout session"""
+    user_id: str
+    product_id: str
+    metadata: dict = Field(default_factory=dict)
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+
+class CheckoutResponse(BaseModel):
+    """Response with checkout info"""
+    success: bool
+    checkout_url: Optional[str] = None
+    session_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class VerifyPaymentRequest(BaseModel):
+    """Request to verify payment"""
+    session_id: str
+    user_id: str
+
+
+class PaymentVerifyResponse(BaseModel):
+    """Response for payment verification"""
+    success: bool
+    paid: bool = False
+    product_id: Optional[str] = None
+    metadata: dict = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class UnlockReportRequest(BaseModel):
+    """Request to unlock a report"""
+    user_id: str
+    report_id: str
+    payment_session_id: str
+
+
+class UnlockResponse(BaseModel):
+    """Response for unlock operation"""
+    success: bool
+    unlocked: bool = False
+    report_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+class SubscriptionResponse(BaseModel):
+    """Response for subscription status"""
+    success: bool
+    has_subscription: bool = False
+    subscription: Optional[dict] = None
+    error: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Dual-Track Pricing Configuration (payment-design v2.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Price IDs from environment (configured in Stripe Dashboard)
+PRICE_MAP = {
+    'CN': {
+        '1m': os.getenv('STRIPE_PRICE_PREPAID_1M_HKD', ''),
+        '3m': os.getenv('STRIPE_PRICE_PREPAID_3M_HKD', ''),
+        '12m': os.getenv('STRIPE_PRICE_PREPAID_12M_HKD', ''),
+    },
+    'GLOBAL': {
+        'monthly': os.getenv('STRIPE_PRICE_SUB_MONTHLY_USD', ''),
+        'quarterly': os.getenv('STRIPE_PRICE_SUB_QUARTERLY_USD', ''),
+        'yearly': os.getenv('STRIPE_PRICE_SUB_YEARLY_USD', ''),
+    }
+}
+
+# Service days for prepaid plans
+SERVICE_DAYS = {
+    '1m': 30,
+    '3m': 90,
+    '12m': 365,
+}
+
+# Display pricing for frontend
+PRICING_DISPLAY = {
+    'CN': {
+        '1m': {'price': 39, 'currency': 'HKD', 'label': '1个月', 'save': None},
+        '3m': {'price': 99, 'currency': 'HKD', 'label': '3个月', 'save': '15%'},
+        '12m': {'price': 298, 'currency': 'HKD', 'label': '12个月', 'save': '36%'},
+    },
+    'GLOBAL': {
+        'monthly': {'price': 9.90, 'currency': 'USD', 'label': 'Monthly', 'save': None},
+        'quarterly': {'price': 24.90, 'currency': 'USD', 'label': 'Quarterly', 'save': '16%'},
+        'yearly': {'price': 69.90, 'currency': 'USD', 'label': 'Yearly', 'save': '41%'},
+    }
+}
+
+# Legacy products (for report purchases)
+PRODUCTS = [
+    Product(
+        id="report_full",
+        name="完整报告 + 高清海报",
+        description="完整深度分析报告、高清AI海报、永久保存",
+        price=19.9,
+        type="report",
+    ),
+]
+
+PRODUCTS_MAP = {p.id: p for p in PRODUCTS}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Database-backed payment tracking
+# ═══════════════════════════════════════════════════════════════════════════
+
+from stores import payment_repo
+from services.billing.stripe_service import StripeService, get_publishable_key
+
+# Stripe service instance
+stripe_service = StripeService()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Routes
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/config")
+async def get_stripe_config():
+    """
+    获取 Stripe 公钥配置（供前端初始化 Stripe.js）
+    安全：只返回公钥，不返回私钥
+    """
+    publishable_key = get_publishable_key()
+    return {
+        "success": True,
+        "publishable_key": publishable_key,
+        "configured": bool(publishable_key),
+    }
+
+@router.get("/products")
+async def get_products():
+    """Get list of available products (legacy)"""
+    return {
+        "success": True,
+        "products": [p.dict() for p in PRODUCTS],
+    }
+
+
+@router.get("/detect-region")
+async def detect_region(request: Request):
+    """
+    Detect user region based on IP for pricing display.
+    Returns CN for China/HK, GLOBAL for others.
+    """
+    # Get client IP from headers (behind proxy) or direct connection
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    real_ip = request.headers.get("X-Real-IP")
+    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else (real_ip or request.client.host)
+
+    # Default to GLOBAL, detect CN based on IP
+    region = "GLOBAL"
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"https://api.ip.sb/geoip/{client_ip}")
+            if resp.status_code == 200:
+                data = resp.json()
+                country_code = data.get("country_code", "")
+                if country_code in ("CN", "HK"):
+                    region = "CN"
+    except Exception as e:
+        logger.warning(f"Region detection failed: {e}, defaulting to GLOBAL")
+
+    return {
+        "success": True,
+        "region": region,
+        "pricing": PRICING_DISPLAY.get(region, PRICING_DISPLAY["GLOBAL"]),
+        "plans": list(PRICING_DISPLAY.get(region, PRICING_DISPLAY["GLOBAL"]).keys()),
+    }
+
+
+@router.get("/pricing")
+async def get_pricing(region: str = Query("GLOBAL", regex="^(CN|GLOBAL)$")):
+    """Get pricing for a specific region"""
+    pricing = PRICING_DISPLAY.get(region, PRICING_DISPLAY["GLOBAL"])
+    mode = "prepaid" if region == "CN" else "subscription"
+
+    return {
+        "success": True,
+        "region": region,
+        "mode": mode,
+        "currency": "HKD" if region == "CN" else "USD",
+        "plans": [
+            {
+                "id": plan_id,
+                "mode": mode,
+                **plan_info
+            }
+            for plan_id, plan_info in pricing.items()
+        ],
+        "ui_hints": {
+            "button_text": "立即购买" if region == "CN" else "Subscribe Now",
+            "renewal_note": "一次性购买，到期需手动续费" if region == "CN" else "Auto-renewal, cancel anytime",
+            "payment_methods": ["alipay", "wechat", "card"] if region == "CN" else ["card", "apple_pay", "google_pay"],
+        }
+    }
+
+
+class CreatePaymentIntentRequest(BaseModel):
+    """Request to create PaymentIntent (custom payment flow)"""
+    user_id: str
+    amount: int  # 金额（最小货币单位）
+    currency: str = "usd"
+    metadata: dict = Field(default_factory=dict)
+
+
+@router.post("/create-payment-intent")
+async def create_payment_intent(request: CreatePaymentIntentRequest):
+    """
+    创建 PaymentIntent（自定义支付流程）
+
+    根据 Stripe 最佳实践：
+    - 金额在服务端计算，防止客户端篡改
+    - 返回 client_secret 供前端确认支付
+    - 使用 automatic_payment_methods 启用动态支付方式
+    """
+    try:
+        if not stripe_service.is_configured:
+            return {
+                "success": False,
+                "error": "Stripe not configured",
+            }
+
+        metadata = {
+            "user_id": request.user_id,
+            **request.metadata
+        }
+
+        result = await stripe_service.create_payment_intent(
+            amount=request.amount,
+            currency=request.currency,
+            metadata=metadata,
+        )
+
+        if not result:
+            return {
+                "success": False,
+                "error": "Failed to create PaymentIntent",
+            }
+
+        return {
+            "success": True,
+            "client_secret": result["client_secret"],
+            "payment_intent_id": result["id"],
+        }
+
+    except Exception as e:
+        logger.error(f"Create PaymentIntent failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@router.post("/create-checkout", response_model=CheckoutResponse)
+async def create_checkout(request: CreateCheckoutRequest):
+    """
+    Create a checkout session with dual-track support.
+
+    - CN region: One-time payment (prepaid) mode
+    - GLOBAL region: Subscription (recurring) mode
+    """
+    try:
+        from uuid import UUID as UUIDType
+
+        # Determine region and plan from product_id
+        # Format: "cn_1m", "cn_3m", "cn_12m" or "global_monthly", "global_quarterly", "global_yearly"
+        product_id = request.product_id
+
+        # Parse region and plan from product_id
+        if product_id.startswith("cn_"):
+            region = "CN"
+            plan = product_id.replace("cn_", "")
+        elif product_id.startswith("global_"):
+            region = "GLOBAL"
+            plan = product_id.replace("global_", "")
+        else:
+            # Legacy product (report purchase)
+            product = PRODUCTS_MAP.get(product_id)
+            if not product:
+                raise HTTPException(status_code=400, detail="Invalid product ID")
+            return await _create_legacy_checkout(request, product)
+
+        # Get price ID for the plan (may be empty in dev mode)
+        price_id = PRICE_MAP.get(region, {}).get(plan)
+
+        # Validate plan exists in pricing display
+        if plan not in PRICING_DISPLAY.get(region, {}):
+            raise HTTPException(status_code=400, detail=f"Invalid plan: {product_id}")
+
+        # Check for Stripe integration
+        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+        if not stripe_key or not price_id:
+            return await _create_dev_checkout(request, region, plan)
+
+        import stripe
+        stripe.api_key = stripe_key
+
+        # Dual-track mode selection
+        mode = "payment" if region == "CN" else "subscription"
+
+        # Build metadata
+        metadata = {
+            "user_id": request.user_id,
+            "plan_type": plan,
+            "region": region,
+            **request.metadata
+        }
+
+        if region == "CN":
+            metadata["service_days"] = str(SERVICE_DAYS.get(plan, 30))
+
+        # Build session params
+        base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+        session_params = {
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "mode": mode,
+            "automatic_payment_methods": {"enabled": True},
+            "success_url": request.success_url or f"{base_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": request.cancel_url or f"{base_url}/pricing",
+            "metadata": metadata,
+        }
+
+        # Add customer email if available
+        if request.metadata.get("email"):
+            session_params["customer_email"] = request.metadata["email"]
+
+        # Add subscription_data for recurring mode
+        if mode == "subscription":
+            session_params["subscription_data"] = {"metadata": metadata}
+
+        session = stripe.checkout.Session.create(**session_params)
+
+        # Create payment record in database
+        pricing = PRICING_DISPLAY.get(region, {}).get(plan, {})
+        await payment_repo.create_payment(
+            user_id=UUIDType(request.user_id) if request.user_id else None,
+            product_type="subscription",
+            product_id=None,
+            amount_cents=int(pricing.get("price", 0) * 100),
+            currency=pricing.get("currency", "USD"),
+            provider="stripe",
+            provider_payment_id=session.id,
+            provider_metadata=json.dumps({
+                "checkout_session_id": session.id,
+                "region": region,
+                "plan": plan,
+                "mode": mode,
+            })
+        )
+
+        return CheckoutResponse(
+            success=True,
+            checkout_url=session.url,
+            session_id=session.id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create checkout failed: {e}")
+        return CheckoutResponse(success=False, error=str(e))
+
+
+async def _create_dev_checkout(request: CreateCheckoutRequest, region: str, plan: str):
+    """Development mode checkout without Stripe"""
+    from uuid import UUID as UUIDType
+    import uuid
+
+    session_id = f"dev_{uuid.uuid4().hex[:16]}"
+    pricing = PRICING_DISPLAY.get(region, {}).get(plan, {})
+
+    await payment_repo.create_payment(
+        user_id=UUIDType(request.user_id) if request.user_id else None,
+        product_type="subscription",
+        product_id=None,
+        amount_cents=int(pricing.get("price", 0) * 100),
+        currency=pricing.get("currency", "USD"),
+        provider="development",
+        provider_payment_id=session_id,
+        provider_metadata=json.dumps({
+            "region": region,
+            "plan": plan,
+            "service_days": SERVICE_DAYS.get(plan, 30) if region == "CN" else None,
+            **request.metadata
+        })
+    )
+
+    base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+    logger.warning(f"Development mode: Created mock checkout session {session_id}")
+
+    return CheckoutResponse(
+        success=True,
+        checkout_url=f"{base_url}/checkout/{session_id}",
+        session_id=session_id,
+    )
+
+
+async def _create_legacy_checkout(request: CreateCheckoutRequest, product: Product):
+    """Legacy checkout for one-time product purchases (reports)"""
+    from uuid import UUID as UUIDType
+
+    stripe_key = os.getenv("STRIPE_SECRET_KEY")
+    base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+
+    if stripe_key:
+        import stripe
+        stripe.api_key = stripe_key
+
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": product.currency.lower(),
+                    "product_data": {"name": product.name, "description": product.description},
+                    "unit_amount": int(product.price * 100),
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=request.success_url or f"{base_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=request.cancel_url or f"{base_url}/payment/cancel",
+            metadata={"user_id": request.user_id, "product_id": request.product_id, **request.metadata}
+        )
+
+        await payment_repo.create_payment(
+            user_id=UUIDType(request.user_id) if request.user_id else None,
+            product_type=product.type,
+            product_id=None,
+            amount_cents=int(product.price * 100),
+            currency=product.currency,
+            provider="stripe",
+            provider_payment_id=session.id,
+            provider_metadata=json.dumps({"checkout_session_id": session.id})
+        )
+
+        return CheckoutResponse(success=True, checkout_url=session.url, session_id=session.id)
+
+    # Development fallback
+    import uuid
+    session_id = f"dev_{uuid.uuid4().hex[:16]}"
+
+    await payment_repo.create_payment(
+        user_id=UUIDType(request.user_id) if request.user_id else None,
+        product_type=product.type,
+        product_id=None,
+        amount_cents=int(product.price * 100),
+        currency=product.currency,
+        provider="development",
+        provider_payment_id=session_id,
+        provider_metadata=json.dumps({"product_id": request.product_id, **request.metadata})
+    )
+
+    return CheckoutResponse(
+        success=True,
+        checkout_url=f"{base_url}/checkout/{session_id}",
+        session_id=session_id,
+    )
+
+
+@router.post("/verify", response_model=PaymentVerifyResponse)
+async def verify_payment(request: VerifyPaymentRequest):
+    """
+    Verify payment completion.
+
+    Checks database for payment status, and optionally verifies with Stripe.
+    """
+    try:
+        # Get payment from database
+        payment = await payment_repo.get_payment_by_provider_id(
+            provider="stripe" if request.session_id.startswith("cs_") else "development",
+            provider_payment_id=request.session_id
+        )
+
+        if not payment:
+            return PaymentVerifyResponse(
+                success=False,
+                error="Session not found",
+            )
+
+        if str(payment["user_id"]) != request.user_id:
+            return PaymentVerifyResponse(
+                success=False,
+                error="User mismatch",
+            )
+
+        # For Stripe payments, optionally verify with Stripe
+        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+        if stripe_key and request.session_id.startswith("cs_"):
+            import stripe
+            stripe.api_key = stripe_key
+            try:
+                session = stripe.checkout.Session.retrieve(request.session_id)
+                if session.payment_status == "paid" and payment["status"] != "success":
+                    # Update database status
+                    await payment_repo.mark_payment_success(payment["id"])
+                    payment["status"] = "success"
+            except Exception as e:
+                logger.warning(f"Stripe verification failed: {e}")
+
+        is_paid = payment["status"] == "success"
+        metadata = payment.get("provider_metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+
+        return PaymentVerifyResponse(
+            success=True,
+            paid=is_paid,
+            product_id=metadata.get("product_id"),
+            metadata=metadata,
+        )
+
+    except Exception as e:
+        logger.error(f"Verify payment failed: {e}")
+        return PaymentVerifyResponse(
+            success=False,
+            error=str(e),
+        )
+
+
+@router.post("/unlock-report", response_model=UnlockResponse)
+async def unlock_report(request: UnlockReportRequest):
+    """
+    Unlock a full report after payment verification.
+
+    This endpoint:
+    1. Verifies the payment session from database
+    2. Marks the report as unlocked for the user
+    3. Returns the full report URL
+    """
+    try:
+        # Get payment from database
+        payment = await payment_repo.get_payment_by_provider_id(
+            provider="stripe" if request.payment_session_id.startswith("cs_") else "development",
+            provider_payment_id=request.payment_session_id
+        )
+
+        if not payment:
+            return UnlockResponse(
+                success=False,
+                error="Payment session not found",
+            )
+
+        if payment["status"] != "success":
+            return UnlockResponse(
+                success=False,
+                error="Payment not completed",
+            )
+
+        if str(payment["user_id"]) != request.user_id:
+            return UnlockResponse(
+                success=False,
+                error="User mismatch",
+            )
+
+        # TODO: Update report in database to mark as unlocked
+        # TODO: Grant subscription if included in product
+
+        base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+        report_url = f"{base_url}/report/{request.report_id}?full=true"
+
+        return UnlockResponse(
+            success=True,
+            unlocked=True,
+            report_url=report_url,
+        )
+
+    except Exception as e:
+        logger.error(f"Unlock report failed: {e}")
+        return UnlockResponse(
+            success=False,
+            error=str(e),
+        )
+
+
+@router.get("/subscription", response_model=SubscriptionResponse)
+async def get_subscription(user_id: str = Query(...)):
+    """
+    Get user's current subscription status.
+    """
+    try:
+        # TODO: Load from database via SubscriptionService
+        # For now, return mock data
+
+        return SubscriptionResponse(
+            success=True,
+            has_subscription=False,
+            subscription=None,
+        )
+
+    except Exception as e:
+        logger.error(f"Get subscription failed: {e}")
+        return SubscriptionResponse(
+            success=False,
+            error=str(e),
+        )
+
+
+@router.post("/webhook")
+async def payment_webhook(request: Request):
+    """
+    Handle Stripe webhook events for dual-track payment system.
+
+    根据 Stripe 最佳实践：
+    - 使用 webhook 而非客户端回调来确认支付状态
+    - 客户端可能关闭浏览器，恶意客户端可能篡改响应
+
+    Processes:
+    - checkout.session.completed -> activate subscription/prepaid
+    - payment_intent.succeeded -> handle successful payment
+    - payment_intent.payment_failed -> handle payment failure
+    - customer.subscription.updated -> sync subscription status
+    - customer.subscription.deleted -> mark subscription cancelled
+    - invoice.payment_failed -> handle subscription payment failure
+    - invoice.paid -> extend subscription period
+    """
+    try:
+        payload = await request.body()
+        sig_header = request.headers.get("Stripe-Signature")
+
+        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+        webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+        if not stripe_key:
+            logger.warning("Stripe not configured, skipping webhook")
+            return {"received": True}
+
+        import stripe
+        stripe.api_key = stripe_key
+
+        # Verify signature (安全最佳实践)
+        if webhook_secret and sig_header:
+            try:
+                event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+            except stripe.error.SignatureVerificationError as e:
+                logger.error(f"Invalid webhook signature: {e}")
+                raise HTTPException(status_code=400, detail="Invalid signature")
+        elif not webhook_secret:
+            if not _is_development_mode():
+                logger.error("Webhook secret not configured in production")
+                raise HTTPException(status_code=500, detail="Webhook not configured")
+            event = json.loads(payload)
+            logger.warning("Webhook signature verification skipped (dev mode)")
+        else:
+            logger.error("Missing Stripe-Signature header")
+            raise HTTPException(status_code=400, detail="Missing signature")
+
+        event_type = event.get("type") if isinstance(event, dict) else event.type
+        data = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
+
+        logger.info(f"Processing webhook event: {event_type}")
+
+        # Checkout Session 完成
+        if event_type == "checkout.session.completed":
+            await _handle_checkout_completed(data)
+
+        # PaymentIntent 事件 (自定义支付流程)
+        elif event_type == "payment_intent.succeeded":
+            await _handle_payment_intent_succeeded(data)
+
+        elif event_type == "payment_intent.payment_failed":
+            await _handle_payment_intent_failed(data)
+
+        # Subscription 事件
+        elif event_type == "customer.subscription.updated":
+            await _handle_subscription_updated(data)
+
+        elif event_type == "customer.subscription.deleted":
+            await _handle_subscription_deleted(data)
+
+        # Invoice 事件
+        elif event_type == "invoice.payment_failed":
+            await _handle_payment_failed(data)
+
+        elif event_type == "invoice.paid":
+            await _handle_invoice_paid(data)
+
+        return {"received": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+async def _handle_checkout_completed(session):
+    """Handle checkout.session.completed - activate subscription or prepaid"""
+    from services.billing.subscription import SubscriptionService
+    from stores.db import get_db_pool
+    import stripe
+
+    session_id = session.get("id") if isinstance(session, dict) else session.id
+    metadata = session.get("metadata", {}) if isinstance(session, dict) else session.metadata
+
+    user_id = metadata.get("user_id")
+    region = metadata.get("region", "GLOBAL")
+    plan = metadata.get("plan_type", "paid")
+
+    if not user_id:
+        logger.warning(f"Checkout completed without user_id: {session_id}")
+        return
+
+    # Mark payment as success
+    payment = await payment_repo.get_payment_by_provider_id("stripe", session_id)
+    if payment:
+        await payment_repo.mark_payment_success(payment["id"])
+        logger.info(f"Payment {payment['id']} marked as success")
+
+    # Get SubscriptionService instance
+    pool = await get_db_pool()
+    sub_service = SubscriptionService(pool)
+
+    # Handle based on region (dual-track)
+    if region == "CN":
+        # Prepaid mode: calculate expiry based on service_days
+        service_days = int(metadata.get("service_days", 30))
+
+        await sub_service.create_prepaid_subscription(
+            user_id=user_id,
+            plan_code=plan,
+            service_days=service_days,
+            payment_session_id=session_id,
+            region=region
+        )
+        logger.info(f"Prepaid subscription activated: user={user_id}, days={service_days}")
+
+    else:
+        # Subscription mode: link Stripe subscription
+        subscription_id = session.get("subscription") if isinstance(session, dict) else session.subscription
+        customer_id = session.get("customer") if isinstance(session, dict) else session.customer
+
+        if subscription_id:
+            # Get subscription details from Stripe
+            try:
+                stripe_sub = stripe.Subscription.retrieve(subscription_id)
+                current_period_end = datetime.fromtimestamp(stripe_sub.current_period_end)
+            except Exception as e:
+                logger.error(f"Failed to retrieve Stripe subscription: {e}")
+                current_period_end = datetime.now() + timedelta(days=30)
+
+            await sub_service.create_stripe_subscription(
+                user_id=user_id,
+                plan_code=plan,
+                stripe_subscription_id=subscription_id,
+                stripe_customer_id=customer_id,
+                current_period_end=current_period_end
+            )
+            logger.info(f"Stripe subscription activated: user={user_id}, sub={subscription_id}")
+
+
+async def _handle_payment_intent_succeeded(payment_intent):
+    """
+    Handle payment_intent.succeeded - 支付成功
+
+    根据 Stripe 最佳实践：使用 webhook 确认支付，而非依赖客户端回调
+    """
+    intent_id = payment_intent.get("id") if isinstance(payment_intent, dict) else payment_intent.id
+    metadata = payment_intent.get("metadata", {}) if isinstance(payment_intent, dict) else payment_intent.metadata
+    amount = payment_intent.get("amount") if isinstance(payment_intent, dict) else payment_intent.amount
+
+    user_id = metadata.get("user_id")
+
+    logger.info(f"PaymentIntent succeeded: {intent_id}, user={user_id}, amount={amount}")
+
+    # 更新支付记录状态
+    payment = await payment_repo.get_payment_by_provider_id("stripe", intent_id)
+    if payment:
+        await payment_repo.mark_payment_success(payment["id"])
+        logger.info(f"Payment {payment['id']} marked as success via PaymentIntent")
+
+
+async def _handle_payment_intent_failed(payment_intent):
+    """
+    Handle payment_intent.payment_failed - 支付失败
+
+    记录失败原因，便于排查问题
+    """
+    intent_id = payment_intent.get("id") if isinstance(payment_intent, dict) else payment_intent.id
+    metadata = payment_intent.get("metadata", {}) if isinstance(payment_intent, dict) else payment_intent.metadata
+
+    # 获取失败原因
+    last_error = payment_intent.get("last_payment_error", {}) if isinstance(payment_intent, dict) else payment_intent.last_payment_error
+    error_message = last_error.get("message", "Unknown error") if isinstance(last_error, dict) else (last_error.message if last_error else "Unknown error")
+
+    user_id = metadata.get("user_id")
+
+    logger.warning(f"PaymentIntent failed: {intent_id}, user={user_id}, error={error_message}")
+
+    # 更新支付记录状态为失败
+    payment = await payment_repo.get_payment_by_provider_id("stripe", intent_id)
+    if payment:
+        await payment_repo.update_payment_status(payment["id"], "failed")
+        logger.info(f"Payment {payment['id']} marked as failed")
+
+
+async def _handle_subscription_updated(subscription):
+    """Handle subscription updates (plan changes, etc.)"""
+    subscription_id = subscription.get("id") if isinstance(subscription, dict) else subscription.id
+    status = subscription.get("status") if isinstance(subscription, dict) else subscription.status
+
+    logger.info(f"Subscription updated: {subscription_id}, status={status}")
+    # TODO: Sync subscription status in database
+
+
+async def _handle_subscription_deleted(subscription):
+    """Handle subscription cancellation"""
+    subscription_id = subscription.get("id") if isinstance(subscription, dict) else subscription.id
+
+    if isinstance(subscription, dict):
+        current_period_end = subscription.get("current_period_end")
+    else:
+        current_period_end = subscription.current_period_end
+
+    logger.info(f"Subscription deleted: {subscription_id}, expires at period end")
+    # TODO: Mark subscription as cancelled, set expiry to current_period_end
+
+
+async def _handle_payment_failed(invoice):
+    """Handle failed payment (for subscription renewals)"""
+    subscription_id = invoice.get("subscription") if isinstance(invoice, dict) else invoice.subscription
+
+    if not subscription_id:
+        return
+
+    logger.warning(f"Payment failed for subscription: {subscription_id}")
+    # TODO: Increment payment_failed_count, send notification
+    # TODO: If payment_failed_count >= 3, suspend subscription
+
+
+async def _handle_invoice_paid(invoice):
+    """Handle successful invoice payment (subscription renewal)"""
+    subscription_id = invoice.get("subscription") if isinstance(invoice, dict) else invoice.subscription
+
+    if not subscription_id:
+        return
+
+    logger.info(f"Invoice paid for subscription: {subscription_id}")
+    # TODO: Reset payment_failed_count, extend subscription period
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Development Helper Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _is_development_mode() -> bool:
+    """Check if running in development mode"""
+    env = os.getenv("VIBELIFE_ENV", "production").lower()
+    return env in ("development", "dev", "local", "test")
+
+
+@router.post("/dev-complete")
+async def dev_complete_payment(session_id: str = Query(...)):
+    """
+    Development endpoint to simulate payment completion.
+    Only works for dev_ prefixed sessions AND only in development mode.
+    """
+    if not _is_development_mode():
+        raise HTTPException(status_code=403, detail="This endpoint is only available in development mode")
+
+    if not session_id.startswith("dev_"):
+        raise HTTPException(status_code=400, detail="Only development sessions can be completed this way")
+
+    payment = await payment_repo.get_payment_by_provider_id("development", session_id)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    await payment_repo.mark_payment_success(payment["id"])
+
+    return {
+        "success": True,
+        "message": "Payment marked as completed (development mode)",
+        "session_id": session_id,
+    }
+

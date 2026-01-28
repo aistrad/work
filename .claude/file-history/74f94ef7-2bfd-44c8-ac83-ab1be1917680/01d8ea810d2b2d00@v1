@@ -1,0 +1,282 @@
+"""
+VibeLife Paywall Service
+付费墙服务 - 管理功能访问权限和触发点
+"""
+
+from datetime import datetime, date
+from typing import Optional
+from pydantic import BaseModel
+from enum import Enum
+import asyncpg
+import logging
+
+from .subscription import SubscriptionService, SubscriptionTier
+
+logger = logging.getLogger(__name__)
+
+
+class PaywallTrigger(str, Enum):
+    """付费墙触发点"""
+    # 八字
+    DEEP_PATTERN_ANALYSIS = "deep_pattern_analysis"    # 深度格局分析
+    DETAILED_TRANSIT = "detailed_transit"              # 详细运势
+    COMPATIBILITY_ANALYSIS = "compatibility_analysis"  # 合婚分析
+    TEN_GODS_DEEP = "ten_gods_deep"                   # 十神深度解读
+
+    # 星座
+    FULL_NATAL_CHART = "full_natal_chart"             # 完整本命盘
+    SYNASTRY_CHART = "synastry_chart"                 # 双人合盘
+    TRANSIT_FORECAST = "transit_forecast"             # 行运预测
+    ASPECT_ANALYSIS = "aspect_analysis"               # 相位分析
+
+    # MBTI
+    COGNITIVE_FUNCTIONS_DEEP = "cognitive_functions_deep"  # 认知功能深度
+    TYPE_COMPATIBILITY = "type_compatibility"              # 类型兼容性
+
+    # 通用
+    UNLIMITED_CHAT = "unlimited_chat"                 # 无限对话
+    PREMIUM_INSIGHTS = "premium_insights"             # 高级洞察
+    EXPORT_DATA = "export_data"                       # 数据导出
+
+
+class PaywallResult(BaseModel):
+    """付费墙检查结果"""
+    allowed: bool
+    trigger: PaywallTrigger
+    reason: Optional[str] = None
+    upgrade_prompt: Optional[str] = None
+    recommended_plan: Optional[str] = None
+
+
+class FeatureUsage(BaseModel):
+    """功能使用记录"""
+    user_id: str
+    feature: str
+    skill_id: str
+    used_at: datetime
+    blocked: bool = False
+
+
+class PaywallService:
+    """付费墙服务"""
+
+    def __init__(self, db_pool: asyncpg.Pool, subscription_service: SubscriptionService = None):
+        self.db = db_pool
+        self.subscription = subscription_service
+
+    async def check_access(
+        self,
+        user_id: str,
+        trigger: PaywallTrigger,
+        skill_id: str = None
+    ) -> PaywallResult:
+        """检查用户是否可以访问某功能"""
+        # 获取用户订阅
+        if self.subscription:
+            subscription = await self.subscription.get_user_subscription(user_id)
+        else:
+            subscription = None
+
+        # 免费功能列表
+        free_features = [
+            PaywallTrigger.UNLIMITED_CHAT,  # 有限的对话是免费的
+        ]
+
+        # 如果是免费功能，检查使用限制
+        if trigger in free_features:
+            return await self._check_free_tier_limit(user_id, trigger, skill_id)
+
+        # 检查订阅状态
+        if not subscription:
+            return PaywallResult(
+                allowed=False,
+                trigger=trigger,
+                reason="需要订阅才能使用此功能",
+                upgrade_prompt=self._get_upgrade_prompt(trigger),
+                recommended_plan=self._get_recommended_plan(trigger, skill_id)
+            )
+
+        # 检查订阅计划是否包含此功能
+        plan = await self.subscription.get_plan(subscription.plan_id)
+        if not plan:
+            return PaywallResult(
+                allowed=False,
+                trigger=trigger,
+                reason="订阅计划无效"
+            )
+
+        # 全站订阅有所有权限
+        if plan.plan_type == SubscriptionTier.VIBELIFE_ALL:
+            await self._record_usage(user_id, trigger, skill_id, blocked=False)
+            return PaywallResult(allowed=True, trigger=trigger)
+
+        # 单站订阅检查 skill_id
+        if skill_id and skill_id not in plan.skill_ids:
+            return PaywallResult(
+                allowed=False,
+                trigger=trigger,
+                reason=f"当前订阅不包含 {skill_id} 的高级功能",
+                upgrade_prompt=f"升级到全能会员，解锁所有技能",
+                recommended_plan="vibelife_all"
+            )
+
+        await self._record_usage(user_id, trigger, skill_id, blocked=False)
+        return PaywallResult(allowed=True, trigger=trigger)
+
+    async def _check_free_tier_limit(
+        self,
+        user_id: str,
+        trigger: PaywallTrigger,
+        skill_id: str
+    ) -> PaywallResult:
+        """检查免费层使用限制"""
+        if trigger == PaywallTrigger.UNLIMITED_CHAT:
+            # 检查今日对话次数
+            usage = await self._get_daily_usage(user_id)
+            daily_limit = 3  # 免费用户每天3次
+
+            if usage >= daily_limit:
+                return PaywallResult(
+                    allowed=False,
+                    trigger=trigger,
+                    reason=f"今日免费对话次数已用完（{usage}/{daily_limit}）",
+                    upgrade_prompt="升级会员，享受无限对话",
+                    recommended_plan=f"{skill_id}_premium" if skill_id else "vibelife_all"
+                )
+
+            await self._record_usage(user_id, trigger, skill_id, blocked=False)
+            return PaywallResult(allowed=True, trigger=trigger)
+
+        # 其他功能默认需要订阅
+        return PaywallResult(
+            allowed=False,
+            trigger=trigger,
+            reason="此功能需要订阅",
+            upgrade_prompt=self._get_upgrade_prompt(trigger),
+            recommended_plan=self._get_recommended_plan(trigger, skill_id)
+        )
+
+    async def _get_daily_usage(self, user_id: str) -> int:
+        """获取用户今日使用次数"""
+        count = await self.db.fetchval("""
+            SELECT COUNT(*) FROM skill_messages sm
+            JOIN skill_conversations sc ON sm.conversation_id = sc.id
+            WHERE sc.user_id = $1::uuid
+              AND sm.role = 'user'
+              AND sm.created_at >= CURRENT_DATE
+        """, user_id)
+        return count or 0
+
+    async def _record_usage(
+        self,
+        user_id: str,
+        trigger: PaywallTrigger,
+        skill_id: str,
+        blocked: bool
+    ):
+        """记录功能使用"""
+        # 可以记录到分析表中用于后续分析
+        pass
+
+    def _get_upgrade_prompt(self, trigger: PaywallTrigger) -> str:
+        """获取升级提示"""
+        prompts = {
+            PaywallTrigger.DEEP_PATTERN_ANALYSIS: "深度格局分析是会员专享功能，升级后即可解锁",
+            PaywallTrigger.DETAILED_TRANSIT: "详细运势解读是会员专享功能，升级后获得更精准的指引",
+            PaywallTrigger.COMPATIBILITY_ANALYSIS: "合婚分析是会员专享功能，了解你们的命理契合度",
+            PaywallTrigger.FULL_NATAL_CHART: "完整星盘分析是会员专享功能，全面了解你的星空密码",
+            PaywallTrigger.SYNASTRY_CHART: "双人合盘是会员专享功能，探索你们的星盘共鸣",
+            PaywallTrigger.UNLIMITED_CHAT: "升级会员，享受无限对话，随时随地获得指引",
+            PaywallTrigger.PREMIUM_INSIGHTS: "高级洞察是会员专享功能，获得更深层的自我认知",
+        }
+        return prompts.get(trigger, "升级会员解锁更多功能")
+
+    def _get_recommended_plan(self, trigger: PaywallTrigger, skill_id: str) -> str:
+        """获取推荐计划"""
+        # 八字相关触发点
+        bazi_triggers = [
+            PaywallTrigger.DEEP_PATTERN_ANALYSIS,
+            PaywallTrigger.DETAILED_TRANSIT,
+            PaywallTrigger.COMPATIBILITY_ANALYSIS,
+            PaywallTrigger.TEN_GODS_DEEP,
+        ]
+
+        # 星座相关触发点
+        zodiac_triggers = [
+            PaywallTrigger.FULL_NATAL_CHART,
+            PaywallTrigger.SYNASTRY_CHART,
+            PaywallTrigger.TRANSIT_FORECAST,
+            PaywallTrigger.ASPECT_ANALYSIS,
+        ]
+
+        # MBTI相关触发点
+        mbti_triggers = [
+            PaywallTrigger.COGNITIVE_FUNCTIONS_DEEP,
+            PaywallTrigger.TYPE_COMPATIBILITY,
+        ]
+
+        if trigger in bazi_triggers or skill_id == "bazi":
+            return "bazi_premium"
+        elif trigger in zodiac_triggers or skill_id == "zodiac":
+            return "zodiac_premium"
+        elif trigger in mbti_triggers or skill_id == "mbti":
+            return "mbti_premium"
+
+        return "vibelife_all"
+
+    async def get_feature_list(self, plan_id: str) -> dict:
+        """获取计划的功能列表"""
+        if self.subscription:
+            plan = await self.subscription.get_plan(plan_id)
+        else:
+            plan = None
+
+        if not plan:
+            return {"features": []}
+
+        # 功能分类
+        feature_categories = {
+            "对话功能": [
+                {"name": "基础对话", "included": True},
+                {"name": "无限对话", "included": plan.plan_type != SubscriptionTier.FREE},
+            ],
+            "分析功能": [
+                {"name": "基础运势", "included": True},
+                {"name": "深度格局分析", "included": plan.plan_type != SubscriptionTier.FREE},
+                {"name": "详细运势解读", "included": plan.plan_type != SubscriptionTier.FREE},
+            ],
+            "高级功能": [
+                {"name": "跨技能洞察", "included": plan.plan_type == SubscriptionTier.VIBELIFE_ALL},
+                {"name": "数据导出", "included": plan.plan_type != SubscriptionTier.FREE},
+                {"name": "优先客服", "included": plan.plan_type == SubscriptionTier.VIBELIFE_ALL},
+            ]
+        }
+
+        return {
+            "plan_id": plan_id,
+            "plan_name": plan.name,
+            "categories": feature_categories
+        }
+
+    async def should_show_upgrade_prompt(
+        self,
+        user_id: str,
+        context: str = None
+    ) -> Optional[dict]:
+        """判断是否应该显示升级提示"""
+        # 检查用户使用量
+        usage = await self._get_daily_usage(user_id)
+
+        # 如果用户已经用完一半以上的免费额度
+        if usage >= 2:
+            return {
+                "show": True,
+                "type": "soft",
+                "message": f"你今天已经对话 {usage} 次了，升级会员享受无限对话",
+                "cta": "查看会员权益"
+            }
+
+        # 检查用户是否触发过付费墙
+        # 可以根据用户行为数据决定
+
+        return None

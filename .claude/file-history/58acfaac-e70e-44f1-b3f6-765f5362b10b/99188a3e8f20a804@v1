@@ -1,0 +1,443 @@
+"""
+Mentis OS v3.0 - Pinecone 向量服务
+
+提供语义搜索和相似度匹配功能。
+支持 GLM 和 OpenAI 两种嵌入模型。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+# 配置
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+PINECONE_HOST = os.getenv("PINECONE_HOST", "")  # e.g., xxx-xxx.svc.pinecone.io
+
+# 嵌入模型配置 - 优先使用 Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+EMBEDDING_PROVIDER = os.getenv("MENTIS_EMBEDDING_PROVIDER", "gemini")  # gemini, glm, or openai
+
+# Gemini Embedding
+GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+
+# GLM Embedding
+GLM_EMBEDDING_URL = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+GLM_EMBEDDING_MODEL = os.getenv("GLM_EMBEDDING_MODEL", "embedding-3")
+
+# OpenAI Embedding
+OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+
+@dataclass
+class VectorMatch:
+    """向量匹配结果"""
+    id: str
+    score: float
+    metadata: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "score": self.score,
+            "metadata": self.metadata,
+        }
+
+
+class VectorError(Exception):
+    """向量服务错误"""
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+async def get_embedding(text: str) -> List[float]:
+    """
+    获取文本的向量表示
+
+    优先使用 Gemini，然后是 GLM，最后是 OpenAI
+
+    Args:
+        text: 输入文本
+
+    Returns:
+        嵌入向量
+
+    Raises:
+        VectorError: 获取失败
+    """
+    # 按配置的提供商选择
+    if EMBEDDING_PROVIDER == "gemini" and GEMINI_API_KEY:
+        return await _get_embedding_gemini(text)
+    elif EMBEDDING_PROVIDER == "glm" and GLM_API_KEY:
+        return await _get_embedding_glm(text)
+    elif EMBEDDING_PROVIDER == "openai" and OPENAI_API_KEY:
+        return await _get_embedding_openai(text)
+    # 回退：按可用性选择
+    elif GEMINI_API_KEY:
+        return await _get_embedding_gemini(text)
+    elif GLM_API_KEY:
+        return await _get_embedding_glm(text)
+    elif OPENAI_API_KEY:
+        return await _get_embedding_openai(text)
+    else:
+        raise VectorError("vector/no-api-key", "未配置 Gemini/GLM/OpenAI API Key")
+
+
+async def _get_embedding_gemini(text: str) -> List[float]:
+    """使用 Google Gemini Embedding API (text-embedding-004)"""
+    url = f"{GEMINI_EMBEDDING_URL}/{GEMINI_EMBEDDING_MODEL}:embedContent?key={GEMINI_API_KEY}"
+
+    payload = {
+        "model": f"models/{GEMINI_EMBEDDING_MODEL}",
+        "content": {
+            "parts": [{"text": text}]
+        },
+        "taskType": "RETRIEVAL_DOCUMENT",  # 或 RETRIEVAL_QUERY, SEMANTIC_SIMILARITY
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            # Gemini 返回格式: {"embedding": {"values": [...]}}
+            return result["embedding"]["values"]
+        except httpx.HTTPStatusError as e:
+            error_text = e.response.text[:200] if e.response else ""
+            raise VectorError("vector/gemini-error", f"Gemini Embedding 错误: {e.response.status_code} - {error_text}")
+        except Exception as e:
+            raise VectorError("vector/error", f"Gemini 嵌入失败: {str(e)}")
+
+
+async def _get_embedding_glm(text: str) -> List[float]:
+    """使用 GLM Embedding API"""
+    headers = {
+        "Authorization": f"Bearer {GLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GLM_EMBEDDING_MODEL,
+        "input": text,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(GLM_EMBEDDING_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result["data"][0]["embedding"]
+        except httpx.HTTPStatusError as e:
+            raise VectorError("vector/glm-error", f"GLM Embedding 错误: {e.response.status_code}")
+        except Exception as e:
+            raise VectorError("vector/error", f"GLM 嵌入失败: {str(e)}")
+
+
+async def _get_embedding_openai(text: str) -> List[float]:
+    """使用 OpenAI Embedding API"""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "input": text,
+        "model": OPENAI_EMBEDDING_MODEL,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(
+                OPENAI_EMBEDDING_URL,
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            return result["data"][0]["embedding"]
+
+        except httpx.HTTPStatusError as e:
+            raise VectorError(
+                "vector/embedding-error",
+                f"获取嵌入失败: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VectorError("vector/error", f"获取嵌入失败: {str(e)}")
+
+
+async def upsert_vectors(
+    vectors: List[Dict[str, Any]],
+    namespace: str = "",
+) -> Dict[str, Any]:
+    """
+    插入或更新向量
+
+    Args:
+        vectors: 向量列表，每个包含 id, values, metadata
+        namespace: 命名空间
+
+    Returns:
+        操作结果
+
+    Raises:
+        VectorError: 操作失败
+    """
+    if not PINECONE_API_KEY or not PINECONE_HOST:
+        raise VectorError("vector/no-pinecone", "未配置 Pinecone")
+
+    url = f"https://{PINECONE_HOST}/vectors/upsert"
+    headers = {
+        "Api-Key": PINECONE_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "vectors": vectors,
+        "namespace": namespace,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+        except httpx.HTTPStatusError as e:
+            raise VectorError(
+                "vector/upsert-error",
+                f"向量插入失败: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VectorError("vector/error", f"向量插入失败: {str(e)}")
+
+
+async def query_vectors(
+    vector: List[float],
+    top_k: int = 10,
+    namespace: str = "",
+    filter: Optional[Dict[str, Any]] = None,
+    include_metadata: bool = True,
+) -> List[VectorMatch]:
+    """
+    查询相似向量
+
+    Args:
+        vector: 查询向量
+        top_k: 返回数量
+        namespace: 命名空间
+        filter: 过滤条件
+        include_metadata: 是否包含元数据
+
+    Returns:
+        匹配结果列表
+
+    Raises:
+        VectorError: 查询失败
+    """
+    if not PINECONE_API_KEY or not PINECONE_HOST:
+        raise VectorError("vector/no-pinecone", "未配置 Pinecone")
+
+    url = f"https://{PINECONE_HOST}/query"
+    headers = {
+        "Api-Key": PINECONE_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "vector": vector,
+        "topK": top_k,
+        "namespace": namespace,
+        "includeMetadata": include_metadata,
+    }
+    if filter:
+        payload["filter"] = filter
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+
+            result = response.json()
+            matches = []
+            for match in result.get("matches", []):
+                matches.append(VectorMatch(
+                    id=match["id"],
+                    score=match["score"],
+                    metadata=match.get("metadata", {}),
+                ))
+            return matches
+
+        except httpx.HTTPStatusError as e:
+            raise VectorError(
+                "vector/query-error",
+                f"向量查询失败: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VectorError("vector/error", f"向量查询失败: {str(e)}")
+
+
+async def semantic_search(
+    query: str,
+    top_k: int = 10,
+    namespace: str = "",
+    filter: Optional[Dict[str, Any]] = None,
+) -> List[VectorMatch]:
+    """
+    语义搜索
+
+    Args:
+        query: 查询文本
+        top_k: 返回数量
+        namespace: 命名空间
+        filter: 过滤条件
+
+    Returns:
+        匹配结果列表
+    """
+    # 获取查询向量
+    embedding = await get_embedding(query)
+
+    # 查询相似向量
+    return await query_vectors(
+        vector=embedding,
+        top_k=top_k,
+        namespace=namespace,
+        filter=filter,
+    )
+
+
+async def delete_vectors(
+    ids: List[str],
+    namespace: str = "",
+) -> Dict[str, Any]:
+    """
+    删除向量
+
+    Args:
+        ids: 向量 ID 列表
+        namespace: 命名空间
+
+    Returns:
+        操作结果
+    """
+    if not PINECONE_API_KEY or not PINECONE_HOST:
+        raise VectorError("vector/no-pinecone", "未配置 Pinecone")
+
+    url = f"https://{PINECONE_HOST}/vectors/delete"
+    headers = {
+        "Api-Key": PINECONE_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "ids": ids,
+        "namespace": namespace,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+        except httpx.HTTPStatusError as e:
+            raise VectorError(
+                "vector/delete-error",
+                f"向量删除失败: {e.response.status_code}",
+            )
+        except Exception as e:
+            raise VectorError("vector/error", f"向量删除失败: {str(e)}")
+
+
+# ===== 行为匹配增强 =====
+
+async def match_behavior_semantic(
+    text: str,
+    user_id: str,
+    top_k: int = 5,
+) -> List[VectorMatch]:
+    """
+    使用语义搜索匹配行为
+
+    Args:
+        text: 输入文本
+        user_id: 用户 ID
+        top_k: 返回数量
+
+    Returns:
+        匹配的行为列表
+    """
+    return await semantic_search(
+        query=text,
+        top_k=top_k,
+        namespace="behaviors",
+        filter={"user_id": {"$eq": user_id}},
+    )
+
+
+async def index_stream_entry(
+    stream_id: str,
+    content: str,
+    user_id: str,
+    metadata: Dict[str, Any],
+) -> None:
+    """
+    索引 Stream 条目
+
+    Args:
+        stream_id: Stream ID
+        content: 内容
+        user_id: 用户 ID
+        metadata: 元数据
+    """
+    try:
+        embedding = await get_embedding(content)
+
+        await upsert_vectors(
+            vectors=[{
+                "id": stream_id,
+                "values": embedding,
+                "metadata": {
+                    "user_id": user_id,
+                    "content": content[:500],  # 截断避免过长
+                    **metadata,
+                },
+            }],
+            namespace="streams",
+        )
+    except VectorError:
+        # 索引失败不影响主流程
+        pass
+
+
+async def search_similar_streams(
+    user_id: str,
+    query: str,
+    top_k: int = 10,
+) -> List[VectorMatch]:
+    """
+    搜索相似的 Stream 条目
+
+    Args:
+        user_id: 用户 ID
+        query: 查询文本
+        top_k: 返回数量
+
+    Returns:
+        相似的 Stream 列表
+    """
+    return await semantic_search(
+        query=query,
+        top_k=top_k,
+        namespace="streams",
+        filter={"user_id": {"$eq": user_id}},
+    )

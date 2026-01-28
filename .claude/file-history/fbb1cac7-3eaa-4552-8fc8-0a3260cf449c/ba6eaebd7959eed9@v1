@@ -1,0 +1,466 @@
+"""
+Profile Extractor Worker V8 - 从用户交互中抽取信息更新 Profile
+
+V8 架构升级：
+- 输出写入 vibe.insight (我是谁) + vibe.target (我要成为谁)
+- 废弃 extracted 字段
+- 保持 Cold Layer 写入 (vibe_profile_timeline + vibe_profile_insights)
+
+极简设计：
+- 单一抽取入口，替代 daily_extraction + portrait_service + insight_generator
+- 定时运行（每日），增量处理新消息
+"""
+import asyncio
+import json
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from uuid import UUID
+
+from stores.db import fetch, fetchrow
+from stores.unified_profile_repo import UnifiedProfileRepository
+from services.model_router.client import chat
+
+logger = logging.getLogger(__name__)
+
+# V8 抽取 Prompt - 输出到 vibe.insight + vibe.target
+EXTRACTION_PROMPT_V8 = """你是一个用户画像分析专家。分析对话记录，提取关键信息。
+
+## 输出格式 (JSON)
+
+{
+  "insight": {
+    "essence": {
+      "archetype": {"primary": "...", "secondary": "..."},
+      "traits": [{"trait": "...", "intensity": 0.8}],
+      "communication_style": "直接/温和/理性/感性",
+      "relationships": ["..."]
+    },
+    "dynamic": {
+      "emotion": {"current": "...", "trend": "stable/improving/declining"},
+      "energy": {"level": "low/medium/high"},
+      "challenges": ["..."]
+    },
+    "pattern": {
+      "interests": ["..."],
+      "behaviors": ["..."],
+      "insights": ["..."]
+    }
+  },
+  "target": {
+    "goals": [
+      {"title": "...", "category": "career/health/relationship/wealth/growth", "status": "in_progress"}
+    ],
+    "focus": {
+      "primary": "...",
+      "heat_map": {"career": 0.8, "health": 0.3, "relationship": 0.5}
+    }
+  },
+  "timeline_events": [
+    {"date": "2024-01", "event": "...", "type": "life_event"}
+  ]
+}
+
+## 抽取规则
+
+1. **archetype**: 用户核心身份原型（创造者/导师/英雄/照顾者/智者/探索者等）
+2. **traits**: 从对话中识别的稳定特质（最多5个，intensity范围0-1）
+3. **communication_style**: 对话风格偏好
+4. **relationships**: 提及的重要关系（家人、朋友、宠物等）
+5. **emotion/energy**: 最近对话中的情绪和能量状态
+6. **challenges**: 当前面临的困难或痛点
+7. **interests**: 反复提及的话题或领域
+8. **behaviors**: 观察到的行为模式
+9. **goals**: 明确表达的目标或愿望（需分类）
+10. **heat_map**: 各领域关注度（0-1，根据对话频率和深度判断）
+11. **timeline_events**: 重要人生节点（带日期）
+
+只返回从对话中明确提取到的信息，不要推测。空字段不要包含。
+如果完全没有新信息，返回空对象 {}"""
+
+
+async def get_active_users(days: int = 7) -> List[UUID]:
+    """获取最近活跃的用户"""
+    query = """
+        SELECT DISTINCT c.user_id FROM conversations c
+        WHERE c.user_id IS NOT NULL
+        AND c.updated_at > NOW() - INTERVAL '%s days'
+    """
+    rows = await fetch(query, days)
+    return [row["user_id"] for row in rows]
+
+
+async def get_user_messages_since(
+    user_id: UUID,
+    since: Optional[datetime] = None,
+    limit: int = 100
+) -> List[Dict[str, Any]]:
+    """获取用户自指定时间以来的消息"""
+    if since is None:
+        since = datetime.now() - timedelta(days=30)
+
+    query = """
+        SELECT m.role, m.content, m.created_at
+        FROM messages m
+        JOIN conversations c ON m.conversation_id = c.id
+        WHERE c.user_id = $1 AND m.created_at > $2
+        ORDER BY m.created_at ASC
+        LIMIT $3
+    """
+    rows = await fetch(query, user_id, since, limit)
+    return [dict(row) for row in rows]
+
+
+async def _write_to_cold_layer(
+    user_id: UUID,
+    timeline_events: List[Dict[str, Any]] = None,
+    insight_data: Dict[str, Any] = None
+) -> None:
+    """
+    将重要洞察和事件写入 Cold Layer (V8 结构)
+
+    - timeline_events → vibe_profile_timeline
+    - insight.pattern.insights → vibe_profile_insights
+    """
+    # 写入时间线事件
+    if timeline_events:
+        for event in timeline_events:
+            event_text = event.get("event", "")
+            event_date_str = event.get("date", "")
+            event_type = event.get("type", "life_event")
+
+            if event_text and event_date_str:
+                try:
+                    # 解析日期 (支持 YYYY-MM 或 YYYY-MM-DD 格式)
+                    if len(event_date_str) == 7:  # YYYY-MM
+                        event_date = datetime.strptime(event_date_str, "%Y-%m").date()
+                    else:
+                        event_date = datetime.strptime(event_date_str[:10], "%Y-%m-%d").date()
+
+                    await ColdLayerRepository.add_timeline_event(
+                        user_id=user_id,
+                        event_type=event_type,
+                        event_date=event_date,
+                        title=event_text[:200],
+                        data=event
+                    )
+                    logger.debug(f"Added timeline event for user {user_id}: {event_text[:50]}")
+                except Exception as e:
+                    logger.warning(f"Failed to add timeline event: {e}")
+
+    # 写入重要洞察
+    if insight_data:
+        # 从 pattern.insights 提取重要发现
+        pattern = insight_data.get("pattern", {})
+        insights = pattern.get("insights", [])
+
+        for insight_content in insights:
+            if insight_content and len(insight_content) > 10:
+                try:
+                    await ColdLayerRepository.add_insight(
+                        user_id=user_id,
+                        insight_type="discovery",
+                        content=insight_content,
+                        metadata={"source": "profile_extraction_v8"}
+                    )
+                    logger.debug(f"Added insight for user {user_id}: {insight_content[:50]}")
+                except Exception as e:
+                    logger.warning(f"Failed to add insight: {e}")
+
+        # 如果有 challenges，也写入洞察
+        dynamic = insight_data.get("dynamic", {})
+        challenges = dynamic.get("challenges", [])
+        for challenge in challenges[:3]:  # 最多 3 个
+            if challenge and len(challenge) > 10:
+                try:
+                    await ColdLayerRepository.add_insight(
+                        user_id=user_id,
+                        insight_type="pattern",
+                        content=f"当前挑战: {challenge}",
+                        metadata={"source": "profile_extraction_v8", "type": "challenge"}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to add challenge insight: {e}")
+
+
+def merge_insight(current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    合并 vibe.insight（我是谁）
+
+    合并策略:
+    - essence: 深度合并，新数据优先
+    - dynamic: 完全覆盖（状态型数据）
+    - pattern: 追加合并，保留最新
+    """
+    if not new:
+        return current
+
+    result = current.copy() if current else {}
+
+    # essence: 深度合并，新数据优先
+    if "essence" in new:
+        current_essence = result.get("essence", {})
+
+        # archetype: 直接覆盖
+        if "archetype" in new["essence"]:
+            current_essence["archetype"] = new["essence"]["archetype"]
+
+        # traits: 合并去重，保留最新 5 个（按 trait 名去重）
+        if "traits" in new["essence"]:
+            new_traits = new["essence"]["traits"]
+            current_traits = current_essence.get("traits", [])
+            # 新的在前，按 trait 去重
+            seen_traits = set()
+            merged_traits = []
+            for t in new_traits + current_traits:
+                trait_name = t.get("trait", "")
+                if trait_name and trait_name not in seen_traits:
+                    seen_traits.add(trait_name)
+                    merged_traits.append(t)
+            current_essence["traits"] = merged_traits[:5]
+
+        # communication_style: 直接覆盖
+        if "communication_style" in new["essence"]:
+            current_essence["communication_style"] = new["essence"]["communication_style"]
+
+        # relationships: 合并去重
+        if "relationships" in new["essence"]:
+            current_rels = current_essence.get("relationships", [])
+            combined = new["essence"]["relationships"] + current_rels
+            current_essence["relationships"] = list(dict.fromkeys(combined))[:10]
+
+        result["essence"] = current_essence
+
+    # dynamic: 完全覆盖（状态型数据，只保留最新）
+    if "dynamic" in new:
+        result["dynamic"] = new["dynamic"]
+
+    # pattern: 追加合并
+    if "pattern" in new:
+        current_pattern = result.get("pattern", {})
+
+        # interests, behaviors, insights: 追加去重
+        for field in ["interests", "behaviors", "insights"]:
+            if field in new["pattern"]:
+                current_list = current_pattern.get(field, [])
+                combined = new["pattern"][field] + current_list
+                current_pattern[field] = list(dict.fromkeys(combined))[:10]
+
+        result["pattern"] = current_pattern
+
+    return result
+
+
+def merge_target(current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    合并 vibe.target（我要成为谁）
+
+    合并策略:
+    - goals: 合并，按 title 去重
+    - focus: 合并 heat_map，primary 覆盖
+    """
+    if not new:
+        return current
+
+    result = current.copy() if current else {}
+
+    # goals: 合并，按 title 去重
+    if "goals" in new and new["goals"]:
+        current_goals = result.get("goals", [])
+        existing_titles = {g.get("title", "") for g in current_goals}
+
+        for goal in new["goals"]:
+            title = goal.get("title", "")
+            if title and title not in existing_titles:
+                current_goals.append(goal)
+                existing_titles.add(title)
+
+        # 保留最新 10 个目标
+        result["goals"] = current_goals[:10]
+
+    # focus: 合并
+    if "focus" in new:
+        current_focus = result.get("focus", {})
+
+        # primary: 直接覆盖
+        if "primary" in new["focus"]:
+            current_focus["primary"] = new["focus"]["primary"]
+
+        # heat_map: 合并（新值覆盖旧值）
+        if "heat_map" in new["focus"]:
+            current_heat_map = current_focus.get("heat_map", {})
+            current_heat_map.update(new["focus"]["heat_map"])
+            current_focus["heat_map"] = current_heat_map
+
+        result["focus"] = current_focus
+
+    return result
+
+
+async def extract_user_profile(user_id: UUID) -> Dict[str, Any]:
+    """
+    为单个用户抽取 Profile (V8 架构)
+
+    输出写入:
+    - vibe.insight: 我是谁（essence + dynamic + pattern）
+    - vibe.target: 我要成为谁（goals + focus）
+    - Cold Layer: timeline_events + insights
+    """
+    logger.info(f"Extracting profile for user {user_id} (V8)")
+
+    # 1. 获取现有 vibe 数据
+    current_insight = await UnifiedProfileRepository.get_vibe_insight(user_id)
+    current_target = await UnifiedProfileRepository.get_vibe_target(user_id)
+
+    # 获取上次抽取时间
+    last_extracted_at = current_insight.get("updated_at") if current_insight else None
+
+    # 2. 确定抽取起始时间
+    if last_extracted_at:
+        try:
+            since = datetime.fromisoformat(last_extracted_at.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            since = datetime.now() - timedelta(days=7)
+    else:
+        since = datetime.now() - timedelta(days=30)  # 首次抽取，取最近 30 天
+
+    # 3. 获取新消息
+    messages = await get_user_messages_since(user_id, since, limit=100)
+
+    if not messages:
+        logger.info(f"No new messages for user {user_id}")
+        return {"insight": current_insight, "target": current_target}
+
+    # 4. 格式化消息
+    messages_text = "\n".join([
+        f"[{m['role']}] {m['content'][:300]}"
+        for m in messages
+        if m.get('content')
+    ])
+
+    if len(messages_text) < 50:
+        logger.info(f"Messages too short for user {user_id}")
+        return {"insight": current_insight, "target": current_target}
+
+    # 5. 构建 prompt (V8 结构)
+    current_context = {
+        "insight": current_insight,
+        "target": current_target
+    }
+    prompt = f"""## 当前已有信息
+{json.dumps(current_context, ensure_ascii=False, indent=2) if (current_insight or current_target) else "无"}
+
+## 新对话记录 (共 {len(messages)} 条)
+{messages_text[:6000]}
+
+请分析新对话，提取需要更新或新增的用户信息。只返回有变化的字段。"""
+
+    # 6. 调用 LLM 抽取
+    try:
+        response = await chat(
+            messages=[{"role": "user", "content": prompt}],
+            system=EXTRACTION_PROMPT_V8,
+            capability="analysis",
+            user_id=str(user_id),
+            temperature=0.3,
+        )
+
+        # 7. 解析响应
+        content = response.content if hasattr(response, 'content') else str(response)
+
+        # 提取 JSON
+        json_match = re.search(r'\{[\s\S]*\}', content)
+        if not json_match:
+            logger.warning(f"No JSON found in response for user {user_id}")
+            return {"insight": current_insight, "target": current_target}
+
+        new_data = json.loads(json_match.group())
+
+        # 8. 分别合并 insight 和 target
+        merged_insight = current_insight
+        merged_target = current_target
+
+        if "insight" in new_data:
+            merged_insight = merge_insight(current_insight, new_data["insight"])
+            await UnifiedProfileRepository.update_vibe_insight(user_id, merged_insight)
+            logger.info(f"Updated vibe.insight for user {user_id}")
+
+        if "target" in new_data:
+            merged_target = merge_target(current_target, new_data["target"])
+            await UnifiedProfileRepository.update_vibe_target(user_id, merged_target)
+            logger.info(f"Updated vibe.target for user {user_id}")
+
+        # 9. 写入 Cold Layer (时间线事件和洞察)
+        timeline_events = new_data.get("timeline_events", [])
+        insight_data = new_data.get("insight", {})
+        await _write_to_cold_layer(user_id, timeline_events, insight_data)
+
+        return {"insight": merged_insight, "target": merged_target}
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error for user {user_id}: {e}")
+        return {"insight": current_insight, "target": current_target}
+    except Exception as e:
+        logger.error(f"Extraction failed for user {user_id}: {e}")
+        return {"insight": current_insight, "target": current_target}
+
+
+async def run_profile_extraction(days: int = 7, batch_size: int = 10):
+    """
+    运行 Profile 抽取任务
+
+    Args:
+        days: 处理最近 N 天活跃的用户
+        batch_size: 每批处理的用户数
+    """
+    logger.info(f"Starting profile extraction task (days={days})")
+
+    # 获取活跃用户
+    active_users = await get_active_users(days=days)
+    logger.info(f"Found {len(active_users)} active users")
+
+    success_count = 0
+    error_count = 0
+
+    for i, user_id in enumerate(active_users):
+        try:
+            await extract_user_profile(user_id)
+            success_count += 1
+
+            # 限流：每处理 batch_size 个用户后暂停
+            if (i + 1) % batch_size == 0:
+                logger.info(f"Processed {i + 1}/{len(active_users)} users, pausing...")
+                await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Failed to extract for user {user_id}: {e}")
+            error_count += 1
+            continue
+
+    logger.info(f"Profile extraction completed: {success_count} success, {error_count} errors")
+
+
+async def main():
+    """命令行入口"""
+    import sys
+
+    # 简单参数解析
+    days = 7
+    if len(sys.argv) > 1:
+        try:
+            days = int(sys.argv[1])
+        except ValueError:
+            pass
+
+    await run_profile_extraction(days=days)
+
+
+if __name__ == "__main__":
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    asyncio.run(main())

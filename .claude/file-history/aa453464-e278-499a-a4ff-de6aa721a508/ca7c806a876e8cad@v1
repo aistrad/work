@@ -1,0 +1,901 @@
+---
+name: vibelife-skill
+description: |
+  VibeLife Skill - 知识库与专家系统构建工具 v6。
+  基于 VibeLife Expert System v6 架构，整合知识构建流水线全流程。
+  触发词：vibelife-skill, 建库, 建skill, 知识库构建, skill构建
+---
+
+# VibeLife Skill v6 - 知识库构建工具
+
+## 快速导航
+
+> **渐进式加载**: 先读本节(L1-60)获取索引，再按需跳转到对应模块
+
+| 模块 | 行号 | 说明 |
+|------|------|------|
+| [概述](#概述) | L30-48 | 流水线架构、核心原则 |
+| [目录结构](#目录结构) | L50-84 | 知识源、Skill目录、工具系统 |
+| [Stage 0-3](#stage-0-3-格式转换与入库) | L86-103 | 格式转换、切块、向量化、入库 |
+| [Stage 4 自动](#stage-4-统一抽取) | L105-175 | 统一抽取 + LLM 自动审核 |
+| [Stage 4M 手工](#stage-4m-手工抽取) | L177-452 | Claude Code 手工抽取流程 (Subagent 并行) ★ |
+| [Stage 6](#stage-6-质量检查) | L454-462 | 质量检查 |
+| [工具定义](#工具定义) | L464-507 | use_skill, search_db |
+| [模板索引](#模板文件) | L509-545 | 所有模板文件引用 |
+| [CLI/API](#使用方式) | L547-575 | 命令行和API端点 |
+| [附录](#附录) | L577-612 | 自检流程、核心原则、禁止行为 |
+
+---
+
+## 概述
+
+基于 VibeLife Expert System v6 架构，提供从原始资料到可用专家系统的完整流水线。
+
+**核心原则**：所有涉及大模型的步骤都在 Claude Code 中完成，自动化流程不调用外部 LLM API。
+
+**流水线架构**:
+```
+Stage 0: 格式转换 (自动化) → PDF/EPUB/DOCX → Markdown
+Stage 1-3: 切块 → 向量化 → 入库 (自动化)
+Stage 4: 统一抽取 + LLM 自动审核
+         ├─ Cases → 自动评分入库 (score >= 0.6)
+         └─ Scenarios → 相似度检测后自动发布/融合
+Stage 6: 质量检查 (自动化)
+```
+
+**大文件处理**: 文件 > 30K tokens 时自动调用 vibe-manus 并行处理框架
+
+---
+
+## 目录结构
+
+### 知识源目录
+```
+/data/vibelife/knowledge/{skill_id}/
+├── source/                    # 原始源文件
+├── converted/                 # 转换后的 Markdown
+└── extracted/
+    └── extraction_records.json  # 抽取记录 (Cases + Scenarios)
+```
+
+### Skill 目录
+```
+/home/aiscend/work/vibelife/apps/api/skills/{skill_id}/
+├── SKILL.md                   # Skill 核心定义
+├── scenarios/{scenario_id}.md # MiniSkill 场景库
+└── tools/
+    ├── tools.yaml             # 工具定义 (YAML)
+    └── handlers.py            # 工具执行器 (@tool_handler)
+```
+
+### 工具系统架构
+```
+全局工具 (skills/core/tools/):
+├── search_db          # 统一数据库查询
+├── ask_user_question  # 主动追问用户
+├── request_info       # 请求用户提供信息
+├── show_service_menu  # 展示服务目录
+├── show_insight       # 通用洞察卡片
+└── show_report        # 通用报告
+
+Skill级工具: 定义在各 skills/{skill}/tools/ 中
+```
+
+---
+
+## Stage 0-3: 格式转换与入库
+
+### Stage 0: 格式转换
+
+| 输入格式 | 转换方法 | 输出 |
+|---------|---------|------|
+| PDF | pymupdf4llm | MD |
+| EPUB | ebooklib + html2text | MD |
+| DOCX | python-docx | MD |
+| HTML | BeautifulSoup + html2text | MD |
+
+### Stage 1-3: 切块 → 向量化 → 入库
+
+- **切块**: max_tokens=2000, min_tokens=200, overlap=50
+- **向量化**: BAAI/bge-m3, 1024维, batch_size=4
+- **入库**: PostgreSQL + pgvector + tsvector
+
+---
+
+## Stage 4: 统一抽取
+
+**实现**: `apps/api/workers/unified_extractor.py`
+
+**数据源**: `/data/vibelife/knowledge/{skill}/converted/*.md`
+
+**输出**:
+- Cases → `cases` 表 (自动审核入库)
+- Scenarios → `skills/{skill}/scenarios/*.md` (自动发布)
+
+### 唯一标识设计
+
+```
+location_id = {source_file}:{section}:{index}
+示例: "东方代码启示录.converted.md:第三章大运分析:0"
+```
+
+### 记录文件结构 (extraction_records.json)
+
+```json
+{
+  "skill_id": "bazi",
+  "schema_version": "2.0",
+  "source_files": {
+    "文件名.md": {"md5": "...", "last_extracted_at": "..."}
+  },
+  "cases": {
+    "{location_id}": {
+      "name": "案例名称",
+      "core_data": {},
+      "reasoning_chain": [],
+      "guidance_patterns": [],
+      "quality_score": 0.85,
+      "status": "approved|pending",
+      "db_id": "CASE_bazi_xxx"
+    }
+  },
+  "scenarios": {
+    "{location_id}": {
+      "scenario_id": "...",
+      "status": "published_new|published_merge|pending"
+    }
+  }
+}
+```
+
+### Case 入库条件
+
+| 条件 | 权重 | 说明 |
+|------|------|------|
+| `reasoning_chain` | 50% | ≥3步得满分 |
+| `guidance_patterns` | 50% | ≥2个得满分 |
+| **总分** | **≥0.6** | 达标自动 approved |
+
+**评分公式**:
+- rc >= 3 → 0.50 | rc >= 2 → 0.40 | rc >= 1 → 0.25
+- gp >= 2 → 0.50 | gp >= 1 → 0.35
+
+**重新抽取**: score < 0.6 时触发 RE_EXTRACTION_PROMPT 补充抽取（最多1次）
+
+### Scenario 发布决策
+
+| 条件 | 动作 |
+|------|------|
+| Q >= 0.6 AND S < 0.5 | 新发布 |
+| Q >= 0.7 AND S >= 0.5 | 融合发布 |
+| 其他 | 保存候选 |
+
+**相似度计算**: 触发词Jaccard(60%) + 名称相似(20%) + SOP相似(20%)
+
+---
+
+## Stage 4M: 手工抽取
+
+> **触发条件**: LLM API 不可用、需要精细控制、特定章节处理
+
+### 核心原则
+
+⚠️ **分离"识别"和"去重"，防止确认偏见**
+- Phase 1-3: 纯粹识别，**禁止参考已有记录**
+- Phase 4-6: 加载已有记录，进行去重和评估
+
+### Phase 1: 准备阶段
+
+```
+☐ 检查源文件是否存在
+☐ 计算源文件 MD5
+☐ 增量检测: MD5 未变且非强制模式 → 跳过
+⚠️ 禁止加载 extraction_records.json 的 cases/scenarios
+```
+
+**输出**:
+```
+☐ 源文件路径: [path]
+☐ 源文件 MD5: [hash]
+☐ 增量检测结果: [需处理/跳过]
+```
+
+### Phase 2: 分段与切块
+
+**目标**：按字符数 + 章节逻辑切块，为并行处理做准备
+
+```
+2.1 读取源文件，获取总行数和字符数
+2.2 识别章节边界 (grep "^#" 或其他标题模式)
+2.3 切块策略:
+    • 每个 chunk 目标大小: ~50K 字符 (~20K tokens)
+    • 优先在章节边界切分
+    • 如果单章节超过 50K 字符，在段落边界切分
+2.4 生成 chunks 列表，每个 chunk 包含:
+    • chunk_index: 序号
+    • chunk_name: 章节名或范围描述
+    • file_path: 源文件绝对路径
+    • start_line: 起始行号
+    • end_line: 结束行号
+2.5 创建 work_state.json (用于断点续传和结果汇总)
+```
+
+**输出**:
+```
+☐ 源文件: [path]
+☐ 总大小: [X KB], [Y 行], 估算 tokens: [Z K]
+☐ 切块数量: [N]
+☐ chunks 列表:
+  | index | name | lines | 估算tokens |
+  |-------|------|-------|------------|
+  | 0 | 前言 | 1-299 | ~5K |
+  | 1 | 第一章 | 300-529 | ~4K |
+  | ... | ... | ... | ... |
+☐ work_state.json 已创建: [path]
+```
+
+**work_state.json 结构** (增强版):
+```json
+{
+  "task_id": "extract_{filename}_{timestamp}",
+  "source_file": "/path/to/file.md",
+  "source_md5": "hash",
+  "status": "in_progress",
+  "created_at": "2026-01-15T00:00:00",
+  "config": {
+    "max_turns": 50,           // subagent 最大轮次
+    "check_interval": 30,      // 监控检查间隔(秒)
+    "timeout_seconds": 300,    // 单个 chunk 超时(秒)
+    "max_retries": 2           // 最大重试次数
+  },
+  "chunks": [
+    {
+      "index": 0,
+      "name": "前言",
+      "start_line": 1,
+      "end_line": 299,
+      "status": "pending",     // pending | in_progress | done | timeout | failed
+      "task_id": null,         // ✅ 新增: Task tool 返回的 ID
+      "agent_id": null,        // ✅ 新增: 用于 resume 的 agent ID
+      "started_at": null,
+      "completed_at": null,
+      "last_checked": null,    // ✅ 新增: 上次检查时间
+      "retry_count": 0         // ✅ 新增: 重试次数
+    }
+  ],
+  "result_refs": {
+    "cases": [],      // 存储文件路径引用，如 ["cases/chunk0_case001.json"]
+    "scenarios": []   // 存储文件路径引用，如 ["scenarios/chunk0_scenario001.json"]
+  }
+}
+```
+
+### Phase 3: 并行识别与监控 (Subagent 模式) ★
+
+**目标**：启动 subagent 并行处理各 chunk，使用 TaskOutput 监控状态，支持超时重试和断点恢复
+
+#### 3.1 启动 Subagents (后台模式)
+
+```
+for chunk in pending_chunks:
+    result = Task(
+        description=f"抽取 chunk {chunk.index} ({chunk.name})",
+        prompt=SUBAGENT_PROMPT,  # 见下方
+        subagent_type="general-purpose",
+        run_in_background=true,   # ✅ 后台运行
+        max_turns=50              # ✅ 限制最大轮次，防止无限运行
+    )
+
+    # ✅ 保存 task_id 到 work_state (关键!)
+    chunk.task_id = result.task_id
+    chunk.status = "in_progress"
+    chunk.started_at = now()
+    save_work_state()
+```
+
+**Subagent Prompt 模板** (优化版 - 分段阅读 + 文件写入模式):
+```
+你是知识抽取 subagent，负责处理一个 chunk。
+
+任务信息:
+- extracted_dir: {extracted_dir}  # 如 /data/vibelife/knowledge/bazi/extracted
+- work_state_path: {extracted_dir}/work_state.json
+- chunk_index: {index}
+- source_file: {source_file}
+- start_line: {start_line}
+- end_line: {end_line}
+- chunk_name: {chunk_name}
+
+## ★ 分段阅读策略 (核心: 避免 context 膨胀)
+
+⚠️ 内存管理规则:
+1. 禁止一次性读取整个 chunk
+2. 使用 Read(file, offset=N, limit=300) 分段读取，每段 ~300 行
+3. 每识别一个 case/scenario，立即写入文件
+4. 写入后不再引用该对象的完整内容
+5. 每处理完一段，更新 work_state.json 的 current_offset
+
+执行步骤:
+
+### Step 1: 分段阅读循环
+```python
+offset = start_line
+case_seq = 0
+scenario_seq = 0
+BATCH_SIZE = 300  # 每次读取 300 行
+
+while offset < end_line:
+    # 读取一段
+    content = Read(source_file, offset=offset, limit=BATCH_SIZE)
+
+    # 在当前段中识别 cases 和 scenarios
+    # ... 识别逻辑 ...
+
+    # 立即写入文件 (见 Step 2-3)
+
+    # 更新进度 (见 Step 4)
+    offset += BATCH_SIZE
+```
+
+### Step 2: 识别并立即写入 Case
+识别 Case 的条件:
+• 是否包含具体分析案例？(有八字/命盘/具体人物)
+• 是否有完整推理过程 (reasoning_chain)?
+• 是否有可复用指导建议 (guidance_patterns)?
+
+识别到 case 后:
+1. 构建 case 对象，添加 location_id = f"{source_file}:{chunk_name}:{seq}"
+2. 立即写入: Write({extracted_dir}/cases/chunk{index}_case{seq:03d}.json)
+3. 清空变量，不再持有完整 case 对象
+4. case_seq += 1
+
+### Step 3: 识别并立即写入 Scenario
+识别 Scenario 的条件:
+• 是否定义了可服务用户的流程？
+• 是否有明确触发条件 (primary_triggers)?
+• 是否有可执行 SOP 步骤 (sop_phases)?
+
+识别到 scenario 后:
+1. 构建 scenario 对象
+2. 立即写入: Write({extracted_dir}/scenarios/chunk{index}_scenario{seq:03d}.json)
+3. 清空变量
+4. scenario_seq += 1
+
+### Step 4: 增量更新 work_state.json
+每处理完一段 (~300行)，更新进度:
+```python
+# 使用 Bash + Python 原子更新
+Bash: python3 -c "
+import json, fcntl
+with open('{work_state_path}', 'r+') as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    d = json.load(f)
+    d['chunks'][{index}]['current_offset'] = {current_offset}
+    d['chunks'][{index}]['processed_cases'] = {case_seq}
+    d['chunks'][{index}]['processed_scenarios'] = {scenario_seq}
+    f.seek(0); f.truncate()
+    json.dump(d, f, ensure_ascii=False)
+    fcntl.flock(f, fcntl.LOCK_UN)
+"
+```
+
+### Step 5: 完成时更新状态
+全部处理完成后:
+```python
+# 更新 chunk 状态为 done，追加文件引用
+Bash: python3 -c "
+import json, fcntl, glob
+with open('{work_state_path}', 'r+') as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    d = json.load(f)
+    d['chunks'][{index}]['status'] = 'done'
+    # 追加文件引用
+    case_files = sorted(glob.glob('{extracted_dir}/cases/chunk{index}_case*.json'))
+    scenario_files = sorted(glob.glob('{extracted_dir}/scenarios/chunk{index}_scenario*.json'))
+    d['result_refs']['cases'].extend([f.split('/')[-1] for f in case_files])
+    d['result_refs']['scenarios'].extend([f.split('/')[-1] for f in scenario_files])
+    f.seek(0); f.truncate()
+    json.dump(d, f, ensure_ascii=False)
+    fcntl.flock(f, fcntl.LOCK_UN)
+"
+```
+
+### Step 6: 返回简短摘要
+返回格式: "chunk {index} done: {case_seq} cases, {scenario_seq} scenarios"
+
+## 禁止行为
+
+⚠️ 禁止参考 extraction_records.json
+⚠️ 禁止一次性读取整个 chunk (必须分段)
+⚠️ 禁止在 context 中保留完整 case/scenario 对象
+⚠️ 禁止在返回值中包含完整的 case/scenario 内容
+⚠️ 禁止跳过任何 section 的实际阅读
+```
+
+#### 3.2 监控循环 (使用 TaskOutput) ★
+
+```
+config = {
+    check_interval: 30,      # 检查间隔(秒)
+    timeout_seconds: 300,    # 单个 chunk 超时(5分钟)
+    max_retries: 2           # 最大重试次数
+}
+
+while has_running_chunks:
+    for chunk in chunks where status == "in_progress":
+
+        # ✅ 使用 TaskOutput 非阻塞检查状态
+        result = TaskOutput(
+            task_id=chunk.task_id,
+            block=false,           # 非阻塞
+            timeout=5000           # 5秒超时
+        )
+
+        if result.status == "completed":
+            chunk.status = "done"
+            chunk.agent_id = result.agent_id  # ✅ 保存用于恢复
+            chunk.completed_at = now()
+
+        elif result.status == "failed":
+            handle_failure(chunk)
+
+        elif result.status == "running":
+            # 检查是否超时
+            if now() - chunk.started_at > timeout_seconds:
+                chunk.status = "timeout"
+                handle_timeout(chunk)
+
+        save_work_state()
+
+    # 显示进度
+    display_progress()
+
+    # 等待下次检查
+    sleep(check_interval)
+```
+
+#### 3.3 超时和失败处理
+
+```python
+def handle_failure(chunk):
+    if chunk.retry_count < max_retries and chunk.agent_id:
+        # ✅ 使用 resume 恢复之前的 subagent
+        result = Task(
+            resume=chunk.agent_id,
+            prompt="继续处理，上次可能因错误中断"
+        )
+        chunk.task_id = result.task_id
+        chunk.status = "in_progress"
+        chunk.retry_count += 1
+    else:
+        chunk.status = "failed"
+
+def handle_timeout(chunk):
+    if chunk.retry_count < max_retries:
+        # 重新启动新的 subagent
+        result = Task(
+            description=f"重试 chunk {chunk.index}",
+            prompt=SUBAGENT_PROMPT,
+            subagent_type="general-purpose",
+            run_in_background=true,
+            max_turns=50
+        )
+        chunk.task_id = result.task_id
+        chunk.status = "in_progress"
+        chunk.started_at = now()
+        chunk.retry_count += 1
+    else:
+        chunk.status = "failed"
+```
+
+#### 3.4 断点续传 (会话恢复后)
+
+```
+# 检测到 work_state.json 存在
+if work_state.status == "in_progress":
+    for chunk in work_state.chunks:
+        if chunk.status == "in_progress":
+            if chunk.agent_id:
+                # ✅ 尝试恢复之前的 subagent
+                result = Task(
+                    resume=chunk.agent_id,
+                    prompt="继续处理..."
+                )
+                chunk.task_id = result.task_id
+            else:
+                # 重新启动
+                restart_chunk(chunk)
+```
+
+#### 3.5 汇总结果 (流式处理模式) ★
+
+```
+• 从 work_state.result_refs 获取文件路径列表
+• 逐个读取 case/scenario 文件进行处理���避免全量加载
+• 处理完一个文件后立即释放内存
+```
+
+**Subagent 文件写入示例** (优化版):
+```python
+import json, fcntl, os
+from datetime import datetime
+
+def save_results_to_files(extracted_dir, chunk_index, cases, scenarios):
+    """将 cases 和 scenarios 写入独立文件，返回文件路径列表"""
+    case_refs = []
+    scenario_refs = []
+
+    # 确保目录存在
+    os.makedirs(f"{extracted_dir}/cases", exist_ok=True)
+    os.makedirs(f"{extracted_dir}/scenarios", exist_ok=True)
+
+    # 写入每个 case 到独立文件
+    for i, case in enumerate(cases, 1):
+        file_path = f"{extracted_dir}/cases/chunk{chunk_index}_case{i:03d}.json"
+        with open(file_path, 'w') as f:
+            json.dump(case, f, ensure_ascii=False, indent=2)
+        case_refs.append(f"cases/chunk{chunk_index}_case{i:03d}.json")
+
+    # 写入每个 scenario 到独立文件
+    for i, scenario in enumerate(scenarios, 1):
+        file_path = f"{extracted_dir}/scenarios/chunk{chunk_index}_scenario{i:03d}.json"
+        with open(file_path, 'w') as f:
+            json.dump(scenario, f, ensure_ascii=False, indent=2)
+        scenario_refs.append(f"scenarios/chunk{chunk_index}_scenario{i:03d}.json")
+
+    return case_refs, scenario_refs
+
+def update_work_state(work_state_path, chunk_index, case_refs, scenario_refs):
+    """原子更新 work_state.json，只存储文件引用"""
+    with open(work_state_path, 'r+') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = json.load(f)
+            # 追加文件引用 (不是完整内容!)
+            data['result_refs']['cases'].extend(case_refs)
+            data['result_refs']['scenarios'].extend(scenario_refs)
+            # 更新 chunk 状态
+            data['chunks'][chunk_index]['status'] = 'done'
+            data['chunks'][chunk_index]['completed_at'] = datetime.now().isoformat()
+            data['chunks'][chunk_index]['result_count'] = {
+                'cases': len(case_refs),
+                'scenarios': len(scenario_refs)
+            }
+            # 写回
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+```
+
+**Phase 3 输出**:
+```
+📊 Subagent 进度监控
+┌───────┬──────────────────┬──────────┬──────────┬─────────┬─────────┐
+│ Chunk │ 名称             │ 状态     │ Task ID  │ 耗时    │ 重试    │
+├───────┼──────────────────┼──────────┼──────────┼─────────┼─────────┤
+│ 0     │ 前言~第六章      │ ✅ done  │ a1b2c3   │ 2m 30s  │ 0       │
+│ 1     │ 第七章~第十章    │ 🔄 运行中│ d4e5f6   │ 1m 45s  │ 0       │
+│ 2     │ 第十一章~第二十章│ 🔄 运行中│ g7h8i9   │ 1m 20s  │ 0       │
+│ 3     │ 第二十一章~第29章│ ⚠️ 重试中│ j0k1l2   │ 0m 30s  │ 1       │
+│ 4     │ 第30章           │ ✅ done  │ m3n4o5   │ 45s     │ 0       │
+└───────┴──────────────────┴──────────┴──────────┴─────────┴─────────┘
+完成: 2/5 | 运行中: 2 | 重试中: 1
+
+☐ 汇总结果:
+  - new_cases[]: [N] 个 (列出名称和 location_id)
+  - new_scenarios[]: [M] 个
+```
+
+### Phase 4: Case 去重与评估 (流式处理) ★
+
+> **前置条件**: 所有 subagent 完成后才开始此阶段
+> 此时才允许加载已有记录
+
+```
+4.0 确认 Phase 3 完成
+    • 检查 work_state.json 中所有 chunks 的 status == "done"
+    • ★ 从 work_state.result_refs.cases 获取文件路径列表 (不加载内容)
+
+4.1 加载 extraction_records.json (只加载 location_id 索引用于去重)
+
+4.2 ★ 流式处理每个 case 文件:
+    for case_ref in work_state.result_refs.cases:
+        case = load_json(f"{extracted_dir}/{case_ref}")  # 单个加载
+        # 去重判断
+        if case.location_id in existing_ids:
+            if content_same: decision = "existing"
+            else: decision = "updated"
+        else:
+            decision = "new"
+        # 评估
+        score = calculate_quality_score(case)
+        case.decision = "approved" if score >= 0.6 else "pending"
+        # ★ 立即写入结果，释放内存
+        append_to_phase4_results(case.location_id, decision, score)
+        del case  # 释放内存
+
+4.3 汇总统计 (不保留完整 case 对象)
+```
+
+**输出**:
+```
+☐ 加载 extraction_records.json: [成功]
+☐ 已有 cases 数量: [N]
+☐ Case 去重与评估表:
+  | location_id | status | rc | gp | score | decision |
+  |-------------|--------|----|----|-------|----------|
+  | ...         | new    | 3  | 2  | 1.0   | approved |
+```
+
+### Phase 5: Scenario 去重与发布 (流式处理) ★
+
+```
+5.1 加载已有 scenarios/*.md 文件名列表 (不加载内容)
+
+5.2 ★ 流式处理每个 scenario 文件:
+    for scenario_ref in work_state.result_refs.scenarios:
+        scenario = load_json(f"{extracted_dir}/{scenario_ref}")  # 单个加载
+        # 计算相似度 (只与已有 scenario_id 比较)
+        max_sim = calculate_similarity(scenario.scenario_id, existing_ids)
+        quality = calculate_quality(scenario)
+        # 决策
+        if quality >= 0.6 and max_sim < 0.5:
+            decision = "new"
+        elif quality >= 0.7 and max_sim >= 0.5:
+            decision = "merge"
+        else:
+            decision = "pending"
+        # ★ 立即写入结果
+        append_to_phase5_results(scenario.scenario_id, quality, max_sim, decision)
+        del scenario  # 释放内存
+
+5.3 汇总统计
+```
+
+**输出**:
+```
+☐ 已有 scenarios 数量: [N]
+☐ Scenario 去重与评估表:
+  | scenario_id | quality | max_sim | decision |
+  |-------------|---------|---------|----------|
+  | ...         | 0.75    | 0.3     | new      |
+```
+
+### Phase 6: 保存与同步 (流式处理) ★
+
+```
+6.1 ★ 流式同步 approved cases 到 DB:
+    for case_ref in approved_case_refs:
+        case = load_json(f"{extracted_dir}/{case_ref}")
+        sync_to_db(case)
+        del case
+
+6.2 ★ 流式发布 approved scenarios:
+    for scenario_ref in approved_scenario_refs:
+        scenario = load_json(f"{extracted_dir}/{scenario_ref}")
+        publish_to_md(scenario)
+        del scenario
+
+6.3 更新 stats
+6.4 保存 extraction_records.json
+6.5 清理临时文件:
+    • 删除 extracted/cases/*.json
+    • 删除 extracted/scenarios/*.json
+    • 删除 work_state.json (可选保留用于审计)
+```
+
+**输出**:
+```
+☐ DB 同步: [执行/跳过] (new: N, updated: M)
+☐ Scenario 发布: [执行/跳过] (new: N, merged: M)
+☐ Stats 更新: total_cases=X, approved=Y, pending=Z
+☐ extraction_records.json 保存: [成功/失败]
+☐ 临时文件清理: [完成]
+```
+
+### 数据结构参考
+
+**Case**:
+```json
+{
+  "name": "案例名称",
+  "core_data": {"year": "甲子", "month": "...", "day": "...", "hour": "...", "gender": "男/女"},
+  "features": {"daymaster": "...", "strength": "...", "pattern": "...", "key_gods": []},
+  "thinking_frameworks_used": ["架构1", "架构2"],
+  "reasoning_chain": [
+    {"step": 1, "framework": "...", "observation": "...", "analysis": "...", "conclusion": "..."}
+  ],
+  "guidance_patterns": [
+    {"pattern_name": "...", "condition": "...", "advice": "...", "source": "..."}
+  ]
+}
+```
+
+**Scenario**:
+```json
+{
+  "scenario_id": "snake_case_id",
+  "name": "中文名称",
+  "level": "entry|standard|professional",
+  "billing": "free|basic|premium",
+  "primary_triggers": ["触发词1", "触发词2"],
+  "sop_phases": [
+    {"phase": 1, "name": "阶段名", "type": "required|optional|reactive", "tools": []}
+  ]
+}
+```
+
+### 禁止行为
+
+- ❌ Phase 1-3 加载或参考已有 cases/scenarios
+- ❌ 跳过任何 section 的实际阅读
+- ❌ 用"已有覆盖"作为跳过识别的理由
+- ❌ 假设"这是理论章节"而不实际阅读
+- ❌ Phase 6 只保存 JSON 而不同步 DB
+- ❌ **Subagent 返回完整 case/scenario 内容** (必须写入文件，只返回状态摘要)
+- ❌ **work_state.json 存储完整结果对象** (只存储文件路径引用)
+- ❌ **Phase 4-6 全量加载所有结果到内存** (必须流式处理)
+
+---
+
+## Stage 6: 质量检查
+
+| 指标 | 目标 |
+|------|------|
+| 知识覆盖率 | ≥300 chunks |
+| 案例分布 | ≥50 cases |
+| 检索质量 | ≥70% |
+
+---
+
+## 工具定义
+
+### use_skill
+
+```python
+{
+  "name": "use_skill",
+  "description": "激活专业技能并选择服务场景",
+  "parameters": {
+    "skill": {"type": "string", "enum": ["bazi", "zodiac", "career", "tarot"]},
+    "scenario": {"type": "string", "description": "场景ID"},
+    "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+  }
+}
+```
+
+**bazi scenarios**:
+| scenario | 适用情况 |
+|----------|---------|
+| basic_reading | 看命盘、算命、初次咨询 |
+| personality | 性格分析、天赋 |
+| career | 事业、工作、职业 |
+| wealth | 财运、投资 |
+| relationship | 感情、婚姻 |
+| yearly_fortune | 今年运势、流年 |
+| dayun | 大运、十年运 |
+| life_blueprint | 完整分析、人生规划 |
+
+### search_db
+
+```python
+{
+  "name": "search_db",
+  "description": "从数据库检索知识或案例",
+  "parameters": {
+    "table": {"enum": ["knowledge_chunks", "cases"]},
+    "query": {"type": "string"},
+    "filters": {"type": "object", "description": "skill_id, scenario_id, tags 等"},
+    "top_k": {"type": "integer", "default": 5}
+  }
+}
+```
+
+---
+
+## 模板文件
+
+所有模板位于 `templates/` 目录：
+
+### 核心模板
+
+| 模板 | 文件 | 用途 |
+|------|------|------|
+| SKILL 模板 | SKILL_TEMPLATE.md | Skill 核心定义 |
+| Scenario 模板 | SCENARIO_TEMPLATE.md | MiniSkill 场景 |
+| 工具定义模板 | TOOLS_TEMPLATE.yaml | 工具 YAML 规范 |
+| 工具执行器模板 | HANDLERS_TEMPLATE.py | @tool_handler |
+
+### Prompt 模板
+
+| 模板 | 文件 | 用途 |
+|------|------|------|
+| **统一抽取** | prompts/UNIFIED_EXTRACTION_PROMPT.md | Stage 4 主 Prompt |
+| **重新抽取** | prompts/RE_EXTRACTION_PROMPT.md | Case 补充抽取 |
+| 术语提取 | prompts/TERM_EXTRACTION_PROMPT.md | 术语提取 |
+
+### Schema 模板
+
+| 模板 | 文件 |
+|------|------|
+| Skill Schema | schemas/SKILL_SCHEMAS.md |
+| 数据库 Schema | schemas/DATABASE_SCHEMAS.sql |
+
+### 前端模板
+
+| 模板 | 文件 |
+|------|------|
+| 卡片组件 | CARD_TEMPLATE.tsx |
+| 卡片注册表 | CARD_REGISTRY.tsx |
+| 工具-卡片映射 | TOOL_CARD_MAPPING.md |
+
+---
+
+## 使用方式
+
+### CLI 命令
+
+```bash
+# 完整流水线
+python scripts/build_knowledge.py --skill bazi --stages all
+
+# 特定阶段
+python scripts/build_knowledge.py --skill bazi --stages 0        # 格式转换
+python scripts/build_knowledge.py --skill bazi --stages 1-3      # 入库
+python scripts/build_knowledge.py --skill bazi --stages 4        # 统一抽取
+python scripts/build_knowledge.py --skill bazi --stages 4 --force-reextract  # 强制重抽
+python scripts/build_knowledge.py --skill bazi --stages 6        # 质量报告
+
+# 大文件处理 (自动调用 vibe-manus)
+python scripts/build_knowledge.py --skill bazi --stages 4 --use-manus
+```
+
+### API 端点
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/api/knowledge/build` | POST | 启动构建流水线 |
+| `/api/knowledge/build/{task_id}` | GET | 获取任务状态 |
+| `/api/knowledge/quality/check` | POST | 运行质量检查 |
+| `/api/knowledge/stats/{skill_id}` | GET | 获取统计 |
+
+---
+
+## 附录
+
+### 自检流程
+
+```bash
+# Stage 0: 检查转换文件
+ls -la /data/vibelife/knowledge/{skill_id}/converted/*.md | wc -l
+
+# Stage 1-3: 检查入库
+psql -c "SELECT COUNT(*) FROM knowledge_chunks WHERE skill_id = '{skill_id}';"
+
+# Stage 4: 检查抽取
+psql -c "SELECT COUNT(*) FROM cases WHERE skill_id = '{skill_id}' AND status = 'approved';"
+ls -la apps/api/skills/{skill_id}/scenarios/*.md | wc -l
+
+# Stage 6: 质量报告
+python scripts/build_knowledge.py --skill {skill_id} --stages 6
+curl http://localhost:8100/api/knowledge/stats/{skill_id}
+```
+
+### 核心原则
+
+1. **质量优先**：只入库高质量内容
+2. **深度优先**：提取大模型不知道的专业知识
+3. **可追溯**：所有规则标注来源
+4. **可迭代**：支持增量更新
+5. **模块化**：各阶段可独立执行
+
+### 禁止行为
+
+1. 禁止创建骨架/占位文件
+2. 禁止入库空内容 (< 50KB)
+3. 禁止猜测/编写内容
+4. 禁止跳过质量评估
+5. 禁止提取常识性规则
+6. 禁止无来源的规则

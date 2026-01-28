@@ -1,0 +1,390 @@
+"""
+Insight Generator - LLM-driven personalized insights (Cold Memory)
+
+Design: docs/user-data-context-design.md
+Core Idea: LLM judges insight value, generates content and embedding
+"""
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from uuid import UUID
+from dataclasses import dataclass
+from enum import Enum
+import json
+
+from stores import SkillRepository
+
+
+class InsightType(Enum):
+    """4 types of insights"""
+    DISCOVERY = "discovery"   # "I see in you..."
+    PATTERN = "pattern"       # "I notice a pattern..."
+    TIMING = "timing"         # "Now is a good time for..."
+    GROWTH = "growth"         # "Your growth..."
+
+
+@dataclass
+class InsightTrigger:
+    """Trigger condition for insight"""
+    should_trigger: bool
+    insight_type: InsightType
+    confidence: float
+    evidence: Dict[str, Any]
+    title: Optional[str] = None
+    content: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LLM-Driven Insight Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+INSIGHT_CHECK_PROMPT = """你是一个洞察判断专家。请基于以下信息，判断是否应该生成洞察。
+
+## 用户画像
+{portrait_text}
+
+## 本次对话
+{conversation}
+
+## 最近生成的洞察 (避免重复)
+{recent_insights}
+
+## 任务
+判断本次对话是否包含值得记录的洞察。
+
+洞察类型:
+1. DISCOVERY - 首次发现用户的新特征或模式
+2. PATTERN - 发现重复出现的规律 (需要至少出现3次)
+3. GROWTH - 发现用户的积极变化或突破
+4. TIMING - 发现与当前运势相关的时机建议
+
+请返回 JSON (只输出 JSON，不要其他内容):
+{{
+  "should_generate": true/false,
+  "reason": "为什么值得/不值得生成",
+  "insight_type": "DISCOVERY/PATTERN/GROWTH/TIMING/null",
+  "insight_title": "洞察标题 (如果生成)",
+  "insight_content": "洞察内容 (如果生成, 2-3句话)"
+}}
+
+注意:
+- 不要为了生成而生成，只有真正有价值的才生成
+- 避免与最近的洞察重复
+- 洞察应该具体、可行动
+- 每 5-10 次对话才应该有一次洞察，不要太频繁
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Insight Generator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InsightGenerator:
+    """
+    LLM-Driven Insight Generator (Cold Memory)
+
+    Design Philosophy:
+    - Let LLM judge insight value (not rule-based)
+    - Generate embedding for vector search
+    - Insights are permanent (append-only)
+    - Cross-skill retrieval enabled (Phase 1.5)
+
+    Cooldown periods (hours) - prevent over-generation
+    """
+
+    # Cooldown periods (hours)
+    COOLDOWN = {
+        InsightType.DISCOVERY: 24,
+        InsightType.PATTERN: 72,
+        InsightType.TIMING: 48,
+        InsightType.GROWTH: 168  # 1 week
+    }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Insight Title Templates
+    # ─────────────────────────────────────────────────────────────────
+
+    TITLES = {
+        InsightType.DISCOVERY: [
+            "我看见你...",
+            "我注意到一些特别的...",
+            "关于你，我发现...",
+        ],
+        InsightType.PATTERN: [
+            "我注意到一个模式...",
+            "我发现了一个规律...",
+            "有个有趣的模式...",
+        ],
+        InsightType.TIMING: [
+            "现在是...的好时机",
+            "时机来了...",
+            "这个时刻很特别...",
+        ],
+        InsightType.GROWTH: [
+            "你的成长...",
+            "我看到了变化...",
+            "回顾你的旅程...",
+        ]
+    }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Cooldown Check
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def check_cooldown(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        insight_type: InsightType
+    ) -> bool:
+        """Check if insight type is in cooldown period"""
+        recent_insights = await SkillRepository.get_user_insights(
+            user_id, skill_id,
+            insight_type=insight_type.value,
+            limit=1
+        )
+
+        if not recent_insights:
+            return False  # No cooldown
+
+        last_insight_time = recent_insights[0]["created_at"]
+        cooldown_hours = cls.COOLDOWN[insight_type]
+        cooldown_end = last_insight_time + timedelta(hours=cooldown_hours)
+
+        # Handle timezone-aware comparison
+        now = datetime.utcnow()
+        if hasattr(last_insight_time, 'tzinfo') and last_insight_time.tzinfo is not None:
+            import pytz
+            now = now.replace(tzinfo=pytz.UTC)
+
+        return now < cooldown_end
+
+    # ─────────────────────────────────────────────────────────────────
+    # Main Entry Point (LLM-Driven)
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def maybe_generate_insight(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        conversation_id: UUID,
+        llm_orchestrator,
+        portrait_text: Optional[str] = None,
+        embedding_service=None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        LLM-driven insight generation.
+
+        Process:
+        1. Get user portrait and recent conversation
+        2. Get recent insights (avoid duplication)
+        3. Let LLM judge if insight should be generated
+        4. If yes, generate embedding and save
+
+        Returns insight data or None.
+        """
+        from .llm_orchestrator import LLMMessage
+
+        # Late import to avoid circular dependency
+        if embedding_service is None:
+            from services.knowledge import EmbeddingService
+            embedding_service = EmbeddingService
+
+        try:
+            # 1. Get user portrait if not provided
+            if portrait_text is None:
+                from .portrait_service import PortraitService
+                portrait_text = await PortraitService.get_portrait(user_id, skill_id)
+
+            if not portrait_text:
+                portrait_text = "这是新用户，还没有足够的了解"
+
+            # 2. Get conversation messages
+            conversation_messages = await SkillRepository.get_messages(
+                conversation_id, limit=20
+            )
+
+            if not conversation_messages:
+                return None
+
+            # 3. Get recent insights (avoid duplication)
+            recent_insights = await SkillRepository.get_user_insights(
+                user_id, skill_id, limit=5
+            )
+
+            # 4. Let LLM judge
+            prompt = INSIGHT_CHECK_PROMPT.format(
+                portrait_text=portrait_text,
+                conversation=cls._format_conversation(conversation_messages),
+                recent_insights=cls._format_insights(recent_insights)
+            )
+
+            response = await llm_orchestrator.chat(
+                [LLMMessage(role="user", content=prompt)],
+                temperature=0.3,
+                max_tokens=500
+            )
+
+            # Parse LLM response
+            try:
+                # Extract JSON from response (handle markdown code blocks)
+                content = response.content.strip()
+                if content.startswith("```"):
+                    # Remove markdown code block
+                    lines = content.split("\n")
+                    content = "\n".join(lines[1:-1])
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # Try to extract JSON from mixed content
+                import re
+                json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    return None
+
+            # 5. Check if should generate
+            if not result.get("should_generate", False):
+                return None
+
+            insight_type_str = result.get("insight_type", "DISCOVERY").upper()
+            try:
+                insight_type = InsightType[insight_type_str]
+            except KeyError:
+                insight_type = InsightType.DISCOVERY
+
+            # Check cooldown
+            if await cls.check_cooldown(user_id, skill_id, insight_type):
+                return None  # In cooldown
+
+            # 6. Generate embedding for the insight content
+            insight_content = result.get("insight_content", "")
+            insight_title = result.get("insight_title", cls.TITLES[insight_type][0])
+
+            embedding = None
+            try:
+                # Embed title + content for better retrieval
+                embed_text = f"{insight_title} {insight_content}"
+                embedding = await embedding_service.embed_text(embed_text)
+            except Exception as e:
+                print(f"Embedding generation failed: {e}")
+                # Continue without embedding
+
+            # 7. Save insight with embedding
+            insight = await SkillRepository.create_insight_with_embedding(
+                user_id=user_id,
+                skill_id=skill_id,
+                insight_type=insight_type.value,
+                title=insight_title,
+                content=insight_content,
+                evidence={"reason": result.get("reason", "")},
+                confidence=0.8,
+                conversation_id=conversation_id,
+                embedding=embedding
+            )
+
+            return insight
+
+        except Exception as e:
+            print(f"Insight generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # ─────────────────────────────────────────────────────────────────
+    # Retrieval (Phase 1.5: Cross-Skill)
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def retrieve_relevant_insights(
+        cls,
+        user_id: UUID,
+        query: str,
+        skill_id: Optional[str] = None,
+        cross_skill: bool = True,
+        threshold: float = 0.75,
+        limit: int = 3,
+        embedding_service=None
+    ) -> List[dict]:
+        """
+        Retrieve relevant insights by embedding similarity.
+
+        Phase 1.5 Design:
+        - cross_skill=True: Search all user's insights (default)
+        - cross_skill=False: Search only current skill's insights
+
+        Returns list of relevant insights with similarity scores.
+        """
+        # Late import to avoid circular dependency
+        if embedding_service is None:
+            from services.knowledge import EmbeddingService
+            embedding_service = EmbeddingService
+
+        try:
+            # 1. Generate query embedding
+            query_embedding = await embedding_service.embed_query(query)
+
+            # 2. Search insights
+            insights = await SkillRepository.search_insights_by_embedding(
+                user_id=user_id,
+                query_embedding=query_embedding,
+                skill_id=None if cross_skill else skill_id,
+                threshold=threshold,
+                limit=limit
+            )
+
+            return insights
+
+        except Exception as e:
+            print(f"Insight retrieval failed: {e}")
+            return []
+
+    # ─────────────────────────────────────────────────────────────────
+    # Legacy Trigger Methods (for backward compatibility)
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def check_discovery_trigger(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        message: str,
+        emotion_result=None,
+        topics: Optional[List[str]] = None
+    ) -> InsightTrigger:
+        """Legacy: Check if DISCOVERY insight should be triggered (rule-based)"""
+        # Simplified - always return low confidence to prefer LLM-driven approach
+        return InsightTrigger(
+            should_trigger=False,
+            insight_type=InsightType.DISCOVERY,
+            confidence=0.0,
+            evidence={}
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Helper Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_conversation(messages: List[dict]) -> str:
+        """Format conversation for prompt"""
+        formatted = []
+        for msg in messages[-15:]:  # Last 15 messages
+            role = "用户" if msg["role"] == "user" else "Vibe"
+            content = msg["content"][:300]  # Truncate
+            formatted.append(f"[{role}]: {content}")
+        return "\n".join(formatted)
+
+    @staticmethod
+    def _format_insights(insights: List[dict]) -> str:
+        """Format recent insights for prompt"""
+        if not insights:
+            return "（暂无）"
+
+        formatted = []
+        for insight in insights:
+            title = insight.get("title", "")
+            content = insight.get("content", "")[:100]
+            formatted.append(f"- {title}: {content}")
+        return "\n".join(formatted)

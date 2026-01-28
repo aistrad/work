@@ -1,0 +1,218 @@
+"use client"
+
+import { create } from "zustand"
+import { streamMentisInput, type StreamEvent } from "@/lib/mentis-stream"
+import { connectRealtime, type RealtimeMessage } from "@/lib/realtime"
+
+export type StreamEntry = {
+  id: string
+  type: string
+  raw_content: string
+  created_at: string
+  emotion?: { primary: string; intensity: number; secondary: string[] }
+  context?: Record<string, unknown>
+  tags?: string[]
+  energy_delta?: number
+}
+
+export type ActionCard = {
+  id: string
+  type: string
+  title: string
+  description?: string
+  momentum_reward?: number
+  expires_at?: string
+}
+
+type CurrentMood = {
+  primary: string
+  intensity: number
+  detected_at: string | null
+}
+
+type TodayStats = {
+  stream_count: number
+  checkin_count: number
+  energy_high: number | null
+  energy_low: number | null
+}
+
+type UserState = {
+  energy_score: number
+  momentum: number
+  streak_days: number
+  aura_state: string
+  current_mood: CurrentMood | null
+  today_stats: TodayStats | null
+  pending_tasks: number
+  unread_insights: number
+  last_active_at: string | null
+}
+
+type StreamStore = {
+  entries: StreamEntry[]
+  actionCards: ActionCard[]
+  isStreaming: boolean
+  userState: UserState
+  lastStreamId: string | null
+  sendInput: (content: string) => void
+  clearEntries: () => void
+  completeActionCard: (id: string) => void
+  dismissActionCard: (id: string) => void
+  subscribeRealtime: () => void
+  unsubscribeRealtime: () => void
+}
+
+const initialUserState: UserState = {
+  energy_score: 50,
+  momentum: 0,
+  streak_days: 0,
+  aura_state: "calm",
+  current_mood: null,
+  today_stats: null,
+  pending_tasks: 0,
+  unread_insights: 0,
+  last_active_at: null,
+}
+
+let realtimeSocket: WebSocket | null = null
+
+export const useStreamStore = create<StreamStore>((set, get) => ({
+  entries: [],
+  actionCards: [],
+  isStreaming: false,
+  userState: initialUserState,
+  lastStreamId: null,
+
+  sendInput: (content) => {
+    if (!content.trim()) return
+    set({ isStreaming: true })
+
+    streamMentisInput(
+      { content, type: "vibe_diary" },
+      {
+        onEvent: (event: StreamEvent) => {
+          if (event.event === "stream_created") {
+            set((state) => ({
+              entries: [
+                ...state.entries,
+                {
+                  id: event.data.id,
+                  type: event.data.type,
+                  raw_content: event.data.raw_content,
+                  created_at: event.data.created_at,
+                },
+              ],
+              lastStreamId: event.data.id,
+            }))
+            return
+          }
+
+          if (event.event === "extraction_complete") {
+            const { lastStreamId } = get()
+            if (!lastStreamId) return
+            set((state) => ({
+              entries: state.entries.map((entry) =>
+                entry.id === lastStreamId
+                  ? {
+                      ...entry,
+                      emotion: event.data.emotion,
+                      context: event.data.context,
+                      tags: event.data.tags,
+                      energy_delta: event.data.energy_delta,
+                    }
+                  : entry
+              ),
+            }))
+            return
+          }
+
+          if (event.event === "state_update") {
+            set((state) => ({
+              userState: {
+                ...state.userState,
+                energy_score: event.data.energy_score ?? state.userState.energy_score,
+                momentum: event.data.momentum ?? state.userState.momentum,
+                streak_days: event.data.streak_days ?? state.userState.streak_days,
+                aura_state: event.data.aura_state ?? state.userState.aura_state,
+              },
+            }))
+            return
+          }
+
+          if (event.event === "agent_response") {
+            const card = (event.data as { card?: ActionCard }).card
+            if (card) {
+              set((state) => ({
+                actionCards: [card, ...state.actionCards],
+              }))
+            }
+            return
+          }
+
+          if (event.event === "done") {
+            set({ isStreaming: false })
+            return
+          }
+        },
+        onError: () => {
+          set({ isStreaming: false })
+        },
+      }
+    )
+  },
+
+  clearEntries: () => set({ entries: [], actionCards: [], lastStreamId: null }),
+
+  completeActionCard: (id) =>
+    set((state) => ({
+      actionCards: state.actionCards.filter((card) => card.id !== id),
+    })),
+
+  dismissActionCard: (id) =>
+    set((state) => ({
+      actionCards: state.actionCards.filter((card) => card.id !== id),
+    })),
+
+  subscribeRealtime: () => {
+    if (realtimeSocket) return
+    const token = process.env.NEXT_PUBLIC_MENTIS_BEARER?.trim()
+      || process.env.NEXT_PUBLIC_MENTIS_USER_ID?.trim()
+      || ""
+    realtimeSocket = connectRealtime(token, (message: RealtimeMessage) => {
+      if (message.type === "state_update" && message.data) {
+        const data = message.data as Record<string, unknown>
+        set((state) => ({
+          userState: {
+            ...state.userState,
+            energy_score: Number(data.energy_score ?? state.userState.energy_score),
+            momentum: Number(data.momentum ?? state.userState.momentum),
+            streak_days: Number(data.streak_days ?? state.userState.streak_days),
+            aura_state: String(data.aura_state ?? state.userState.aura_state),
+            current_mood: data.current_mood as CurrentMood ?? state.userState.current_mood,
+          },
+        }))
+      }
+      if (message.type === "pending_tasks" && message.data) {
+        const data = message.data as { tasks?: ActionCard[] }
+        if (data.tasks) {
+          set((state) => ({
+            actionCards: [...data.tasks!, ...state.actionCards.filter(
+              (c) => !data.tasks!.some((t) => t.id === c.id)
+            )],
+            userState: {
+              ...state.userState,
+              pending_tasks: data.tasks!.length,
+            },
+          }))
+        }
+      }
+    })
+  },
+
+  unsubscribeRealtime: () => {
+    if (!realtimeSocket) return
+    realtimeSocket.close()
+    realtimeSocket = null
+  },
+}))

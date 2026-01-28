@@ -1,0 +1,872 @@
+"""
+BaziComputer - 八字计算器
+
+整合 fortune_calculator 和 kline_service 的功能。
+从 unified_profiles 读取数据，不再使用独立的 user_fortune_cache 表。
+
+功能:
+1. 大运计算 (Major Cycles)
+2. 流年计算 (Annual Fortune)
+3. 每日运势计算 (Daily Fortune)
+4. K-Line 数据生成 (实时计算，不缓存)
+5. 拐点检测 (Inflection Points)
+"""
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, date
+from enum import Enum
+from typing import List, Dict, Any, Optional
+from uuid import UUID, uuid4
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Enums and Types
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FortunePhase(str, Enum):
+    ACCUMULATION = "accumulation"  # 积累期
+    BREAKTHROUGH = "breakthrough"  # 突破期
+    PEAK = "peak"                  # 高峰期
+    ADJUSTMENT = "adjustment"      # 调整期
+    TRANSITION = "transition"      # 过渡期
+    FOUNDATION = "foundation"      # 基础期
+
+
+class Element(str, Enum):
+    WOOD = "wood"    # 木
+    FIRE = "fire"    # 火
+    EARTH = "earth"  # 土
+    METAL = "metal"  # 金
+    WATER = "water"  # 水
+
+
+# 五行相生
+ELEMENT_GENERATES = {
+    Element.WOOD: Element.FIRE,
+    Element.FIRE: Element.EARTH,
+    Element.EARTH: Element.METAL,
+    Element.METAL: Element.WATER,
+    Element.WATER: Element.WOOD,
+}
+
+# 五行相克
+ELEMENT_CONTROLS = {
+    Element.WOOD: Element.EARTH,
+    Element.FIRE: Element.METAL,
+    Element.EARTH: Element.WATER,
+    Element.METAL: Element.WOOD,
+    Element.WATER: Element.FIRE,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MajorCycle:
+    """十年大运周期"""
+    start_year: int
+    end_year: int
+    element: Element
+    polarity: str  # "yin" or "yang"
+    phase: FortunePhase
+    theme: str
+    description: str
+    fortune_score: int  # 0-100
+
+    def to_dict(self) -> dict:
+        return {
+            "start_year": self.start_year,
+            "end_year": self.end_year,
+            "element": self.element.value,
+            "polarity": self.polarity,
+            "phase": self.phase.value,
+            "theme": self.theme,
+            "description": self.description,
+            "fortune_score": self.fortune_score,
+        }
+
+
+@dataclass
+class AnnualFortune:
+    """年度运势"""
+    year: int
+    element: Element
+    polarity: str
+    influence: str
+    fortune_score: int
+    theme: str
+    highlights: List[str] = field(default_factory=list)
+    cautions: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "year": self.year,
+            "element": self.element.value,
+            "polarity": self.polarity,
+            "influence": self.influence,
+            "fortune_score": self.fortune_score,
+            "theme": self.theme,
+            "highlights": self.highlights,
+            "cautions": self.cautions,
+        }
+
+
+@dataclass
+class DailyFortune:
+    """每日运势"""
+    date: date
+    fortune_score: int
+    element: Element
+    theme: str
+    highlights: List[str] = field(default_factory=list)
+    cautions: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "date": self.date.isoformat(),
+            "fortune_score": self.fortune_score,
+            "element": self.element.value,
+            "theme": self.theme,
+            "highlights": self.highlights,
+            "cautions": self.cautions,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BaziComputer
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BaziComputer:
+    """八字计算器"""
+
+    # 天干及其五行
+    STEMS = [
+        ("甲", Element.WOOD, "yang"),
+        ("乙", Element.WOOD, "yin"),
+        ("丙", Element.FIRE, "yang"),
+        ("丁", Element.FIRE, "yin"),
+        ("戊", Element.EARTH, "yang"),
+        ("己", Element.EARTH, "yin"),
+        ("庚", Element.METAL, "yang"),
+        ("辛", Element.METAL, "yin"),
+        ("壬", Element.WATER, "yang"),
+        ("癸", Element.WATER, "yin"),
+    ]
+
+    # 阶段主题
+    PHASE_THEMES = {
+        FortunePhase.ACCUMULATION: "积累实力、打基础",
+        FortunePhase.BREAKTHROUGH: "突破瓶颈、跨越障碍",
+        FortunePhase.PEAK: "收获成果、实现目标",
+        FortunePhase.ADJUSTMENT: "调整节奏、反思沉淀",
+        FortunePhase.TRANSITION: "转型变化、新的开始",
+        FortunePhase.FOUNDATION: "稳固根基、建立体系",
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 公共接口
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def calculate_daily_fortune(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        计算每日运势
+
+        v2.0 优化：
+        - 增加 24 小时能量曲线
+        - 支持个性化领域评分（事业/感情/健康/财富）
+        - 生成行动导向的建议
+        """
+        day_master_element = self._get_day_master_element(profile)
+        today = date.today()
+
+        # 计算今日天干
+        stem_index = self._get_day_stem_index(today)
+        _, day_element, polarity = self.STEMS[stem_index]
+
+        # 计算影响
+        influence = self._calculate_influence(
+            Element(day_master_element),
+            day_element,
+        )
+
+        # 计算分数
+        score = self._calculate_daily_score(
+            Element(day_master_element),
+            day_element,
+            influence,
+        )
+
+        # 生成主题和建议
+        theme = self._generate_daily_theme(influence, day_element)
+        highlights, cautions = self._generate_daily_advice(
+            Element(day_master_element),
+            day_element,
+            influence,
+        )
+
+        # v2.0 新增：24 小时能量曲线
+        energy_curve = self._calculate_hourly_energy(
+            Element(day_master_element),
+            day_element,
+            score,
+        )
+
+        # v2.0 新增：个性化领域评分
+        area_scores = self._calculate_area_scores(
+            Element(day_master_element),
+            day_element,
+            influence,
+            score,
+        )
+
+        return {
+            "date": today.isoformat(),
+            "score": score,
+            "element": day_element.value,
+            "influence": influence,
+            "theme": theme,
+            "highlights": highlights,
+            "cautions": cautions,
+            # v2.0 新增字段
+            "energy_curve": energy_curve,
+            "area_scores": area_scores,
+        }
+
+    def _calculate_hourly_energy(
+        self,
+        day_master: Element,
+        day_element: Element,
+        base_score: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        计算 24 小时能量曲线
+
+        基于五行生克关系和时辰能量分布：
+        - 卯时 (5-7)：木旺
+        - 巳时 (9-11)：火旺
+        - 午时 (11-13)：火旺
+        - 申时 (15-17)：金旺
+        - 酉时 (17-19)：金旺
+        - 子时 (23-1)：水旺
+        - 丑时 (1-3)：土旺
+        """
+        curve = []
+
+        # 时辰对应元素
+        hour_elements = {
+            1: Element.WATER, 3: Element.WATER,   # 子时、丑时
+            5: Element.WOOD, 7: Element.WOOD,     # 寅时、卯时
+            9: Element.FIRE, 11: Element.FIRE,    # 辰时、巳时
+            13: Element.FIRE, 15: Element.EARTH,  # 午时、未时
+            17: Element.METAL, 19: Element.METAL, # 申时、酉时
+            21: Element.EARTH, 23: Element.WATER, # 戌时、亥时
+        }
+
+        for hour in range(0, 24, 2):  # 每 2 小时一个数据点
+            hour_element = hour_elements.get(hour + 1, Element.EARTH)
+
+            # 计算该时辰的能量加成
+            if hour_element == day_element:
+                # 当前时辰元素与今日元素相同，能量+10%
+                energy_boost = 10
+            elif ELEMENT_GENERATES.get(hour_element) == day_element:
+                # 时辰元素生今日元素，能量+5%
+                energy_boost = 5
+            elif ELEMENT_GENERATES.get(day_element) == hour_element:
+                # 今日元素生时辰元素，能量-5%
+                energy_boost = -5
+            elif ELEMENT_CONTROLS.get(hour_element) == day_element:
+                # 时辰元素克今日元素，能量-10%
+                energy_boost = -10
+            else:
+                energy_boost = 0
+
+            hour_score = min(100, max(0, base_score + energy_boost))
+
+            curve.append({
+                "hour": hour,
+                "energy": hour_score,
+                "element": hour_element.value,
+            })
+
+        return curve
+
+    def _calculate_area_scores(
+        self,
+        day_master: Element,
+        day_element: Element,
+        influence: str,
+        base_score: int,
+    ) -> Dict[str, int]:
+        """
+        计算个性化领域评分（事业/财富/感情/健康）
+
+        基于五行对应关系：
+        - 事业：印星（生我）、官星（克我）
+        - 财富：财星（我克）
+        - 感情：官星（女命克我）、财星（男命我克）
+        - 健康：比劫（同我）、印星（生我）
+        """
+        scores = {}
+
+        # 事业运：官印得力
+        if influence in ["controlled_by", "generated_by"]:
+            scores["career"] = min(100, base_score + 10)
+        elif influence == "same":
+            scores["career"] = base_score
+        else:
+            scores["career"] = max(0, base_score - 10)
+
+        # 财运：我克为财
+        if influence == "controls":
+            scores["wealth"] = min(100, base_score + 10)
+        elif influence == "same":
+            scores["wealth"] = base_score
+        else:
+            scores["wealth"] = max(0, base_score - 5)
+
+        # 感情运：异性星得力（简化处理）
+        if influence in ["controls", "controlled_by"]:
+            scores["romance"] = min(100, base_score + 5)
+        else:
+            scores["romance"] = base_score
+
+        # 健康运：印比得力
+        if influence in ["same", "generated_by"]:
+            scores["health"] = min(100, base_score + 10)
+        else:
+            scores["health"] = base_score
+
+        return scores
+
+    async def calculate_annual_fortune(
+        self,
+        profile: Dict[str, Any],
+        year: int,
+    ) -> Dict[str, Any]:
+        """计算年度运势"""
+        day_master_element = self._get_day_master_element(profile)
+        day_element = Element(day_master_element)
+
+        # 获取年份天干
+        stem_index = (year - 4) % 10
+        stem_name, year_element, polarity = self.STEMS[stem_index]
+
+        # 计算影响
+        influence = self._calculate_influence(day_element, year_element)
+
+        # 计算分数
+        score = self._calculate_annual_score(day_element, year_element, influence)
+
+        # 生成主题和建议
+        theme = self._generate_annual_theme(influence, year_element)
+        highlights, cautions = self._generate_annual_advice(
+            day_element, year_element, influence
+        )
+
+        return {
+            "year": year,
+            "element": year_element.value,
+            "polarity": polarity,
+            "influence": influence,
+            "score": score,
+            "theme": theme,
+            "highlights": highlights,
+            "cautions": cautions,
+        }
+
+    async def get_daily_fortune_score(self, profile: Dict[str, Any]) -> int:
+        """获取今日运势分数 (用于阈值触发)"""
+        fortune = await self.calculate_daily_fortune(profile)
+        return fortune.get("score", 60)
+
+    async def get_inflection_points(self, profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """获取运势拐点 (用于事件触发)"""
+        identity = profile.get("identity", {})
+        birth_info = identity.get("birth_info", {})
+        birth_date_str = birth_info.get("date", "")
+
+        if not birth_date_str:
+            return []
+
+        try:
+            birth_date = datetime.strptime(birth_date_str, "%Y-%m-%d").date()
+            birth_year = birth_date.year
+        except ValueError:
+            return []
+
+        day_master_element = self._get_day_master_element(profile)
+        gender = birth_info.get("gender", "unknown")
+
+        # 计算大运
+        cycles = self._calculate_major_cycles(
+            birth_year=birth_year,
+            day_master_element=day_master_element,
+            gender=gender,
+        )
+
+        # 提取拐点
+        inflection_points = []
+        current_year = datetime.now().year
+
+        for i, cycle in enumerate(cycles):
+            if i > 0:
+                prev_cycle = cycles[i - 1]
+                significance = abs(cycle.fortune_score - prev_cycle.fortune_score) // 10
+
+                if significance >= 2:
+                    inflection_points.append({
+                        "year": cycle.start_year,
+                        "type": "major_cycle_change",
+                        "significance": min(significance, 10),
+                        "title": f"大运交接 - 进入「{cycle.theme}」",
+                        "explanation": f"从「{prev_cycle.theme}」转换到「{cycle.theme}」阶段",
+                        "is_past": cycle.start_year < current_year,
+                    })
+
+        return inflection_points
+
+    async def generate_kline_data(
+        self,
+        profile: Dict[str, Any],
+        year_range: tuple = None,
+    ) -> Dict[str, Any]:
+        """
+        生成 K-Line 数据 (实时计算，不缓存)
+
+        Args:
+            profile: 用户画像
+            year_range: (start_year, end_year)
+
+        Returns:
+            K-Line 数据字典
+        """
+        identity = profile.get("identity", {})
+        birth_info = identity.get("birth_info", {})
+        birth_date_str = birth_info.get("date", "")
+
+        if not birth_date_str:
+            return {"error": "No birth date"}
+
+        try:
+            birth_date = datetime.strptime(birth_date_str, "%Y-%m-%d").date()
+            birth_year = birth_date.year
+        except ValueError:
+            return {"error": "Invalid birth date"}
+
+        day_master_element = self._get_day_master_element(profile)
+        gender = birth_info.get("gender", "unknown")
+        current_year = datetime.now().year
+
+        # 默认范围
+        if not year_range:
+            year_range = (birth_year, birth_year + 80)
+
+        # 计算大运
+        cycles = self._calculate_major_cycles(
+            birth_year=birth_year,
+            day_master_element=day_master_element,
+            gender=gender,
+        )
+
+        # 生成数据点
+        data_points = []
+        for year in range(year_range[0], year_range[1] + 1):
+            # 获取流年运势
+            annual = await self.calculate_annual_fortune(profile, year)
+
+            # 找到当前年份所属的大运
+            cycle_score = 50
+            phase = None
+            for cycle in cycles:
+                if cycle.start_year <= year < cycle.end_year:
+                    cycle_score = cycle.fortune_score
+                    phase = cycle.phase.value
+                    break
+
+            # 混合大运和流年分数
+            blended_score = int(cycle_score * 0.6 + annual["score"] * 0.4)
+
+            data_points.append({
+                "year": year,
+                "score": blended_score,
+                "is_current": year == current_year,
+                "phase": phase,
+            })
+
+        # 生成阶段
+        phases = []
+        for cycle in cycles:
+            trend = self._determine_trend(cycle, cycles)
+            phases.append({
+                "start_year": cycle.start_year,
+                "end_year": cycle.end_year,
+                "phase": cycle.phase.value,
+                "label": cycle.theme,
+                "description": cycle.description,
+                "fortune_trend": trend,
+            })
+
+        # 获取拐点
+        inflection_points = await self.get_inflection_points(profile)
+
+        # 当前阶段
+        current_phase = None
+        for phase in phases:
+            if phase["start_year"] <= current_year < phase["end_year"]:
+                current_phase = phase
+                break
+
+        # 下一个拐点
+        next_inflection = None
+        for point in inflection_points:
+            if point["year"] > current_year:
+                next_inflection = point
+                break
+
+        return {
+            "id": str(uuid4()),
+            "data_points": data_points,
+            "phases": phases,
+            "inflection_points": inflection_points,
+            "current_year": current_year,
+            "current_phase": current_phase,
+            "next_inflection": next_inflection,
+            "now_summary": self._generate_now_summary(current_phase, current_year),
+            "next_summary": self._generate_next_summary(next_inflection),
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 内部方法
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _get_day_master_element(self, profile: Dict[str, Any]) -> str:
+        """从 profile 获取日主元素"""
+        # v9.0: 只从 skills 读取
+        skill_data = profile.get("skills", {}).get("bazi", {})
+        chart = skill_data.get("chart", {})
+        day_master = chart.get("day_master", {})
+
+        if day_master.get("element"):
+            return day_master["element"]
+
+        # 回退到 birth_info (旧格式兼容)
+        identity = profile.get("identity", {})
+        birth_info = identity.get("birth_info", {})
+        return birth_info.get("day_master_element", "wood")
+
+    def _get_day_stem_index(self, d: date) -> int:
+        """计算某日的天干索引"""
+        # 简化算法：基于儒略日
+        jd = self._date_to_julian(d)
+        return (jd + 9) % 10
+
+    def _date_to_julian(self, d: date) -> int:
+        """日期转儒略日 (简化版)"""
+        a = (14 - d.month) // 12
+        y = d.year + 4800 - a
+        m = d.month + 12 * a - 3
+        return d.day + (153 * m + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
+
+    def _calculate_major_cycles(
+        self,
+        birth_year: int,
+        day_master_element: str,
+        gender: str = "unknown",
+        start_age: int = 5,
+    ) -> List[MajorCycle]:
+        """计算大运周期"""
+        cycles = []
+        day_element = Element(day_master_element) if day_master_element else Element.WOOD
+
+        # 起始天干索引
+        stem_index = (birth_year - 4) % 10
+
+        # 根据性别确定方向
+        direction = 1 if gender == "male" else -1
+
+        cycle_start = birth_year + start_age
+        while cycle_start < birth_year + 85:
+            cycle_end = cycle_start + 10
+
+            # 获取当前周期的天干
+            stem_index = (stem_index + direction) % 10
+            stem_name, element, polarity = self.STEMS[stem_index]
+
+            # 确定阶段
+            phase = self._determine_phase(day_element, element, len(cycles))
+
+            # 计算分数
+            score = self._calculate_cycle_score(day_element, element)
+
+            # 生成描述
+            description = self._generate_cycle_description(element, phase)
+
+            cycles.append(MajorCycle(
+                start_year=cycle_start,
+                end_year=cycle_end,
+                element=element,
+                polarity=polarity,
+                phase=phase,
+                theme=self.PHASE_THEMES[phase],
+                description=description,
+                fortune_score=score,
+            ))
+
+            cycle_start = cycle_end
+
+        return cycles
+
+    def _determine_phase(
+        self,
+        day_element: Element,
+        cycle_element: Element,
+        cycle_index: int,
+    ) -> FortunePhase:
+        """确定大运阶段"""
+        if cycle_element == day_element:
+            return FortunePhase.PEAK
+        elif ELEMENT_GENERATES[cycle_element] == day_element:
+            return FortunePhase.ACCUMULATION
+        elif ELEMENT_GENERATES[day_element] == cycle_element:
+            return FortunePhase.BREAKTHROUGH
+        elif ELEMENT_CONTROLS[cycle_element] == day_element:
+            return FortunePhase.ADJUSTMENT
+        elif ELEMENT_CONTROLS[day_element] == cycle_element:
+            return FortunePhase.TRANSITION
+        else:
+            return FortunePhase.FOUNDATION
+
+    def _calculate_cycle_score(
+        self,
+        day_element: Element,
+        cycle_element: Element,
+    ) -> int:
+        """计算大运分数"""
+        score = 60
+
+        if cycle_element == day_element:
+            score += 20
+        elif ELEMENT_GENERATES[cycle_element] == day_element:
+            score += 15
+        elif ELEMENT_GENERATES[day_element] == cycle_element:
+            score += 10
+        elif ELEMENT_CONTROLS[cycle_element] == day_element:
+            score -= 10
+        elif ELEMENT_CONTROLS[day_element] == cycle_element:
+            score += 5
+
+        return max(30, min(95, score))
+
+    def _calculate_influence(
+        self,
+        day_element: Element,
+        other_element: Element,
+    ) -> str:
+        """计算五行影响关系"""
+        if other_element == day_element:
+            return "比肩"
+        elif ELEMENT_GENERATES[other_element] == day_element:
+            return "生扶"
+        elif ELEMENT_GENERATES[day_element] == other_element:
+            return "泄耗"
+        elif ELEMENT_CONTROLS[other_element] == day_element:
+            return "克制"
+        else:
+            return "财星"
+
+    def _calculate_annual_score(
+        self,
+        day_element: Element,
+        year_element: Element,
+        influence: str,
+    ) -> int:
+        """计算年度分数"""
+        influence_scores = {
+            "生扶": 80,
+            "比肩": 70,
+            "财星": 65,
+            "泄耗": 55,
+            "克制": 45,
+        }
+        return influence_scores.get(influence, 60)
+
+    def _calculate_daily_score(
+        self,
+        day_element: Element,
+        daily_element: Element,
+        influence: str,
+    ) -> int:
+        """计算每日分数"""
+        base_scores = {
+            "生扶": 75,
+            "比肩": 70,
+            "财星": 65,
+            "泄耗": 55,
+            "克制": 45,
+        }
+        base = base_scores.get(influence, 60)
+
+        # 添加一些随机性 (基于日期的稳定随机)
+        today = date.today()
+        seed = today.year * 10000 + today.month * 100 + today.day
+        variation = (seed % 11) - 5  # -5 到 +5
+
+        return max(30, min(95, base + variation))
+
+    def _generate_cycle_description(
+        self,
+        element: Element,
+        phase: FortunePhase,
+    ) -> str:
+        """生成大运描述"""
+        descriptions = {
+            FortunePhase.ACCUMULATION: "这个阶段适合积累资源、学习新技能、建立人脉。不急于求成，稳扎稳打会有更好的收获。",
+            FortunePhase.BREAKTHROUGH: "这个阶段会遇到一些挑战，但这正是成长的机会。勇于尝试新事物，突破舒适区。",
+            FortunePhase.PEAK: "这是收获的阶段，之前的努力会开始看到成果。把握机会，但也要为下一个周期做准备。",
+            FortunePhase.ADJUSTMENT: "这个阶段需要放慢脚步，反思过去，调整方向。不是停滞，而是为了走得更远。",
+            FortunePhase.TRANSITION: "变化是这个阶段的主题。可能会有新的开始、新的选择。保持开放心态。",
+            FortunePhase.FOUNDATION: "这是打基础的阶段，专注于建立稳固的根基。看似平淡，实则重要。",
+        }
+        return descriptions.get(phase, "")
+
+    def _generate_annual_theme(self, influence: str, element: Element) -> str:
+        """生成年度主题"""
+        themes = {
+            "生扶": "贵人相助、资源充足的一年",
+            "比肩": "同侪协作、竞争并存的一年",
+            "财星": "机遇与挑战并存的一年",
+            "泄耗": "付出与贡献的一年",
+            "克制": "压力与成长的一年",
+        }
+        return themes.get(influence, "平稳发展的一年")
+
+    def _generate_daily_theme(self, influence: str, element: Element) -> str:
+        """生成每日主题"""
+        themes = {
+            "生扶": "贵人运旺，适合社交",
+            "比肩": "合作顺利，团队协作",
+            "财星": "财运活跃，把握机会",
+            "泄耗": "创意旺盛，适合表达",
+            "克制": "稳扎稳打，避免冲动",
+        }
+        return themes.get(influence, "平稳度过")
+
+    def _generate_annual_advice(
+        self,
+        day_element: Element,
+        year_element: Element,
+        influence: str,
+    ) -> tuple:
+        """生成年度建议"""
+        highlights = []
+        cautions = []
+
+        if influence == "生扶":
+            highlights = ["适合学习进修", "贵人运较好", "资源获取容易"]
+            cautions = ["不要过于依赖他人"]
+        elif influence == "比肩":
+            highlights = ["团队合作顺利", "社交活动增多", "同行交流收获"]
+            cautions = ["注意竞争关系", "避免意气用事"]
+        elif influence == "财星":
+            highlights = ["财务机会增多", "事业突破机会", "行动力增强"]
+            cautions = ["控制支出", "避免冒进"]
+        elif influence == "泄耗":
+            highlights = ["创造力旺盛", "表达能力强", "助人获成就感"]
+            cautions = ["注意体力消耗", "不要过度付出"]
+        else:
+            highlights = ["抗压能力提升", "潜力被激发"]
+            cautions = ["注意健康", "不宜冒险"]
+
+        return highlights, cautions
+
+    def _generate_daily_advice(
+        self,
+        day_element: Element,
+        daily_element: Element,
+        influence: str,
+    ) -> tuple:
+        """生成每日建议"""
+        highlights = []
+        cautions = []
+
+        if influence == "生扶":
+            highlights = ["适合社交", "贵人运好"]
+            cautions = ["不要过于依赖"]
+        elif influence == "比肩":
+            highlights = ["团队协作", "交流顺畅"]
+            cautions = ["避免争执"]
+        elif influence == "财星":
+            highlights = ["财运活跃", "行动力强"]
+            cautions = ["控制冲动"]
+        elif influence == "泄耗":
+            highlights = ["创意旺盛", "表达顺畅"]
+            cautions = ["注意休息"]
+        else:
+            highlights = ["稳扎稳打"]
+            cautions = ["避免冒险"]
+
+        return highlights, cautions
+
+    def _determine_trend(
+        self,
+        cycle: MajorCycle,
+        all_cycles: List[MajorCycle],
+    ) -> str:
+        """确定趋势方向"""
+        idx = all_cycles.index(cycle)
+
+        if idx == 0:
+            return "stable"
+
+        prev_score = all_cycles[idx - 1].fortune_score
+        curr_score = cycle.fortune_score
+
+        if curr_score > prev_score + 10:
+            return "up"
+        elif curr_score < prev_score - 10:
+            return "down"
+        return "stable"
+
+    def _generate_now_summary(
+        self,
+        current_phase: Optional[Dict],
+        current_year: int,
+    ) -> str:
+        """生成当前状态摘要"""
+        if not current_phase:
+            return f"{current_year}年，保持平稳心态，专注当下。"
+
+        phase = current_phase.get("phase", "")
+        summaries = {
+            "accumulation": f"你当前处于「积累期」。{current_year}年适合学习、积攒资源。",
+            "breakthrough": f"你当前处于「突破期」。{current_year}年适合尝试新事物、突破舒适区。",
+            "peak": f"你当前处于「高峰期」。{current_year}年是收获成果的好时机。",
+            "adjustment": f"你当前处于「调整期」。{current_year}年适合放慢脚步、反思沉淀。",
+            "transition": f"你当前处于「过渡期」。{current_year}年可能有新的变化和选择。",
+            "foundation": f"你当前处于「基础期」。{current_year}年适合打好根基、稳扎稳打。",
+        }
+
+        return summaries.get(phase, f"{current_year}年，保持平稳心态。")
+
+    def _generate_next_summary(
+        self,
+        next_inflection: Optional[Dict],
+    ) -> str:
+        """生成未来摘要"""
+        if not next_inflection:
+            return "继续当前的节奏前进。"
+
+        years_away = next_inflection["year"] - datetime.now().year
+
+        if years_away <= 1:
+            return f"即将在{next_inflection['year']}年迎来「{next_inflection['title']}」。"
+        elif years_away <= 3:
+            return f"{years_away}年后将迎来「{next_inflection['title']}」，可以开始准备。"
+        else:
+            return f"下一个关键节点在{next_inflection['year']}年。"

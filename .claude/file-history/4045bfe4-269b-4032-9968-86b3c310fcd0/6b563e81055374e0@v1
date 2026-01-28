@@ -1,0 +1,419 @@
+"""
+Mentis OS v3.0 - 智谱 GLM 服务
+
+统一的 GLM API 调用，支持：
+- 文本生成
+- 图片理解 (GLM-4V)
+- 向量嵌入 (Embedding-3)
+- 语音识别 (需调用其他服务)
+
+API 文档: https://bigmodel.cn/dev/api
+"""
+from __future__ import annotations
+
+import base64
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+# 配置
+GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+# 模型配置
+GLM_CHAT_MODEL = os.getenv("GLM_CHAT_MODEL", "glm-4-flash")  # glm-4, glm-4-flash, glm-4-air
+GLM_VISION_MODEL = os.getenv("GLM_VISION_MODEL", "glm-4v-flash")  # glm-4v, glm-4v-flash
+GLM_EMBEDDING_MODEL = os.getenv("GLM_EMBEDDING_MODEL", "embedding-3")  # embedding-2, embedding-3
+
+
+class GLMError(Exception):
+    """GLM 服务错误"""
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def _get_headers() -> Dict[str, str]:
+    """获取请求头"""
+    if not GLM_API_KEY:
+        raise GLMError("glm/no-api-key", "未配置 GLM API Key")
+    return {
+        "Authorization": f"Bearer {GLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+# =============================================================================
+# 文本生成
+# =============================================================================
+
+async def chat_completion(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 1024,
+) -> str:
+    """
+    GLM 对话补全
+
+    Args:
+        messages: 消息列表 [{"role": "user", "content": "..."}]
+        model: 模型名称
+        temperature: 温度
+        max_tokens: 最大 token 数
+
+    Returns:
+        生成的文本
+    """
+    url = f"{GLM_BASE_URL}/chat/completions"
+    payload = {
+        "model": model or GLM_CHAT_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, headers=_get_headers(), json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            raise GLMError("glm/api-error", f"GLM API 错误: {e.response.status_code}")
+        except Exception as e:
+            raise GLMError("glm/error", f"GLM 调用失败: {str(e)}")
+
+
+# =============================================================================
+# 图片理解 (Vision)
+# =============================================================================
+
+@dataclass
+class VisionResult:
+    """图像分析结果"""
+    description: str
+    emotion_detected: Optional[str]
+    scene: Optional[str]
+    objects: List[str]
+    text_content: Optional[str]
+    confidence: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "description": self.description,
+            "emotion_detected": self.emotion_detected,
+            "scene": self.scene,
+            "objects": self.objects,
+            "text_content": self.text_content,
+            "confidence": self.confidence,
+        }
+
+
+MENTIS_VISION_PROMPT = """分析这张图片，提取与用户情绪和状态相关的信息。
+
+请以 JSON 格式返回以下信息：
+{
+  "description": "图片的简要描述（50字以内）",
+  "emotion_detected": "从图片中感知到的情绪（如 joy, sadness, calm, anxiety 等，或 null）",
+  "scene": "场景类型（work, home, outdoor, social, 或 null）",
+  "objects": ["识别到的主要物体列表"],
+  "text_content": "图片中的文字内容（如有）"
+}
+
+只返回 JSON，不要其他文字。"""
+
+
+async def analyze_image(
+    image_data: bytes,
+    mime_type: str = "image/jpeg",
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    使用 GLM-4V 分析图片
+
+    Args:
+        image_data: 图片数据
+        mime_type: MIME 类型
+        prompt: 自定义提示词
+
+    Returns:
+        VisionResult: 分析结果
+    """
+    base64_image = base64.b64encode(image_data).decode()
+    return await analyze_image_base64(base64_image, mime_type, prompt)
+
+
+async def analyze_image_base64(
+    base64_image: str,
+    mime_type: str = "image/jpeg",
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    分析 Base64 编码的图片
+    """
+    # 移除可能的 data URL 前缀
+    if "," in base64_image:
+        base64_image = base64_image.split(",", 1)[1]
+
+    url = f"{GLM_BASE_URL}/chat/completions"
+
+    # GLM-4V 的消息格式
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt or MENTIS_VISION_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
+                },
+            ],
+        }
+    ]
+
+    payload = {
+        "model": GLM_VISION_MODEL,
+        "messages": messages,
+        "max_tokens": 500,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, headers=_get_headers(), json=payload)
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            return _parse_vision_response(content)
+        except httpx.HTTPStatusError as e:
+            raise GLMError("glm/vision-error", f"GLM Vision 错误: {e.response.status_code}")
+        except Exception as e:
+            raise GLMError("glm/error", f"图片分析失败: {str(e)}")
+
+
+async def analyze_image_url(
+    image_url: str,
+    prompt: Optional[str] = None,
+) -> VisionResult:
+    """
+    分析图片 URL
+    """
+    url = f"{GLM_BASE_URL}/chat/completions"
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt or MENTIS_VISION_PROMPT},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }
+    ]
+
+    payload = {
+        "model": GLM_VISION_MODEL,
+        "messages": messages,
+        "max_tokens": 500,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, headers=_get_headers(), json=payload)
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            return _parse_vision_response(content)
+        except httpx.HTTPStatusError as e:
+            raise GLMError("glm/vision-error", f"GLM Vision 错误: {e.response.status_code}")
+        except Exception as e:
+            raise GLMError("glm/error", f"图片分析失败: {str(e)}")
+
+
+def _parse_vision_response(content: str) -> VisionResult:
+    """解析 Vision 响应"""
+    import json
+
+    try:
+        # 移除 markdown 代码块
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        data = json.loads(content.strip())
+
+        return VisionResult(
+            description=data.get("description", ""),
+            emotion_detected=data.get("emotion_detected"),
+            scene=data.get("scene"),
+            objects=data.get("objects", []),
+            text_content=data.get("text_content"),
+            confidence=data.get("confidence"),
+        )
+    except json.JSONDecodeError:
+        return VisionResult(
+            description=content[:200],
+            emotion_detected=None,
+            scene=None,
+            objects=[],
+            text_content=None,
+            confidence=None,
+        )
+
+
+# =============================================================================
+# 向量嵌入 (Embedding)
+# =============================================================================
+
+async def get_embedding(text: str) -> List[float]:
+    """
+    获取文本的向量表示
+
+    Args:
+        text: 输入文本
+
+    Returns:
+        嵌入向量 (1024 维)
+    """
+    url = f"{GLM_BASE_URL}/embeddings"
+    payload = {
+        "model": GLM_EMBEDDING_MODEL,
+        "input": text,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, headers=_get_headers(), json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result["data"][0]["embedding"]
+        except httpx.HTTPStatusError as e:
+            raise GLMError("glm/embedding-error", f"GLM Embedding 错误: {e.response.status_code}")
+        except Exception as e:
+            raise GLMError("glm/error", f"获取嵌入失败: {str(e)}")
+
+
+async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """
+    批量获取文本向量
+
+    Args:
+        texts: 文本列表
+
+    Returns:
+        嵌入向量列表
+    """
+    url = f"{GLM_BASE_URL}/embeddings"
+    payload = {
+        "model": GLM_EMBEDDING_MODEL,
+        "input": texts,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, headers=_get_headers(), json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return [item["embedding"] for item in result["data"]]
+        except httpx.HTTPStatusError as e:
+            raise GLMError("glm/embedding-error", f"GLM Embedding 错误: {e.response.status_code}")
+        except Exception as e:
+            raise GLMError("glm/error", f"批量获取嵌入失败: {str(e)}")
+
+
+# =============================================================================
+# 语音识别 (使用其他方案)
+# =============================================================================
+
+@dataclass
+class TranscriptionResult:
+    """语音识别结果"""
+    text: str
+    language: Optional[str]
+    duration: Optional[float]
+    confidence: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "language": self.language,
+            "duration": self.duration,
+            "confidence": self.confidence,
+        }
+
+
+async def transcribe_audio(
+    audio_data: bytes,
+    filename: str = "audio.wav",
+    language: Optional[str] = None,
+) -> TranscriptionResult:
+    """
+    语音识别
+
+    注意: GLM 暂不支持语音识别，此处使用百度/阿里云 ASR 或返回占位结果
+    """
+    # TODO: 集成百度 ASR 或阿里云语音识别
+    # 临时方案：返回提示信息
+    raise GLMError(
+        "glm/asr-not-supported",
+        "GLM 暂不支持语音识别，请配置 OPENAI_API_KEY 使用 Whisper，或等待百度 ASR 集成"
+    )
+
+
+async def transcribe_base64(
+    base64_audio: str,
+    filename: str = "audio.wav",
+    language: Optional[str] = None,
+) -> TranscriptionResult:
+    """
+    Base64 音频语音识别
+    """
+    if "," in base64_audio:
+        base64_audio = base64_audio.split(",", 1)[1]
+    audio_data = base64.b64decode(base64_audio)
+    return await transcribe_audio(audio_data, filename, language)
+
+
+# =============================================================================
+# 同步版本
+# =============================================================================
+
+def chat_completion_sync(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 1024,
+) -> str:
+    """同步版本的对话补全"""
+    url = f"{GLM_BASE_URL}/chat/completions"
+    payload = {
+        "model": model or GLM_CHAT_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(url, headers=_get_headers(), json=payload)
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+
+def get_embedding_sync(text: str) -> List[float]:
+    """同步版本的嵌入获取"""
+    url = f"{GLM_BASE_URL}/embeddings"
+    payload = {
+        "model": GLM_EMBEDDING_MODEL,
+        "input": text,
+    }
+
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(url, headers=_get_headers(), json=payload)
+        response.raise_for_status()
+        result = response.json()
+        return result["data"][0]["embedding"]

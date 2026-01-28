@@ -1,0 +1,372 @@
+     1→# VibeLife V8.1 重构方案
+     2→
+     3→> 日期: 2026-01-20
+     4→> 目标: 简化协议执行架构，实现 Chat-First + LLM 驱动
+     5→
+     6→---
+     7→
+     8→## 1. 重构背景
+     9→
+    10→### 1.1 当前问题
+    11→
+    12→| 问题 | 现状 | 影响 |
+    13→|-----|------|-----|
+    14→| Protocol 工具过多 | start_protocol, advance_protocol_step 等 8 个工具 | 复杂度高，LLM 不一定调用 |
+    15→| 状态管理分散 | 前端 + 后端 + 数据库 | 容易丢失上下文 |
+    16→| Rule 文件未加载 | _route_scenario 返回默认值 | dankoe.md 没有进入 System Prompt |
+    17→| 设计冲突 | 方案 D vs Protocol 工具方案 | 两种方案都没完整实现 |
+    18→
+    19→### 1.2 根本原因
+    20→
+    21→用户说"帮我用 Dan Koe 方法"后，AI 开始问问题，但：
+    22→1. `_route_scenario` 返回 "basic_reading"（默认值）
+    23→2. `dankoe.md` 没有被加载到 System Prompt
+    24→3. LLM 没有协议细节，凭"记忆"执行
+    25→4. 后续请求丢失上下文，跳出协议
+    26→
+    27→---
+    28→
+    29→## 2. 重构目标
+    30→
+    31→### 2.1 核心目标
+    32→
+    33→```
+    34→┌─────────────────────────────────────────────────────────────────────────┐
+    35→│                           重构目标                                        │
+    36→├─────────────────────────────────────────────────────────────────────────┤
+    37→│                                                                          │
+    38→│  1. 简化架构                                                              │
+    39→│     • 删除 Protocol 工具，采用方案 D（纯 Prompt 驱动）                    │
+    40→│     • Rule 文件 + save_skill_data = 完整协议                             │
+    41→│                                                                          │
+    42→│  2. 确保 Rule 加载                                                        │
+    43→│     • 前端显式传 scenario 参数                                           │
+    44→│     • 后端智能路由作为 fallback                                          │
+    45→│                                                                          │
+    46→│  3. Chat-First 体验                                                       │
+    47→│     • Journey/Me 页面只负责展示                                          │
+    48→│     • 所有深度交互回到 Chat                                              │
+    49→│                                                                          │
+    50→└─────────────────────────────────────────────────────────────────────────┘
+    51→```
+    52→
+    53→### 2.2 成功标准
+    54→
+    55→- [ ] 用户点击 Journey [开始设计我的人生] → 正确执行 Dan Koe 6 问
+    56→- [ ] 用户在 Chat 中说"帮我用 Dan Koe 方法" → 正确执行 Dan Koe 6 问
+    57→- [ ] 协议中断后恢复 → LLM 从对话历史判断进度，继续执行
+    58→- [ ] 协议完成 → 数据正确保存到 VibeProfile
+    59→- [ ] Journey 页面 → 正确展示保存的数据
+    60→
+    61→---
+    62→
+    63→## 3. 重构清单
+    64→
+    65→### Phase 1: 前端修改（已完成 ✅）
+    66→
+    67→| 任务 | 文件 | 状态 |
+    68→|-----|------|------|
+    69→| 所有可控入口加 scenario 参数 | `JourneyContent.tsx` | ✅ |
+    70→| EmptyJourneyCard 加 scenario 参数 | `EmptyJourneyCard.tsx` | ✅ |
+    71→
+    72→**修改内容**：
+    73→
+    74→```typescript
+    75→// 修改前
+    76→router.push("/chat?skill=lifecoach&prompt=我想做一次人生重置");
+    77→
+    78→// 修改后
+    79→router.push("/chat?skill=lifecoach&scenario=dankoe&prompt=我想做一次人生重置");
+    80→```
+    81→
+    82→### Phase 2: 后端 - ChatRequestV5 新增 scenario（已完成 ✅）
+    83→
+    84→| 任务 | 文件 | 状态 |
+    85→|-----|------|------|
+    86→| 新增 scenario 字段 | chat_v5.py | ✅ |
+    87→
+    88→**修改内容**：
+    89→
+    90→```python
+    91→class ChatRequestV5(BaseModel):
+    92→    skill: Optional[str] = None
+    93→    scenario: Optional[str] = None  # 新增
+    94→    # ...
+    95→```
+    96→
+    97→### Phase 3: 后端 - 优先使用前端传参（待完成）
+    98→
+    99→| 任务 | 文件 | 状态 |
+   100→|-----|------|------|
+   101→| 解析 scenario 参数 | chat_v5.py | ⏳ |
+   102→| 传递给 AgentContext | chat_v5.py | ⏳ |
+   103→| CoreAgent 使用 scenario | core.py | ⏳ |
+   104→
+   105→**修改内容**：
+   106→
+   107→```python
+   108→# chat_v5.py - generate() 函数中
+   109→
+   110→# 1. 获取前端传的 scenario
+   111→active_scenario = request.scenario
+   112→
+   113→# 2. 如果没有，使用智能路由
+   114→if not active_scenario and active_skill:
+   115→    active_scenario = await route_scenario_by_tags(active_skill, user_message)
+   116→
+   117→# 3. 传递给 AgentContext
+   118→context = AgentContext(
+   119→    user_id=str(user_id) if user_id else "guest",
+   120→    user_tier=user_tier,
+   121→    profile=profile,
+   122→    skill_data=skill_data,
+   123→    history=history,
+   124→    skill=active_skill,
+   125→    scenario=active_scenario,  # 新增
+   126→    voice_mode=request.voice_mode,
+   127→    conversation_id=str(conversation_id)
+   128→)
+   129→```
+   130→
+   131→### Phase 4: 后端 - 智能路由 fallback（待完成）
+   132→
+   133→| 任务 | 文件 | 状态 |
+   134→|-----|------|------|
+   135→| 实现 route_scenario_by_tags | chat_v5.py 或 skill_loader.py | ⏳ |
+   136→
+   137→**修改内容**：
+   138→
+   139→```python
+   140→# chat_v5.py 或 skill_loader.py
+   141→
+   142→async def route_scenario_by_tags(skill_id: str, message: str) -> Optional[str]:
+   143→    """基于 tags 匹配最佳 rule（作为 fallback）"""
+   144→    from services.agent.skill_loader import has_rules, load_rule, SKILLS_DIR
+   145→
+   146→    if not has_rules(skill_id):
+   147→        return None
+   148→
+   149→    rules_dir = SKILLS_DIR / skill_id / "rules"
+   150→    message_lower = message.lower()
+   151→
+   152→    for rule_path in rules_dir.glob("*.md"):
+   153→        # 跳过 _index.md 等
+   154→        if rule_path.stem.startswith("_"):
+   155→            continue
+   156→        # 跳过 companion 子目录
+   157→        if rule_path.is_dir():
+   158→            continue
+   159→
+   160→        rule = load_rule(skill_id, rule_path.stem)
+   161→        if rule and rule.tags:
+   162→            for tag in rule.tags:
+   163→                if tag.lower() in message_lower:
+   164→                    logger.info(f"[route_scenario] Matched rule={rule_path.stem} by tag={tag}")
+   165→                    return rule_path.stem
+   166→
+   167→    return None
+   168→```
+   169→
+   170→### Phase 5: 后端 - AgentContext 新增 scenario（待完成）
+   171→
+   172→| 任务 | 文件 | 状态 |
+   173→|-----|------|------|
+   174→| AgentContext 新增 scenario 字段 | core.py | ⏳ |
+   175→| build_system_prompt 使用 scenario | core.py | ⏳ |
+   176→
+   177→**修改内容**：
+   178→
+   179→```python
+   180→# core.py
+   181→
+   182→@dataclass
+   183→class AgentContext:
+   184→    user_id: str
+   185→    user_tier: str = "free"
+   186→    profile: Optional[Dict[str, Any]] = None
+   187→    skill_data: Optional[Dict[str, Any]] = None
+   188→    history: Optional[List[Dict[str, str]]] = None
+   189→    skill: Optional[str] = None
+   190→    scenario: Optional[str] = None  # 新增
+   191→    conversation_id: Optional[str] = None
+   192→    voice_mode: Optional[str] = "warm"
+   193→
+   194→# core.py - _build_system_prompt 中
+   195→
+   196→# 使用 context.scenario 而不是 self._active_scenario
+   197→if self._active_skill:
+   198→    scenario_id = context.scenario or self._active_scenario
+   199→    base_prompt = build_system_prompt(
+   200→        self._active_skill,
+   201→        scenario_id,  # 使用传入的 scenario
+   202→        user_ctx
+   203→    )
+   204→```
+   205→
+   206→### Phase 6: 删除 Protocol 工具（待完成）
+   207→
+   208→| 任务 | 文件 | 状态 |
+   209→|-----|------|------|
+   210→| 删除 Protocol 工具定义 | tools/tools.yaml | ⏳ |
+   211→| 删除 Protocol handlers | tools/handlers.py | ⏳ |
+   212→| 删除 protocols 目录 | protocols/ | ⏳ |
+   213→| 删除 chat_v5.py Protocol 逻辑 | chat_v5.py | ⏳ |
+   214→| 更新 SKILL.md | SKILL.md | ⏳ |
+   215→
+   216→**需要删除的工具**：
+   217→- start_protocol
+   218→- continue_protocol
+   219→- advance_protocol_step
+   220→- cancel_protocol
+   221→- show_protocol_invitation
+   222→- show_protocol_progress
+   223→- show_protocol_step
+   224→- show_protocol_completion
+   225→
+   226→**需要删除的文件**：
+   227→- apps/api/skills/lifecoach/protocols/dankoe.yaml
+   228→- apps/api/skills/lifecoach/protocols/engine.py（如果存在）
+   229→
+   230→**需要删除的 chat_v5.py 代码**：
+   231→- load_protocol_config() 函数
+   232→- build_protocol_prompt() 函数
+   233→- get_protocol_state() 函数
+   234→- emit_protocol_progress_event() 函数
+   235→- async_generator() 函数
+   236→- Protocol 相关的 SSE 事件处理逻辑
+   237→
+   238→---
+   239→
+   240→## 4. 实施步骤
+   241→
+   242→### Step 1: 完成 Phase 3-5（后端核心）
+   243→
+   244→```bash
+   245→# 1. 修改 chat_v5.py
+   246→# 2. 修改 core.py
+   247→# 3. 测试：前端传 scenario 是否生效
+   248→```
+   249→
+   250→### Step 2: 测试验证
+   251→
+   252→```bash
+   253→# 测试 1: 前端显式传参
+   254→curl -X POST http://localhost:8000/chat/v5/stream \
+   255→  -H "Content-Type: application/json" \
+   256→  -d '{
+   257→    "message": "我想做一次人生重置",
+   258→    "skill": "lifecoach",
+   259→    "scenario": "dankoe"
+   260→  }'
+   261→
+   262→# 预期：System Prompt 包含 dankoe.md 内容
+   263→
+   264→# 测试 2: 智能路由 fallback
+   265→curl -X POST http://localhost:8000/chat/v5/stream \
+   266→  -H "Content-Type: application/json" \
+   267→  -d '{
+   268→    "message": "帮我用 Dan Koe 方法",
+   269→    "skill": "lifecoach"
+   270→  }'
+   271→
+   272→# 预期：自动匹配到 dankoe，System Prompt 包含 dankoe.md 内容
+   273→```
+   274→
+   275→### Step 3: 删除 Protocol 代码（Phase 6）
+   276→
+   277→```bash
+   278→# 1. 删除 tools.yaml 中的 Protocol 工具
+   279→# 2. 删除 handlers.py 中的 Protocol handlers
+   280→# 3. 删除 protocols/ 目录
+   281→# 4. 删除 chat_v5.py 中的 Protocol 逻辑
+   282→# 5. 更新 SKILL.md，删除 Protocol 执行流程部分
+   283→```
+   284→
+   285→### Step 4: 端到端测试
+   286→
+   287→```bash
+   288→# 1. 启动测试环境
+   289→./scripts/start-test.sh
+   290→
+   291→# 2. 访问 http://localhost:8232
+   292→# 3. 进入 Journey 页面
+   293→# 4. 点击 [开始设计我的人生]
+   294→# 5. 验证 Dan Koe 6 问流程
+   295→# 6. 验证数据保存
+   296→# 7. 验证 Journey 页面展示
+   297→```
+   298→
+   299→---
+   300→
+   301→## 5. 风险与缓解
+   302→
+   303→| 风险 | 影响 | 缓解措施 |
+   304→|-----|------|---------|
+   305→| 智能路由匹配不准确 | 用户自由输入可能匹配到错误的 rule | 优先使用前端显式传参；优化 tags |
+   306→| 对话历史被截断 | LLM 丢失协议上下文 | 协议对话时增加 history 限制到 20 条 |
+   307→| LLM 忘记问某个问题 | 协议不完整 | Rule 文件中明确"必须按顺序完成所有问题" |
+   308→| 删除 Protocol 代码影响其他功能 | 系统不稳定 | 分步删除，每步测试 |
+   309→
+   310→---
+   311→
+   312→## 6. 时间估算
+   313→
+   314→| Phase | 任务 | 估算 |
+   315→|-------|------|------|
+   316→| Phase 1-2 | 前端 + ChatRequestV5 | ✅ 已完成 |
+   317→| Phase 3-5 | 后端核心修改 | 1-2 小时 |
+   318→| Phase 6 | 删除 Protocol 代码 | 1 小时 |
+   319→| 测试 | 端到端测试 | 1 小时 |
+   320→| 总计 | | 3-4 小时 |
+   321→
+   322→---
+   323→
+   324→## 7. 后续优化
+   325→
+   326→### 7.1 短期
+   327→
+   328→- 优化 tags 匹配算法（支持优先级）
+   329→- 添加日志追踪路由决策
+   330→- 增加 history 限制配置
+   331→
+   332→### 7.2 中期
+   333→
+   334→- 支持多 rule 组合（如 dankoe + weekly-review）
+   335→- Rule 文件热更新（无需重启）
+   336→- 协议执行统计（完成率、中断率）
+   337→
+   338→### 7.3 长期
+   339→
+   340→- 用户自定义协议
+   341→- 协议模板市场
+   342→- AI 自动生成协议
+   343→
+   344→---
+   345→
+   346→## 8. 总结
+   347→
+   348→本次重构的核心是简化：
+   349→
+   350→```
+   351→┌─────────────────────────────────────────────────────────────────────────┐
+   352→│                           重构前 vs 重构后                                │
+   353→├─────────────────────────────────────────────────────────────────────────┤
+   354→│                                                                          │
+   355→│   重构前                              重构后                              │
+   356→│   ──────                              ──────                              │
+   357→│   8 个 Protocol 工具                  0 个 Protocol 工具                  │
+   358→│   前端+后端+数据库状态管理             LLM 自己管理（对话历史）             │
+   359→│   protocols/*.yaml 配置               rules/*.md 规则文件                 │
+   360→│   复杂的 SSE 事件                     简单的文本流                         │
+   361→│                                                                          │
+   362→│   Protocol = 工具 + 状态 + 配置       Protocol = Rule + save_skill_data  │
+   363→│                                                                          │
+   364→└─────────────────────────────────────────────────────────────────────────┘
+   365→```
+   366→
+   367→核心原则：让 LLM 做它擅长的事（理解上下文、控制对话流程），让代码做它擅长的事（数据存储、API 调用）。
+   368→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

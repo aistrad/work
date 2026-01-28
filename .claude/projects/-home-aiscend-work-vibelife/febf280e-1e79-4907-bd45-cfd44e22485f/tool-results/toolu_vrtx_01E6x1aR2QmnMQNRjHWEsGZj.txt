@@ -1,0 +1,154 @@
+     0→"""
+     1→CoreAgent v8 - 分阶段渐进式加载的智能体
+     2→
+     3→v8 架构特性：
+     4→- 分阶段上下文加载：Phase 1 (Skill 选择) / Phase 2 (Skill 执行)
+     5→- use_skill 同轮重载：激活 skill 后同一轮内重新构建上下文
+     6→- 历史消息从数据库获取（不依赖前端传入）
+     7→- Case 倒排索引匹配
+     8→- LLM 驱动的 SOP 执行
+     9→
+    10→v7 架构特性（保留）：
+    11→- Scenario 路由：根据用户消息匹配最佳场景
+    12→- PostgreSQL 知识检索：RAG + 案例匹配
+    13→- 7 阶段 SOP：P1-P2 强制，P3-P7 LLM 自由发挥
+    14→- 工具-卡片映射：标准化工具元数据
+    15→"""
+    16→import json
+    17→import logging
+    18→import time
+    19→from typing import Optional, List, Dict, Any, AsyncGenerator
+    20→from dataclasses import dataclass
+    21→from enum import Enum
+    22→
+    23→from services.llm import LLMClient, get_llm_client
+    24→from services.llm.client import LLMMessage
+    25→from .case_index import get_case_index, extract_features, CaseIndex
+    26→from .skill_loader import (
+    27→    load_skill, get_skill_triggers,
+    28→    build_system_prompt,
+    29→    get_available_skills, get_skill_scenarios,
+    30→    skill_requires_birth_info,
+    31→    skill_requires_compute,
+    32→    get_skill_compute_type,
+    33→    get_skill_compute_tool,
+    34→    get_skill_collect_tool,
+    35→    load_rule, get_skill_rules,
+    36→)
+    37→from .tool_registry import ToolRegistry, ToolContext
+    38→
+    39→logger = logging.getLogger(__name__)
+    40→
+    41→
+    42→class AgentState(str, Enum):
+    43→    """Agent 执行状态"""
+    44→    IDLE = "idle"
+    45→    THINKING = "thinking"
+    46→    TOOL_CALLING = "tool_calling"
+    47→    COMPLETED = "completed"
+    48→    ERROR = "error"
+    49→
+    50→
+    51→@dataclass
+    52→class AgentEvent:
+    53→    """Agent 执行事件"""
+    54→    type: str  # thinking, content, tool_call, tool_result, done, error, sop_phase
+    55→    data: Any = None
+    56→
+    57→
+    58→@dataclass
+    59→class AgentContext:
+    60→    """Agent 执行上下文
+    61→
+    62→    v8 更新：
+    63→    - 删除 portrait 和 recent_insights（已废弃，数据从 profile.extracted 获取）
+    64→    - history 从数据库获取，不再依赖前端传入
+    65→    - profile 和 skill_data 分阶段加载
+    66→    - 新增 protocol_prompt 支持协议模式
+    67→    """
+    68→    user_id: str
+    69→    user_tier: str = "free"
+    70→    profile: Optional[Dict[str, Any]] = None      # Phase 2 才加载
+    71→    skill_data: Optional[Dict[str, Any]] = None   # Phase 2 才加载，只含当前 skill
+    72→    history: Optional[List[Dict[str, str]]] = None  # 从数据库获取
+    73→    skill: Optional[str] = None
+    74→    scenario: Optional[str] = None
+    75→    conversation_id: Optional[str] = None
+    76→    voice_mode: Optional[str] = "warm"
+    77→    protocol_prompt: Optional[str] = None  # 协议模式专用 prompt
+    78→
+    79→
+    80→def build_use_skill_tool() -> Dict[str, Any]:
+    81→    """
+    82→    动态构建 use_skill 工具定义
+    83→
+    84→    从 SKILL.md 自动读取：
+    85→    - 可用的 Skills 列表
+    86→    - 每个 Skill 的语义描述（用于 LLM 理解）
+    87→    - 每个 Skill 的场景列表
+    88→
+    89→    v7.3: 改为语义描述驱动，让 LLM 基于理解而非关键词匹配来选择 skill
+    90→    """
+    91→    available_skills = [s for s in get_available_skills() if s != "core"]
+    92→
+    93→    # 构建 Skill 路由说明（语义描述 + 触发词辅助）
+    94→    skill_routing = "## Skill 路由（基于语义理解选择最匹配的 skill）\n\n"
+    95→    for skill_id in available_skills:
+    96→        skill = load_skill(skill_id)
+    97→        if skill:
+    98→            # 提取 description 中触发词之前的部分作为语义描述
+    99→            desc = skill.description
+   100→            if "触发词" in desc:
+   101→                desc = desc.split("触发词")[0].strip().rstrip("。")
+   102→            # 限制长度
+   103→            if len(desc) > 100:
+   104→                desc = desc[:100] + "..."
+   105→            skill_routing += f"### {skill_id}\n{desc}\n"
+   106→            # 触发词作为辅助提示
+   107→            if skill.triggers:
+   108→                trigger_str = "、".join(skill.triggers[:5])
+   109→                skill_routing += f"常见关键词：{trigger_str}\n"
+   110→            skill_routing += "\n"
+   111→
+   112→    # 构建场景目录（只列出主要场景，避免 description 过长）
+   113→    scenario_catalog = "\n## 场景目录（常用）\n"
+   114→    for skill_id in available_skills:
+   115→        scenarios = get_skill_scenarios(skill_id)
+   116→        if scenarios:
+   117→            # 只列出前5个场景
+   118→            top_scenarios = scenarios[:5]
+   119→            scenario_catalog += f"\n### {skill_id}\n"
+   120→            for s in top_scenarios:
+   121→                scenario_catalog += f"- {s}\n"
+   122→            if len(scenarios) > 5:
+   123→                scenario_catalog += f"- ... (共 {len(scenarios)} 个场景)\n"
+   124→
+   125→    description = f"""激活专业技能来回答用户问题。一次决定 skill、scenario 和 confidence。
+   126→
+   127→{skill_routing}
+   128→{scenario_catalog}
+   129→
+   130→## Confidence 说明
+   131→- high: 用户意图明确，直接执行
+   132→- medium: 基本确定，可能需要追问细节
+   133→- low: 不确定，需要向用户确认
+   134→
+   135→重要：如果用户消息中已经包含了出生信息，设置 birth_info_provided=true。"""
+   136→
+   137→    return {
+   138→        "type": "function",
+   139→        "function": {
+   140→            "name": "use_skill",
+   141→            "description": description,
+   142→            "parameters": {
+   143→                "type": "object",
+   144→                "properties": {
+   145→                    "skill": {
+   146→                        "type": "string",
+   147→                        "enum": available_skills,
+   148→                        "description": "要使用的技能"
+   149→                    },
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

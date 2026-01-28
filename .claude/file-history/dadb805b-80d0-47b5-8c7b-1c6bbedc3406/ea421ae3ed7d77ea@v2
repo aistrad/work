@@ -1,0 +1,346 @@
+"""
+Chat Routes - Skill conversation endpoints
+"""
+from typing import Optional, List
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from services.identity import get_current_user, get_optional_user, CurrentUser
+from services.agent import AgentRuntime
+
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    skill_id: str
+    conversation_id: Optional[UUID] = None
+
+
+class ChatResponse(BaseModel):
+    content: str
+    conversation_id: UUID
+    intent: Optional[str] = None
+    tools_used: Optional[List[str]] = None
+    knowledge_used: bool = False
+    insight: Optional[dict] = None
+    suggestions: Optional[List[str]] = None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Send a message and get response"""
+    try:
+        response = await AgentRuntime.process_message(
+            user_id=current_user.user_id,
+            skill_id=request.skill_id,
+            message=request.message,
+            conversation_id=request.conversation_id
+        )
+
+        return ChatResponse(
+            content=response.content,
+            conversation_id=response.conversation_id,
+            intent=response.intent.value if response.intent else None,
+            tools_used=response.tools_used,
+            knowledge_used=response.knowledge_used,
+            insight=response.insight,
+            suggestions=response.suggestions
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Send a message and get streaming response (SSE)"""
+
+    async def generate():
+        try:
+            async for chunk in AgentRuntime.stream_message(
+                user_id=current_user.user_id,
+                skill_id=request.skill_id,
+                message=request.message,
+                conversation_id=request.conversation_id
+            ):
+                yield f"data: {chunk}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+@router.post("/guest")
+async def chat_guest(request: ChatRequest):
+    """
+    Guest chat (limited functionality, no persistence).
+    For landing page demo.
+    """
+    # For guest users, use a simple direct LLM call
+    from services.vibe_engine import LLMOrchestrator, LLMMessage
+    from services.agent import PersonaManager
+
+    persona = PersonaManager.get_persona(request.skill_id)
+
+    messages = [
+        LLMMessage(role="system", content=persona),
+        LLMMessage(role="user", content=request.message)
+    ]
+
+    try:
+        # Note: some GLM models may spend a large portion of tokens on reasoning
+        # before producing final `content`. Use a safer default budget for guest mode.
+        response = await LLMOrchestrator.chat(messages, max_tokens=1024)
+
+        return {
+            "content": response.content or "你好，我在这里。你想从哪里开始聊起？",
+            "is_guest": True,
+            "suggestion": "注册后可以获得完整的个性化分析"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Guest Tool API - Direct tool invocation for landing page
+# ─────────────────────────────────────────────────────────────────
+
+class GuestToolRequest(BaseModel):
+    """Request for guest tool invocation"""
+    skill_id: str
+    tool: str  # 'bazi_chart', 'zodiac_chart', etc.
+    birth_date: str  # "YYYY-MM-DD"
+    birth_time: Optional[str] = None  # "HH:MM" or hour index
+    gender: Optional[str] = "male"
+    birth_location: Optional[str] = None
+
+
+@router.post("/guest/tool")
+async def guest_tool(request: GuestToolRequest):
+    """
+    Direct tool invocation for guest users on landing page.
+    Allows experiencing the core value without registration.
+    """
+    from datetime import datetime
+    from tools.bazi import BaziCalculator, TransitCalculator, BaziAnalysis
+    from tools.zodiac import ZodiacChart
+    from services.vibe_engine import LLMOrchestrator, LLMMessage
+    from services.agent import PersonaManager
+
+    try:
+        # Parse birth datetime
+        birth_date_str = request.birth_date
+        birth_time_str = request.birth_time
+
+        # Handle various time formats
+        # 1. Numeric index (0-11 for 12 时辰)
+        # 2. Range format "HH-HH" (e.g., "01-03" for 丑时)
+        # 3. Standard "HH:MM" format
+        if birth_time_str:
+            # Map 时辰 range format to start hour
+            shichen_map = {
+                "23-01": "00:00",  # 子时
+                "01-03": "02:00",  # 丑时
+                "03-05": "04:00",  # 寅时
+                "05-07": "06:00",  # 卯时
+                "07-09": "08:00",  # 辰时
+                "09-11": "10:00",  # 巳时
+                "11-13": "12:00",  # 午时
+                "13-15": "14:00",  # 未时
+                "15-17": "16:00",  # 申时
+                "17-19": "18:00",  # 酉时
+                "19-21": "20:00",  # 戌时
+                "21-23": "22:00",  # 亥时
+            }
+
+            if birth_time_str in shichen_map:
+                # Range format like "01-03"
+                birth_time_str = shichen_map[birth_time_str]
+            elif birth_time_str.isdigit():
+                # Numeric index
+                hour_idx = int(birth_time_str)
+                idx_map = {
+                    0: "00:00",  # 子时
+                    1: "02:00",  # 丑时
+                    2: "04:00",  # 寅时
+                    3: "06:00",  # 卯时
+                    4: "08:00",  # 辰时
+                    5: "10:00",  # 巳时
+                    6: "12:00",  # 午时
+                    7: "14:00",  # 未时
+                    8: "16:00",  # 申时
+                    9: "18:00",  # 酉时
+                    10: "20:00", # 戌时
+                    11: "22:00", # 亥时
+                }
+                birth_time_str = idx_map.get(hour_idx, "12:00")
+            elif birth_time_str == "unknown":
+                birth_time_str = None
+            # else: assume it's already in HH:MM format
+
+        if birth_time_str:
+            birth_datetime = datetime.strptime(f"{birth_date_str} {birth_time_str}", "%Y-%m-%d %H:%M")
+        else:
+            birth_datetime = datetime.strptime(f"{birth_date_str} 12:00", "%Y-%m-%d %H:%M")
+
+        tool_result = None
+        chart_data = None
+
+        # ─────────────────────────────────────────────────────────────────
+        # Bazi Tool
+        # ─────────────────────────────────────────────────────────────────
+        if request.tool == "bazi_chart" or request.skill_id == "bazi":
+            chart = BaziCalculator.calculate(birth_datetime)
+            chart_str = BaziCalculator.format_chart(chart)
+
+            # Analysis
+            elements = BaziAnalysis.analyze_five_elements(chart)
+            personality = BaziAnalysis.analyze_personality(chart)
+            ten_gods = BaziAnalysis.calculate_ten_gods(chart)
+
+            # Format tool result
+            tool_result = f"""
+八字命盘
+{chart_str}
+
+【日主分析】
+日主: {chart.day_master} ({personality.get('symbol', '')})
+属性: {personality.get('element', '')}
+
+【五行分布】
+木: {elements['percentages']['木']}%  火: {elements['percentages']['火']}%  土: {elements['percentages']['土']}%
+金: {elements['percentages']['金']}%  水: {elements['percentages']['水']}%
+
+最强五行: {elements['strongest']}
+最弱五行: {elements['weakest']}
+
+【性格特质】
+{', '.join(personality.get('traits', []))}
+
+优势: {personality.get('strengths', '')}
+挑战: {personality.get('challenges', '')}
+"""
+
+            chart_data = {
+                "year": {"stem": chart.year.stem, "branch": chart.year.branch},
+                "month": {"stem": chart.month.stem, "branch": chart.month.branch},
+                "day": {"stem": chart.day.stem, "branch": chart.day.branch},
+                "hour": {"stem": chart.hour.stem, "branch": chart.hour.branch},
+                "day_master": chart.day_master,
+                "day_element": chart.day_element,
+                "elements": elements,
+                "personality": personality,
+            }
+
+        # ─────────────────────────────────────────────────────────────────
+        # Zodiac Tool
+        # ─────────────────────────────────────────────────────────────────
+        elif request.tool == "zodiac_chart" or request.skill_id == "zodiac":
+            chart = ZodiacChart.calculate_natal(birth_datetime, request.birth_location)
+            chart_dict = ZodiacChart.to_dict(chart)
+
+            sun_info = chart_dict['sun']['info']
+            moon_info = chart_dict['moon']['info']
+
+            tool_result = f"""
+星盘解析
+═══════════════════════════════════════
+  太阳星座: {chart.sun.sign}
+  月亮星座: {chart.moon.sign}
+  上升星座: {chart.ascendant}
+  水星: {chart.mercury.sign}
+  金星: {chart.venus.sign}
+  火星: {chart.mars.sign}
+═══════════════════════════════════════
+
+{chart_dict['summary']}
+
+【太阳{chart.sun.sign}特质】
+元素: {sun_info.get('element', '')}  模式: {sun_info.get('modality', '')}
+守护星: {sun_info.get('ruler', '')}
+特点: {', '.join(sun_info.get('traits', []))}
+优势: {sun_info.get('strengths', '')}
+挑战: {sun_info.get('challenges', '')}
+
+【月亮{chart.moon.sign}内在】
+元素: {moon_info.get('element', '')}
+特点: {', '.join(moon_info.get('traits', []))}
+"""
+
+            chart_data = chart_dict
+
+        # ─────────────────────────────────────────────────────────────────
+        # Generate LLM Interpretation
+        # ─────────────────────────────────────────────────────────────────
+        if tool_result:
+            persona = PersonaManager.get_persona(request.skill_id)
+
+            interpretation_prompt = f"""
+基于以下计算结果，给出一个简洁但有洞察力的解读（3-5句话）。
+语气温暖、有启发性，避免过于技术化的表述。
+
+{tool_result}
+
+请用中文回复，不要重复原始数据，直接给出你的洞察。
+"""
+
+            messages = [
+                LLMMessage(role="system", content=persona),
+                LLMMessage(role="user", content=interpretation_prompt)
+            ]
+
+            try:
+                llm_response = await LLMOrchestrator.chat(messages, max_tokens=512)
+                interpretation = llm_response.content or "这是一个很有意思的命盘，建议注册后获得更深入的分析。"
+            except Exception:
+                interpretation = "这是一个独特的命盘，蕴含着丰富的信息。注册后可以获得更详细的个性化解读。"
+
+            return {
+                "success": True,
+                "tool": request.tool,
+                "skill_id": request.skill_id,
+                "raw_result": tool_result.strip(),
+                "chart_data": chart_data,
+                "interpretation": interpretation,
+                "is_guest": True,
+                "suggestion": "注册后可以获得完整的大运流年分析、十神解读和个性化建议"
+            }
+
+        return {
+            "success": False,
+            "error": "Unsupported tool or skill",
+            "is_guest": True
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {str(e)}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

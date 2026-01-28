@@ -1,0 +1,354 @@
+"""
+Portrait Service - User portrait (Hot Memory) management
+
+Design: docs/user-data-context-design.md
+Core Idea: LLM-generated natural language portraits with structured format
+"""
+import os
+from typing import Optional, List, Dict, Any
+from uuid import UUID
+from datetime import datetime
+
+from stores.db import get_connection
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+PORTRAIT_UPDATE_PROMPT = """你是一个用户画像分析专家。请基于以下信息，为这位用户生成或更新画像摘要。
+
+## 当前画像 (如果存在)
+{current_portrait}
+
+## 用户基础信息
+- 出生日期: {birth_datetime}
+- 八字: {bazi_chart}
+- 使用技能: {skill_id}
+
+## 最近 {message_count} 条对话
+{recent_messages}
+
+## 任务
+请生成结构化的用户画像，**必须**包含以下四个区域：
+
+# 用户画像
+
+## 📌 长期事实 (Facts)
+*不随时间改变的硬事实。如：姓名、生日、宠物名、重大经历、过敏信息。*
+*【重要】更新时必须保留已有的事实，除非用户明确纠正！*
+
+## 🌊 当前状态 (State)
+*流动的情绪、近期话题、当前困扰。可以随时更新。*
+
+## 💡 互动偏好 (Preferences)
+*用户喜欢什么样的回应方式、沟通风格。*
+
+## 🎯 当前关注 (Focus)
+*用户正在思考或处理的事情。*
+
+要求:
+- 每个区域用 bullet points
+- 具体而非笼统
+- 📌 Facts 区域：只增不删，除非用户明确纠正
+- 总长度控制在 500 字以内
+- 只输出画像内容，不要其他解释
+"""
+
+PORTRAIT_INIT_TEXT = """# 用户画像
+
+## 📌 长期事实 (Facts)
+*等待发现...*
+
+## 🌊 当前状态 (State)
+*新用户，还没有足够的了解*
+
+## 💡 互动偏好 (Preferences)
+*等待观察...*
+
+## 🎯 当前关注 (Focus)
+*等待了解...*
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Portrait Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PortraitService:
+    """
+    User Portrait Service (Hot Memory)
+
+    Core Design:
+    - Stores LLM-generated natural language portraits
+    - Structured format: Facts/State/Preferences/Focus
+    - Facts are "anchored" and protected from compression loss
+    - Updated every N messages via background task
+
+    Phase 1.5:
+    - Portraits are isolated per skill_id (keeps persona pure)
+    - Reserved skill_id 'global' for future aggregation
+    """
+
+    # Trigger conditions (can be overridden by env var)
+    UPDATE_INTERVAL_MESSAGES = int(os.getenv("PORTRAIT_UPDATE_INTERVAL", "20"))  # Default: every 20 messages
+    PORTRAIT_MAX_TOKENS = 1000     # Max tokens for portrait generation
+
+    # ─────────────────────────────────────────────────────────────────
+    # Read Operations
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_portrait(user_id: UUID, skill_id: str) -> Optional[str]:
+        """
+        Get user portrait text for a skill.
+        Returns None if no portrait exists yet.
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT portrait_text FROM user_portraits
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill_id
+            )
+            return row["portrait_text"] if row else None
+
+    @staticmethod
+    async def get_portrait_metadata(user_id: UUID, skill_id: str) -> Optional[dict]:
+        """Get portrait with metadata (for update decision)"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, portrait_text, based_on_messages, last_message_id, version
+                FROM user_portraits
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill_id
+            )
+            return dict(row) if row else None
+
+    # ─────────────────────────────────────────────────────────────────
+    # Update Decision
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def should_update(cls, user_id: UUID, skill_id: str) -> bool:
+        """
+        Check if portrait should be updated.
+        Returns True if:
+        - No portrait exists (new user)
+        - New messages >= UPDATE_INTERVAL_MESSAGES since last update
+        """
+        async with get_connection() as conn:
+            portrait = await conn.fetchrow(
+                """
+                SELECT based_on_messages, last_message_id
+                FROM user_portraits
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill_id
+            )
+
+            # New user, needs portrait
+            if not portrait:
+                # Check if user has any messages first
+                msg_count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM skill_messages sm
+                    JOIN skill_conversations sc ON sm.conversation_id = sc.id
+                    WHERE sc.user_id = $1 AND sc.skill_id = $2
+                    """,
+                    user_id, skill_id
+                )
+                return msg_count >= 3  # At least 3 messages to generate portrait
+
+            # Count new messages since last update
+            new_messages = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM skill_messages sm
+                JOIN skill_conversations sc ON sm.conversation_id = sc.id
+                WHERE sc.user_id = $1 AND sc.skill_id = $2
+                  AND (sm.id > $3 OR $3 IS NULL)
+                """,
+                user_id, skill_id, portrait["last_message_id"]
+            )
+
+            return new_messages >= cls.UPDATE_INTERVAL_MESSAGES
+
+    # ─────────────────────────────────────────────────────────────────
+    # Update Operations
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def update_portrait(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        llm_orchestrator,
+        user_repo=None,
+        skill_repo=None
+    ) -> Optional[str]:
+        """
+        Update user portrait (background task).
+
+        Process:
+        1. Get current portrait
+        2. Get user basic info
+        3. Get recent messages
+        4. Call LLM to generate/update portrait
+        5. Save with optimistic lock
+
+        Returns new portrait text or None on failure.
+        """
+        from .llm_orchestrator import LLMMessage
+
+        # Late imports to avoid circular dependency
+        if user_repo is None:
+            from stores import UserRepository
+            user_repo = UserRepository
+        if skill_repo is None:
+            from stores import SkillRepository
+            skill_repo = SkillRepository
+
+        try:
+            # 1. Get current portrait and metadata
+            portrait_meta = await cls.get_portrait_metadata(user_id, skill_id)
+            current_portrait = portrait_meta["portrait_text"] if portrait_meta else None
+            expected_version = portrait_meta["version"] if portrait_meta else 0
+
+            # 2. Get user basic info
+            user_data = await user_repo.get_by_id(user_id)
+            profile = await skill_repo.get_or_create_profile(user_id, skill_id)
+
+            birth_datetime = user_data.get("birth_datetime") if user_data else None
+            bazi_chart = profile.get("profile_data", {}).get("bazi", {}) if profile else {}
+
+            # 3. Get recent messages
+            messages = await skill_repo.get_recent_messages(
+                user_id, skill_id, limit=50
+            )
+
+            if not messages:
+                return None  # No messages to process
+
+            # 4. Build prompt and call LLM
+            prompt = PORTRAIT_UPDATE_PROMPT.format(
+                current_portrait=current_portrait or "这是新用户，还没有画像",
+                birth_datetime=birth_datetime or "未知",
+                bazi_chart=bazi_chart or "未排盘",
+                skill_id=skill_id,
+                message_count=len(messages),
+                recent_messages=cls._format_messages(messages)
+            )
+
+            response = await llm_orchestrator.chat(
+                [LLMMessage(role="user", content=prompt)],
+                temperature=0.3,
+                max_tokens=cls.PORTRAIT_MAX_TOKENS
+            )
+
+            new_portrait = response.content
+
+            # 5. Save portrait with optimistic lock
+            last_msg_id = messages[0]["id"] if messages else None
+
+            success = await cls._save_portrait(
+                user_id=user_id,
+                skill_id=skill_id,
+                portrait_text=new_portrait,
+                message_count=len(messages),
+                last_message_id=last_msg_id,
+                expected_version=expected_version,
+                old_portrait=current_portrait
+            )
+
+            if success:
+                return new_portrait
+            else:
+                # Optimistic lock failed, concurrent update
+                print(f"Portrait update skipped (concurrent): user={user_id}, skill={skill_id}")
+                return None
+
+        except Exception as e:
+            print(f"Portrait update failed: user={user_id}, skill={skill_id}, error={e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    async def _save_portrait(
+        user_id: UUID,
+        skill_id: str,
+        portrait_text: str,
+        message_count: int,
+        last_message_id: Optional[UUID],
+        expected_version: int,
+        old_portrait: Optional[str]
+    ) -> bool:
+        """
+        Save portrait with optimistic lock.
+        Returns True if saved successfully, False if concurrent update detected.
+        """
+        async with get_connection() as conn:
+            async with conn.transaction():
+                # Archive old portrait to history (if exists)
+                if old_portrait and expected_version > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO user_portrait_history (user_id, skill_id, portrait_text, version)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        user_id, skill_id, old_portrait, expected_version
+                    )
+
+                if expected_version == 0:
+                    # New portrait (INSERT)
+                    await conn.execute(
+                        """
+                        INSERT INTO user_portraits (
+                            user_id, skill_id, portrait_text,
+                            based_on_messages, last_message_id, version
+                        )
+                        VALUES ($1, $2, $3, $4, $5, 1)
+                        ON CONFLICT (user_id, skill_id) DO NOTHING
+                        """,
+                        user_id, skill_id, portrait_text, message_count, last_message_id
+                    )
+                    return True
+                else:
+                    # Update with optimistic lock
+                    result = await conn.execute(
+                        """
+                        UPDATE user_portraits
+                        SET portrait_text = $1,
+                            based_on_messages = based_on_messages + $2,
+                            last_message_id = $3,
+                            version = version + 1,
+                            generated_at = NOW()
+                        WHERE user_id = $4 AND skill_id = $5 AND version = $6
+                        """,
+                        portrait_text, message_count, last_message_id,
+                        user_id, skill_id, expected_version
+                    )
+
+                    return "UPDATE 1" in result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Helper Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_messages(messages: List[dict]) -> str:
+        """Format messages for portrait prompt"""
+        formatted = []
+        for msg in messages[-30:]:  # Limit to last 30 messages
+            role = "用户" if msg["role"] == "user" else "Vibe"
+            content = msg["content"][:200]  # Truncate long messages
+            formatted.append(f"[{role}]: {content}")
+        return "\n".join(formatted)
+
+    @staticmethod
+    def get_default_portrait() -> str:
+        """Get default portrait for new users"""
+        return PORTRAIT_INIT_TEXT

@@ -1,0 +1,594 @@
+/**
+ * API Layer - 与后端 Soul OS API 通信
+ *
+ * 后端 API 格式: { ok: boolean, data?: T, error?: { code, message, detail } }
+ */
+
+import { parseJsonEventStream, uiMessageChunkSchema, consumeStream } from 'ai'
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
+const BASE_PATH = '/new' // Must match next.config.ts basePath
+
+// Cookie helper
+function getCookie(name: string): string {
+  if (typeof document === 'undefined') return ''
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name.replace(/[-.]/g, '\\$&')}=([^;]*)`))
+  return match ? decodeURIComponent(match[1]) : ''
+}
+
+// CSRF headers
+function csrfHeaders(): Record<string, string> {
+  const csrf = getCookie('fortune_csrf')
+  return csrf ? { 'X-CSRF-Token': csrf } : {}
+}
+
+// Generic API response type
+interface ApiResponse<T> {
+  ok: boolean
+  data?: T
+  error?: {
+    code: string
+    message: string
+    detail?: Record<string, unknown>
+  }
+}
+
+// Fetch with auth
+async function fetchApi<T>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...csrfHeaders(),
+    ...(options.headers as Record<string, string> || {}),
+  }
+
+  const res = await fetch(`${API_BASE}${url}`, {
+    ...options,
+    headers,
+    credentials: 'include', // Send cookies
+  })
+
+  const json: ApiResponse<T> = await res.json().catch(() => ({ ok: false }))
+
+  if (!res.ok || !json.ok) {
+    if (res.status === 401 || res.status === 403) {
+      // Redirect to login (with basePath)
+      if (typeof window !== 'undefined') {
+        window.location.href = '/new/login'
+      }
+      throw new Error('Unauthorized')
+    }
+    throw new Error(json.error?.message || 'Request failed')
+  }
+
+  return json.data as T
+}
+
+// =============================================================================
+// Dashboard API Types
+// =============================================================================
+
+export interface StateScore {
+  score: number
+  breakdown: {
+    emotion: number
+    action: number
+    streak: number
+  }
+  recovery_action: string | null
+}
+
+export interface PermaScore {
+  score: number
+  trend?: 'up' | 'down' | 'stable'
+}
+
+export interface PermaData {
+  positive_emotion: PermaScore
+  engagement: PermaScore
+  relationships: PermaScore
+  meaning: PermaScore
+  accomplishment: PermaScore
+}
+
+export interface TaskItem {
+  task_id: string
+  title: string
+  status: 'suggested' | 'active' | 'done' | 'skipped'
+  commitment_type?: 'start_task' | 'schedule_task'
+  minutes?: number
+  if_then?: string
+}
+
+export interface RiskAlert {
+  type: string
+  message: string
+}
+
+export interface OverviewData {
+  insight: string
+  state_score: StateScore
+  perma: PermaData
+  today_tasks: TaskItem[]
+  risk_alerts: RiskAlert[]
+}
+
+export interface L0Translation {
+  concept: string
+  translation: string
+  action: string
+}
+
+export interface L0Facts {
+  day_master: string
+  strength: string
+  translations: L0Translation[]
+}
+
+export interface L1Schema {
+  perma_snapshot: PermaData
+  cognitive_patterns: {
+    identified_schemas: string[]
+    reframe_count?: number
+  }
+  strengths_in_use: string[]
+}
+
+export interface StatusData {
+  l0_facts: L0Facts
+  l1_schema: L1Schema
+  state_score: StateScore
+}
+
+export interface TrendPoint {
+  date: string
+  score: number
+}
+
+export interface TrendEvent {
+  date: string
+  type: string
+  title: string
+}
+
+export interface TrendsData {
+  state_score_history: TrendPoint[]
+  events: TrendEvent[]
+}
+
+export interface TasksData {
+  active: TaskItem[]
+  suggested: TaskItem[]
+  completed_recent: TaskItem[]
+}
+
+export interface RelationItem {
+  id: string
+  name: string
+  type: string
+  compatibility?: number
+}
+
+export interface RelationsData {
+  relations: RelationItem[]
+}
+
+export interface ExploreItem {
+  id: string
+  title: string
+  type: 'mystic' | 'course' | 'artifact'
+  description?: string
+}
+
+export interface ExploreData {
+  mystic_entries: ExploreItem[]
+  courses: ExploreItem[]
+  artifacts: ExploreItem[]
+}
+
+export interface CheckinResponse {
+  insight: string
+  action: {
+    content: string
+    minutes: number
+    if_then: string
+  }
+  state_score: StateScore
+}
+
+// =============================================================================
+// Dashboard API Functions
+// =============================================================================
+
+export async function fetchOverview(): Promise<OverviewData> {
+  return fetchApi<OverviewData>('/api/dashboard/overview')
+}
+
+export async function fetchStatus(): Promise<StatusData> {
+  return fetchApi<StatusData>('/api/dashboard/status')
+}
+
+export async function fetchTrends(days: number = 7): Promise<TrendsData> {
+  return fetchApi<TrendsData>(`/api/dashboard/trends?days=${days}`)
+}
+
+export async function fetchTasks(): Promise<TasksData> {
+  return fetchApi<TasksData>('/api/dashboard/tasks')
+}
+
+export async function fetchRelations(): Promise<RelationsData> {
+  return fetchApi<RelationsData>('/api/dashboard/relations')
+}
+
+export async function fetchExplore(): Promise<ExploreData> {
+  return fetchApi<ExploreData>('/api/dashboard/explore')
+}
+
+// Task Actions
+export async function acceptTask(
+  taskId: string,
+  commitmentType: 'start_task' | 'schedule_task' = 'start_task'
+): Promise<{ commitment_id: string; status: string }> {
+  return fetchApi('/api/dashboard/task/accept', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId, commitment_type: commitmentType }),
+  })
+}
+
+export async function completeTask(
+  taskId: string,
+  note: string = ''
+): Promise<{ status: string; state_score: StateScore }> {
+  return fetchApi('/api/dashboard/task/done', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId, note }),
+  })
+}
+
+export async function skipTask(
+  taskId: string,
+  reason: string = ''
+): Promise<{ status: string }> {
+  return fetchApi('/api/dashboard/task/skip', {
+    method: 'POST',
+    body: JSON.stringify({ task_id: taskId, reason }),
+  })
+}
+
+// Checkin
+export async function submitCheckin(
+  mood: string,
+  intensity: number,
+  note: string = ''
+): Promise<CheckinResponse> {
+  return fetchApi('/api/dashboard/checkin', {
+    method: 'POST',
+    body: JSON.stringify({ mood, intensity, note }),
+  })
+}
+
+// =============================================================================
+// Chat API
+// =============================================================================
+
+// AI SDK 6.0: Always use the new Agent Runtime (Next.js)
+// Legacy FastAPI streaming has been removed
+
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  timestamp?: string
+  toolInvocations?: ToolInvocation[]
+}
+
+export interface ToolInvocation {
+  toolCallId: string
+  toolName: string
+  args: Record<string, unknown>
+  result?: unknown
+}
+
+export interface SendChatRequest {
+  message: string
+  session_id?: string
+  command?: string
+}
+
+export interface SendChatResponse {
+  session_id: string
+  reply: string
+  ui_components?: unknown[]
+  toolInvocations?: ToolInvocation[]
+}
+
+export async function sendChatMessage(
+  message: string,
+  sessionId?: string
+): Promise<SendChatResponse> {
+  const result = await fetchApi<{
+    session_id: string
+    assistant_message?: { role: string; a2ui?: unknown }
+    suggested_tasks?: unknown[]
+  }>('/api/chat/send', {
+    method: 'POST',
+    body: JSON.stringify({ text: message, session_id: sessionId }),
+  })
+
+  // Extract reply from a2ui response
+  const a2ui = result.assistant_message?.a2ui as { ui_components?: Array<{ type: string; data: string }> } | undefined
+  const markdownComponent = a2ui?.ui_components?.find(c => c.type === 'markdown_text')
+  const reply = markdownComponent?.data || ''
+
+  return {
+    session_id: result.session_id,
+    reply,
+    ui_components: a2ui?.ui_components,
+  }
+}
+
+// =============================================================================
+// Auth API
+// =============================================================================
+
+export interface LoginRequest {
+  email: string
+  password: string
+}
+
+export interface LoginResponse {
+  user_id: number
+  email: string
+}
+
+export interface RegisterRequest {
+  email: string
+  password: string
+  name: string
+  gender: string
+  birthday_local: string
+  tz_offset_hours: number
+  location: {
+    name: string
+    longitude: number
+    latitude: number
+  }
+}
+
+export interface RegisterResponse {
+  user_id: number
+  email: string
+  profile_summary: {
+    name: string
+    gender: string
+    location_name: string
+  }
+}
+
+export interface UserInfo {
+  user_id: number
+  email: string
+  name: string
+  persona_style: string
+}
+
+export type ChatBackend = 'agent_service' | 'fastapi'
+
+export interface UserPreferences {
+  persona_style: 'standard' | 'warm' | 'roast'
+  push_enabled: boolean
+  push_time: string
+  quiet_hours_start: string
+  quiet_hours_end: string
+  chat_backend: ChatBackend
+}
+
+export async function login(email: string, password: string): Promise<LoginResponse> {
+  const res = await fetch(`${API_BASE}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ email, password }),
+  })
+  const json = await res.json()
+  if (!res.ok || !json.ok) {
+    throw new Error(json.error?.message || 'Login failed')
+  }
+  return json.data
+}
+
+export async function register(data: RegisterRequest): Promise<RegisterResponse> {
+  const res = await fetch(`${API_BASE}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(data),
+  })
+  const json = await res.json()
+  if (!res.ok || !json.ok) {
+    throw new Error(json.error?.message || 'Register failed')
+  }
+  return json.data
+}
+
+export async function logout(): Promise<void> {
+  await fetchApi('/api/auth/logout', { method: 'POST' })
+}
+
+export async function fetchMe(): Promise<UserInfo> {
+  return fetchApi<UserInfo>('/api/auth/me')
+}
+
+export async function fetchPreferences(): Promise<UserPreferences> {
+  return fetchApi<UserPreferences>('/api/user/preferences')
+}
+
+export async function updatePreferences(
+  patch: Partial<Pick<UserPreferences, 'persona_style' | 'push_enabled' | 'push_time' | 'quiet_hours_start' | 'quiet_hours_end' | 'chat_backend'>>
+): Promise<void> {
+  await fetchApi('/api/user/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+}
+
+// Agent Runtime streaming (Vercel AI SDK 6.0 UI Message Stream)
+export function streamChatMessageNew(
+  message: string,
+  sessionId: string | undefined,
+  command: string | undefined,
+  onChunk: (chunk: string) => void,
+  onToolCall: (toolInvocation: ToolInvocation) => void,
+  onDone: (fullResponse: SendChatResponse) => void,
+  onError: (error: Error) => void
+): () => void {
+  const controller = new AbortController()
+
+  // Use async IIFE to handle async/await properly
+  ;(async () => {
+    try {
+      const response = await fetch(`${BASE_PATH}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          session_id: sessionId || null,
+          message,
+          command: command || null,
+        }),
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '')
+        throw new Error(`Request failed (${response.status}): ${errorText.slice(0, 200)}`)
+      }
+
+      // Get session info from headers
+      const resolvedSessionId = response.headers.get('X-Session-Id') || sessionId || ''
+
+      if (!response.body) {
+        throw new Error('No response body')
+      }
+
+      let fullContent = ''
+      const toolInvocations: ToolInvocation[] = []
+
+      // Use AI SDK 6.0 official stream parser
+      // parseJsonEventStream parses SSE into JSON chunks validated by uiMessageChunkSchema
+      const chunkStream = parseJsonEventStream({
+        stream: response.body,
+        schema: uiMessageChunkSchema,
+      })
+
+      await consumeStream({
+        stream: chunkStream.pipeThrough(
+          new TransformStream({
+            transform(part, ctrl) {
+              if (!part.success) {
+                console.warn('[chat] Failed to parse chunk:', part.error)
+                return
+              }
+
+              const chunk = part.value
+
+              switch (chunk.type) {
+                case 'text-delta':
+                  // Streaming text chunk
+                  fullContent += chunk.delta
+                  onChunk(chunk.delta)
+                  break
+
+                case 'tool-input-available':
+                  // AI SDK 6.0: Tool call with input available
+                  {
+                    const invocation: ToolInvocation = {
+                      toolCallId: chunk.toolCallId,
+                      toolName: chunk.toolName,
+                      args: chunk.input as Record<string, unknown>,
+                      result: undefined,
+                    }
+                    toolInvocations.push(invocation)
+                    onToolCall(invocation)
+                  }
+                  break
+
+                case 'tool-output-available':
+                  // AI SDK 6.0: Tool output available
+                  {
+                    const existingIdx = toolInvocations.findIndex(
+                      (t) => t.toolCallId === chunk.toolCallId
+                    )
+                    if (existingIdx >= 0) {
+                      toolInvocations[existingIdx].result = chunk.output
+                      onToolCall(toolInvocations[existingIdx])
+                    } else {
+                      // Tool output without prior call - create a new entry
+                      const invocation: ToolInvocation = {
+                        toolCallId: chunk.toolCallId,
+                        toolName: 'unknown',
+                        args: {},
+                        result: chunk.output,
+                      }
+                      toolInvocations.push(invocation)
+                      onToolCall(invocation)
+                    }
+                  }
+                  break
+
+                case 'error':
+                  throw new Error(chunk.errorText)
+
+                // Ignore other chunk types (text-start, step-start, finish, etc.)
+                default:
+                  break
+              }
+            },
+          })
+        ),
+        onError: (error) => {
+          throw error
+        },
+      })
+
+      // Stream complete
+      onDone({
+        session_id: resolvedSessionId,
+        reply: fullContent,
+        toolInvocations: toolInvocations.length > 0 ? toolInvocations : undefined,
+      })
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        onError(err as Error)
+      }
+    }
+  })()
+
+  return () => controller.abort()
+}
+
+// Stream chat using AI SDK 6.0 Agent Runtime
+export function streamChat(
+  message: string,
+  sessionId: string | undefined,
+  options: {
+    command?: string
+    onChunk: (chunk: string) => void
+    onToolCall?: (toolInvocation: ToolInvocation) => void
+    onDone: (fullResponse: SendChatResponse) => void
+    onError: (error: Error) => void
+  }
+): () => void {
+  return streamChatMessageNew(
+    message,
+    sessionId,
+    options.command,
+    options.onChunk,
+    options.onToolCall || (() => {}),
+    options.onDone,
+    options.onError
+  )
+}

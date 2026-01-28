@@ -1,0 +1,120 @@
+-- ═══════════════════════════════════════════════════════════════
+-- VIBELIFE DATABASE SCHEMA - USER PORTRAITS & INSIGHT ENHANCEMENT
+-- Version: 003
+-- Description: Hot & Cold Memory System for User Data Context
+-- Design Doc: docs/user-data-context-design.md
+-- ═══════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────────
+-- USER PORTRAITS (Hot Memory)
+-- ─────────────────────────────────────────────────────────────────
+-- Core: LLM-generated natural language portrait for each user per skill
+-- Structure: Facts/State/Preferences/Focus format
+-- Update: Every 10 messages via background task
+
+CREATE TABLE IF NOT EXISTS user_portraits (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES vibe_users(id) ON DELETE CASCADE,
+    skill_id VARCHAR(50) NOT NULL,
+
+    -- Core: LLM-generated structured portrait text
+    -- Format: ## Facts | ## State | ## Preferences | ## Focus
+    portrait_text TEXT NOT NULL,
+
+    -- Metadata for incremental updates
+    based_on_messages INT DEFAULT 0,      -- Total messages processed
+    last_message_id UUID,                  -- Last processed message ID
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
+    version INT DEFAULT 1,                 -- Optimistic lock version
+
+    UNIQUE(user_id, skill_id),
+    CREATED_AT TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Portrait history for tracking evolution (optional, for analysis)
+CREATE TABLE IF NOT EXISTS user_portrait_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES vibe_users(id) ON DELETE CASCADE,
+    skill_id VARCHAR(50) NOT NULL,
+    portrait_text TEXT NOT NULL,
+    version INT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for portraits
+CREATE INDEX IF NOT EXISTS idx_portraits_user_skill ON user_portraits(user_id, skill_id);
+CREATE INDEX IF NOT EXISTS idx_portrait_history_user ON user_portrait_history(user_id, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────
+-- SKILL INSIGHTS ENHANCEMENT (Cold Memory)
+-- ─────────────────────────────────────────────────────────────────
+-- Add embedding column for vector search
+-- Enables cross-skill RAG retrieval (Phase 1.5)
+
+ALTER TABLE skill_insights
+ADD COLUMN IF NOT EXISTS embedding vector(3072);
+
+-- Vector index for similarity search (ivfflat)
+-- Note: Requires pgvector extension (already enabled in 001_init.sql)
+CREATE INDEX IF NOT EXISTS idx_skill_insights_embedding
+ON skill_insights USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Compound index for user insights query
+CREATE INDEX IF NOT EXISTS idx_skill_insights_user_embedding
+ON skill_insights(user_id) WHERE embedding IS NOT NULL;
+
+-- ─────────────────────────────────────────────────────────────────
+-- HELPER FUNCTIONS
+-- ─────────────────────────────────────────────────────────────────
+
+-- Function to search relevant insights by embedding similarity
+CREATE OR REPLACE FUNCTION search_user_insights(
+    p_user_id UUID,
+    p_query_embedding vector(3072),
+    p_limit INT DEFAULT 3,
+    p_threshold FLOAT DEFAULT 0.75,
+    p_skill_id VARCHAR(50) DEFAULT NULL
+)
+RETURNS TABLE (
+    id UUID,
+    skill_id VARCHAR(50),
+    insight_type VARCHAR(50),
+    title VARCHAR(255),
+    content TEXT,
+    similarity FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        si.id,
+        si.skill_id,
+        si.insight_type,
+        si.title,
+        si.content,
+        (1 - (si.embedding <=> p_query_embedding))::FLOAT as similarity
+    FROM skill_insights si
+    WHERE si.user_id = p_user_id
+      AND si.embedding IS NOT NULL
+      AND (p_skill_id IS NULL OR si.skill_id = p_skill_id)
+      AND (1 - (si.embedding <=> p_query_embedding)) > p_threshold
+    ORDER BY si.embedding <=> p_query_embedding
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ─────────────────────────────────────────────────────────────────
+-- RESERVED SKILL_IDs
+-- ─────────────────────────────────────────────────────────────────
+-- The following skill_id values are reserved for future use:
+-- 'global'   - Global aggregated portrait (Phase 2)
+-- 'vibecore' - Core universal portrait (backup)
+
+COMMENT ON TABLE user_portraits IS
+'Hot Memory: LLM-generated user portraits per skill. Reserved skill_ids: global, vibecore';
+
+COMMENT ON COLUMN skill_insights.embedding IS
+'Cold Memory: Vector embedding for RAG retrieval. Dimension: 3072 (Gemini)';
+
+-- Done
+SELECT 'User portraits schema initialized successfully' as result;

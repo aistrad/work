@@ -1,0 +1,656 @@
+"""
+TriggerDetector - 触发条件检测器
+
+支持三种触发类型:
+1. time_based - 基于时间 (cron 表达式)
+2. event_based - 基于事件 (节气、月相、生日、大运交接等)
+3. threshold_based - 基于阈值 (运势分数等)
+
+设计原则:
+- 从 unified_profiles 读取数据
+- 支持 Skill 级自定义事件
+- 智能化: 事件触发 + 阈值触发
+"""
+
+import logging
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, Optional, Tuple, List
+
+import pytz
+
+from skills.zodiac.services.events import ZodiacEvents
+
+logger = logging.getLogger(__name__)
+
+
+class TriggerDetector:
+    """触发条件检测器"""
+
+    def __init__(self):
+        self._event_detectors = {
+            "birthday": self._detect_birthday,
+            "dayun_change": self._detect_dayun_change,
+            "new_year": self._detect_new_year,
+            "solar_term": self._detect_solar_term,
+            "lunar_phase": self._detect_lunar_phase,
+            "mercury_retrograde": self._detect_mercury_retrograde,
+            "significant_transit": self._detect_significant_transit,
+            # Lifecoach 事件
+            "streak_broken": self._detect_streak_broken,
+        }
+
+        # Lifecoach 条件检查器 (用于 reminders.yaml conditions)
+        self._condition_checkers = {
+            "has_data": self._check_has_data,
+            "not_checked_in_today": self._check_not_checked_in_today,
+            "checked_in_today": self._check_checked_in_today,
+            "has_weekly_data": self._check_has_weekly_data,
+            "not_reviewed_this_week": self._check_not_reviewed_this_week,
+            "not_planned_this_week": self._check_not_planned_this_week,
+            "has_pending_levers": self._check_has_pending_levers,
+            "had_streak": self._check_had_streak,
+        }
+
+    async def should_trigger(
+        self,
+        trigger_config: Dict[str, Any],
+        profile: Dict[str, Any],
+        skill_id: str,
+        conditions: Optional[List[Dict]] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        检测是否应该触发
+
+        Args:
+            trigger_config: 触发配置 (type, schedule 等)
+            profile: 用户 profile
+            skill_id: Skill ID
+            conditions: 额外条件列表 (来自 reminders.yaml)
+
+        Returns:
+            (should_trigger, event_info)
+            - should_trigger: 是否触发
+            - event_info: 事件信息 (event_name, event_date 等)
+        """
+        trigger_type = trigger_config.get("type")
+
+        # 1. 检查触发条件
+        if trigger_type == "time_based":
+            triggered = self._check_time_based(trigger_config, profile)
+            event_info = None
+        elif trigger_type == "event_based":
+            triggered, event_info = await self._check_event_based(trigger_config, profile, skill_id)
+        elif trigger_type == "threshold_based":
+            triggered, event_info = await self._check_threshold_based(trigger_config, profile, skill_id)
+        else:
+            return False, None
+
+        if not triggered:
+            return False, None
+
+        # 2. 检查额外条件 (所有条件必须满足)
+        if conditions:
+            for condition in conditions:
+                if not await self._check_condition(condition, profile, skill_id):
+                    return False, None
+
+        return True, event_info
+
+    async def _check_condition(
+        self,
+        condition: Dict[str, Any],
+        profile: Dict[str, Any],
+        skill_id: str,
+    ) -> bool:
+        """检查单个条件"""
+        condition_type = condition.get("type")
+        checker = self._condition_checkers.get(condition_type)
+
+        if not checker:
+            logger.warning(f"Unknown condition type: {condition_type}")
+            return True  # 未知条件默认通过
+
+        try:
+            return await checker(condition, profile, skill_id)
+        except Exception as e:
+            logger.error(f"Failed to check condition {condition_type}: {e}")
+            return False
+
+    def _check_time_based(self, config: Dict, profile: Dict) -> bool:
+        """
+        检查时间触发条件
+
+        支持简化的 cron 格式: "0 4 * * *" (分 时 日 月 周)
+        """
+        schedule = config.get("schedule", "")
+        timezone_aware = config.get("timezone_aware", True)
+
+        if not schedule:
+            return False
+
+        # 获取用户时区
+        if timezone_aware:
+            user_tz = profile.get("preferences", {}).get("timezone", "Asia/Shanghai")
+            try:
+                now = datetime.now(pytz.timezone(user_tz))
+            except Exception:
+                now = datetime.now(pytz.timezone("Asia/Shanghai"))
+        else:
+            now = datetime.now(pytz.UTC)
+
+        # 解析 cron 表达式
+        return self._match_cron(schedule, now)
+
+    def _match_cron(self, schedule: str, now: datetime) -> bool:
+        """匹配简化的 cron 表达式"""
+        try:
+            parts = schedule.split()
+            if len(parts) != 5:
+                return False
+
+            minute, hour, day, month, weekday = parts
+
+            # 检查各字段
+            if minute != "*" and int(minute) != now.minute:
+                return False
+            if hour != "*" and int(hour) != now.hour:
+                return False
+            if day != "*" and int(day) != now.day:
+                return False
+            if month != "*" and int(month) != now.month:
+                return False
+            if weekday != "*" and int(weekday) != now.weekday():
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to parse cron schedule '{schedule}': {e}")
+            return False
+
+    async def _check_event_based(
+        self,
+        config: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检查事件触发条件"""
+        event = config.get("event")
+        advance_days = config.get("advance_days", [0])
+
+        # 确保 advance_days 是列表
+        if isinstance(advance_days, int):
+            advance_days = [advance_days]
+
+        detector = self._event_detectors.get(event)
+        if not detector:
+            logger.warning(f"Unknown event type: {event}")
+            return False, None
+
+        return await detector(profile, advance_days, skill_id)
+
+    async def _check_threshold_based(
+        self,
+        config: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检查阈值触发条件"""
+        metric = config.get("metric")
+        condition = config.get("condition")
+        threshold = config.get("threshold")
+        cooldown = config.get("cooldown", 0)
+
+        # 获取指标值
+        value = await self._get_metric_value(metric, profile, skill_id)
+        if value is None:
+            return False, None
+
+        # TODO: 检查冷却期 (需要记录上次触发时间)
+
+        # 检查条件
+        triggered = False
+        if condition == "<":
+            triggered = value < threshold
+        elif condition == ">":
+            triggered = value > threshold
+        elif condition == "<=":
+            triggered = value <= threshold
+        elif condition == ">=":
+            triggered = value >= threshold
+        elif condition == "==":
+            triggered = value == threshold
+
+        if triggered:
+            return True, {"metric": metric, "value": value, "threshold": threshold}
+
+        return False, None
+
+    async def _get_metric_value(
+        self,
+        metric: str,
+        profile: Dict,
+        skill_id: str,
+    ) -> Optional[float]:
+        """获取指标值"""
+        if metric == "daily_fortune_score":
+            # 计算今日运势分数
+            from skills.bazi.services import BaziComputer
+            computer = BaziComputer()
+            return await computer.get_daily_fortune_score(profile)
+
+        # 可扩展其他指标
+        return None
+
+    # ═════════════════���═════════════════════════════════════════════════════════
+    # 事件检测器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _detect_birthday(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测生日"""
+        identity = profile.get("identity", {})
+        birth_info = identity.get("birth_info", {})
+        birth_date_str = birth_info.get("date")
+
+        if not birth_date_str:
+            return False, None
+
+        try:
+            birth = datetime.strptime(birth_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return False, None
+
+        today = date.today()
+        birthday_this_year = date(today.year, birth.month, birth.day)
+
+        # 如果今年生日已过，检查明年
+        if birthday_this_year < today:
+            birthday_this_year = date(today.year + 1, birth.month, birth.day)
+
+        days_until = (birthday_this_year - today).days
+
+        if days_until in advance_days:
+            event_name = "birthday" if days_until == 0 else f"birthday_{days_until}days"
+            return True, {
+                "event_name": event_name,
+                "event_date": birthday_this_year,
+                "days_until": days_until,
+            }
+
+        return False, None
+
+    async def _detect_dayun_change(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测大运交接"""
+        from skills.bazi.services import BaziComputer
+
+        computer = BaziComputer()
+        inflection_points = await computer.get_inflection_points(profile)
+
+        today = date.today()
+
+        for point in inflection_points:
+            if point.get("type") == "major_cycle_change":
+                point_year = point.get("year")
+                if point_year:
+                    # 大运交接通常在年初
+                    point_date = date(point_year, 1, 1)
+                    days_until = (point_date - today).days
+
+                    if days_until in advance_days:
+                        return True, {
+                            "event_name": point.get("title", "大运交接"),
+                            "event_date": point_date,
+                            "days_until": days_until,
+                            "point": point,
+                        }
+
+        return False, None
+
+    async def _detect_new_year(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测新年"""
+        today = date.today()
+        next_new_year = date(today.year + 1, 1, 1)
+
+        # 如果今天是元旦
+        if today.month == 1 and today.day == 1:
+            if 0 in advance_days:
+                return True, {
+                    "event_name": "new_year",
+                    "event_date": today,
+                    "days_until": 0,
+                }
+
+        days_until = (next_new_year - today).days
+
+        if days_until in advance_days:
+            return True, {
+                "event_name": "new_year",
+                "event_date": next_new_year,
+                "days_until": days_until,
+            }
+
+        return False, None
+
+    async def _detect_zodiac_event(
+        self,
+        advance_days: List[int],
+        event_types: Tuple[str, ...],
+        extra_fields: Optional[Dict[str, str]] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """通用星象事件检测器"""
+        today = date.today()
+
+        try:
+            events = ZodiacEvents.get_upcoming_events(today, days=max(advance_days) + 1)
+
+            for event in events:
+                if event.event_type in event_types:
+                    days_until = (event.start_date - today).days
+                    if days_until in advance_days:
+                        result = {
+                            "event_name": event.name,
+                            "event_date": event.start_date,
+                            "days_until": days_until,
+                        }
+                        # 添加事件特定字段
+                        if extra_fields:
+                            for key, attr in extra_fields.items():
+                                result[key] = getattr(event, attr, None) if attr != "event_type" else event.event_type
+                        return True, result
+        except Exception as e:
+            logger.error(f"Failed to detect zodiac event {event_types}: {e}")
+
+        return False, None
+
+    async def _detect_solar_term(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测节气"""
+        return await self._detect_zodiac_event(
+            advance_days,
+            ("solar_term",),
+            {"description": "description"}
+        )
+
+    async def _detect_lunar_phase(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测月相 (新月/满月)"""
+        return await self._detect_zodiac_event(
+            advance_days,
+            ("new_moon", "full_moon"),
+            {"phase": "event_type"}
+        )
+
+    async def _detect_mercury_retrograde(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测水逆"""
+        return await self._detect_zodiac_event(
+            advance_days,
+            ("mercury_retrograde",),
+            {"end_date": "end_date"}
+        )
+
+    async def _detect_significant_transit(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测重要行星过境"""
+        return await self._detect_zodiac_event(
+            advance_days,
+            ("saturn_return", "jupiter_transit", "eclipse"),
+            {"transit_type": "event_type"}
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Lifecoach 事件检测器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _detect_streak_broken(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        skill_id: str,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """检测断签事件 (v8.0 兼容层)"""
+        lifecoach = self._get_lifecoach_data(profile)
+        progress = lifecoach.get("progress", {})
+
+        last_checkin = progress.get("last_checkin_date")
+        previous_streak = progress.get("current_streak", 0)
+
+        if not last_checkin:
+            return False, None
+
+        try:
+            last_date = datetime.strptime(last_checkin, "%Y-%m-%d").date()
+            days_since = (date.today() - last_date).days
+
+            # 断签：超过1天未签到，且之前有连续签到记录
+            if days_since >= 2 and previous_streak >= 3:
+                return True, {
+                    "event_name": "streak_broken",
+                    "event_date": date.today(),
+                    "days_since_checkin": days_since,
+                    "previous_streak": previous_streak,
+                }
+        except Exception as e:
+            logger.error(f"Failed to detect streak broken: {e}")
+
+        return False, None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Lifecoach 条件检查器
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_lifecoach_data(self, profile: Dict) -> Dict:
+        """
+        获取 lifecoach 数据 (v8.0 兼容层)
+
+        优先从 skills.lifecoach 读取，回退到 life_context._paths.lifecoach.content
+        """
+        # 优先从 skills.lifecoach 读取
+        skills = profile.get("skills", {})
+        if "lifecoach" in skills and skills["lifecoach"]:
+            return skills["lifecoach"]
+
+        # 回退到 skill_data.lifecoach
+        skill_data = profile.get("skill_data", {})
+        if "lifecoach" in skill_data and skill_data["lifecoach"]:
+            return skill_data["lifecoach"]
+
+        # 回退到旧的 life_context._paths 结构
+        life_context = profile.get("life_context", {})
+        paths = life_context.get("_paths", {})
+        lifecoach_path = paths.get("lifecoach", {})
+        return lifecoach_path.get("content", lifecoach_path)
+
+    async def _check_has_data(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查指定路径是否有数据"""
+        path = condition.get("path", "")
+        if not path:
+            return False
+
+        # 解析路径 (e.g., "lifecoach.north_star.vision_statement")
+        parts = path.split(".")
+        data = profile
+
+        # 处理 life_context._paths 前缀
+        if parts[0] == "lifecoach":
+            data = self._get_lifecoach_data(profile)
+            parts = parts[1:]  # 去掉 lifecoach 前缀
+
+        for part in parts:
+            if isinstance(data, dict) and part in data:
+                data = data[part]
+            else:
+                return False
+
+        return bool(data)
+
+    def _is_checked_in_today(self, profile: Dict) -> bool:
+        """判断今天是否已签到"""
+        lifecoach = self._get_lifecoach_data(profile)
+        last_checkin = lifecoach.get("progress", {}).get("last_checkin_date")
+        return last_checkin == date.today().isoformat() if last_checkin else False
+
+    async def _check_not_checked_in_today(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查今天是否未签到"""
+        return not self._is_checked_in_today(profile)
+
+    async def _check_checked_in_today(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查今天是否已签到"""
+        return self._is_checked_in_today(profile)
+
+    async def _check_has_weekly_data(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查是否有本周数据"""
+        lifecoach = self._get_lifecoach_data(profile)
+        current = lifecoach.get("current", {})
+        week = current.get("week", {})
+
+        return bool(week.get("rocks"))
+
+    async def _check_not_reviewed_this_week(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查本周是否未复盘"""
+        lifecoach = self._get_lifecoach_data(profile)
+        journal = lifecoach.get("journal", [])
+
+        if not journal:
+            return True
+
+        # 获取本周一的日期
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+
+        # 检查是否有本周的 weekly 复盘
+        for entry in journal:
+            if entry.get("type") == "weekly":
+                entry_date_str = entry.get("date")
+                if entry_date_str:
+                    try:
+                        entry_date = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
+                        if entry_date >= monday:
+                            return False  # 本周已复盘
+                    except ValueError:
+                        continue
+
+        return True
+
+    async def _check_not_planned_this_week(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查本周是否未规划"""
+        lifecoach = self._get_lifecoach_data(profile)
+        current = lifecoach.get("current", {})
+        week = current.get("week", {})
+
+        week_start = week.get("week_start")
+        if not week_start:
+            return True
+
+        # 获取本周一的日期
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+
+        try:
+            planned_week_start = datetime.strptime(week_start, "%Y-%m-%d").date()
+            return planned_week_start < monday  # 规划日期在本周之前，说明未规划
+        except ValueError:
+            return True
+
+    async def _check_has_pending_levers(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查是否有未完成的杠杆"""
+        lifecoach = self._get_lifecoach_data(profile)
+        current = lifecoach.get("current", {})
+        daily = current.get("daily", {})
+        levers = daily.get("levers", [])
+
+        if not levers:
+            return False
+
+        # 检查今天的杠杆
+        today_str = date.today().isoformat()
+        daily_date = daily.get("date")
+
+        if daily_date != today_str:
+            return False  # 不是今天的数据
+
+        pending_count = sum(1 for lever in levers if lever.get("status") != "completed")
+        return pending_count > 0
+
+    async def _check_had_streak(
+        self,
+        condition: Dict,
+        profile: Dict,
+        skill_id: str,
+    ) -> bool:
+        """检查之前是否有连续签到记录"""
+        min_days = condition.get("min_days", 3)
+
+        lifecoach = self._get_lifecoach_data(profile)
+        progress = lifecoach.get("progress", {})
+
+        # 检查当前或历史最长连续
+        current_streak = progress.get("current_streak", 0)
+        longest_streak = progress.get("longest_streak", 0)
+
+        return max(current_streak, longest_streak) >= min_days

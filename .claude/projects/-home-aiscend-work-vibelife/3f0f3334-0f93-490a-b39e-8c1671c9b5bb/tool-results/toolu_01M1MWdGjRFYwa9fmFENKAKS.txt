@@ -1,0 +1,291 @@
+     1→"""
+     2→UserDataService - 用户数据读写服务
+     3→
+     4→职责:
+     5→1. 读取/写入/查询用户数据 (user_data_store)
+     6→2. 支持虚拟文件系统路径
+     7→3. 版本控制和乐观锁
+     8→"""
+     9→
+    10→import logging
+    11→from dataclasses import dataclass
+    12→from datetime import datetime
+    13→from typing import Any, Dict, List, Optional
+    14→from uuid import UUID
+    15→
+    16→from stores.db import get_connection
+    17→
+    18→logger = logging.getLogger(__name__)
+    19→
+    20→
+    21→@dataclass
+    22→class UserData:
+    23→    """用户数据对象"""
+    24→    id: UUID
+    25→    user_id: UUID
+    26→    data_type: str
+    27→    data_path: str
+    28→    content: Dict[str, Any]
+    29→    version: int
+    30→    created_at: datetime
+    31→    updated_at: datetime
+    32→
+    33→    def to_dict(self) -> Dict[str, Any]:
+    34→        return {
+    35→            "id": str(self.id),
+    36→            "user_id": str(self.user_id),
+    37→            "data_type": self.data_type,
+    38→            "data_path": self.data_path,
+    39→            "content": self.content,
+    40→            "version": self.version,
+    41→            "created_at": self.created_at.isoformat() if self.created_at else None,
+    42→            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+    43→        }
+    44→
+    45→
+    46→class UserDataService:
+    47→    """用户数据服务"""
+    48→
+    49→    async def read(
+    50→        self,
+    51→        user_id: UUID,
+    52→        path: str,
+    53→    ) -> Optional[UserData]:
+    54→        """
+    55→        读取用户数据
+    56→
+    57→        Args:
+    58→            user_id: 用户 ID
+    59→            path: 虚拟路径，如 "goals/2026/year"
+    60→
+    61→        Returns:
+    62→            UserData 对象，不存在返回 None
+    63→        """
+    64→        query = """
+    65→            SELECT id, user_id, data_type, data_path, content, version, created_at, updated_at
+    66→            FROM user_data_store
+    67→            WHERE user_id = $1 AND data_path = $2
+    68→        """
+    69→        try:
+    70→            async with get_connection() as conn:
+    71→                row = await conn.fetchrow(query, user_id, path)
+    72→                if row:
+    73→                    return UserData(
+    74→                        id=row["id"],
+    75→                        user_id=row["user_id"],
+    76→                        data_type=row["data_type"],
+    77→                        data_path=row["data_path"],
+    78→                        content=row["content"],
+    79→                        version=row["version"],
+    80→                        created_at=row["created_at"],
+    81→                        updated_at=row["updated_at"],
+    82→                    )
+    83→                return None
+    84→        except Exception as e:
+    85→            logger.error(f"Failed to read user data: {e}")
+    86→            raise
+    87→
+    88→    async def write(
+    89→        self,
+    90→        user_id: UUID,
+    91→        path: str,
+    92→        content: Dict[str, Any],
+    93→        data_type: Optional[str] = None,
+    94→    ) -> UserData:
+    95→        """
+    96→        写入用户数据（创建或更新）
+    97→
+    98→        Args:
+    99→            user_id: 用户 ID
+   100→            path: 虚拟路径
+   101→            content: JSON 内容
+   102→            data_type: 数据类型（可选，默认从路径推断）
+   103→
+   104→        Returns:
+   105→            更新后的 UserData 对象
+   106→        """
+   107→        # 推断 data_type
+   108→        if not data_type:
+   109→            data_type = path.split("/")[0] if "/" in path else "general"
+   110→
+   111→        query = """
+   112→            INSERT INTO user_data_store (user_id, data_type, data_path, content)
+   113→            VALUES ($1, $2, $3, $4)
+   114→            ON CONFLICT (user_id, data_path)
+   115→            DO UPDATE SET
+   116→                content = $4,
+   117→                data_type = $2,
+   118→                updated_at = NOW(),
+   119→                version = user_data_store.version + 1
+   120→            RETURNING id, user_id, data_type, data_path, content, version, created_at, updated_at
+   121→        """
+   122→        try:
+   123→            async with get_connection() as conn:
+   124→                row = await conn.fetchrow(query, user_id, data_type, path, content)
+   125→                return UserData(
+   126→                    id=row["id"],
+   127→                    user_id=row["user_id"],
+   128→                    data_type=row["data_type"],
+   129→                    data_path=row["data_path"],
+   130→                    content=row["content"],
+   131→                    version=row["version"],
+   132→                    created_at=row["created_at"],
+   133→                    updated_at=row["updated_at"],
+   134→                )
+   135→        except Exception as e:
+   136→            logger.error(f"Failed to write user data: {e}")
+   137→            raise
+   138→
+   139→    async def query(
+   140→        self,
+   141→        user_id: UUID,
+   142→        data_type: Optional[str] = None,
+   143→        path_prefix: Optional[str] = None,
+   144→        filters: Optional[Dict[str, Any]] = None,
+   145→        limit: int = 100,
+   146→    ) -> List[UserData]:
+   147→        """
+   148→        查询用户数据
+   149→
+   150→        Args:
+   151→            user_id: 用户 ID
+   152→            data_type: 数据类型过滤
+   153→            path_prefix: 路径前缀过滤，如 "goals/2026"
+   154→            filters: JSONB 过滤条件
+   155→            limit: 返回数量限制
+   156→
+   157→        Returns:
+   158→            UserData 列表
+   159→        """
+   160→        conditions = ["user_id = $1"]
+   161→        params: List[Any] = [user_id]
+   162→        param_idx = 2
+   163→
+   164→        if data_type:
+   165→            conditions.append(f"data_type = ${param_idx}")
+   166→            params.append(data_type)
+   167→            param_idx += 1
+   168→
+   169→        if path_prefix:
+   170→            conditions.append(f"data_path LIKE ${param_idx}")
+   171→            params.append(f"{path_prefix}%")
+   172→            param_idx += 1
+   173→
+   174→        if filters:
+   175→            conditions.append(f"content @> ${param_idx}")
+   176→            params.append(filters)
+   177→            param_idx += 1
+   178→
+   179→        query = f"""
+   180→            SELECT id, user_id, data_type, data_path, content, version, created_at, updated_at
+   181→            FROM user_data_store
+   182→            WHERE {' AND '.join(conditions)}
+   183→            ORDER BY updated_at DESC
+   184→            LIMIT {limit}
+   185→        """
+   186→
+   187→        try:
+   188→            async with get_connection() as conn:
+   189→                rows = await conn.fetch(query, *params)
+   190→                return [
+   191→                    UserData(
+   192→                        id=row["id"],
+   193→                        user_id=row["user_id"],
+   194→                        data_type=row["data_type"],
+   195→                        data_path=row["data_path"],
+   196→                        content=row["content"],
+   197→                        version=row["version"],
+   198→                        created_at=row["created_at"],
+   199→                        updated_at=row["updated_at"],
+   200→                    )
+   201→                    for row in rows
+   202→                ]
+   203→        except Exception as e:
+   204→            logger.error(f"Failed to query user data: {e}")
+   205→            raise
+   206→
+   207→    async def delete(
+   208→        self,
+   209→        user_id: UUID,
+   210→        path: str,
+   211→    ) -> bool:
+   212→        """
+   213→        删除用户数据
+   214→
+   215→        Args:
+   216→            user_id: 用户 ID
+   217→            path: 虚拟路径
+   218→
+   219→        Returns:
+   220→            是否删除成功
+   221→        """
+   222→        query = """
+   223→            DELETE FROM user_data_store
+   224→            WHERE user_id = $1 AND data_path = $2
+   225→            RETURNING id
+   226→        """
+   227→        try:
+   228→            async with get_connection() as conn:
+   229→                row = await conn.fetchrow(query, user_id, path)
+   230→                return row is not None
+   231→        except Exception as e:
+   232→            logger.error(f"Failed to delete user data: {e}")
+   233→            raise
+   234→
+   235→    async def list_paths(
+   236→        self,
+   237→        user_id: UUID,
+   238→        path_prefix: Optional[str] = None,
+   239→    ) -> List[str]:
+   240→        """
+   241→        列出用户的所有数据路径
+   242→
+   243→        Args:
+   244→            user_id: 用户 ID
+   245→            path_prefix: 路径前缀过滤
+   246→
+   247→        Returns:
+   248→            路径列表
+   249→        """
+   250→        if path_prefix:
+   251→            query = """
+   252→                SELECT data_path FROM user_data_store
+   253→                WHERE user_id = $1 AND data_path LIKE $2
+   254→                ORDER BY data_path
+   255→            """
+   256→            params = [user_id, f"{path_prefix}%"]
+   257→        else:
+   258→            query = """
+   259→                SELECT data_path FROM user_data_store
+   260→                WHERE user_id = $1
+   261→                ORDER BY data_path
+   262→            """
+   263→            params = [user_id]
+   264→
+   265→        try:
+   266→            async with get_connection() as conn:
+   267→                rows = await conn.fetch(query, *params)
+   268→                return [row["data_path"] for row in rows]
+   269→        except Exception as e:
+   270→            logger.error(f"Failed to list paths: {e}")
+   271→            raise
+   272→
+   273→
+   274→# ═══════════════════════════════════════════════════════════════════════════
+   275→# Singleton
+   276→# ═══════════════════════════════════════════════════════════════════════════
+   277→
+   278→_service: Optional[UserDataService] = None
+   279→
+   280→
+   281→def get_user_data_service() -> UserDataService:
+   282→    """获取单例 UserDataService"""
+   283→    global _service
+   284→    if _service is None:
+   285→        _service = UserDataService()
+   286→    return _service
+   287→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

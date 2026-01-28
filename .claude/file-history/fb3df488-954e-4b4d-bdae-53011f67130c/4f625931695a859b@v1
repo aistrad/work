@@ -1,0 +1,714 @@
+"""
+Digital Twin Service.
+
+REQ: REQ-TWIN-001 ~ REQ-TWIN-005
+Design: §3.1.1 ~ §3.1.3
+HOS-REF: §1.2, §1.3, §10.5.2
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from common.logging import get_logger
+from models.twin import (
+    DimensionScores,
+    TwinData,
+    TwinHistoryEntry,
+    TwinHistoryResponse,
+    TwinLayer,
+    TwinUpdateEvent,
+    TwinUpdateResult,
+)
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+class TwinServiceError(Exception):
+    """Base exception for twin service errors."""
+    pass
+
+
+class TwinNotFoundError(TwinServiceError):
+    """Twin not found for user."""
+    pass
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _row_to_twin(row: Dict[str, Any]) -> TwinData:
+    """Convert database row to TwinData model."""
+    dimension_scores_raw = row.get("dimension_scores") or {}
+    if isinstance(dimension_scores_raw, str):
+        dimension_scores_raw = json.loads(dimension_scores_raw)
+
+    return TwinData(
+        twin_id=row.get("twin_id"),
+        user_id=row["user_id"],
+        metadata_astrology=row.get("metadata_astrology") or {},
+        metadata_psychology=row.get("metadata_psychology") or {},
+        metadata_memory=row.get("metadata_memory") or {},
+        dynamic_astro=row.get("dynamic_astro") or {},
+        dynamic_bio=row.get("dynamic_bio") or {},
+        dynamic_social=row.get("dynamic_social") or {},
+        dynamic_emotional=row.get("dynamic_emotional") or {},
+        aura_points=row.get("aura_points") or 0,
+        overall_wellbeing=float(row.get("overall_wellbeing") or 50.0),
+        growth_streak=row.get("growth_streak") or 0,
+        dimension_scores=DimensionScores(**dimension_scores_raw),
+        compute_version=row.get("compute_version") or "v1.0",
+        last_full_refresh=row.get("last_full_refresh"),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+def _get_bazi_data_for_user(user_id: int) -> Dict[str, Any]:
+    """
+    Fetch bazi snapshot data for user.
+    Returns empty dict if no bazi data exists.
+    """
+    row = fortune_db.fetch_one(
+        """
+        SELECT facts, facts_hash, compute_version
+        FROM fortune_bazi_snapshot
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        [user_id],
+    )
+    if not row:
+        return {}
+
+    facts = row.get("facts") or {}
+    if isinstance(facts, str):
+        facts = json.loads(facts)
+
+    return {
+        "bazi": facts,
+        "facts_hash": row.get("facts_hash"),
+        "compute_version": row.get("compute_version"),
+    }
+
+
+# =============================================================================
+# TASK-1.2.1: create_twin
+# =============================================================================
+
+def create_twin(user_id: int) -> TwinData:
+    """
+    Create a new digital twin for user.
+
+    REQ: REQ-TWIN-001
+    Design: §3.1.1 步骤 1-3
+
+    - Idempotent: returns existing twin if already exists
+    - Syncs bazi data from fortune_bazi_snapshot to L1
+    - Initializes all default values
+    """
+    # Check if twin already exists (idempotent)
+    existing = fortune_db.fetch_one(
+        "SELECT * FROM fortune_digital_twin WHERE user_id = %s",
+        [user_id],
+    )
+    if existing:
+        logger.debug("twin_exists", user_id=user_id, twin_id=existing["twin_id"])
+        return _row_to_twin(existing)
+
+    # Fetch bazi data for L1 metadata
+    bazi_data = _get_bazi_data_for_user(user_id)
+
+    # Initialize default dimension scores
+    default_dimensions = {
+        "energy": 50,
+        "clarity": 50,
+        "connection": 50,
+        "growth": 50,
+        "balance": 50,
+    }
+
+    # Insert new twin
+    row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_digital_twin (
+            user_id,
+            metadata_astrology,
+            metadata_psychology,
+            metadata_memory,
+            dynamic_astro,
+            dynamic_bio,
+            dynamic_social,
+            dynamic_emotional,
+            aura_points,
+            overall_wellbeing,
+            growth_streak,
+            dimension_scores,
+            compute_version,
+            created_at,
+            updated_at
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        RETURNING *
+        """,
+        [
+            user_id,
+            json.dumps(bazi_data),  # metadata_astrology
+            json.dumps({}),  # metadata_psychology
+            json.dumps({}),  # metadata_memory
+            json.dumps({}),  # dynamic_astro
+            json.dumps({}),  # dynamic_bio
+            json.dumps({}),  # dynamic_social
+            json.dumps({}),  # dynamic_emotional
+            0,  # aura_points
+            50.0,  # overall_wellbeing
+            0,  # growth_streak
+            json.dumps(default_dimensions),  # dimension_scores
+            "v1.0",  # compute_version
+            _now_utc(),  # created_at
+            _now_utc(),  # updated_at
+        ],
+    )
+
+    if not row:
+        raise TwinServiceError(f"Failed to create twin for user {user_id}")
+
+    logger.info("twin_created", user_id=user_id, twin_id=row["twin_id"])
+    return _row_to_twin(row)
+
+
+# =============================================================================
+# TASK-1.2.2: get_twin
+# =============================================================================
+
+def get_twin(
+    user_id: int,
+    layers: Optional[List[TwinLayer]] = None,
+    auto_create: bool = True,
+) -> TwinData:
+    """
+    Get digital twin for user.
+
+    REQ: REQ-TWIN-002
+    Design: §3.1.2 步骤 1-3
+
+    Args:
+        user_id: User ID
+        layers: Optional list of layers to include (default: all)
+        auto_create: If True, create twin if not exists
+
+    Returns:
+        TwinData with requested layers
+    """
+    row = fortune_db.fetch_one(
+        "SELECT * FROM fortune_digital_twin WHERE user_id = %s",
+        [user_id],
+    )
+
+    if not row:
+        if auto_create:
+            logger.debug("twin_auto_create", user_id=user_id)
+            return create_twin(user_id)
+        raise TwinNotFoundError(f"Twin not found for user {user_id}")
+
+    twin = _row_to_twin(row)
+    logger.debug("twin_query", user_id=user_id, twin_id=twin.twin_id)
+    return twin
+
+
+def get_twin_by_layer(
+    user_id: int,
+    layer: str,
+    auto_create: bool = True,
+) -> Dict[str, Any]:
+    """
+    Get specific layer data for user's twin.
+
+    Args:
+        user_id: User ID
+        layer: Layer name ('L1', 'L2', 'L3', or 'all')
+        auto_create: If True, create twin if not exists
+
+    Returns:
+        Dict with layer data
+    """
+    twin = get_twin(user_id, auto_create=auto_create)
+
+    if layer == "all":
+        return twin.model_dump()
+    elif layer == "L1":
+        return twin.get_layer(TwinLayer.L1)
+    elif layer == "L2":
+        return twin.get_layer(TwinLayer.L2)
+    elif layer == "L3":
+        return twin.get_layer(TwinLayer.L3)
+    else:
+        raise ValueError(f"Invalid layer: {layer}")
+
+
+# =============================================================================
+# TASK-1.2.3: update_twin
+# =============================================================================
+
+def _parse_json_path(path: str) -> Tuple[str, List[str]]:
+    """
+    Parse JSON path to column name and path parts.
+
+    Example:
+        'dynamic_emotional.current_mood' -> ('dynamic_emotional', ['current_mood'])
+        'metadata_astrology.bazi.day_master' -> ('metadata_astrology', ['bazi', 'day_master'])
+    """
+    parts = path.split(".")
+    if not parts:
+        raise ValueError(f"Invalid path: {path}")
+
+    column = parts[0]
+    path_parts = parts[1:] if len(parts) > 1 else []
+
+    # Validate column name
+    valid_columns = {
+        "metadata_astrology", "metadata_psychology", "metadata_memory",
+        "dynamic_astro", "dynamic_bio", "dynamic_social", "dynamic_emotional",
+        "dimension_scores",
+    }
+    if column not in valid_columns:
+        raise ValueError(f"Invalid column in path: {column}")
+
+    return column, path_parts
+
+
+def _get_nested_value(data: Dict[str, Any], path_parts: List[str]) -> Any:
+    """Get nested value from dict using path parts."""
+    current = data
+    for part in path_parts:
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def _set_nested_value(data: Dict[str, Any], path_parts: List[str], value: Any) -> Dict[str, Any]:
+    """Set nested value in dict using path parts. Returns new dict."""
+    if not path_parts:
+        return value if isinstance(value, dict) else data
+
+    result = dict(data)
+    current = result
+
+    for i, part in enumerate(path_parts[:-1]):
+        if part not in current or not isinstance(current[part], dict):
+            current[part] = {}
+        current[part] = dict(current[part])
+        current = current[part]
+
+    current[path_parts[-1]] = value
+    return result
+
+
+def update_twin(event: TwinUpdateEvent) -> TwinUpdateResult:
+    """
+    Update digital twin data.
+
+    REQ: REQ-TWIN-003
+    Design: §3.1.3 步骤 1-5
+
+    - Uses transaction for atomicity
+    - Supports nested path updates via jsonb_set
+    - Records old_value and new_value in log
+    - Triggers L3 recalculation if L2 is updated
+    """
+    user_id = event.user_id
+    column, path_parts = _parse_json_path(event.path)
+
+    # Get current twin
+    row = fortune_db.fetch_one(
+        "SELECT * FROM fortune_digital_twin WHERE user_id = %s FOR UPDATE",
+        [user_id],
+    )
+    if not row:
+        # Auto-create twin if not exists
+        twin = create_twin(user_id)
+        row = fortune_db.fetch_one(
+            "SELECT * FROM fortune_digital_twin WHERE user_id = %s FOR UPDATE",
+            [user_id],
+        )
+
+    twin_id = row["twin_id"]
+
+    # Get current column value
+    current_data = row.get(column) or {}
+    if isinstance(current_data, str):
+        current_data = json.loads(current_data)
+
+    # Get old value
+    old_value = _get_nested_value(current_data, path_parts) if path_parts else current_data
+
+    # Set new value
+    if path_parts:
+        new_data = _set_nested_value(current_data, path_parts, event.new_value)
+    else:
+        new_data = event.new_value if isinstance(event.new_value, dict) else current_data
+
+    # Update database
+    fortune_db.execute(
+        f"""
+        UPDATE fortune_digital_twin
+        SET {column} = %s, updated_at = %s
+        WHERE twin_id = %s
+        """,
+        [json.dumps(new_data), _now_utc(), twin_id],
+    )
+
+    # Write update log
+    log_row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_twin_update_log (
+            twin_id, trigger_type, layer, path, old_value, new_value,
+            confidence, source, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING log_id
+        """,
+        [
+            twin_id,
+            event.trigger,
+            event.layer.value,
+            event.path,
+            json.dumps(old_value) if old_value is not None else None,
+            json.dumps(event.new_value),
+            event.confidence,
+            event.source,
+            _now_utc(),
+        ],
+    )
+
+    log_id = log_row["log_id"] if log_row else None
+
+    # Trigger L3 recalculation if L2 was updated
+    dimensions_recalculated = False
+    if event.layer == TwinLayer.L2:
+        recalculate_dimensions(user_id)
+        dimensions_recalculated = True
+
+    logger.info(
+        "twin_update",
+        user_id=user_id,
+        twin_id=twin_id,
+        path=event.path,
+        layer=event.layer.value,
+        trigger=event.trigger,
+    )
+
+    return TwinUpdateResult(
+        updated=True,
+        log_id=log_id,
+        old_value=old_value,
+        new_value=event.new_value,
+        dimensions_recalculated=dimensions_recalculated,
+    )
+
+
+# =============================================================================
+# TASK-1.2.4: recalculate_dimensions
+# =============================================================================
+
+def recalculate_dimensions(user_id: int) -> DimensionScores:
+    """
+    Recalculate L3 dimension scores from L2 data.
+
+    REQ: REQ-TWIN-004
+    Design: §3.1.3 步骤 4
+
+    Dimension formulas:
+    - energy: f(mood_intensity, sleep_score, activity_level)
+    - clarity: f(focus_score, stress_level, meditation_minutes)
+    - connection: f(social_interactions, buffs_received, relationship_quality)
+    - growth: f(commitments_completed, streak, learning_activities)
+    - balance: f(work_life_ratio, emotional_stability, routine_adherence)
+    """
+    row = fortune_db.fetch_one(
+        """
+        SELECT dynamic_bio, dynamic_social, dynamic_emotional,
+               aura_points, growth_streak
+        FROM fortune_digital_twin
+        WHERE user_id = %s
+        """,
+        [user_id],
+    )
+
+    if not row:
+        raise TwinNotFoundError(f"Twin not found for user {user_id}")
+
+    # Parse L2 data
+    bio = row.get("dynamic_bio") or {}
+    social = row.get("dynamic_social") or {}
+    emotional = row.get("dynamic_emotional") or {}
+    aura = row.get("aura_points") or 0
+    streak = row.get("growth_streak") or 0
+
+    if isinstance(bio, str):
+        bio = json.loads(bio)
+    if isinstance(social, str):
+        social = json.loads(social)
+    if isinstance(emotional, str):
+        emotional = json.loads(emotional)
+
+    # Calculate energy dimension
+    mood_intensity = emotional.get("mood_intensity", 5)
+    sleep_score = bio.get("sleep_score", 50)
+    activity_level = bio.get("activity_level", 50)
+    energy = (mood_intensity * 5 + sleep_score * 0.3 + activity_level * 0.2)
+    energy = max(0, min(100, energy))
+
+    # Calculate clarity dimension
+    focus_score = emotional.get("focus_score", 50)
+    stress_level = emotional.get("stress_level", 50)
+    meditation_minutes = bio.get("meditation_minutes", 0)
+    clarity = focus_score * 0.4 + (100 - stress_level) * 0.4 + min(meditation_minutes, 30) * 0.67
+    clarity = max(0, min(100, clarity))
+
+    # Calculate connection dimension
+    social_interactions = social.get("interactions_today", 0)
+    buffs_received = social.get("recent_buffs_received", 0)
+    relationship_quality = social.get("relationship_quality", 50)
+    connection = min(social_interactions * 5, 30) + min(buffs_received * 10, 30) + relationship_quality * 0.4
+    connection = max(0, min(100, connection))
+
+    # Calculate growth dimension
+    commitments_completed = social.get("commitments_completed_week", 0)
+    learning_activities = bio.get("learning_activities", 0)
+    growth = min(commitments_completed * 10, 40) + min(streak * 2, 30) + min(learning_activities * 5, 30)
+    growth = max(0, min(100, growth))
+
+    # Calculate balance dimension
+    work_life_ratio = bio.get("work_life_ratio", 50)
+    emotional_stability = 100 - abs(emotional.get("mood_volatility", 0))
+    routine_adherence = bio.get("routine_adherence", 50)
+    balance = work_life_ratio * 0.3 + emotional_stability * 0.4 + routine_adherence * 0.3
+    balance = max(0, min(100, balance))
+
+    # Create dimension scores
+    scores = DimensionScores(
+        energy=energy,
+        clarity=clarity,
+        connection=connection,
+        growth=growth,
+        balance=balance,
+    )
+
+    # Calculate overall wellbeing
+    overall = (energy + clarity + connection + growth + balance) / 5
+
+    # Update database
+    fortune_db.execute(
+        """
+        UPDATE fortune_digital_twin
+        SET dimension_scores = %s,
+            overall_wellbeing = %s,
+            updated_at = %s
+        WHERE user_id = %s
+        """,
+        [json.dumps(scores.model_dump()), overall, _now_utc(), user_id],
+    )
+
+    logger.debug("dimension_recalc", user_id=user_id, scores=scores.model_dump())
+    return scores
+
+
+# =============================================================================
+# Additional helpers
+# =============================================================================
+
+def get_twin_history(
+    user_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    trigger_type: Optional[str] = None,
+    layer: Optional[TwinLayer] = None,
+) -> TwinHistoryResponse:
+    """
+    Get twin update history.
+
+    REQ: REQ-TWIN-005
+    Design: §3.1 (扩展)
+    """
+    # Get twin_id
+    twin_row = fortune_db.fetch_one(
+        "SELECT twin_id FROM fortune_digital_twin WHERE user_id = %s",
+        [user_id],
+    )
+    if not twin_row:
+        return TwinHistoryResponse(entries=[], total_count=0, limit=limit, offset=offset)
+
+    twin_id = twin_row["twin_id"]
+
+    # Build query
+    conditions = ["twin_id = %s"]
+    params: List[Any] = [twin_id]
+
+    if trigger_type:
+        conditions.append("trigger_type = %s")
+        params.append(trigger_type)
+
+    if layer:
+        conditions.append("layer = %s")
+        params.append(layer.value)
+
+    where_clause = " AND ".join(conditions)
+
+    # Get total count
+    count_row = fortune_db.fetch_one(
+        f"SELECT COUNT(*) as cnt FROM fortune_twin_update_log WHERE {where_clause}",
+        params,
+    )
+    total_count = count_row["cnt"] if count_row else 0
+
+    # Get entries
+    params.extend([limit, offset])
+    rows = fortune_db.fetch_all(
+        f"""
+        SELECT * FROM fortune_twin_update_log
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        params,
+    )
+
+    entries = []
+    for row in rows:
+        old_val = row.get("old_value")
+        new_val = row.get("new_value")
+        if isinstance(old_val, str):
+            old_val = json.loads(old_val)
+        if isinstance(new_val, str):
+            new_val = json.loads(new_val)
+
+        entries.append(TwinHistoryEntry(
+            log_id=row["log_id"],
+            trigger_type=row["trigger_type"],
+            layer=TwinLayer(row["layer"]),
+            path=row["path"],
+            old_value=old_val,
+            new_value=new_val,
+            confidence=float(row["confidence"]),
+            source=row["source"],
+            created_at=row["created_at"],
+        ))
+
+    return TwinHistoryResponse(
+        entries=entries,
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def sync_bazi_to_twin(user_id: int) -> bool:
+    """
+    Sync latest bazi snapshot to twin's L1 metadata.
+
+    Called when bazi data is updated.
+    """
+    bazi_data = _get_bazi_data_for_user(user_id)
+    if not bazi_data:
+        return False
+
+    # Check if twin exists
+    row = fortune_db.fetch_one(
+        "SELECT twin_id FROM fortune_digital_twin WHERE user_id = %s",
+        [user_id],
+    )
+
+    if not row:
+        # Create twin with bazi data
+        create_twin(user_id)
+        return True
+
+    # Update existing twin
+    fortune_db.execute(
+        """
+        UPDATE fortune_digital_twin
+        SET metadata_astrology = %s, updated_at = %s
+        WHERE user_id = %s
+        """,
+        [json.dumps(bazi_data), _now_utc(), user_id],
+    )
+
+    logger.info("bazi_synced_to_twin", user_id=user_id)
+    return True
+
+
+def increment_aura(user_id: int, amount: int, reason: str = "action") -> int:
+    """
+    Increment user's aura points.
+
+    Returns new aura total.
+    """
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_digital_twin
+        SET aura_points = aura_points + %s, updated_at = %s
+        WHERE user_id = %s
+        RETURNING aura_points
+        """,
+        [amount, _now_utc(), user_id],
+    )
+
+    if not row:
+        # Create twin first
+        twin = create_twin(user_id)
+        row = fortune_db.execute_returning_one(
+            """
+            UPDATE fortune_digital_twin
+            SET aura_points = aura_points + %s, updated_at = %s
+            WHERE user_id = %s
+            RETURNING aura_points
+            """,
+            [amount, _now_utc(), user_id],
+        )
+
+    new_aura = row["aura_points"] if row else 0
+    logger.debug("aura_increment", user_id=user_id, amount=amount, new_total=new_aura, reason=reason)
+    return new_aura
+
+
+def increment_growth_streak(user_id: int) -> int:
+    """
+    Increment user's growth streak.
+
+    Returns new streak count.
+    """
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_digital_twin
+        SET growth_streak = growth_streak + 1, updated_at = %s
+        WHERE user_id = %s
+        RETURNING growth_streak
+        """,
+        [_now_utc(), user_id],
+    )
+
+    if not row:
+        twin = create_twin(user_id)
+        return 1
+
+    return row["growth_streak"]
+
+
+def reset_growth_streak(user_id: int) -> None:
+    """Reset user's growth streak to 0."""
+    fortune_db.execute(
+        """
+        UPDATE fortune_digital_twin
+        SET growth_streak = 0, updated_at = %s
+        WHERE user_id = %s
+        """,
+        [_now_utc(), user_id],
+    )

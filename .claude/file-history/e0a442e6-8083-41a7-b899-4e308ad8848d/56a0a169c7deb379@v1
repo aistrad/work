@@ -1,0 +1,201 @@
+"""
+数据库操作性能基准测试
+
+注意：这些测试需要真实的数据库连接
+如果 VIBELIFE_DB_URL 未设置，测试将被跳过
+"""
+import pytest
+import asyncio
+import time
+import os
+from typing import List
+from uuid import uuid4
+
+
+# 检查数据库是否可用
+DB_AVAILABLE = bool(os.getenv("VIBELIFE_DB_URL"))
+
+
+@pytest.fixture
+async def db_pool():
+    """获取数据库连接池"""
+    if not DB_AVAILABLE:
+        pytest.skip("VIBELIFE_DB_URL not set, skipping DB tests")
+
+    from stores.db import init_db, close_db, get_db
+    await init_db()
+    pool = await get_db()
+    yield pool
+    await close_db()
+
+
+@pytest.mark.skipif(not DB_AVAILABLE, reason="Database not configured")
+class TestDatabaseBenchmark:
+    """数据库性能测试"""
+
+    def test_simple_query(self, db_pool):
+        """简单查询 - 目标: < 5ms"""
+        async def query():
+            async with db_pool.acquire() as conn:
+                return await conn.fetchval("SELECT 1")
+
+        # 预热
+        asyncio.get_event_loop().run_until_complete(query())
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(query())
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[95]
+
+        print(f"\n  SELECT 1: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 5.0, f"Simple query avg {avg_ms:.3f}ms exceeds 5ms target"
+        assert p95_ms < 10.0, f"Simple query p95 {p95_ms:.3f}ms exceeds 10ms target"
+
+    def test_connection_acquire(self, db_pool):
+        """连接获取性能 - 目标: < 2ms"""
+        async def acquire():
+            async with db_pool.acquire():
+                pass
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(acquire())
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[95]
+
+        print(f"\n  Connection acquire: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 2.0, f"Connection acquire avg {avg_ms:.3f}ms exceeds 2ms target"
+
+    def test_profile_fetch(self, db_pool):
+        """Profile 查询 - 目标: < 20ms"""
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        user_id = uuid4()
+
+        async def fetch():
+            return await UnifiedProfileRepository.get_profile(user_id)
+
+        times: List[float] = []
+        for _ in range(50):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(fetch())
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[int(len(times) * 0.95)]
+
+        print(f"\n  Profile fetch: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 20.0, f"Profile fetch avg {avg_ms:.3f}ms exceeds 20ms target"
+
+    def test_concurrent_queries(self, db_pool):
+        """并发查询性能 - 20 并发"""
+        async def concurrent_queries():
+            async def single_query():
+                async with db_pool.acquire() as conn:
+                    return await conn.fetchval("SELECT pg_sleep(0.001), 1")
+
+            tasks = [single_query() for _ in range(20)]
+            return await asyncio.gather(*tasks)
+
+        times: List[float] = []
+        for _ in range(10):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(concurrent_queries())
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  20 concurrent queries: avg={avg_ms:.3f}ms")
+
+        # 20 并发 * 1ms 理论最小时间，考虑池大小 20
+        # 应该在 50ms 内完成
+        assert avg_ms < 50.0, f"Concurrent queries avg {avg_ms:.3f}ms exceeds 50ms target"
+
+    def test_pool_stats(self, db_pool):
+        """连接池状态检查"""
+        print(f"\n  Pool size: {db_pool.get_size()}")
+        print(f"  Pool min_size: {db_pool.get_min_size()}")
+        print(f"  Pool max_size: {db_pool.get_max_size()}")
+        print(f"  Pool free_size: {db_pool.get_idle_size()}")
+
+        assert db_pool.get_size() > 0, "Pool should have connections"
+        assert db_pool.get_idle_size() >= 0, "Pool should have idle connections"
+
+
+@pytest.mark.skipif(not DB_AVAILABLE, reason="Database not configured")
+class TestKnowledgeRepoBenchmark:
+    """知识库性能测试"""
+
+    def test_route_scenario(self):
+        """场景路由 (内存) - 目标: < 5ms"""
+        from services.knowledge.repository import KnowledgeRepository
+        repo = KnowledgeRepository()
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(
+                repo.route_scenario("bazi", "帮我看看八字")
+            )
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[95]
+
+        print(f"\n  route_scenario: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 5.0, f"Route scenario avg {avg_ms:.3f}ms exceeds 5ms target"
+
+    def test_search_knowledge_fulltext(self, db_pool):
+        """全文检索 - 目标: < 50ms"""
+        from services.knowledge.repository import KnowledgeRepository
+        repo = KnowledgeRepository()
+
+        times: List[float] = []
+        for _ in range(30):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(
+                repo.search_knowledge("bazi", "日主强弱分析", top_k=5)
+            )
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[int(len(times) * 0.95)]
+
+        print(f"\n  search_knowledge (fulltext): avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 50.0, f"Fulltext search avg {avg_ms:.3f}ms exceeds 50ms target"
+
+    def test_search_cases(self, db_pool):
+        """案例检索 - 目标: < 100ms"""
+        from services.knowledge.repository import KnowledgeRepository
+        repo = KnowledgeRepository()
+
+        times: List[float] = []
+        for _ in range(30):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(
+                repo.search_cases(
+                    skill_id="bazi",
+                    features={"day_master": "甲", "month_branch": "子"},
+                    top_k=3
+                )
+            )
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[int(len(times) * 0.95)]
+
+        print(f"\n  search_cases: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 100.0, f"Case search avg {avg_ms:.3f}ms exceeds 100ms target"

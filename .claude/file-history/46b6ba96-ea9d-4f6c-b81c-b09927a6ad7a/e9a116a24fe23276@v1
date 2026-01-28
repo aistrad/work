@@ -1,0 +1,266 @@
+-- Migration 021: Migrate business data to unified_profiles
+-- Created: 2026-01-20
+--
+-- Purpose: Enhance sync trigger to migrate all business data from vibe_users
+--          to unified_profiles, preparing for vibe_users to become account-only table
+--
+-- Changes:
+-- 1. Replace sync_account_to_profile() to sync ALL business fields
+-- 2. Backfill existing data (avatar_url, birth_info, timezone, language, deletion_*)
+-- 3. Add indexes for JSONB queries
+-- 4. Ensure unified_profiles record exists before syncing
+--
+-- Note: This is a zero-downtime migration - vibe_users columns remain intact
+
+BEGIN;
+
+-- ============================================================================
+-- Step 1: Enhanced sync function (replaces Migration 019)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION sync_account_to_profile_enhanced()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Ensure unified_profiles record exists
+    INSERT INTO unified_profiles (user_id, profile)
+    VALUES (NEW.id, '{}'::jsonb)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    -- Sync all business fields to unified_profiles
+    UPDATE unified_profiles
+    SET profile = jsonb_set(
+        jsonb_set(
+            jsonb_set(
+                COALESCE(profile, '{}'::jsonb),
+                '{account}',
+                jsonb_build_object(
+                    'vibe_id', NEW.vibe_id,
+                    'display_name', COALESCE(NEW.display_name, ''),
+                    'avatar_url', NEW.avatar_url,
+                    'tier', COALESCE(NEW.tier, 'free'),
+                    'status', COALESCE(NEW.status, 'active'),
+                    'deletion_requested_at', NEW.deletion_requested_at,
+                    'deletion_scheduled_at', NEW.deletion_scheduled_at
+                )
+            ),
+            '{preferences}',
+            jsonb_set(
+                jsonb_set(
+                    COALESCE(profile -> 'preferences', '{}'::jsonb),
+                    '{timezone}',
+                    to_jsonb(COALESCE(NEW.timezone, 'Asia/Shanghai'))
+                ),
+                '{language}',
+                to_jsonb(COALESCE(NEW.language, 'zh-CN'))
+            )
+        ),
+        '{birth_info}',
+        CASE
+            WHEN NEW.birth_datetime IS NOT NULL THEN
+                jsonb_build_object(
+                    'date', to_char(NEW.birth_datetime, 'YYYY-MM-DD'),
+                    'time', to_char(NEW.birth_datetime, 'HH24:MI:SS'),
+                    'place', COALESCE(NEW.birth_location, ''),
+                    'gender', COALESCE(NEW.gender, ''),
+                    'timezone', COALESCE(NEW.timezone, 'Asia/Shanghai')
+                )
+            ELSE
+                COALESCE(profile -> 'birth_info', '{}'::jsonb)
+        END
+    ),
+    updated_at = NOW()
+    WHERE user_id = NEW.id;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION sync_account_to_profile_enhanced() IS
+'Enhanced sync: migrates ALL business data from vibe_users to unified_profiles (account, birth_info, preferences)';
+
+-- ============================================================================
+-- Step 2: Replace trigger to monitor all business fields
+-- ============================================================================
+
+DROP TRIGGER IF EXISTS trigger_sync_account_to_profile ON vibe_users;
+
+CREATE TRIGGER trigger_sync_account_to_profile
+    AFTER INSERT OR UPDATE OF
+        vibe_id, display_name, avatar_url, tier, status,
+        birth_datetime, birth_location, gender,
+        timezone, language,
+        deletion_requested_at, deletion_scheduled_at
+    ON vibe_users
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_account_to_profile_enhanced();
+
+-- ============================================================================
+-- Step 3: Backfill existing data
+-- ============================================================================
+
+DO $$
+DECLARE
+    migrated_count INT;
+BEGIN
+    RAISE NOTICE 'Backfilling business data to unified_profiles...';
+
+    -- For all existing users, sync ALL fields
+    WITH updated AS (
+        UPDATE unified_profiles up
+        SET profile = (
+            SELECT jsonb_build_object(
+                'account', jsonb_build_object(
+                    'vibe_id', vu.vibe_id,
+                    'display_name', COALESCE(vu.display_name, ''),
+                    'avatar_url', vu.avatar_url,
+                    'tier', COALESCE(vu.tier, 'free'),
+                    'status', COALESCE(vu.status, 'active'),
+                    'deletion_requested_at', vu.deletion_requested_at,
+                    'deletion_scheduled_at', vu.deletion_scheduled_at
+                ),
+                'birth_info', CASE
+                    WHEN vu.birth_datetime IS NOT NULL THEN
+                        jsonb_build_object(
+                            'date', to_char(vu.birth_datetime, 'YYYY-MM-DD'),
+                            'time', to_char(vu.birth_datetime, 'HH24:MI:SS'),
+                            'place', COALESCE(vu.birth_location, ''),
+                            'gender', COALESCE(vu.gender, ''),
+                            'timezone', COALESCE(vu.timezone, 'Asia/Shanghai')
+                        )
+                    ELSE COALESCE(up.profile -> 'birth_info', '{}'::jsonb)
+                END,
+                'preferences', jsonb_set(
+                    jsonb_set(
+                        COALESCE(up.profile -> 'preferences', '{}'::jsonb),
+                        '{timezone}',
+                        to_jsonb(COALESCE(vu.timezone, 'Asia/Shanghai'))
+                    ),
+                    '{language}',
+                    to_jsonb(COALESCE(vu.language, 'zh-CN'))
+                ),
+                'state', COALESCE(up.profile -> 'state', jsonb_build_object(
+                    'focus', '[]'::jsonb,
+                    'updated_at', to_jsonb(NOW())
+                )),
+                'life_context', COALESCE(up.profile -> 'life_context', '{}'::jsonb),
+                'skill_data', COALESCE(up.profile -> 'skill_data', '{}'::jsonb),
+                'extracted', COALESCE(up.profile -> 'extracted', '{}'::jsonb)
+            )
+        ),
+        updated_at = NOW()
+        FROM vibe_users vu
+        WHERE up.user_id = vu.id
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO migrated_count FROM updated;
+
+    RAISE NOTICE '  Migrated % user profiles', migrated_count;
+END $$;
+
+-- ============================================================================
+-- Step 4: Add JSONB indexes for fast queries
+-- ============================================================================
+
+-- Index for status check (authentication)
+CREATE INDEX IF NOT EXISTS idx_profile_account_status
+    ON unified_profiles ((profile->'account'->>'status'));
+
+-- Index for vibe_id lookup
+CREATE INDEX IF NOT EXISTS idx_profile_account_vibe_id
+    ON unified_profiles ((profile->'account'->>'vibe_id'));
+
+-- Index for tier-based filtering
+CREATE INDEX IF NOT EXISTS idx_profile_account_tier
+    ON unified_profiles ((profile->'account'->>'tier'));
+
+-- GIN index for full-text search on profile
+CREATE INDEX IF NOT EXISTS idx_profile_gin
+    ON unified_profiles USING GIN (profile);
+
+COMMENT ON INDEX idx_profile_account_status IS 'Fast status check for authentication';
+COMMENT ON INDEX idx_profile_account_vibe_id IS 'Fast vibe_id lookup';
+COMMENT ON INDEX idx_profile_account_tier IS 'Fast tier-based filtering';
+COMMENT ON INDEX idx_profile_gin IS 'Full-text search on profile JSONB';
+
+-- ============================================================================
+-- Step 5: Verification
+-- ============================================================================
+
+DO $$
+DECLARE
+    total_users INT;
+    total_profiles INT;
+    with_account INT;
+    with_birth_info INT;
+    with_prefs INT;
+    missing_count INT;
+    sample_profile JSONB;
+BEGIN
+    SELECT COUNT(*) INTO total_users FROM vibe_users;
+    SELECT COUNT(*) INTO total_profiles FROM unified_profiles;
+    SELECT COUNT(*) INTO with_account FROM unified_profiles WHERE profile ? 'account';
+    SELECT COUNT(*) INTO with_birth_info
+        FROM unified_profiles
+        WHERE profile ? 'birth_info' AND (profile->'birth_info')::text != '{}'::text;
+    SELECT COUNT(*) INTO with_prefs
+        FROM unified_profiles
+        WHERE profile ? 'preferences'
+        AND profile->'preferences' ? 'timezone'
+        AND profile->'preferences' ? 'language';
+
+    -- Check for missing profiles
+    SELECT COUNT(*) INTO missing_count
+    FROM vibe_users vu
+    LEFT JOIN unified_profiles up ON vu.id = up.user_id
+    WHERE up.user_id IS NULL;
+
+    RAISE NOTICE '';
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'Migration 021 Verification:';
+    RAISE NOTICE '  Total vibe_users: %', total_users;
+    RAISE NOTICE '  Total unified_profiles: %', total_profiles;
+    RAISE NOTICE '  With account field: %', with_account;
+    RAISE NOTICE '  With birth_info: %', with_birth_info;
+    RAISE NOTICE '  With timezone+language: %', with_prefs;
+    RAISE NOTICE '  Missing profiles: %', missing_count;
+    RAISE NOTICE '========================================';
+
+    -- Show sample profile structure
+    SELECT profile INTO sample_profile
+    FROM unified_profiles
+    LIMIT 1;
+
+    IF sample_profile IS NOT NULL THEN
+        RAISE NOTICE '';
+        RAISE NOTICE 'Sample profile structure:';
+        RAISE NOTICE '  account: %', sample_profile->'account';
+        RAISE NOTICE '  birth_info: %', sample_profile->'birth_info';
+        RAISE NOTICE '  preferences: %', sample_profile->'preferences';
+    END IF;
+
+    -- Validation checks
+    IF missing_count > 0 THEN
+        RAISE WARNING 'Found % users without unified_profiles!', missing_count;
+    END IF;
+
+    IF with_account < total_profiles THEN
+        RAISE WARNING 'Some profiles missing account field!';
+    ELSIF with_prefs < total_profiles THEN
+        RAISE WARNING 'Some profiles missing preferences!';
+    ELSE
+        RAISE NOTICE '✓ All profiles successfully migrated';
+    END IF;
+END $$;
+
+-- ============================================================================
+-- Step 6: Record migration
+-- ============================================================================
+
+INSERT INTO migration_log (migration_name, description)
+VALUES (
+    '021_migrate_to_unified_profile',
+    'Enhanced sync trigger to migrate all business data (account, birth_info, preferences) from vibe_users to unified_profiles'
+)
+ON CONFLICT DO NOTHING;
+
+COMMIT;

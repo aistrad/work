@@ -1,0 +1,395 @@
+"""
+K-Line Service - Life K-Line visualization data
+Based on: vibelife spec v3.0, section 2.2.5
+
+Generates:
+1. K-Line data points for visualization
+2. Key inflection points with explanations
+3. Phase markers on timeline
+4. Integration with chat (highlight relevant nodes)
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from .fortune_calculator import (
+    FortuneCalculator,
+    MajorCycle,
+    AnnualFortune,
+    FortunePhase,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class KLinePhase:
+    """A phase marker on the K-Line"""
+    start_year: int
+    end_year: int
+    phase: FortunePhase
+    label: str
+    description: str
+    fortune_trend: str  # "up", "down", "stable"
+
+    def to_dict(self) -> dict:
+        return {
+            "start_year": self.start_year,
+            "end_year": self.end_year,
+            "phase": self.phase.value,
+            "label": self.label,
+            "description": self.description,
+            "fortune_trend": self.fortune_trend,
+        }
+
+
+@dataclass
+class InflectionPoint:
+    """A key turning point on the K-Line"""
+    year: int
+    type: str          # "major_cycle_change", "clash", "support", "peak", "trough"
+    significance: int  # 1-10
+    title: str
+    explanation: str
+    is_past: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "year": self.year,
+            "type": self.type,
+            "significance": self.significance,
+            "title": self.title,
+            "explanation": self.explanation,
+            "is_past": self.is_past,
+        }
+
+
+@dataclass
+class KLineDataPoint:
+    """A single data point for the K-Line chart"""
+    year: int
+    score: int           # 0-100
+    is_current: bool
+    phase: Optional[str] = None
+    label: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "year": self.year,
+            "score": self.score,
+            "is_current": self.is_current,
+            "phase": self.phase,
+            "label": self.label,
+        }
+
+
+@dataclass
+class KLineData:
+    """Complete K-Line data for visualization"""
+    id: UUID
+    user_id: UUID
+
+    # Data series
+    data_points: List[KLineDataPoint] = field(default_factory=list)
+    phases: List[KLinePhase] = field(default_factory=list)
+    inflection_points: List[InflectionPoint] = field(default_factory=list)
+
+    # Current state
+    current_year: int = field(default_factory=lambda: datetime.now().year)
+    current_phase: Optional[KLinePhase] = None
+    next_inflection: Optional[InflectionPoint] = None
+
+    # Summary
+    now_summary: str = ""    # Current state summary
+    next_summary: str = ""   # What's coming next
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "data_points": [p.to_dict() for p in self.data_points],
+            "phases": [p.to_dict() for p in self.phases],
+            "inflection_points": [p.to_dict() for p in self.inflection_points],
+            "current_year": self.current_year,
+            "current_phase": self.current_phase.to_dict() if self.current_phase else None,
+            "next_inflection": self.next_inflection.to_dict() if self.next_inflection else None,
+            "now_summary": self.now_summary,
+            "next_summary": self.next_summary,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# K-Line Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class KLineService:
+    """Service for generating K-Line visualization data"""
+
+    def __init__(self):
+        self._calculator = FortuneCalculator()
+
+    def generate_kline(
+        self,
+        user_id: UUID,
+        profile: Dict[str, Any],
+        year_range: tuple = None,
+    ) -> KLineData:
+        """
+        Generate complete K-Line data for a user.
+
+        Args:
+            user_id: User's ID
+            profile: User's profile with birth data
+            year_range: Optional (start, end) year range
+
+        Returns:
+            KLineData ready for visualization
+        """
+        basic = profile.get("basic", {})
+        birth_year = basic.get("birth_year", 1990)
+        day_master = basic.get("day_master_element", "wood")
+        gender = basic.get("gender", "unknown")
+
+        current_year = datetime.now().year
+
+        # Default range: birth to birth + 80 years
+        if not year_range:
+            year_range = (birth_year, birth_year + 80)
+
+        # Calculate major cycles
+        cycles = self._calculator.calculate_major_cycles(
+            birth_year=birth_year,
+            day_master_element=day_master,
+            gender=gender,
+        )
+
+        # Generate data points
+        data_points = []
+        for year in range(year_range[0], year_range[1] + 1):
+            # Get annual fortune
+            annual = self._calculator.calculate_annual_fortune(day_master, year)
+
+            # Find which cycle this year belongs to
+            cycle_score = 50
+            phase = None
+            for cycle in cycles:
+                if cycle.start_year <= year < cycle.end_year:
+                    cycle_score = cycle.fortune_score
+                    phase = cycle.phase.value
+                    break
+
+            # Blend cycle and annual scores
+            blended_score = int(cycle_score * 0.6 + annual.fortune_score * 0.4)
+
+            data_points.append(KLineDataPoint(
+                year=year,
+                score=blended_score,
+                is_current=(year == current_year),
+                phase=phase,
+            ))
+
+        # Generate phases from cycles
+        phases = []
+        for cycle in cycles:
+            trend = self._determine_trend(cycle, cycles)
+            phases.append(KLinePhase(
+                start_year=cycle.start_year,
+                end_year=cycle.end_year,
+                phase=cycle.phase,
+                label=cycle.theme,
+                description=cycle.description,
+                fortune_trend=trend,
+            ))
+
+        # Generate inflection points
+        inflection_points = self._find_inflection_points(
+            cycles, data_points, current_year
+        )
+
+        # Find current phase and next inflection
+        current_phase = None
+        for phase in phases:
+            if phase.start_year <= current_year < phase.end_year:
+                current_phase = phase
+                break
+
+        next_inflection = None
+        for point in inflection_points:
+            if point.year > current_year:
+                next_inflection = point
+                break
+
+        # Generate summaries
+        now_summary = self._generate_now_summary(current_phase, current_year)
+        next_summary = self._generate_next_summary(next_inflection)
+
+        return KLineData(
+            id=uuid4(),
+            user_id=user_id,
+            data_points=data_points,
+            phases=phases,
+            inflection_points=inflection_points,
+            current_year=current_year,
+            current_phase=current_phase,
+            next_inflection=next_inflection,
+            now_summary=now_summary,
+            next_summary=next_summary,
+        )
+
+    def get_year_detail(
+        self,
+        user_id: UUID,
+        profile: Dict[str, Any],
+        year: int,
+    ) -> Dict[str, Any]:
+        """Get detailed information for a specific year"""
+        basic = profile.get("basic", {})
+        day_master = basic.get("day_master_element", "wood")
+
+        annual = self._calculator.calculate_annual_fortune(day_master, year)
+
+        return {
+            "year": year,
+            "fortune": annual.to_dict(),
+            "is_past": year < datetime.now().year,
+            "is_current": year == datetime.now().year,
+        }
+
+    def _determine_trend(
+        self,
+        cycle: MajorCycle,
+        all_cycles: List[MajorCycle],
+    ) -> str:
+        """Determine trend direction for a cycle"""
+        idx = all_cycles.index(cycle)
+
+        if idx == 0:
+            return "stable"
+
+        prev_score = all_cycles[idx - 1].fortune_score
+        curr_score = cycle.fortune_score
+
+        if curr_score > prev_score + 10:
+            return "up"
+        elif curr_score < prev_score - 10:
+            return "down"
+        return "stable"
+
+    def _find_inflection_points(
+        self,
+        cycles: List[MajorCycle],
+        data_points: List[KLineDataPoint],
+        current_year: int,
+    ) -> List[InflectionPoint]:
+        """Find key inflection points in the K-Line"""
+        points = []
+
+        # Add cycle transitions
+        for i, cycle in enumerate(cycles):
+            if i > 0:
+                prev_cycle = cycles[i - 1]
+                significance = abs(cycle.fortune_score - prev_cycle.fortune_score) // 10
+
+                if significance >= 2:
+                    points.append(InflectionPoint(
+                        year=cycle.start_year,
+                        type="major_cycle_change",
+                        significance=min(significance, 10),
+                        title=f"大运交接 - 进入「{cycle.theme}」",
+                        explanation=f"从「{prev_cycle.theme}」转换到「{cycle.theme}」阶段",
+                        is_past=cycle.start_year < current_year,
+                    ))
+
+        # Find local peaks and troughs in data
+        for i in range(2, len(data_points) - 2):
+            point = data_points[i]
+            prev_scores = [data_points[i-1].score, data_points[i-2].score]
+            next_scores = [data_points[i+1].score, data_points[i+2].score]
+
+            # Peak detection
+            if point.score > max(prev_scores) and point.score > max(next_scores):
+                if point.score >= 75:
+                    points.append(InflectionPoint(
+                        year=point.year,
+                        type="peak",
+                        significance=7,
+                        title=f"{point.year}年 - 运势高峰",
+                        explanation="这一年整体运势较好，是把握机会的好时机",
+                        is_past=point.year < current_year,
+                    ))
+
+            # Trough detection
+            elif point.score < min(prev_scores) and point.score < min(next_scores):
+                if point.score <= 45:
+                    points.append(InflectionPoint(
+                        year=point.year,
+                        type="trough",
+                        significance=6,
+                        title=f"{point.year}年 - 调整期",
+                        explanation="这一年可能会遇到一些挑战，但也是成长的机会",
+                        is_past=point.year < current_year,
+                    ))
+
+        # Sort by year
+        points.sort(key=lambda p: p.year)
+
+        return points
+
+    def _generate_now_summary(
+        self,
+        current_phase: Optional[KLinePhase],
+        current_year: int,
+    ) -> str:
+        """Generate summary of current state"""
+        if not current_phase:
+            return f"{current_year}年，保持平稳心态，专注当下。"
+
+        phase_summaries = {
+            FortunePhase.ACCUMULATION: f"你当前处于「积累期」。{current_year}年适合学习、积攒资源。",
+            FortunePhase.BREAKTHROUGH: f"你当前处于「突破期」。{current_year}年适合尝试新事物、突破舒适区。",
+            FortunePhase.PEAK: f"你当前处于「高峰期」。{current_year}年是收获成果的好时机。",
+            FortunePhase.ADJUSTMENT: f"你当前处于「调整期」。{current_year}年适合放慢脚步、反思沉淀。",
+            FortunePhase.TRANSITION: f"你当前处于「过渡期」。{current_year}年可能有新的变化和选择。",
+            FortunePhase.FOUNDATION: f"你当前处于「基础期」。{current_year}年适合打好根基、稳扎稳打。",
+        }
+
+        return phase_summaries.get(current_phase.phase, f"{current_year}年，保持平稳心态。")
+
+    def _generate_next_summary(
+        self,
+        next_inflection: Optional[InflectionPoint],
+    ) -> str:
+        """Generate summary of what's coming next"""
+        if not next_inflection:
+            return "继续当前的节奏前进。"
+
+        years_away = next_inflection.year - datetime.now().year
+
+        if years_away <= 1:
+            return f"即将在{next_inflection.year}年迎来「{next_inflection.title}」。"
+        elif years_away <= 3:
+            return f"{years_away}年后将迎来「{next_inflection.title}」，可以开始准备。"
+        else:
+            return f"下一个关键节点在{next_inflection.year}年。"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_kline_service: Optional[KLineService] = None
+
+
+def get_kline_service() -> KLineService:
+    """Get singleton K-Line service"""
+    global _kline_service
+    if _kline_service is None:
+        _kline_service = KLineService()
+    return _kline_service

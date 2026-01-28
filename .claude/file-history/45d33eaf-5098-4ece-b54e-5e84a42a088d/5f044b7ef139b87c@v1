@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from common.logging import get_logger
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+
+router = APIRouter(prefix="/api/push", tags=["push"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+@router.get("/inbox")
+def inbox(request: Request, limit: int = 5):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    lim = int(limit or 5)
+    if lim < 1:
+        lim = 1
+    if lim > 20:
+        lim = 20
+
+    rows = fortune_db.fetch_all(
+        """
+        SELECT push_id, push_type, scheduled_at, payload
+        FROM fortune_push_event
+        WHERE user_id=%s
+          AND status='scheduled'
+          AND scheduled_at <= now()
+        ORDER BY scheduled_at ASC
+        LIMIT %s
+        """,
+        (user_id, lim),
+    )
+    if not rows:
+        return _ok({"events": []})
+
+    ids = [int(r["push_id"]) for r in rows]
+    fortune_db.execute(
+        """
+        UPDATE fortune_push_event
+        SET status='sent', sent_at=now()
+        WHERE user_id=%s AND push_id = ANY(%s)
+        """,
+        (user_id, ids),
+    )
+
+    events = [
+        {
+            "push_id": int(r["push_id"]),
+            "push_type": str(r.get("push_type") or ""),
+            "scheduled_at": str(r.get("scheduled_at") or ""),
+            "payload": r.get("payload") or {},
+        }
+        for r in rows
+    ]
+    logger.info("push delivered", extra={"operation": "push_sent", "user_id": user_id, "count": len(events)})
+    return _ok({"events": events})
+
+
+class UnsubscribeRequest(BaseModel):
+    push_enabled: bool = Field(False)
+
+
+@router.post("/subscribe")
+def subscribe(req: UnsubscribeRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    fortune_db.execute(
+        "UPDATE fortune_user_preferences SET push_enabled=%s, updated_at=now() WHERE user_id=%s",
+        (bool(req.push_enabled), user_id),
+    )
+    return _ok({"push_enabled": bool(req.push_enabled)})
+

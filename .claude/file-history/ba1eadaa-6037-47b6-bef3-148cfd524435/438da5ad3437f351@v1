@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from stores import fortune_db
+from services import bazi_facts
+
+
+router = APIRouter(prefix="/api/user", tags=["user"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+def _parse_birthday_local(text: str) -> datetime:
+    try:
+        return datetime.strptime((text or "").strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        raise ValueError("invalid_birthday_local")
+
+
+def _to_utc(local_dt: datetime, tz_offset_hours: float) -> datetime:
+    off = float(tz_offset_hours)
+    if off < -12 or off > 14:
+        raise ValueError("invalid_tz_offset_hours")
+    return (local_dt - timedelta(hours=off)).replace(tzinfo=timezone.utc)
+
+
+def _validate_location(location: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(location, dict):
+        raise ValueError("invalid_location")
+    name = str(location.get("name") or "").strip()
+    try:
+        longitude = float(location.get("longitude"))
+        latitude = float(location.get("latitude"))
+    except Exception:
+        raise ValueError("invalid_location")
+    if longitude < -180 or longitude > 180 or latitude < -90 or latitude > 90:
+        raise ValueError("invalid_location")
+    return {"name": name, "longitude": longitude, "latitude": latitude}
+
+
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    gender: str = Field(..., min_length=1)
+    birthday_local: str = Field(..., min_length=19, description="YYYY-MM-DD HH:MM:SS")
+    tz_offset_hours: float = Field(8.0)
+    location: Dict[str, Any]
+
+
+@router.get("/profile")
+def get_profile(request: Request):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    u = fortune_db.fetch_one(
+        """
+        SELECT name, gender, birthday_local, tz_offset_hours, location
+        FROM fortune_user
+        WHERE user_id=%s AND deleted_at IS NULL
+        """,
+        (user_id,),
+    )
+    if not u:
+        return _err(404, "not_found", "user_not_found")
+    p = fortune_db.fetch_one(
+        """
+        SELECT persona_style, push_enabled, push_time, quiet_hours_start, quiet_hours_end
+        FROM fortune_user_preferences
+        WHERE user_id=%s
+        """,
+        (user_id,),
+    ) or {}
+    return _ok(
+        {
+            "profile": {
+                "name": str(u.get("name") or ""),
+                "gender": str(u.get("gender") or ""),
+                "birthday_local": str(u.get("birthday_local") or ""),
+                "tz_offset_hours": float(u.get("tz_offset_hours") or 8.0),
+                "location": u.get("location") or {},
+            },
+            "preferences": {
+                "persona_style": str(p.get("persona_style") or "warm"),
+                "push_enabled": bool(p.get("push_enabled") if p.get("push_enabled") is not None else True),
+                "push_time": str(p.get("push_time") or "08:00:00"),
+                "quiet_hours_start": str(p.get("quiet_hours_start") or "22:00:00"),
+                "quiet_hours_end": str(p.get("quiet_hours_end") or "07:00:00"),
+            },
+        }
+    )
+
+
+@router.put("/profile")
+def update_profile(req: ProfileUpdateRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    gender = (req.gender or "").strip()
+    if gender not in ("男", "女"):
+        return _err(400, "invalid_request", "invalid_gender", {"field": "gender"})
+    try:
+        bday_local = _parse_birthday_local(req.birthday_local)
+        bday_utc = _to_utc(bday_local, req.tz_offset_hours)
+        loc = _validate_location(req.location)
+    except ValueError as e:
+        msg = str(e)
+        return _err(400, "invalid_request", msg, {})
+
+    facts = bazi_facts.compute_facts(
+        name=req.name.strip(),
+        gender=gender,
+        birthday_local=bday_local,
+        tz_offset_hours=float(req.tz_offset_hours),
+        location=loc,
+    )
+    digest = bazi_facts.make_bazi_digest(facts)
+    facts_json = json.dumps(facts, ensure_ascii=False)
+    facts_hash = str(facts.get("version", {}).get("facts_hash") or "")
+
+    loc_json = json.dumps(loc, ensure_ascii=False)
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """
+            UPDATE fortune_user
+            SET
+              name=%s,
+              gender=%s,
+              birthday_local=%s,
+              birthday_utc=%s,
+              tz_offset_hours=%s,
+              location=%s::jsonb,
+              bazi_digest=%s,
+              updated_at=now()
+            WHERE user_id=%s AND deleted_at IS NULL
+            RETURNING user_id
+            """,
+            (req.name.strip(), gender, bday_local, bday_utc, float(req.tz_offset_hours), loc_json, digest, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return _err(404, "not_found", "user_not_found")
+        cur.execute(
+            """
+            INSERT INTO fortune_bazi_snapshot (user_id, compute_version, facts, facts_hash)
+            VALUES (%s, %s, %s::jsonb, %s)
+            ON CONFLICT (user_id, compute_version, facts_hash) DO NOTHING
+            """,
+            (user_id, bazi_facts.BAZI_FACTS_VERSION, facts_json, facts_hash),
+        )
+    return _ok({})
+
+
+class PreferencesUpdateRequest(BaseModel):
+    persona_style: Optional[str] = Field(None, description="standard|warm|roast")
+    push_enabled: Optional[bool] = None
+    push_time: Optional[str] = Field(None, description="HH:MM:SS")
+    quiet_hours_start: Optional[str] = Field(None, description="HH:MM:SS")
+    quiet_hours_end: Optional[str] = Field(None, description="HH:MM:SS")
+    chat_backend: Optional[str] = Field(None, description="fastapi|agent_service")
+
+
+_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+
+
+@router.get("/preferences")
+def get_preferences(request: Request):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    p = fortune_db.fetch_one(
+        """
+        SELECT persona_style, push_enabled, push_time, quiet_hours_start, quiet_hours_end
+        FROM fortune_user_preferences
+        WHERE user_id=%s
+        """,
+        (user_id,),
+    )
+    if not p:
+        return _ok({"persona_style": "warm", "push_enabled": True, "push_time": "08:00:00", "quiet_hours_start": "22:00:00", "quiet_hours_end": "07:00:00"})
+    return _ok(
+        {
+            "persona_style": str(p.get("persona_style") or "warm"),
+            "push_enabled": bool(p.get("push_enabled") if p.get("push_enabled") is not None else True),
+            "push_time": str(p.get("push_time") or "08:00:00"),
+            "quiet_hours_start": str(p.get("quiet_hours_start") or "22:00:00"),
+            "quiet_hours_end": str(p.get("quiet_hours_end") or "07:00:00"),
+        }
+    )
+
+
+@router.put("/preferences")
+def update_preferences(req: PreferencesUpdateRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    persona_style = req.persona_style
+    if persona_style is not None:
+        persona_style = persona_style.strip()
+        if persona_style not in ("standard", "warm", "roast"):
+            return _err(400, "invalid_request", "invalid_persona_style", {"field": "persona_style"})
+
+    def _check_time(field: str, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        v = value.strip()
+        if not _TIME_RE.match(v):
+            raise ValueError(f"invalid_time:{field}")
+        return v
+
+    try:
+        push_time = _check_time("push_time", req.push_time)
+        q_start = _check_time("quiet_hours_start", req.quiet_hours_start)
+        q_end = _check_time("quiet_hours_end", req.quiet_hours_end)
+    except ValueError as e:
+        return _err(400, "invalid_request", str(e))
+
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_user_preferences (user_id, persona_style, push_enabled, push_time, quiet_hours_start, quiet_hours_end)
+        VALUES (
+          %s,
+          COALESCE(%s, 'warm'),
+          COALESCE(%s, TRUE),
+          COALESCE(%s::time, '08:00:00'::time),
+          COALESCE(%s::time, '22:00:00'::time),
+          COALESCE(%s::time, '07:00:00'::time)
+        )
+        ON CONFLICT (user_id) DO UPDATE SET
+          persona_style = COALESCE(EXCLUDED.persona_style, fortune_user_preferences.persona_style),
+          push_enabled = COALESCE(EXCLUDED.push_enabled, fortune_user_preferences.push_enabled),
+          push_time = COALESCE(EXCLUDED.push_time, fortune_user_preferences.push_time),
+          quiet_hours_start = COALESCE(EXCLUDED.quiet_hours_start, fortune_user_preferences.quiet_hours_start),
+          quiet_hours_end = COALESCE(EXCLUDED.quiet_hours_end, fortune_user_preferences.quiet_hours_end),
+          updated_at = now()
+        """,
+        (
+            user_id,
+            persona_style,
+            req.push_enabled,
+            push_time,
+            q_start,
+            q_end,
+        ),
+    )
+    return _ok({})

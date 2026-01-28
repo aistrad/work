@@ -1,0 +1,502 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import swisseph as swe
+from lunar_python import LunarYear, Solar
+
+from common.logging import get_logger
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+
+BAZI_FACTS_VERSION = "bazi-tts-v1"
+
+_DAY_GAN_ELEMENT = {
+    "甲": "木",
+    "乙": "木",
+    "丙": "火",
+    "丁": "火",
+    "戊": "土",
+    "己": "土",
+    "庚": "金",
+    "辛": "金",
+    "壬": "水",
+    "癸": "水",
+}
+
+_MONTH_BRANCH_SEASON_ELEMENT = {
+    "寅": "木",
+    "卯": "木",
+    "辰": "木",
+    "巳": "火",
+    "午": "火",
+    "未": "火",
+    "申": "金",
+    "酉": "金",
+    "戌": "金",
+    "亥": "水",
+    "子": "水",
+    "丑": "水",
+}
+
+_ELEMENT_REL = {
+    "木": {"generator": "水", "produces": "火", "controls": "土", "controlled_by": "金"},
+    "火": {"generator": "木", "produces": "土", "controls": "金", "controlled_by": "水"},
+    "土": {"generator": "火", "produces": "金", "controls": "水", "controlled_by": "木"},
+    "金": {"generator": "土", "produces": "水", "controls": "木", "controlled_by": "火"},
+    "水": {"generator": "金", "produces": "木", "controls": "火", "controlled_by": "土"},
+}
+
+_SHENSHA_SANHE_GROUPS = [
+    ("申子辰", {"taohua": "酉", "yima": "寅", "huagai": "辰"}),
+    ("亥卯未", {"taohua": "子", "yima": "巳", "huagai": "未"}),
+    ("寅午戌", {"taohua": "卯", "yima": "申", "huagai": "戌"}),
+    ("巳酉丑", {"taohua": "午", "yima": "亥", "huagai": "丑"}),
+]
+
+_TIANYI_BY_DAY_GAN = {
+    "甲": ["丑", "未"],
+    "戊": ["丑", "未"],
+    "庚": ["丑", "未"],
+    "乙": ["子", "申"],
+    "己": ["子", "申"],
+    "丙": ["亥", "酉"],
+    "丁": ["亥", "酉"],
+    "辛": ["寅", "午"],
+    "壬": ["卯", "巳"],
+    "癸": ["卯", "巳"],
+}
+
+_WENCHANG_BY_DAY_GAN = {
+    "甲": ["巳", "午"],
+    "乙": ["巳", "午"],
+    "丙": ["申", "酉"],
+    "丁": ["申", "酉"],
+    "戊": ["申", "酉"],
+    "己": ["申", "酉"],
+    "庚": ["亥", "子"],
+    "辛": ["亥", "子"],
+    "壬": ["寅", "卯"],
+    "癸": ["寅", "卯"],
+}
+
+
+def _dt_str(dt: datetime) -> str:
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(s: str) -> str:
+    return "sha256:" + hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class TrueSolarTime:
+    tz_meridian_deg: float
+    lon_corr_min: float
+    eot_min: float
+    true_solar_time_local: datetime
+
+
+def compute_true_solar_time(
+    *,
+    birthday_local: datetime,
+    tz_offset_hours: float,
+    longitude: float,
+) -> TrueSolarTime:
+    tz_meridian_deg = float(tz_offset_hours) * 15.0
+    lon_corr_min = (float(longitude) - tz_meridian_deg) * 4.0
+
+    birthday_utc = (birthday_local - timedelta(hours=float(tz_offset_hours))).replace(tzinfo=timezone.utc)
+    hour_decimal_utc = (
+        birthday_utc.hour
+        + birthday_utc.minute / 60.0
+        + birthday_utc.second / 3600.0
+        + birthday_utc.microsecond / 3600.0 / 1_000_000.0
+    )
+    jd_ut = swe.julday(birthday_utc.year, birthday_utc.month, birthday_utc.day, hour_decimal_utc)
+    eot_min = swe.time_equ(jd_ut) * 1440.0
+
+    corr_seconds = (lon_corr_min + eot_min) * 60.0
+    t = birthday_local + timedelta(seconds=corr_seconds)
+    true_solar_time_local = (t + timedelta(seconds=0.5)).replace(microsecond=0)  # round to nearest second
+    return TrueSolarTime(
+        tz_meridian_deg=tz_meridian_deg,
+        lon_corr_min=lon_corr_min,
+        eot_min=eot_min,
+        true_solar_time_local=true_solar_time_local,
+    )
+
+
+def _wuxing_counts(wuxing: str) -> Dict[str, int]:
+    out = {"金": 0, "木": 0, "水": 0, "火": 0, "土": 0}
+    for k in out:
+        out[k] = (wuxing or "").count(k)
+    return out
+
+
+def _season_bonus(
+    *,
+    month_branch: str,
+    day_master_element: str,
+) -> Tuple[str, int]:
+    season_element = _MONTH_BRANCH_SEASON_ELEMENT.get(month_branch, "")
+    if not season_element:
+        return "", 0
+    if season_element == day_master_element:
+        return season_element, 2
+    rel = _ELEMENT_REL[day_master_element]
+    if season_element == rel["generator"]:
+        return season_element, 1
+    if season_element == rel["controlled_by"]:
+        return season_element, -1
+    if season_element == rel["controls"]:
+        return season_element, -1
+    return season_element, 0
+
+
+def _compute_strength(
+    *,
+    wuxing_count: Dict[str, int],
+    month_branch: str,
+    day_master_element: str,
+) -> Dict[str, Any]:
+    rel = _ELEMENT_REL[day_master_element]
+    generator = rel["generator"]
+    produced = rel["produces"]
+    controlled_by = rel["controlled_by"]
+    controls = rel["controls"]
+
+    support = int(wuxing_count.get(day_master_element, 0)) + int(wuxing_count.get(generator, 0))
+    drain = int(wuxing_count.get(produced, 0)) + int(wuxing_count.get(controlled_by, 0))
+    season_element, season_bonus = _season_bonus(month_branch=month_branch, day_master_element=day_master_element)
+    score = int(support - drain + season_bonus)
+
+    if score >= 2:
+        status = "strong"
+        favorable = [produced, controls, controlled_by]
+    elif score <= -2:
+        status = "weak"
+        favorable = [day_master_element, generator]
+    else:
+        status = "neutral"
+        min_count = min(wuxing_count.values()) if wuxing_count else 0
+        favorable = [k for k, v in wuxing_count.items() if v == min_count]
+
+    return {
+        "rule_id": "RULE-STRENGTH-SCORE-V1",
+        "day_master_element": day_master_element,
+        "generator_element": generator,
+        "produced_element": produced,
+        "controls_element": controls,
+        "controlled_by_element": controlled_by,
+        "season_element": season_element,
+        "season_bonus": season_bonus,
+        "support": support,
+        "drain": drain,
+        "score": score,
+        "status": status,
+        "favorable_elements": favorable,
+    }
+
+
+def _branch_group_targets(branch: str) -> Dict[str, str]:
+    for group, targets in _SHENSHA_SANHE_GROUPS:
+        if branch in group:
+            return targets
+    return {}
+
+
+def _compute_shensha(
+    *,
+    pillars: Dict[str, str],
+    day_gan: str,
+) -> List[Dict[str, Any]]:
+    year_branch = pillars.get("year", "")[1:2]
+    day_branch = pillars.get("day", "")[1:2]
+    branches = [p[1:2] for p in pillars.values() if isinstance(p, str) and len(p) >= 2]
+    branch_set = set(branches)
+
+    targets: Dict[str, str] = {}
+    targets.update(_branch_group_targets(year_branch))
+    targets.update(_branch_group_targets(day_branch))
+
+    taohua = targets.get("taohua")
+    yima = targets.get("yima")
+    huagai = targets.get("huagai")
+
+    out: List[Dict[str, Any]] = [
+        {
+            "name": "桃花",
+            "rule_id": "RULE-SHENSHA-TAOHUA-V1",
+            "hit": bool(taohua and taohua in branch_set),
+            "note": "以日支/年支推咸池",
+        },
+        {
+            "name": "驿马",
+            "rule_id": "RULE-SHENSHA-YIMA-V1",
+            "hit": bool(yima and yima in branch_set),
+            "note": "以日支/年支推驿马",
+        },
+        {
+            "name": "华盖",
+            "rule_id": "RULE-SHENSHA-HUAGAI-V1",
+            "hit": bool(huagai and huagai in branch_set),
+            "note": "以日支/年支推华盖",
+        },
+    ]
+
+    tianyi_targets = _TIANYI_BY_DAY_GAN.get(day_gan, [])
+    out.append(
+        {
+            "name": "天乙贵人",
+            "rule_id": "RULE-SHENSHA-TIANYI-V1",
+            "hit": any(b in branch_set for b in tianyi_targets),
+            "note": "以日干推贵人",
+        }
+    )
+    wenchang_targets = _WENCHANG_BY_DAY_GAN.get(day_gan, [])
+    out.append(
+        {
+            "name": "文昌",
+            "rule_id": "RULE-SHENSHA-WENCHANG-V1",
+            "hit": any(b in branch_set for b in wenchang_targets),
+            "note": "以日干推文昌",
+        }
+    )
+    return out
+
+
+def _compute_luck(*, eight_char, gender: str) -> Dict[str, Any]:
+    gender_code = 1 if gender == "男" else 0
+    yun = eight_char.getYun(gender_code)
+    forward = bool(yun.isForward())
+    start_age_year = int(yun.getStartYear())
+
+    da_yun_items: List[Dict[str, Any]] = []
+    for dy in yun.getDaYun(10) or []:
+        gz = str(dy.getGanZhi() or "")
+        if not gz:
+            continue
+        da_yun_items.append(
+            {
+                "start_age": int(dy.getStartAge()),
+                "end_age": int(dy.getEndAge()),
+                "start_year": int(dy.getStartYear()),
+                "end_year": int(dy.getEndYear()),
+                "gan_zhi": gz,
+                "xun": str(dy.getXun() or ""),
+                "xun_kong": str(dy.getXunKong() or ""),
+            }
+        )
+
+    for idx, item in enumerate(da_yun_items, start=1):
+        item["index"] = idx
+
+    this_year = datetime.now().year
+    liu_nian_next5 = [{"year": y, "gan_zhi": LunarYear.fromYear(y).getGanZhi()} for y in range(this_year + 1, this_year + 6)]
+
+    return {
+        "forward": forward,
+        "start_age_year": start_age_year,
+        "da_yun": da_yun_items,
+        "liu_nian_next5": liu_nian_next5,
+    }
+
+
+def compute_facts(
+    *,
+    name: str,
+    gender: str,
+    birthday_local: datetime,
+    tz_offset_hours: float,
+    location: Dict[str, Any],
+) -> Dict[str, Any]:
+    if gender not in ("男", "女"):
+        raise ValueError("invalid_gender")
+    longitude = float(location["longitude"])
+    latitude = float(location["latitude"])
+
+    solar_time = compute_true_solar_time(birthday_local=birthday_local, tz_offset_hours=float(tz_offset_hours), longitude=longitude)
+    ts = solar_time.true_solar_time_local
+
+    solar = Solar.fromYmdHms(ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second)
+    lunar = solar.getLunar()
+    eight = lunar.getEightChar()
+
+    pillars = {"year": eight.getYear(), "month": eight.getMonth(), "day": eight.getDay(), "hour": eight.getTime()}
+    wuxing_concat = str(eight.getYearWuXing() or "") + str(eight.getMonthWuXing() or "") + str(eight.getDayWuXing() or "") + str(eight.getTimeWuXing() or "")
+    wuxing_count = _wuxing_counts(wuxing_concat)
+
+    day_gan = pillars["day"][0:1]
+    day_master_element = _DAY_GAN_ELEMENT.get(day_gan, "")
+    month_branch = pillars["month"][1:2]
+
+    facts_base: Dict[str, Any] = {
+        "profile": {
+            "name": str(name),
+            "gender": gender,
+            "birthday_local": _dt_str(birthday_local),
+            "tz_offset_hours": float(tz_offset_hours),
+            "location": {"name": str(location.get("name") or ""), "longitude": longitude, "latitude": latitude},
+        },
+        "solar_time": {
+            "tz_meridian_deg": round(float(solar_time.tz_meridian_deg), 4),
+            "lon_corr_min": round(float(solar_time.lon_corr_min), 4),
+            "eot_min": round(float(solar_time.eot_min), 4),
+            "true_solar_time_local": _dt_str(ts),
+        },
+        "bazi": {
+            "pillars": pillars,
+            "day_master": {"gan": day_gan, "element": day_master_element},
+            "wuxing_count": wuxing_count,
+            "shi_shen_gan": {
+                "year": str(eight.getYearShiShenGan() or ""),
+                "month": str(eight.getMonthShiShenGan() or ""),
+                "day": str(eight.getDayShiShenGan() or ""),
+                "hour": str(eight.getTimeShiShenGan() or ""),
+            },
+            "shi_shen_zhi": {
+                "year": list(eight.getYearShiShenZhi() or []),
+                "month": list(eight.getMonthShiShenZhi() or []),
+                "day": list(eight.getDayShiShenZhi() or []),
+                "hour": list(eight.getTimeShiShenZhi() or []),
+            },
+            "na_yin": {
+                "year": str(eight.getYearNaYin() or ""),
+                "month": str(eight.getMonthNaYin() or ""),
+                "day": str(eight.getDayNaYin() or ""),
+                "hour": str(eight.getTimeNaYin() or ""),
+            },
+            "di_shi": {
+                "year": str(eight.getYearDiShi() or ""),
+                "month": str(eight.getMonthDiShi() or ""),
+                "day": str(eight.getDayDiShi() or ""),
+                "hour": str(eight.getTimeDiShi() or ""),
+            },
+            "luck": _compute_luck(eight_char=eight, gender=gender),
+            "strength": _compute_strength(wuxing_count=wuxing_count, month_branch=month_branch, day_master_element=day_master_element),
+            "shensha": _compute_shensha(pillars=pillars, day_gan=day_gan),
+        },
+        "version": {"compute_version": BAZI_FACTS_VERSION},
+    }
+
+    facts_hash = _sha256_text(_canonical_json(facts_base))
+    facts_base["version"]["facts_hash"] = facts_hash
+    return facts_base
+
+
+def make_bazi_digest(facts: Dict[str, Any]) -> str:
+    try:
+        pillars = facts.get("bazi", {}).get("pillars", {})
+        y = str(pillars.get("year") or "")
+        m = str(pillars.get("month") or "")
+        d = str(pillars.get("day") or "")
+        h = str(pillars.get("hour") or "")
+        dm = facts.get("bazi", {}).get("day_master", {})
+        dm_gan = str(dm.get("gan") or "")
+        dm_el = str(dm.get("element") or "")
+        strength = facts.get("bazi", {}).get("strength", {})
+        status = str(strength.get("status") or "")
+        return f"{y}{m}{d}{h} 日主{dm_gan}{dm_el} {status}".strip()
+    except Exception:
+        return ""
+
+
+def ensure_snapshot_for_user(user_id: int) -> Dict[str, Any]:
+    user = fortune_db.fetch_one(
+        "SELECT name, gender, birthday_local, tz_offset_hours, location FROM fortune_user WHERE user_id=%s AND deleted_at IS NULL",
+        (int(user_id),),
+    )
+    if not user:
+        raise ValueError("user_not_found")
+
+    snap = fortune_db.fetch_one(
+        "SELECT facts, facts_hash, compute_version FROM fortune_bazi_snapshot WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+        (int(user_id),),
+    )
+    if snap and snap.get("facts") and snap.get("facts_hash"):
+        return {"facts": snap.get("facts") or {}, "facts_hash": str(snap.get("facts_hash") or ""), "compute_version": str(snap.get("compute_version") or "")}
+
+    # Ensure birthday_local is a datetime object (not just date)
+    birthday_local = user["birthday_local"]
+    if isinstance(birthday_local, date) and not isinstance(birthday_local, datetime):
+        birthday_local = datetime.combine(birthday_local, datetime.min.time())
+
+    facts = compute_facts(
+        name=str(user.get("name") or ""),
+        gender=str(user.get("gender") or ""),
+        birthday_local=birthday_local,
+        tz_offset_hours=float(user.get("tz_offset_hours") or 8.0),
+        location=user.get("location") or {},
+    )
+    digest = make_bazi_digest(facts)
+    facts_json = json.dumps(facts, ensure_ascii=False)
+    facts_hash = str(facts.get("version", {}).get("facts_hash") or "")
+
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO fortune_bazi_snapshot (user_id, compute_version, facts, facts_hash)
+            VALUES (%s, %s, %s::jsonb, %s)
+            ON CONFLICT (user_id, compute_version, facts_hash) DO NOTHING
+            """,
+            (int(user_id), BAZI_FACTS_VERSION, facts_json, facts_hash),
+        )
+        if digest:
+            cur.execute("UPDATE fortune_user SET bazi_digest=%s, updated_at=now() WHERE user_id=%s", (digest, int(user_id)))
+
+    logger.info(
+        "bazi facts computed",
+        extra={"operation": "bazi_facts_compute", "user_id": int(user_id), "compute_version": BAZI_FACTS_VERSION, "facts_hash": facts_hash},
+    )
+    return {"facts": facts, "facts_hash": facts_hash, "compute_version": BAZI_FACTS_VERSION}
+
+
+def upsert_snapshot_for_profile(
+    *,
+    user_id: int,
+    name: str,
+    gender: str,
+    birthday_local: datetime,
+    tz_offset_hours: float,
+    location: Dict[str, Any],
+) -> Dict[str, Any]:
+    facts = compute_facts(
+        name=name,
+        gender=gender,
+        birthday_local=birthday_local,
+        tz_offset_hours=tz_offset_hours,
+        location=location,
+    )
+    digest = make_bazi_digest(facts)
+    facts_json = json.dumps(facts, ensure_ascii=False)
+    facts_hash = str(facts.get("version", {}).get("facts_hash") or "")
+
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO fortune_bazi_snapshot (user_id, compute_version, facts, facts_hash)
+            VALUES (%s, %s, %s::jsonb, %s)
+            ON CONFLICT (user_id, compute_version, facts_hash) DO NOTHING
+            """,
+            (int(user_id), BAZI_FACTS_VERSION, facts_json, facts_hash),
+        )
+        cur.execute("UPDATE fortune_user SET bazi_digest=%s, updated_at=now() WHERE user_id=%s", (digest, int(user_id)))
+
+    logger.info(
+        "bazi facts computed",
+        extra={"operation": "bazi_facts_compute", "user_id": int(user_id), "compute_version": BAZI_FACTS_VERSION, "facts_hash": facts_hash},
+    )
+    return {"facts": facts, "facts_hash": facts_hash, "compute_version": BAZI_FACTS_VERSION}
+

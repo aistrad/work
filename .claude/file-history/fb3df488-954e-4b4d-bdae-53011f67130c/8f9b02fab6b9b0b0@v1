@@ -1,0 +1,473 @@
+"""
+Agent Tool API Routes.
+
+Internal API endpoints for Agent Service to interact with FastAPI backend.
+Uses SERVICE_TOKEN authentication instead of user session.
+
+TASK-2.1.1~2.2.6: Tool API 端点实现
+REQ: REQ-TOOL-001 ~ REQ-TOOL-006
+Design: §3.3.1 ~ §3.3.2
+HOS-REF: §10.5.2
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from common.logging import get_logger
+from models.twin import TwinLayer, TwinUpdateEvent
+from services import twin_service
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/api/agent/tool", tags=["Agent Tools"])
+
+
+# =============================================================================
+# TASK-2.1.1: Service Token Authentication
+# =============================================================================
+
+def get_service_token() -> str:
+    """Get the expected service token from environment."""
+    token = os.getenv("AGENT_SERVICE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("AGENT_SERVICE_TOKEN not configured")
+    return token
+
+
+async def verify_service_token(authorization: str = Header(...)) -> bool:
+    """
+    Verify the service token from Authorization header.
+
+    REQ: REQ-TOOL-001
+    Design: §3.3.1
+
+    Uses hmac.compare_digest to prevent timing attacks.
+    """
+    if not authorization.startswith("Bearer "):
+        logger.warning("tool_auth_fail: invalid format")
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+
+    token = authorization[7:]  # Remove "Bearer " prefix
+
+    try:
+        expected = get_service_token()
+    except RuntimeError as e:
+        logger.error("tool_auth_fail: %s", str(e))
+        raise HTTPException(status_code=500, detail="Service token not configured")
+
+    if not hmac.compare_digest(token, expected):
+        logger.warning("tool_auth_fail: invalid token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return True
+
+
+# =============================================================================
+# Request/Response Models
+# =============================================================================
+
+class ContextRequest(BaseModel):
+    """Request for GET /context"""
+    user_id: int
+    layers: List[str] = Field(default=["L1", "L2", "L3"])
+    include_recent_messages: int = Field(default=5, ge=0, le=20)
+
+
+class ContextResponse(BaseModel):
+    """Response for GET /context"""
+    user_id: int
+    twin: Dict[str, Any]
+    recent_messages: List[Dict[str, Any]]
+    active_commitments: List[Dict[str, Any]]
+    current_plan: Optional[Dict[str, Any]]
+    facts_hash: str
+
+
+class CommitmentRequest(BaseModel):
+    """Request for POST /commitment"""
+    user_id: int
+    title: str = Field(..., min_length=1, max_length=200)
+    category: str = Field(default="general")
+    aura_reward: int = Field(default=10, ge=0, le=100)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CommitmentResponse(BaseModel):
+    """Response for POST /commitment"""
+    commitment_id: str
+    status: str
+    created_at: str
+
+
+class TwinUpdateRequest(BaseModel):
+    """Request for POST /twin_update"""
+    user_id: int
+    layer: str = Field(..., description="L1, L2, or L3")
+    path: str = Field(..., description="JSON path like 'dynamic_emotional.current_mood'")
+    new_value: Any
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source: str = Field(default="agent")
+    trigger: str = Field(default="chat_insight")
+
+
+class TwinUpdateResponse(BaseModel):
+    """Response for POST /twin_update"""
+    updated: bool
+    log_id: Optional[int]
+
+
+class ShareCardRequest(BaseModel):
+    """Request for POST /share_card"""
+    user_id: int
+    card_type: Literal["daily_guidance", "insight", "achievement", "chain_invite"]
+    content: Dict[str, Any]
+
+
+class ShareCardResponse(BaseModel):
+    """Response for POST /share_card"""
+    card_id: str
+    share_url: str
+
+
+class FactsResponse(BaseModel):
+    """Response for GET /facts/{user_id}"""
+    user_id: int
+    bazi: Optional[Dict[str, Any]]
+    facts_hash: Optional[str]
+
+
+# =============================================================================
+# TASK-2.2.1: GET /context
+# =============================================================================
+
+@router.get("/context", response_model=ContextResponse)
+async def get_context(
+    user_id: int = Query(..., description="User ID"),
+    layers: str = Query(default="L1,L2,L3", description="Comma-separated layers"),
+    include_recent_messages: int = Query(default=5, ge=0, le=20),
+    _auth: bool = Depends(verify_service_token),
+) -> ContextResponse:
+    """
+    Get user context for Agent Service.
+
+    REQ: REQ-TOOL-002
+    Design: §3.3.2
+
+    Returns twin data, recent messages, active commitments, and current plan.
+    """
+    # Parse layers
+    layer_list = [l.strip() for l in layers.split(",") if l.strip()]
+
+    # Get twin data
+    try:
+        twin = twin_service.get_twin(user_id, auto_create=True)
+        twin_data = twin.model_dump()
+    except Exception as e:
+        logger.error("tool_context_error: twin fetch failed for user %s: %s", user_id, str(e))
+        twin_data = {}
+
+    # Get recent messages
+    recent_messages = []
+    try:
+        rows = fortune_db.fetch_all(
+            """
+            SELECT role, content, created_at
+            FROM fortune_conversation_message
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            [user_id, include_recent_messages],
+        )
+        for row in rows:
+            recent_messages.append({
+                "role": row["role"],
+                "content": row["content"][:500],  # Truncate for context
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            })
+        recent_messages.reverse()  # Chronological order
+    except Exception as e:
+        logger.warning("tool_context_error: messages fetch failed: %s", str(e))
+
+    # Get active commitments
+    active_commitments = []
+    try:
+        rows = fortune_db.fetch_all(
+            """
+            SELECT task_id, title, commitment_type, status, due_at, created_at
+            FROM fortune_commitment
+            WHERE user_id = %s AND status IN ('suggested', 'active')
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            [user_id],
+        )
+        for row in rows:
+            active_commitments.append({
+                "task_id": str(row["task_id"]),
+                "title": row["title"],
+                "type": row["commitment_type"],
+                "status": row["status"],
+                "due_at": row["due_at"].isoformat() if row["due_at"] else None,
+            })
+    except Exception as e:
+        logger.warning("tool_context_error: commitments fetch failed: %s", str(e))
+
+    # Get current plan enrollment
+    current_plan = None
+    try:
+        row = fortune_db.fetch_one(
+            """
+            SELECT e.enrollment_id, e.plan_id, e.current_day, e.status, p.name, p.duration_days
+            FROM fortune_plan_enrollment e
+            JOIN fortune_plan p ON e.plan_id = p.plan_id
+            WHERE e.user_id = %s AND e.status = 'active'
+            ORDER BY e.updated_at DESC
+            LIMIT 1
+            """,
+            [user_id],
+        )
+        if row:
+            current_plan = {
+                "enrollment_id": row["enrollment_id"],
+                "plan_id": row["plan_id"],
+                "plan_name": row["name"],
+                "current_day": row["current_day"],
+                "total_days": row["duration_days"],
+            }
+    except Exception as e:
+        logger.warning("tool_context_error: plan fetch failed: %s", str(e))
+
+    # Calculate facts_hash
+    facts_hash = ""
+    try:
+        astrology = twin_data.get("metadata_astrology", {})
+        facts_json = json.dumps(astrology, sort_keys=True, ensure_ascii=False)
+        facts_hash = hashlib.sha256(facts_json.encode()).hexdigest()[:16]
+    except Exception:
+        pass
+
+    logger.debug("tool_context user_id=%s", user_id)
+
+    return ContextResponse(
+        user_id=user_id,
+        twin=twin_data,
+        recent_messages=recent_messages,
+        active_commitments=active_commitments,
+        current_plan=current_plan,
+        facts_hash=facts_hash,
+    )
+
+
+# =============================================================================
+# TASK-2.2.2: POST /commitment
+# =============================================================================
+
+@router.post("/commitment", response_model=CommitmentResponse)
+async def create_commitment(
+    request: CommitmentRequest,
+    _auth: bool = Depends(verify_service_token),
+) -> CommitmentResponse:
+    """
+    Create a commitment/task for user.
+
+    REQ: REQ-TOOL-003
+    Design: §3.3 (扩展)
+
+    Source is always 'agent' for Tool API created commitments.
+    """
+    task_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    try:
+        fortune_db.execute(
+            """
+            INSERT INTO fortune_commitment (
+                task_id, user_id, source, commitment_type, title,
+                details, status, category, aura_reward, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                task_id,
+                request.user_id,
+                "agent",  # Source is always 'agent' for Tool API
+                "start_task",
+                request.title,
+                json.dumps(request.details),
+                "suggested",
+                request.category,
+                request.aura_reward,
+                now,
+            ],
+        )
+    except Exception as e:
+        logger.error("tool_commitment_error: %s", str(e))
+        raise HTTPException(status_code=500, detail="Failed to create commitment")
+
+    logger.info("tool_commitment_create user_id=%s task_id=%s", request.user_id, task_id)
+
+    return CommitmentResponse(
+        commitment_id=task_id,
+        status="created",
+        created_at=now.isoformat(),
+    )
+
+
+# =============================================================================
+# TASK-2.2.3: POST /twin_update
+# =============================================================================
+
+@router.post("/twin_update", response_model=TwinUpdateResponse)
+async def update_twin(
+    request: TwinUpdateRequest,
+    _auth: bool = Depends(verify_service_token),
+) -> TwinUpdateResponse:
+    """
+    Update user's digital twin data.
+
+    REQ: REQ-TOOL-004
+    Design: §3.1.3, §3.3
+
+    Validates layer and confidence, then delegates to twin_service.
+    """
+    # Validate layer
+    if request.layer not in ("L1", "L2", "L3"):
+        raise HTTPException(status_code=400, detail=f"Invalid layer: {request.layer}")
+
+    try:
+        event = TwinUpdateEvent(
+            user_id=request.user_id,
+            layer=TwinLayer(request.layer),
+            path=request.path,
+            new_value=request.new_value,
+            confidence=request.confidence,
+            source=request.source,
+            trigger=request.trigger,
+        )
+
+        result = twin_service.update_twin(event)
+
+        logger.info(
+            "tool_twin_update user_id=%s path=%s",
+            request.user_id, request.path
+        )
+
+        return TwinUpdateResponse(
+            updated=result.updated,
+            log_id=result.log_id,
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("tool_twin_update_error: %s", str(e))
+        raise HTTPException(status_code=500, detail="Failed to update twin")
+
+
+# =============================================================================
+# TASK-2.2.4: POST /share_card
+# =============================================================================
+
+@router.post("/share_card", response_model=ShareCardResponse)
+async def create_share_card(
+    request: ShareCardRequest,
+    _auth: bool = Depends(verify_service_token),
+) -> ShareCardResponse:
+    """
+    Create a shareable card for user.
+
+    REQ: REQ-TOOL-005
+    Design: §3.3 (扩展)
+    """
+    card_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    # Generate share URL
+    base_url = os.getenv("H5_BASE", "http://localhost:8230")
+    share_url = f"{base_url}/share/{card_id}"
+
+    try:
+        fortune_db.execute(
+            """
+            INSERT INTO fortune_share_card (
+                card_id, user_id, card_type, content, share_url, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [
+                card_id,
+                request.user_id,
+                request.card_type,
+                json.dumps(request.content),
+                share_url,
+                now,
+            ],
+        )
+    except Exception as e:
+        logger.error("tool_share_card_error: %s", str(e))
+        raise HTTPException(status_code=500, detail="Failed to create share card")
+
+    logger.info("tool_share_card user_id=%s card_id=%s", request.user_id, card_id)
+
+    return ShareCardResponse(
+        card_id=card_id,
+        share_url=share_url,
+    )
+
+
+# =============================================================================
+# TASK-2.2.5: GET /facts/{user_id}
+# =============================================================================
+
+@router.get("/facts/{user_id}", response_model=FactsResponse)
+async def get_facts(
+    user_id: int,
+    _auth: bool = Depends(verify_service_token),
+) -> FactsResponse:
+    """
+    Get bazi facts for user.
+
+    REQ: REQ-TOOL-006
+    Design: §3.3 (扩展)
+
+    Returns bazi data and facts_hash for cache validation.
+    """
+    bazi = None
+    facts_hash = None
+
+    try:
+        row = fortune_db.fetch_one(
+            """
+            SELECT facts, facts_hash
+            FROM fortune_bazi_snapshot
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [user_id],
+        )
+
+        if row:
+            bazi = row["facts"]
+            if isinstance(bazi, str):
+                bazi = json.loads(bazi)
+            facts_hash = row["facts_hash"]
+
+    except Exception as e:
+        logger.warning("tool_facts_error: %s", str(e))
+
+    return FactsResponse(
+        user_id=user_id,
+        bazi=bazi,
+        facts_hash=facts_hash,
+    )

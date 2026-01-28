@@ -1,0 +1,316 @@
+"""
+SOPEngine v6 单元测试
+测试混合 SOP 执行引擎：P1/P2 强制执行，P3-P6 LLM 自由
+"""
+import pytest
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from services.agent.sop_engine import (
+    SOPEngine, SOPPhase, SOPAction, SOPState,
+    create_sop_engine, check_sop_requirements
+)
+
+
+class TestSOPPhaseEnum:
+    """测试 SOP 阶段枚举"""
+
+    def test_all_phases_defined(self):
+        assert SOPPhase.COLLECT == "collect"
+        assert SOPPhase.COMPUTE == "compute"
+        assert SOPPhase.SCAN == "scan"
+        assert SOPPhase.ANALYZE == "analyze"
+        assert SOPPhase.OUTPUT == "output"
+        assert SOPPhase.DISCUSS == "discuss"
+
+
+class TestSOPActionEnum:
+    """测试 SOP 动作枚举"""
+
+    def test_all_actions_defined(self):
+        assert SOPAction.NEED_INFO == "need_info"
+        assert SOPAction.NEED_COMPUTE == "need_compute"
+        assert SOPAction.READY_FOR_LLM == "ready_for_llm"
+        assert SOPAction.COMPLETED == "completed"
+
+
+class TestSOPState:
+    """测试 SOP 状态"""
+
+    def test_default_state(self):
+        state = SOPState(current_phase=SOPPhase.COLLECT)
+        assert state.current_phase == SOPPhase.COLLECT
+        assert state.has_birth_info is False
+        assert state.has_chart_data is False
+        assert state.context == {}
+
+    def test_state_with_values(self):
+        state = SOPState(
+            current_phase=SOPPhase.ANALYZE,
+            has_birth_info=True,
+            has_chart_data=True,
+            skill_id="bazi"
+        )
+        assert state.has_birth_info is True
+        assert state.has_chart_data is True
+        assert state.skill_id == "bazi"
+
+
+class TestSOPEngineP1Collect:
+    """测试 P1 收集阶段"""
+
+    def test_bazi_needs_birth_info(self):
+        """八字 Skill 无出生信息时需要收集"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={"basic": {"name": "test"}},
+            skill_data={},
+            message="看看我的命盘"
+        )
+        assert action == SOPAction.NEED_INFO
+        assert context["phase"] == SOPPhase.COLLECT
+
+    def test_bazi_has_birth_info(self):
+        """八字 Skill 有出生信息时跳过 P1"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={
+                "basic": {"name": "test"},
+                "birth_info": {"date": "1990-05-15", "time": "14:30"}
+            },
+            skill_data={},
+            message="看看我的命盘"
+        )
+        # 有出生信息但无命盘，应该需要计算
+        assert action == SOPAction.NEED_COMPUTE
+
+    def test_zodiac_needs_birth_info(self):
+        """星座 Skill 无出生信息时需要收集"""
+        engine = SOPEngine("zodiac")
+        action, context = engine.check_phase(
+            profile={},
+            skill_data={},
+            message="看看我的星盘"
+        )
+        assert action == SOPAction.NEED_INFO
+
+    def test_career_no_birth_required(self):
+        """职业 Skill 不需要出生信息"""
+        engine = SOPEngine("career")
+        action, context = engine.check_phase(
+            profile={},
+            skill_data={},
+            message="我适合什么工作"
+        )
+        # career 不需要出生信息，直接交给 LLM
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_birth_info_in_message(self):
+        """消息中包含出生信息时不弹表单"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={},
+            skill_data={},
+            message="我是1990年5月15日下午2点出生的，帮我看看命盘"
+        )
+        # 消息中有出生信息，不需要收集
+        assert action != SOPAction.NEED_INFO or context.get("birth_in_message")
+
+
+class TestSOPEngineP2Compute:
+    """测试 P2 计算阶段"""
+
+    def test_bazi_needs_compute(self):
+        """八字有出生信息但无命盘时需要计算"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={
+                "birth_info": {"date": "1990-05-15"}
+            },
+            skill_data={},
+            message="分析我的命盘"
+        )
+        assert action == SOPAction.NEED_COMPUTE
+        assert context["phase"] == SOPPhase.COMPUTE
+
+    def test_bazi_has_chart_data(self):
+        """八字已有命盘数据时跳过 P2"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={
+                "birth_info": {"date": "1990-05-15"}
+            },
+            skill_data={
+                "bazi": {"chart": {"year": {"gan": "庚"}}}
+            },
+            message="分析我的命盘"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_zodiac_needs_compute(self):
+        """星座有出生信息但无星盘时需要计算"""
+        engine = SOPEngine("zodiac")
+        action, context = engine.check_phase(
+            profile={
+                "birth_info": {"birth_date": "1990-05-15"}
+            },
+            skill_data={},
+            message="看看我的星盘"
+        )
+        assert action == SOPAction.NEED_COMPUTE
+
+    def test_tarot_needs_compute(self):
+        """塔罗无牌时需要计算（抽牌）"""
+        engine = SOPEngine("tarot")
+        action, context = engine.check_phase(
+            profile={},
+            skill_data={},
+            message="帮我抽一张牌"
+        )
+        assert action == SOPAction.NEED_COMPUTE
+
+
+class TestSOPEngineP3ToP6:
+    """测试 P3-P6 LLM 自由阶段"""
+
+    def test_ready_for_llm_with_chart(self):
+        """有命盘数据时交给 LLM"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={"birth_info": {"date": "1990-05-15"}},
+            skill_data={"bazi": {"chart": {"year": {"gan": "庚"}}}},
+            message="分析我的事业运"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+        assert context["has_chart"] is True
+
+    def test_determine_discuss_phase(self):
+        """追问时进入讨论阶段"""
+        engine = SOPEngine("bazi")
+        engine.state.has_chart_data = True
+        action, context = engine.check_phase(
+            profile={"birth_info": {"date": "1990-05-15"}},
+            skill_data={"bazi": {"chart": {}}},
+            message="为什么你说我身强？详细解释一下"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+        assert context["phase"] == SOPPhase.DISCUSS
+
+    def test_determine_analyze_phase(self):
+        """有命盘的新问题进入分析阶段"""
+        engine = SOPEngine("bazi")
+        engine.state.has_chart_data = True
+        action, context = engine.check_phase(
+            profile={"birth_info": {"date": "1990-05-15"}},
+            skill_data={"bazi": {"chart": {}}},
+            message="看看我的财运"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+        assert context["phase"] == SOPPhase.ANALYZE
+
+
+class TestSOPEngineHelpers:
+    """测试辅助方法"""
+
+    def test_message_contains_birth_info_positive(self):
+        """检测消息中包含出生信息"""
+        engine = SOPEngine("bazi")
+        assert engine._message_contains_birth_info("我是1990年5月15日下午2点出生的") is True
+        assert engine._message_contains_birth_info("1995年3月20日早上8点") is True
+
+    def test_message_contains_birth_info_negative(self):
+        """检测消息中不包含出生信息"""
+        engine = SOPEngine("bazi")
+        assert engine._message_contains_birth_info("看看我的命盘") is False
+        assert engine._message_contains_birth_info("最近运势怎么样") is False
+
+    def test_get_phase_prompt(self):
+        """获取阶段提示词"""
+        engine = SOPEngine("bazi")
+        engine.state.current_phase = SOPPhase.COLLECT
+        prompt = engine.get_phase_prompt()
+        assert "收集" in prompt or "信息" in prompt
+
+        engine.state.current_phase = SOPPhase.ANALYZE
+        prompt = engine.get_phase_prompt()
+        assert "分析" in prompt
+
+
+class TestCreateSOPEngine:
+    """测试工厂函数"""
+
+    def test_create_sop_engine(self):
+        engine = create_sop_engine("bazi")
+        assert isinstance(engine, SOPEngine)
+        assert engine.skill_id == "bazi"
+
+
+class TestCheckSOPRequirements:
+    """测试快捷函数"""
+
+    def test_check_sop_requirements_bazi_no_info(self):
+        action, context = check_sop_requirements(
+            skill_id="bazi",
+            profile={},
+            skill_data={},
+            message="看命盘"
+        )
+        assert action == SOPAction.NEED_INFO
+
+    def test_check_sop_requirements_bazi_complete(self):
+        action, context = check_sop_requirements(
+            skill_id="bazi",
+            profile={"birth_info": {"date": "1990-05-15"}},
+            skill_data={"bazi": {"chart": {"year": {}}}},
+            message="分析事业"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_check_sop_requirements_career(self):
+        action, context = check_sop_requirements(
+            skill_id="career",
+            profile={},
+            skill_data={},
+            message="职业建议"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+
+class TestSOPEngineEdgeCases:
+    """测试边界情况"""
+
+    def test_unknown_skill(self):
+        """未知 Skill 直接交给 LLM"""
+        engine = SOPEngine("unknown_skill")
+        action, context = engine.check_phase(
+            profile={},
+            skill_data={},
+            message="测试"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_empty_message(self):
+        """空消息处理"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile={"birth_info": {"date": "1990-05-15"}},
+            skill_data={"bazi": {"chart": {}}},
+            message=""
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_none_profile(self):
+        """None profile 处理"""
+        engine = SOPEngine("bazi")
+        action, context = engine.check_phase(
+            profile=None,
+            skill_data=None,
+            message="看命盘"
+        )
+        assert action == SOPAction.NEED_INFO
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

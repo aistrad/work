@@ -1,0 +1,570 @@
+     1→"""
+     2→Dashboard API 路由
+     3→
+     4→Zone B Dashboard = 6 Tabs:
+     5→1. 概览 (Overview): State Score + PERMA + 今日任务
+     6→2. 状态 (Status): L0 事实 + L1 图式
+     7→3. 趋势 (Trends): 历史数据 + 事件标记
+     8→4. 任务 (Tasks): Commitment 管理
+     9→5. 关系 (Relations): 关系页
+    10→6. 探索 (Explore): Mystic + 课程
+    11→
+    12→参考：/home/aiscend/work/fortune_ai/docs/os/os_design_claude_mvp.md
+    13→"""
+    14→
+    15→from __future__ import annotations
+    16→
+    17→import re
+    18→from datetime import datetime, time, timedelta, timezone
+    19→from typing import Any, Dict, List, Optional
+    20→from zoneinfo import ZoneInfo
+    21→
+    22→from fastapi import APIRouter, Request
+    23→from fastapi.responses import JSONResponse
+    24→from pydantic import BaseModel, Field
+    25→
+    26→from api.deps import require_auth, require_csrf
+    27→from services import soul_os
+    28→from stores import fortune_db
+    29→
+    30→
+    31→router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+    32→
+    33→
+    34→def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    35→    return JSONResponse({"ok": True, "data": data or {}})
+    36→
+    37→
+    38→def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    39→    return JSONResponse(
+    40→        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+    41→        status_code=status,
+    42→    )
+    43→
+    44→
+    45→_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+    46→
+    47→
+    48→# =============================================================================
+    49→# Request Models
+    50→# =============================================================================
+    51→
+    52→class TaskAcceptRequest(BaseModel):
+    53→    task_id: str = Field(..., min_length=36, max_length=36)
+    54→    commitment_type: Optional[str] = Field(None, description="start_task|schedule_task")
+    55→
+    56→
+    57→class TaskDoneRequest(BaseModel):
+    58→    task_id: str = Field(..., min_length=36, max_length=36)
+    59→    note: str = Field("", max_length=500)
+    60→
+    61→
+    62→class CheckinRequest(BaseModel):
+    63→    mood: str = Field(..., min_length=1, max_length=50)
+    64→    intensity: int = Field(..., ge=0, le=10)
+    65→    note: str = Field("", max_length=1000)
+    66→
+    67→
+    68→# =============================================================================
+    69→# Tab 1: 概览 (Overview)
+    70→# =============================================================================
+    71→
+    72→@router.get("/overview")
+    73→def get_overview(request: Request):
+    74→    """
+    75→    概览 Tab 数据
+    76→
+    77→    返回：
+    78→    - insight: 一句话洞察
+    79→    - state_score: 状态分数 + 三信号分解 + 补救动作
+    80→    - perma: PERMA 五维快照
+    81→    - today_tasks: 今日任务（≤3条）
+    82→    - risk_alerts: 风险提示
+    83→    """
+    84→    auth = require_auth(request)
+    85→    user_id = int(auth["user_id"])
+    86→
+    87→    # State Score
+    88→    state_score = soul_os.calculate_state_score(user_id)
+    89→
+    90→    # L1 Schema (PERMA)
+    91→    l1 = soul_os.get_l1_schema(user_id)
+    92→    perma_data = l1.perma.to_dict()
+    93→
+    94→    # 今日任务
+    95→    tasks = soul_os.list_commitments(user_id, status=["suggested", "active"], limit=3)
+    96→
+    97→    # 反依赖检查
+    98→    anti_dep = soul_os.check_anti_dependency(user_id)
+    99→    risk_alerts = []
+   100→    if anti_dep.should_intervene:
+   101→        risk_alerts.append({
+   102→            "type": anti_dep.intervention_type,
+   103→            "message": anti_dep.intervention_message,
+   104→        })
+   105→
+   106→    # 生成洞察
+   107→    score = state_score.score
+   108→    if score >= 70:
+   109→        insight = "今天状态不错，保持这个节奏！"
+   110→    elif score >= 50:
+   111→        insight = "状态还行，做一个小任务可以让你感觉更好。"
+   112→    elif score >= 30:
+   113→        insight = "今天需要一点自我关怀，先做一个最小行动。"
+   114→    else:
+   115→        insight = "今天可能有点累，先照顾好自己。"
+   116→
+   117→    return _ok({
+   118→        "insight": insight,
+   119→        "state_score": state_score.to_dict(),
+   120→        "perma": {
+   121→            "positive_emotion": perma_data["positive_emotion"],
+   122→            "engagement": perma_data["engagement"],
+   123→            "relationships": perma_data["relationships"],
+   124→            "meaning": perma_data["meaning"],
+   125→            "accomplishment": perma_data["accomplishment"],
+   126→        },
+   127→        "today_tasks": [
+   128→            {
+   129→                "task_id": t["task_id"],
+   130→                "title": t["title"],
+   131→                "status": t["status"],
+   132→                "commitment_type": t.get("commitment_type", "start_task"),
+   133→            }
+   134→            for t in tasks
+   135→        ],
+   136→        "risk_alerts": risk_alerts,
+   137→    })
+   138→
+   139→
+   140→# =============================================================================
+   141→# Tab 2: 状态 (Status)
+   142→# =============================================================================
+   143→
+   144→@router.get("/status")
+   145→def get_status(request: Request):
+   146→    """
+   147→    状态 Tab 数据
+   148→
+   149→    返回：
+   150→    - l0_facts: 八字事实 + 心理学翻译
+   151→    - l1_schema: PERMA 快照 + 认知图式 + 优势
+   152→    - state_score: 当前分数
+   153→    """
+   154→    auth = require_auth(request)
+   155→    user_id = int(auth["user_id"])
+   156→
+   157→    # L0 Facts
+   158→    l0 = soul_os.get_l0_facts(user_id)
+   159→    facts = l0.get("facts", {})
+   160→    translations = soul_os.translate_bazi_to_psychology(facts)
+   161→
+   162→    # 提取日主信息
+   163→    bazi = facts.get("bazi", {})
+   164→    day_master = bazi.get("day_master", {})
+   165→    strength = bazi.get("strength", {})
+   166→
+   167→    # L1 Schema
+   168→    l1 = soul_os.get_l1_schema(user_id)
+   169→
+   170→    # State Score
+   171→    state_score = soul_os.calculate_state_score(user_id)
+   172→
+   173→    return _ok({
+   174→        "l0_facts": {
+   175→            "day_master": day_master.get("gan", ""),
+   176→            "day_master_element": day_master.get("element", ""),
+   177→            "strength": strength.get("level", "neutral"),
+   178→            "strength_score": strength.get("score", 0),
+   179→            "translations": translations,
+   180→            "facts_hash": l0.get("facts_hash", ""),
+   181→        },
+   182→        "l1_schema": l1.to_dict(),
+   183→        "state_score": state_score.to_dict(),
+   184→    })
+   185→
+   186→
+   187→# =============================================================================
+   188→# Tab 3: 趋势 (Trends)
+   189→# =============================================================================
+   190→
+   191→@router.get("/trends")
+   192→def get_trends(request: Request, days: int = 7):
+   193→    """
+   194→    趋势 Tab 数据
+   195→
+   196→    返回：
+   197→    - state_score_history: 历史分数
+   198→    - events: 关键事件（任务完成、打卡等）
+   199→    """
+   200→    auth = require_auth(request)
+   201→    user_id = int(auth["user_id"])
+   202→
+   203→    days = max(1, min(30, int(days)))
+   204→    window_start = datetime.now(timezone.utc) - timedelta(days=days)
+   205→
+   206→    # 获取打卡历史计算每日分数
+   207→    checkins = fortune_db.fetch_all(
+   208→        """
+   209→        SELECT DATE(created_at) as date, AVG(intensity) as avg_intensity
+   210→        FROM fortune_checkin
+   211→        WHERE user_id = %s AND created_at >= %s
+   212→        GROUP BY DATE(created_at)
+   213→        ORDER BY date
+   214→        """,
+   215→        (user_id, window_start),
+   216→    ) or []
+   217→
+   218→    # 获取任务完成历史
+   219→    done_by_date = fortune_db.fetch_all(
+   220→        """
+   221→        SELECT DATE(done_at) as date, COUNT(*) as cnt
+   222→        FROM fortune_commitment
+   223→        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+   224→        GROUP BY DATE(done_at)
+   225→        """,
+   226→        (user_id, window_start),
+   227→    ) or []
+   228→    done_map = {str(r["date"]): r["cnt"] for r in done_by_date}
+   229→
+   230→    # 构建历史分数（简化版）
+   231→    score_history = []
+   232→    for c in checkins:
+   233→        date_str = str(c["date"])
+   234→        intensity = float(c.get("avg_intensity") or 5)
+   235→        emotion_signal = max(0, (10 - intensity)) * 4
+   236→        action_signal = min(done_map.get(date_str, 0) * 10, 40)
+   237→        score = int(emotion_signal + action_signal + 10)  # 简化 streak
+   238→        score_history.append({
+   239→            "date": date_str,
+   240→            "score": score,
+   241→        })
+   242→
+   243→    # 获取事件列表
+   244→    events = []
+   245→
+   246→    # 任务完成事件
+   247→    done_tasks = fortune_db.fetch_all(
+   248→        """
+   249→        SELECT task_id, title, done_at
+   250→        FROM fortune_commitment
+   251→        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+   252→        ORDER BY done_at DESC
+   253→        LIMIT 20
+   254→        """,
+   255→        (user_id, window_start),
+   256→    ) or []
+   257→    for t in done_tasks:
+   258→        events.append({
+   259→            "date": str(t["done_at"].date()) if t.get("done_at") else "",
+   260→            "type": "commitment_done",
+   261→            "title": f"完成了：{t.get('title', '')}",
+   262→        })
+   263→
+   264→    # 打卡事件
+   265→    recent_checkins = fortune_db.fetch_all(
+   266→        """
+   267→        SELECT mood, intensity, created_at
+   268→        FROM fortune_checkin
+   269→        WHERE user_id = %s AND created_at >= %s
+   270→        ORDER BY created_at DESC
+   271→        LIMIT 10
+   272→        """,
+   273→        (user_id, window_start),
+   274→    ) or []
+   275→    for c in recent_checkins:
+   276→        events.append({
+   277→            "date": str(c["created_at"].date()) if c.get("created_at") else "",
+   278→            "type": "checkin",
+   279→            "title": f"情绪打卡：{c.get('mood', '')}（{c.get('intensity', 0)}/10）",
+   280→        })
+   281→
+   282→    # 按日期排序
+   283→    events.sort(key=lambda x: x["date"], reverse=True)
+   284→
+   285→    return _ok({
+   286→        "state_score_history": score_history,
+   287→        "events": events[:20],
+   288→    })
+   289→
+   290→
+   291→# =============================================================================
+   292→# Tab 4: 任务 (Tasks)
+   293→# =============================================================================
+   294→
+   295→@router.get("/tasks")
+   296→def get_tasks(request: Request):
+   297→    """
+   298→    任务 Tab 数据
+   299→
+   300→    返回：
+   301→    - active: 进行中的任务
+   302→    - suggested: 建议任务
+   303→    - completed_recent: 最近完成的任务
+   304→    """
+   305→    auth = require_auth(request)
+   306→    user_id = int(auth["user_id"])
+   307→
+   308→    active = soul_os.list_commitments(user_id, status=["active"], limit=10)
+   309→    suggested = soul_os.list_commitments(user_id, status=["suggested"], limit=10)
+   310→    completed = soul_os.list_commitments(user_id, status=["done"], limit=5)
+   311→
+   312→    return _ok({
+   313→        "active": active,
+   314→        "suggested": suggested,
+   315→        "completed_recent": completed,
+   316→    })
+   317→
+   318→
+   319→@router.post("/task/accept")
+   320→def accept_task(req: TaskAcceptRequest, request: Request):
+   321→    """接受任务"""
+   322→    auth = require_auth(request)
+   323→    require_csrf(request, auth)
+   324→    user_id = int(auth["user_id"])
+   325→    task_id = (req.task_id or "").strip()
+   326→
+   327→    if not _UUID_RE.match(task_id):
+   328→        return _err(400, "invalid_request", "invalid_task_id")
+   329→
+   330→    ctype = (req.commitment_type or "").strip() if req.commitment_type else None
+   331→    if ctype is not None and ctype not in ("start_task", "schedule_task"):
+   332→        return _err(400, "invalid_request", "invalid_commitment_type")
+   333→
+   334→    # 计算 due_at
+   335→    due_at = None
+   336→    if ctype == "schedule_task":
+   337→        prefs = fortune_db.fetch_one(
+   338→            "SELECT push_timezone FROM fortune_user_preferences WHERE user_id=%s",
+   339→            (user_id,),
+   340→        ) or {}
+   341→        tz_name = str(prefs.get("push_timezone") or "Asia/Shanghai")
+   342→        try:
+   343→            tz = ZoneInfo(tz_name)
+   344→        except Exception:
+   345→            tz = ZoneInfo("Asia/Shanghai")
+   346→        now_local = datetime.now(tz)
+   347→        end_local = datetime.combine(now_local.date(), time(23, 0, 0), tzinfo=tz)
+   348→        due_at = end_local.astimezone(timezone.utc)
+   349→
+   350→    row = fortune_db.execute_returning_one(
+   351→        """
+   352→        UPDATE fortune_commitment
+   353→        SET
+   354→          status = 'active',
+   355→          accepted_at = COALESCE(accepted_at, now()),
+   356→          commitment_type = COALESCE(%s, commitment_type),
+   357→          due_at = COALESCE(%s, due_at)
+   358→        WHERE task_id=%s AND user_id=%s AND status IN ('suggested','active')
+   359→        RETURNING task_id, status, accepted_at
+   360→        """,
+   361→        (ctype, due_at, task_id, user_id),
+   362→    )
+   363→
+   364→    if not row:
+   365→        return _err(404, "not_found", "task_not_found")
+   366→
+   367→    return _ok({
+   368→        "task_id": str(row["task_id"]),
+   369→        "status": str(row["status"]),
+   370→        "accepted_at": str(row.get("accepted_at") or ""),
+   371→    })
+   372→
+   373→
+   374→@router.post("/task/done")
+   375→def complete_task(req: TaskDoneRequest, request: Request):
+   376→    """
+   377→    完成任务
+   378→
+   379→    实现完整反馈回路：
+   380→    1. 更新任务状态
+   381→    2. 奖励 Aura 积分
+   382→    3. 更新 growth_streak
+   383→    4. 返回新的 State Score
+   384→    """
+   385→    auth = require_auth(request)
+   386→    require_csrf(request, auth)
+   387→    user_id = int(auth["user_id"])
+   388→    task_id = (req.task_id or "").strip()
+   389→
+   390→    if not _UUID_RE.match(task_id):
+   391→        return _err(400, "invalid_request", "invalid_task_id")
+   392→
+   393→    # 使用 soul_os 完成任务
+   394→    result = soul_os.complete_commitment(user_id, task_id, note=req.note)
+   395→
+   396→    if not result.get("success"):
+   397→        return _err(404, "not_found", result.get("message", "task_not_found"))
+   398→
+   399→    # 奖励 Aura
+   400→    aura_earned = 0
+   401→    try:
+   402→        from services import currency_service
+   403→        from models.currency import CurrencyType, LedgerCategory
+   404→
+   405→        entry = currency_service.add_currency(
+   406→            user_id=user_id,
+   407→            currency_type=CurrencyType.AURA,
+   408→            amount=10,
+   409→            category=LedgerCategory.EARN,
+   410→            reason="commitment_complete",
+   411→            ref_type="commitment",
+   412→            ref_id=task_id,
+   413→            description="完成任务奖励",
+   414→        )
+   415→        aura_earned = entry.amount
+   416→    except Exception:
+   417→        pass
+   418→
+   419→    # 更新 streak
+   420→    new_streak = 0
+   421→    try:
+   422→        from services import twin_service
+   423→        new_streak = twin_service.increment_growth_streak(user_id)
+   424→    except Exception:
+   425→        pass
+   426→
+   427→    return _ok({
+   428→        "task_id": task_id,
+   429→        "status": "done",
+   430→        "state_score": result.get("state_score", {}),
+   431→        "rewards": {
+   432→            "aura_earned": aura_earned,
+   433→            "new_streak": new_streak,
+   434→        },
+   435→        "message": result.get("message", ""),
+   436→    })
+   437→
+   438→
+   439→@router.post("/task/skip")
+   440→def skip_task(req: TaskDoneRequest, request: Request):
+   441→    """跳过任务"""
+   442→    auth = require_auth(request)
+   443→    require_csrf(request, auth)
+   444→    user_id = int(auth["user_id"])
+   445→    task_id = (req.task_id or "").strip()
+   446→
+   447→    if not _UUID_RE.match(task_id):
+   448→        return _err(400, "invalid_request", "invalid_task_id")
+   449→
+   450→    row = fortune_db.execute_returning_one(
+   451→        """
+   452→        UPDATE fortune_commitment
+   453→        SET status = 'skipped', done_at = now()
+   454→        WHERE task_id=%s AND user_id=%s AND status IN ('suggested','active')
+   455→        RETURNING task_id, status
+   456→        """,
+   457→        (task_id, user_id),
+   458→    )
+   459→
+   460→    if not row:
+   461→        return _err(404, "not_found", "task_not_found")
+   462→
+   463→    return _ok({
+   464→        "task_id": str(row["task_id"]),
+   465→        "status": "skipped",
+   466→    })
+   467→
+   468→
+   469→# =============================================================================
+   470→# 情绪打卡 (Check-in)
+   471→# =============================================================================
+   472→
+   473→@router.post("/checkin")
+   474→def checkin(req: CheckinRequest, request: Request):
+   475→    """
+   476→    情绪打卡
+   477→
+   478→    返回 JITAI 推荐动作 + A2UI 格式
+   479→    """
+   480→    auth = require_auth(request)
+   481→    require_csrf(request, auth)
+   482→    user_id = int(auth["user_id"])
+   483→
+   484→    # 使用 soul_os 创建打卡
+   485→    data = soul_os.create_checkin_with_jitai(
+   486→        user_id,
+   487→        mood=req.mood,
+   488→        intensity=int(req.intensity),
+   489→        note=req.note,
+   490→    )
+   491→
+   492→    # 构建 A2UI 响应
+   493→    md = f"### 情绪打卡\n- 情绪：{req.mood}（{int(req.intensity)}/10）\n\n### 推荐动作\n- {data['recommended_action']}\n\n你愿意现在开始吗？"
+   494→    a2ui = {
+   495→        "meta": {"summary": f"情绪打卡：{req.mood}"},
+   496→        "ui_components": [
+   497→            {"type": "markdown_text", "title": "情绪打卡", "data": md},
+   498→            {
+   499→                "type": "action_buttons",
+   500→                "title": "下一步",
+   501→                "data": [
+   502→                    {"label": "开始这个动作", "action": {"type": "start_task", "task_id": data["task_id"]}},
+   503→                    {"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": data["task_id"]}},
+   504→                    {"label": "先不需要", "action": {"type": "opt_out"}},
+   505→                ],
+   506→            },
+   507→        ],
+   508→    }
+   509→
+   510→    # 返回新的 State Score
+   511→    state_score = soul_os.calculate_state_score(user_id)
+   512→
+   513→    return _ok({
+   514→        "task_id": data["task_id"],
+   515→        "recommended_action": data["recommended_action"],
+   516→        "a2ui": a2ui,
+   517→        "state_score": state_score.to_dict(),
+   518→    })
+   519→
+   520→
+   521→# =============================================================================
+   522→# Tab 5: 关系 (Relations) - MVP 简化版
+   523→# =============================================================================
+   524→
+   525→@router.get("/relations")
+   526→def get_relations(request: Request):
+   527→    """
+   528→    关系 Tab 数据（MVP 简化版）
+   529→    """
+   530→    auth = require_auth(request)
+   531→    user_id = int(auth["user_id"])
+   532→
+   533→    # MVP: 返回空列表，后续实现
+   534→    return _ok({
+   535→        "relations": [],
+   536→        "social_features": [
+   537→            {"id": "energy_tip", "name": "能量打赏", "enabled": False},
+   538→            {"id": "luck_chain", "name": "好运接龙", "enabled": False},
+   539→            {"id": "vent_chain", "name": "吐槽接龙", "enabled": False},
+   540→        ],
+   541→    })
+   542→
+   543→
+   544→# =============================================================================
+   545→# Tab 6: 探索 (Explore) - MVP 简化版
+   546→# =============================================================================
+   547→
+   548→@router.get("/explore")
+   549→def get_explore(request: Request):
+   550→    """
+   551→    探索 Tab 数据（MVP 简化版）
+   552→    """
+   553→    auth = require_auth(request)
+   554→    user_id = int(auth["user_id"])
+   555→
+   556→    # MVP: 返回入口列表
+   557→    return _ok({
+   558→        "mystic_entries": [
+   559→            {"id": "bazi_report", "name": "八字深度报告", "description": "30页专业分析"},
+   560→            {"id": "star_chart", "name": "星盘解读", "description": "西方占星视角"},
+   561→            {"id": "tarot", "name": "塔罗占卜", "description": "即时问答"},
+   562→        ],
+   563→        "courses": [],
+   564→        "artifacts": [],
+   565→    })
+   566→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

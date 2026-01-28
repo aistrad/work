@@ -1,0 +1,5333 @@
+# VibeLife 前端 v7.1 设计规格
+
+> **版本**: 7.1 | 2026-01-17
+> **目标读者**: AI Agent 优化
+> **后端架构**: V7 API
+> **设计系统**: 「暖阳神秘」+ Linear 精致风格
+> **视觉标杆**: Linear (精致度) + 东方美学 (温暖感)
+> **优先级来源**: VibeID设计-v5.md > SPEC-v7.md > Frontend-v6.md
+
+---
+
+## 设计理念升级 (v7.1 新增)
+
+### 核心定位
+> **"Linear 的精致度 + 温暖的东方美学 = 高级但不冷漠"**
+
+### 与 Linear 的对比与融合
+
+| 维度 | Linear 特点 | VibeLife 融合方案 |
+|------|------------|------------------|
+| **色调** | 冷峻科技感、深色主题 | 保持暖色调，降低饱和度增加高级感 |
+| **阴影** | 极淡多层、带色彩倾向 | 采用多层阴影，融入暖棕色调 |
+| **边框** | 几乎无边框，用阴影分隔 | 减少边框使用，改用微妙阴影 |
+| **动效** | 微妙 spring、blur 过渡 | 采用 spring physics，保持温和节奏 |
+| **字体** | 精心调校的字重/间距 | 优化中英文混排，精调间距 |
+| **hover** | 微妙背景变化 + 光标反馈 | 添加 translateY 微动 + 阴影变化 |
+
+### 设计原则 (v7.1 更新)
+
+1. **精致克制**: 每个像素都有意义，避免装饰性元素
+2. **微妙层次**: 用阴影和透明度创造深度，而非边框
+3. **温暖亲切**: 在精致中保持人情味，不冷漠
+4. **流畅自然**: 动效服务于体验，不抢夺注意力
+5. **渐进揭示**: 信息逐步展现，尊重用户的探索旅程
+
+---
+
+## 目录
+
+1. [系统架构](#1-系统架构)
+2. [VibeID 核心模块](#2-vibeid-核心模块)
+3. [设计系统](#3-设计系统)
+4. [性能优化](#4-性能优化)
+5. [组件库与卡片系统](#5-组件库与卡片系统)
+6. [API 对接与数据流](#6-api-对接与数据流)
+7. [实施计划与验证](#7-实施计划与验证)
+
+---
+
+## 1. 系统架构
+
+### 1.1 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           VibeLife Frontend v7.0                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         App Shell (Next.js 14)                       │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │   │
+│  │  │   Layout    │  │   Router    │  │   Auth      │  │   Theme    │  │   │
+│  │  │  Provider   │  │  (App Dir)  │  │  Provider   │  │  Provider  │  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        Feature Modules                               │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │   │
+│  │  │   VibeID    │  │    Chat     │  │   Skills    │  │  Commerce  │  │   │
+│  │  │   Module    │  │   Module    │  │   Module    │  │   Module   │  │   │
+│  │  │ (Archetype) │  │ (Agentic)   │  │ (Bazi/Zodiac│  │ (Payment)  │  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        Core Services Layer                           │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │   │
+│  │  │    API      │  │   State     │  │   Stream    │  │   Card     │  │   │
+│  │  │   Client    │  │   Store     │  │   Handler   │  │  Registry  │  │   │
+│  │  │  (SWR 2.x)  │  │(Zustand 4.x)│  │ (AI SDK 6)  │  │ (Dynamic)  │  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        Design System Layer                           │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │   │
+│  │  │  UI Core    │  │  Archetype  │  │  Animation  │  │   Theme    │  │   │
+│  │  │ Components  │  │   Visuals   │  │   System    │  │   Tokens   │  │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Backend API (V7)                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐│
+│  │  CoreAgent  │  │   Skill     │  │    Tool     │  │      Knowledge      ││
+│  │  (Agentic   │  │  Service    │  │  Registry   │  │       Store         ││
+│  │   Loop)     │  │  Registry   │  │  (Schema)   │  │     (Qdrant)        ││
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 技术栈
+
+| 类别 | 技术 | 版本 | 用途 |
+|------|------|------|------|
+| 框架 | Next.js | 14.x | App Router、RSC、流式渲染 |
+| 语言 | TypeScript | 5.3+ | 类型安全 |
+| 样式 | Tailwind CSS | 3.4 | 原子化 CSS |
+| 状态管理 | Zustand | 4.x | 客户端状态 |
+| 数据获取 | SWR | 2.x | 服务端状态 + 缓存 |
+| AI | AI SDK | 6.x | 流式响应 + 工具调用 |
+| 图表 | ECharts | 5.x | 数据可视化 |
+| 动画 | Framer Motion | 10.x | UI 动效 |
+| 表单 | React Hook Form | 7.x | 表单处理 |
+| 校验 | Zod | 3.x | Schema 校验 |
+
+### 1.3 目录结构
+
+```
+apps/web/
+├── src/
+│   ├── app/                          # Next.js App Router 路由
+│   │   ├── (auth)/                   # 认证路由组
+│   │   │   ├── login/
+│   │   │   └── register/
+│   │   ├── (main)/                   # 主应用路由
+│   │   │   ├── chat/
+│   │   │   ├── profile/
+│   │   │   ├── vibe-id/              # VibeID 功能
+│   │   │   │   ├── page.tsx
+│   │   │   │   ├── archetype/[id]/
+│   │   │   │   └── journey/
+│   │   │   └── skills/
+│   │   │       ├── bazi/
+│   │   │       ├── zodiac/
+│   │   │       ├── tarot/
+│   │   │       └── career/
+│   │   ├── api/                      # API 路由
+│   │   ├── layout.tsx
+│   │   └── page.tsx
+│   │
+│   ├── components/                   # 共享组件
+│   │   ├── ui/                       # 设计系统基础组件
+│   │   │   ├── Button.tsx
+│   │   │   ├── Card.tsx
+│   │   │   ├── Input.tsx
+│   │   │   └── ...
+│   │   ├── layout/                   # 布局组件
+│   │   │   ├── Header.tsx
+│   │   │   ├── Sidebar.tsx
+│   │   │   └── BottomNav.tsx
+│   │   ├── chat/                     # 聊天组件
+│   │   │   ├── ChatContainer.tsx
+│   │   │   ├── ChatMessage.tsx
+│   │   │   └── MessageInput.tsx
+│   │   └── shared/                   # 跨功能共享组件
+│   │       ├── BreathAura.tsx
+│   │       ├── VibeGlyph.tsx
+│   │       └── InsightSeal.tsx
+│   │
+│   ├── skills/                       # 技能模块
+│   │   ├── bazi/
+│   │   │   ├── components/
+│   │   │   ├── tools/                # 工具结果卡片
+│   │   │   │   ├── index.ts          # 卡片导出
+│   │   │   │   └── show-bazi-chart.tsx
+│   │   │   └── types/
+│   │   ├── zodiac/
+│   │   ├── tarot/
+│   │   ├── career/
+│   │   ├── vibe-id/                  # VibeID 技能组件
+│   │   │   ├── components/
+│   │   │   │   ├── VibeIDCard.tsx
+│   │   │   │   ├── ArchetypeWheel.tsx
+│   │   │   │   ├── ArchetypeBadge.tsx
+│   │   │   │   └── DimensionRow.tsx
+│   │   │   ├── tools/
+│   │   │   │   ├── index.ts
+│   │   │   │   └── show-vibe-id.tsx
+│   │   │   └── hooks/
+│   │   │       └── useVibeID.ts
+│   │   ├── CardRegistry.ts           # 动态卡片注册表
+│   │   └── initCards.ts              # 卡片初始化
+│   │
+│   ├── hooks/                        # 共享 Hooks
+│   │   ├── useVibeChat.ts            # 聊天流 Hook
+│   │   ├── useToolSchema.ts          # 工具 Schema 获取
+│   │   ├── useAuth.ts
+│   │   └── useTheme.ts
+│   │
+│   ├── stores/                       # Zustand 状态存储
+│   │   ├── chatStore.ts
+│   │   ├── userStore.ts
+│   │   └── vibeIdStore.ts
+│   │
+│   ├── services/                     # API 服务
+│   │   ├── api.ts                    # 基础 API 客户端
+│   │   ├── chat.ts                   # 聊天 API
+│   │   └── skills.ts                 # 技能 API
+│   │
+│   ├── types/                        # TypeScript 类型定义
+│   │   ├── api.ts
+│   │   ├── chat.ts
+│   │   ├── vibe-id.ts
+│   │   └── skills.ts
+│   │
+│   ├── utils/                        # 工具函数
+│   │   ├── cn.ts                     # 类名合并
+│   │   ├── format.ts
+│   │   └── validation.ts
+│   │
+│   ├── providers/                    # React Provider
+│   │   ├── AuthProvider.tsx
+│   │   ├── ThemeProvider.tsx
+│   │   └── Providers.tsx             # 组合 Provider
+│   │
+│   └── styles/                       # 全局样式
+│       ├── globals.css
+│       └── variables.css
+│
+├── public/
+│   ├── fonts/
+│   ├── icons/
+│   └── images/
+│
+├── tailwind.config.ts
+├── next.config.js
+└── tsconfig.json
+```
+
+### 1.4 数据流架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              用户交互                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           聊天组件层                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  ChatContainer.tsx                                               │   │
+│  │  - 处理用户输入                                                   │   │
+│  │  - 渲染消息                                                       │   │
+│  │  - 通过 CardRegistry 显示工具结果                                  │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+┌─────────────────────────────┐   ┌─────────────────────────────────────┐
+│      useVibeChat Hook       │   │           CardRegistry               │
+│  - 流式响应处理              │   │  - 动态组件加载                       │
+│  - 工具调用处理              │   │  - 工具名 → 组件映射                   │
+│  - 消息状态管理              │   │  - 懒加载提升性能                      │
+└─────────────────────────────┘   └─────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         后端 API (V7)                                    │
+│  POST /chat/v5/stream                                                    │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  请求: { user_id, messages, skill_id?, context? }               │   │
+│  │  响应: SSE 流                                                    │   │
+│  │    - type: "text" | "tool_call" | "tool_result" | "done"        │   │
+│  │    - 工具结果包含用于卡片渲染的结构化数据                          │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.5 流事件类型
+
+```typescript
+// 后端 SSE 事件类型
+type StreamEventType =
+  | 'text'           // 文本内容块
+  | 'tool_call'      // 工具调用中
+  | 'tool_result'    // 工具执行结果
+  | 'thinking'       // Agent 思考过程
+  | 'error'          // 发生错误
+  | 'done';          // 流结束
+
+interface StreamEvent {
+  type: StreamEventType;
+  data: unknown;
+  timestamp: number;
+}
+
+interface ToolCallEvent {
+  type: 'tool_call';
+  data: {
+    tool_name: string;      // 例如 "show_bazi_chart"
+    tool_id: string;        // 唯一调用ID
+    arguments: Record<string, unknown>;
+  };
+}
+
+interface ToolResultEvent {
+  type: 'tool_result';
+  data: {
+    tool_name: string;
+    tool_id: string;
+    result: Record<string, unknown>;  // 用于卡片渲染的结构化数据
+    skill_id?: string;                // 所属技能
+  };
+}
+```
+
+---
+
+## 2. VibeID 核心模块
+
+> **来源**: VibeID设计-v5.md（主要）、SPEC-v7.md
+> **优先级**: 核心功能 - 所有实现必须与 VibeID-v5.md 规格保持一致
+
+### 2.1 四维原型系统
+
+VibeID 使用荣格的 12 原型，按 4 个维度组织，构建全面的人格画像。
+
+#### 2.1.1 维度定义
+
+| 维度 | 英文 | 描述 | 可见性 |
+|------|------|------|--------|
+| **核心** | Core | 真实自我，本质特性 | 私密 |
+| **内在** | Inner | 内心世界，情感模式 | 半私密 |
+| **外在** | Outer | 社交表现，公众形象 | 公开 |
+| **阴影** | Shadow | 隐藏面向，成长空间 | 私密 |
+
+#### 2.1.2 十二原型
+
+```typescript
+// src/types/vibe-id.ts
+
+/**
+ * 荣格十二原型
+ * 每个原型都有用于视觉呈现的关联元数据
+ */
+export type ArchetypeId =
+  | 'innocent'    // 天真者
+  | 'explorer'    // 探索者
+  | 'sage'        // 智者
+  | 'hero'        // 英雄
+  | 'outlaw'      // 叛逆者
+  | 'magician'    // 魔术师
+  | 'regular'     // 凡人
+  | 'lover'       // 情人
+  | 'jester'      // 愚者
+  | 'caregiver'   // 照顾者
+  | 'creator'     // 创造者
+  | 'ruler';      // 统治者
+
+export type DimensionId = 'core' | 'inner' | 'outer' | 'shadow';
+
+/**
+ * 原型元数据（用于 UI 渲染）
+ */
+export interface ArchetypeMeta {
+  id: ArchetypeId;
+  name: string;           // 英文名
+  nameCn: string;         // 中文名
+  emoji: string;          // 视觉标识
+  color: string;          // 十六进制颜色
+  gradient: string;       // CSS 渐变
+  slogan: string;         // 一句话描述
+  superpower: string;     // 核心优势
+  growthPoints: string[]; // 成长方向
+  element: 'fire' | 'earth' | 'air' | 'water';  // 关联元素
+}
+
+/**
+ * 四维原型档案
+ */
+export interface FourDimensionArchetypes {
+  core: ArchetypeId;
+  inner: ArchetypeId;
+  outer: ArchetypeId;
+  shadow: ArchetypeId;
+}
+
+/**
+ * 完整的 VibeID 档案
+ */
+export interface VibeIDProfile {
+  userId: string;
+  archetypes: FourDimensionArchetypes;
+  scores: Record<ArchetypeId, number>;  // 每个原型的 0-100 分数
+  confidence: number;                    // 0-1 计算置信度
+  calculatedAt: string;                  // ISO 时间戳
+  source: 'bazi' | 'zodiac' | 'interview' | 'combined';
+
+  // 可选的扩展数据
+  dimensionScores?: {
+    core: Record<ArchetypeId, number>;
+    inner: Record<ArchetypeId, number>;
+    outer: Record<ArchetypeId, number>;
+    shadow: Record<ArchetypeId, number>;
+  };
+}
+```
+
+### 2.2 原型元数据常量
+
+```typescript
+// src/skills/vibe-id/constants/archetypes.ts
+
+import type { ArchetypeMeta, ArchetypeId } from '@/types/vibe-id';
+
+/**
+ * 完整的原型元数据注册表
+ * 来源: VibeID设计-v5.md 第 3.2 节
+ */
+export const ARCHETYPE_META: Record<ArchetypeId, ArchetypeMeta> = {
+  innocent: {
+    id: 'innocent',
+    name: 'Innocent',
+    nameCn: '天真者',
+    emoji: '🌸',
+    color: '#FFB7C5',
+    gradient: 'linear-gradient(135deg, #FFB7C5 0%, #FFF0F3 100%)',
+    slogan: '追求纯粹与美好',
+    superpower: '保持乐观与信任的能力',
+    growthPoints: ['面对现实的复杂性', '建立健康的边界'],
+    element: 'air'
+  },
+  explorer: {
+    id: 'explorer',
+    name: 'Explorer',
+    nameCn: '探索者',
+    emoji: '🧭',
+    color: '#87CEEB',
+    gradient: 'linear-gradient(135deg, #87CEEB 0%, #E0F4FF 100%)',
+    slogan: '追寻自由与发现',
+    superpower: '勇于探索未知的勇气',
+    growthPoints: ['学会承诺与扎根', '平衡冒险与责任'],
+    element: 'air'
+  },
+  sage: {
+    id: 'sage',
+    name: 'Sage',
+    nameCn: '智者',
+    emoji: '📚',
+    color: '#9B59B6',
+    gradient: 'linear-gradient(135deg, #9B59B6 0%, #E8D5F2 100%)',
+    slogan: '追求真理与智慧',
+    superpower: '洞察本质的分析能力',
+    growthPoints: ['将知识转化为行动', '接纳非理性的情感'],
+    element: 'air'
+  },
+  hero: {
+    id: 'hero',
+    name: 'Hero',
+    nameCn: '英雄',
+    emoji: '⚔️',
+    color: '#E74C3C',
+    gradient: 'linear-gradient(135deg, #E74C3C 0%, #FADBD8 100%)',
+    slogan: '勇敢面对挑战',
+    superpower: '克服困难的勇气与毅力',
+    growthPoints: ['学会接受帮助', '平衡刚强与柔软'],
+    element: 'fire'
+  },
+  outlaw: {
+    id: 'outlaw',
+    name: 'Outlaw',
+    nameCn: '叛逆者',
+    emoji: '🔥',
+    color: '#8B0000',
+    gradient: 'linear-gradient(135deg, #8B0000 0%, #E6B8AF 100%)',
+    slogan: '打破常规创造变革',
+    superpower: '挑战权威的勇气',
+    growthPoints: ['建设性地使用破坏力', '找到归属感'],
+    element: 'fire'
+  },
+  magician: {
+    id: 'magician',
+    name: 'Magician',
+    nameCn: '魔术师',
+    emoji: '✨',
+    color: '#8E44AD',
+    gradient: 'linear-gradient(135deg, #8E44AD 0%, #D7BDE2 100%)',
+    slogan: '化不可能为可能',
+    superpower: '转化与创造奇迹的能力',
+    growthPoints: ['脚踏实地落地', '避免操控他人'],
+    element: 'fire'
+  },
+  regular: {
+    id: 'regular',
+    name: 'Regular',
+    nameCn: '凡人',
+    emoji: '🤝',
+    color: '#27AE60',
+    gradient: 'linear-gradient(135deg, #27AE60 0%, #D5F5E3 100%)',
+    slogan: '脚踏实地融入群体',
+    superpower: '建立真诚连接的能力',
+    growthPoints: ['发展独特个性', '不惧与众不同'],
+    element: 'earth'
+  },
+  lover: {
+    id: 'lover',
+    name: 'Lover',
+    nameCn: '情人',
+    emoji: '💕',
+    color: '#E91E63',
+    gradient: 'linear-gradient(135deg, #E91E63 0%, #F8BBD9 100%)',
+    slogan: '追求亲密与热情',
+    superpower: '深度连接与感受美的能力',
+    growthPoints: ['保持独立自我', '平衡付出与接受'],
+    element: 'water'
+  },
+  jester: {
+    id: 'jester',
+    name: 'Jester',
+    nameCn: '愚者',
+    emoji: '🎭',
+    color: '#F39C12',
+    gradient: 'linear-gradient(135deg, #F39C12 0%, #FDEBD0 100%)',
+    slogan: '活在当下享受人生',
+    superpower: '带来欢乐与轻松的能力',
+    growthPoints: ['面对严肃议题', '发展深度关系'],
+    element: 'fire'
+  },
+  caregiver: {
+    id: 'caregiver',
+    name: 'Caregiver',
+    nameCn: '照顾者',
+    emoji: '🌿',
+    color: '#2ECC71',
+    gradient: 'linear-gradient(135deg, #2ECC71 0%, #E8F8F5 100%)',
+    slogan: '关爱他人无私奉献',
+    superpower: '滋养与支持他人的能力',
+    growthPoints: ['学会自我关怀', '设立健康边界'],
+    element: 'earth'
+  },
+  creator: {
+    id: 'creator',
+    name: 'Creator',
+    nameCn: '创造者',
+    emoji: '🎨',
+    color: '#3498DB',
+    gradient: 'linear-gradient(135deg, #3498DB 0%, #D6EAF8 100%)',
+    slogan: '创造独特价值',
+    superpower: '将想象变为现实的能力',
+    growthPoints: ['完成而非只是开始', '接受不完美'],
+    element: 'water'
+  },
+  ruler: {
+    id: 'ruler',
+    name: 'Ruler',
+    nameCn: '统治者',
+    emoji: '👑',
+    color: '#D4AF37',
+    gradient: 'linear-gradient(135deg, #D4AF37 0%, #FEF9E7 100%)',
+    slogan: '掌控全局引领方向',
+    superpower: '组织与领导的能力',
+    growthPoints: ['倾听他人声音', '放下控制欲'],
+    element: 'earth'
+  }
+};
+
+/**
+ * Get archetype metadata by ID
+ */
+export function getArchetypeMeta(id: ArchetypeId): ArchetypeMeta {
+  return ARCHETYPE_META[id];
+}
+
+/**
+ * Get all archetypes as array
+ */
+export function getAllArchetypes(): ArchetypeMeta[] {
+  return Object.values(ARCHETYPE_META);
+}
+
+/**
+ * Group archetypes by element
+ */
+export function getArchetypesByElement(element: ArchetypeMeta['element']): ArchetypeMeta[] {
+  return getAllArchetypes().filter(a => a.element === element);
+}
+```
+
+### 2.3 VibeID 钩子函数
+
+```typescript
+// src/skills/vibe-id/hooks/useVibeID.ts
+
+import { useCallback } from 'react';
+import useSWR from 'swr';
+import { create } from 'zustand';
+import type { VibeIDProfile, ArchetypeId, DimensionId } from '@/types/vibe-id';
+import { getArchetypeMeta } from '../constants/archetypes';
+
+// ============================================================================
+// Store
+// ============================================================================
+
+interface VibeIDState {
+  profile: VibeIDProfile | null;
+  isLoading: boolean;
+  error: Error | null;
+
+  // Actions
+  setProfile: (profile: VibeIDProfile) => void;
+  clearProfile: () => void;
+}
+
+export const useVibeIDStore = create<VibeIDState>((set) => ({
+  profile: null,
+  isLoading: false,
+  error: null,
+
+  setProfile: (profile) => set({ profile, isLoading: false, error: null }),
+  clearProfile: () => set({ profile: null }),
+}));
+
+// ============================================================================
+// API Fetcher
+// ============================================================================
+
+const fetcher = async (url: string): Promise<VibeIDProfile> => {
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  if (!res.ok) {
+    const error = new Error('Failed to fetch VibeID profile');
+    throw error;
+  }
+
+  return res.json();
+};
+
+// ============================================================================
+// Main Hook
+// ============================================================================
+
+interface UseVibeIDOptions {
+  userId?: string;
+  autoFetch?: boolean;
+}
+
+interface UseVibeIDReturn {
+  // Data
+  profile: VibeIDProfile | null;
+  isLoading: boolean;
+  error: Error | null;
+
+  // Computed
+  coreArchetype: ReturnType<typeof getArchetypeMeta> | null;
+  innerArchetype: ReturnType<typeof getArchetypeMeta> | null;
+  outerArchetype: ReturnType<typeof getArchetypeMeta> | null;
+  shadowArchetype: ReturnType<typeof getArchetypeMeta> | null;
+
+  // Actions
+  getArchetype: (dimension: DimensionId) => ReturnType<typeof getArchetypeMeta> | null;
+  getTopArchetypes: (count?: number) => Array<{ id: ArchetypeId; score: number }>;
+  refresh: () => Promise<void>;
+}
+
+export function useVibeID(options: UseVibeIDOptions = {}): UseVibeIDReturn {
+  const { userId, autoFetch = true } = options;
+  const { profile: storeProfile, setProfile } = useVibeIDStore();
+
+  // SWR for data fetching with automatic deduplication (Vercel rule: client-swr-dedup)
+  const { data, error, isLoading, mutate } = useSWR<VibeIDProfile>(
+    autoFetch && userId ? `/api/vibe-id/${userId}` : null,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      dedupingInterval: 60000, // 1 minute deduplication
+      onSuccess: (data) => setProfile(data),
+    }
+  );
+
+  const profile = data || storeProfile;
+
+  // Get archetype for a specific dimension
+  const getArchetype = useCallback((dimension: DimensionId) => {
+    if (!profile) return null;
+    const archetypeId = profile.archetypes[dimension];
+    return getArchetypeMeta(archetypeId);
+  }, [profile]);
+
+  // Get top N archetypes by score
+  const getTopArchetypes = useCallback((count = 4) => {
+    if (!profile?.scores) return [];
+
+    return Object.entries(profile.scores)
+      .map(([id, score]) => ({ id: id as ArchetypeId, score }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, count);
+  }, [profile]);
+
+  // Refresh profile data
+  const refresh = useCallback(async () => {
+    await mutate();
+  }, [mutate]);
+
+  return {
+    profile,
+    isLoading,
+    error: error || null,
+
+    // Computed archetypes
+    coreArchetype: getArchetype('core'),
+    innerArchetype: getArchetype('inner'),
+    outerArchetype: getArchetype('outer'),
+    shadowArchetype: getArchetype('shadow'),
+
+    // Actions
+    getArchetype,
+    getTopArchetypes,
+    refresh,
+  };
+}
+```
+
+### 2.4 VibeID 组件
+
+#### 2.4.1 原型徽章组件
+
+```tsx
+// src/skills/vibe-id/components/ArchetypeBadge.tsx
+
+import { memo } from 'react';
+import { motion } from 'framer-motion';
+import type { ArchetypeId, DimensionId } from '@/types/vibe-id';
+import { getArchetypeMeta } from '../constants/archetypes';
+import { cn } from '@/utils/cn';
+
+interface ArchetypeBadgeProps {
+  archetypeId: ArchetypeId;
+  dimension?: DimensionId;
+  size?: 'sm' | 'md' | 'lg';
+  showLabel?: boolean;
+  showDimension?: boolean;
+  interactive?: boolean;
+  className?: string;
+  onClick?: () => void;
+}
+
+const DIMENSION_LABELS: Record<DimensionId, string> = {
+  core: '核心',
+  inner: '内在',
+  outer: '外在',
+  shadow: '阴影',
+};
+
+const SIZE_CLASSES = {
+  sm: 'w-10 h-10 text-lg',
+  md: 'w-14 h-14 text-2xl',
+  lg: 'w-20 h-20 text-4xl',
+};
+
+// Memoized to prevent unnecessary re-renders (Vercel rule: rerender-memo)
+export const ArchetypeBadge = memo(function ArchetypeBadge({
+  archetypeId,
+  dimension,
+  size = 'md',
+  showLabel = false,
+  showDimension = false,
+  interactive = false,
+  className,
+  onClick,
+}: ArchetypeBadgeProps) {
+  const meta = getArchetypeMeta(archetypeId);
+
+  return (
+    <motion.div
+      className={cn(
+        'flex flex-col items-center gap-1',
+        interactive && 'cursor-pointer',
+        className
+      )}
+      whileHover={interactive ? { scale: 1.05 } : undefined}
+      whileTap={interactive ? { scale: 0.95 } : undefined}
+      onClick={onClick}
+    >
+      {/* Badge circle */}
+      <div
+        className={cn(
+          'rounded-full flex items-center justify-center',
+          'shadow-md transition-shadow hover:shadow-lg',
+          SIZE_CLASSES[size]
+        )}
+        style={{ background: meta.gradient }}
+      >
+        <span role="img" aria-label={meta.name}>
+          {meta.emoji}
+        </span>
+      </div>
+
+      {/* Dimension label */}
+      {showDimension && dimension && (
+        <span className="text-xs text-ink-400 font-medium">
+          {DIMENSION_LABELS[dimension]}
+        </span>
+      )}
+
+      {/* Archetype name */}
+      {showLabel && (
+        <span className="text-sm text-ink-700 font-medium">
+          {meta.nameCn}
+        </span>
+      )}
+    </motion.div>
+  );
+});
+```
+
+#### 2.4.2 维度行组件
+
+```tsx
+// src/skills/vibe-id/components/DimensionRow.tsx
+
+import { memo } from 'react';
+import type { ArchetypeId, DimensionId } from '@/types/vibe-id';
+import { ArchetypeBadge } from './ArchetypeBadge';
+import { getArchetypeMeta } from '../constants/archetypes';
+import { cn } from '@/utils/cn';
+
+interface DimensionRowProps {
+  dimension: DimensionId;
+  archetypeId: ArchetypeId;
+  score?: number;
+  expanded?: boolean;
+  className?: string;
+  onToggle?: () => void;
+}
+
+const DIMENSION_INFO: Record<DimensionId, { label: string; description: string; icon: string }> = {
+  core: {
+    label: '核心原型',
+    description: '你最真实的自我，内心深处的本质',
+    icon: '💎',
+  },
+  inner: {
+    label: '内在原型',
+    description: '你的情感世界与内在驱动力',
+    icon: '🌙',
+  },
+  outer: {
+    label: '外在原型',
+    description: '你呈现给世界的样子',
+    icon: '☀️',
+  },
+  shadow: {
+    label: '阴影原型',
+    description: '隐藏的潜能与成长空间',
+    icon: '🌑',
+  },
+};
+
+export const DimensionRow = memo(function DimensionRow({
+  dimension,
+  archetypeId,
+  score,
+  expanded = false,
+  className,
+  onToggle,
+}: DimensionRowProps) {
+  const dimensionInfo = DIMENSION_INFO[dimension];
+  const archetype = getArchetypeMeta(archetypeId);
+
+  return (
+    <div
+      className={cn(
+        'flex items-center gap-4 p-4 rounded-xl',
+        'bg-vellum-50 hover:bg-vellum-100 transition-colors',
+        'cursor-pointer',
+        className
+      )}
+      onClick={onToggle}
+    >
+      {/* Dimension icon */}
+      <span className="text-2xl">{dimensionInfo.icon}</span>
+
+      {/* Dimension info */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="font-medium text-ink-800">
+            {dimensionInfo.label}
+          </span>
+          {score !== undefined && (
+            <span className="text-xs text-ink-400 bg-ink-100 px-2 py-0.5 rounded-full">
+              {Math.round(score)}%
+            </span>
+          )}
+        </div>
+        <p className="text-sm text-ink-500 truncate">
+          {dimensionInfo.description}
+        </p>
+      </div>
+
+      {/* Archetype badge */}
+      <ArchetypeBadge
+        archetypeId={archetypeId}
+        size="sm"
+        showLabel
+      />
+
+      {/* Expanded content */}
+      {expanded && (
+        <div className="mt-4 pt-4 border-t border-ink-100">
+          <p className="text-sm text-ink-600 mb-2">
+            {archetype.slogan}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {archetype.growthPoints.map((point, i) => (
+              <span
+                key={i}
+                className="text-xs bg-mystic-100 text-mystic-700 px-2 py-1 rounded-full"
+              >
+                {point}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+```
+
+#### 2.4.3 VibeID 卡片组件（主展示组件）
+
+```tsx
+// src/skills/vibe-id/components/VibeIDCard.tsx
+
+import { memo, useState, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import type { VibeIDProfile, DimensionId } from '@/types/vibe-id';
+import { ArchetypeBadge } from './ArchetypeBadge';
+import { DimensionRow } from './DimensionRow';
+import { ArchetypeWheel } from './ArchetypeWheel';
+import { cn } from '@/utils/cn';
+
+interface VibeIDCardProps {
+  profile: VibeIDProfile;
+  variant?: 'compact' | 'full' | 'expanded';
+  showWheel?: boolean;
+  className?: string;
+}
+
+const DIMENSIONS: DimensionId[] = ['core', 'inner', 'outer', 'shadow'];
+
+export const VibeIDCard = memo(function VibeIDCard({
+  profile,
+  variant = 'full',
+  showWheel = true,
+  className,
+}: VibeIDCardProps) {
+  const [expandedDimension, setExpandedDimension] = useState<DimensionId | null>(null);
+
+  // Stable callback using functional pattern (Vercel rule: rerender-functional-setstate)
+  const toggleDimension = useCallback((dimension: DimensionId) => {
+    setExpandedDimension(prev => prev === dimension ? null : dimension);
+  }, []);
+
+  if (variant === 'compact') {
+    return (
+      <div className={cn('flex items-center gap-2', className)}>
+        {DIMENSIONS.map(dim => (
+          <ArchetypeBadge
+            key={dim}
+            archetypeId={profile.archetypes[dim]}
+            dimension={dim}
+            size="sm"
+            showDimension
+          />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        'bg-white rounded-2xl shadow-card overflow-hidden',
+        'border border-ink-100',
+        className
+      )}
+    >
+      {/* Header with main archetypes */}
+      <div className="p-6 bg-gradient-to-br from-vellum-50 to-white">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-ink-800">
+            你的 VibeID
+          </h3>
+          <span className="text-xs text-ink-400">
+            置信度: {Math.round(profile.confidence * 100)}%
+          </span>
+        </div>
+
+        {/* Four dimension badges in a row */}
+        <div className="flex justify-around">
+          {DIMENSIONS.map(dim => (
+            <ArchetypeBadge
+              key={dim}
+              archetypeId={profile.archetypes[dim]}
+              dimension={dim}
+              size="md"
+              showLabel
+              showDimension
+              interactive
+              onClick={() => toggleDimension(dim)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Archetype wheel visualization */}
+      {showWheel && variant === 'expanded' && (
+        <div className="p-6 border-t border-ink-100">
+          <ArchetypeWheel
+            scores={profile.scores}
+            highlighted={profile.archetypes}
+          />
+        </div>
+      )}
+
+      {/* Dimension details */}
+      <div className="p-4 space-y-2">
+        <AnimatePresence mode="popLayout">
+          {DIMENSIONS.map(dim => (
+            <motion.div
+              key={dim}
+              layout
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <DimensionRow
+                dimension={dim}
+                archetypeId={profile.archetypes[dim]}
+                score={profile.dimensionScores?.[dim]?.[profile.archetypes[dim]]}
+                expanded={expandedDimension === dim}
+                onToggle={() => toggleDimension(dim)}
+              />
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+
+      {/* Footer with source info */}
+      <div className="px-6 py-3 bg-ink-50 text-xs text-ink-400">
+        基于 {profile.source === 'bazi' ? '八字' : profile.source === 'zodiac' ? '星盘' : '综合'} 分析 ·
+        更新于 {new Date(profile.calculatedAt).toLocaleDateString('zh-CN')}
+      </div>
+    </div>
+  );
+});
+```
+
+#### 2.4.4 原型轮盘（雷达图）
+
+```tsx
+// src/skills/vibe-id/components/ArchetypeWheel.tsx
+
+import { memo, useMemo } from 'react';
+import ReactECharts from 'echarts-for-react';
+import type { ArchetypeId, FourDimensionArchetypes } from '@/types/vibe-id';
+import { ARCHETYPE_META, getAllArchetypes } from '../constants/archetypes';
+
+interface ArchetypeWheelProps {
+  scores: Record<ArchetypeId, number>;
+  highlighted?: FourDimensionArchetypes;
+  size?: number;
+  className?: string;
+}
+
+export const ArchetypeWheel = memo(function ArchetypeWheel({
+  scores,
+  highlighted,
+  size = 300,
+  className,
+}: ArchetypeWheelProps) {
+  // Memoize chart options to prevent re-computation (Vercel rule: rerender-memo)
+  const option = useMemo(() => {
+    const archetypes = getAllArchetypes();
+
+    // Build indicator array for radar
+    const indicator = archetypes.map(a => ({
+      name: a.emoji + ' ' + a.nameCn,
+      max: 100,
+    }));
+
+    // Build data array
+    const data = archetypes.map(a => scores[a.id] || 0);
+
+    // Determine highlighted points
+    const highlightedIds = highlighted
+      ? Object.values(highlighted)
+      : [];
+
+    return {
+      tooltip: {
+        trigger: 'item',
+      },
+      radar: {
+        indicator,
+        shape: 'polygon',
+        splitNumber: 4,
+        axisName: {
+          color: '#3D3D3D',
+          fontSize: 11,
+        },
+        splitLine: {
+          lineStyle: {
+            color: 'rgba(139, 115, 85, 0.2)',
+          },
+        },
+        splitArea: {
+          areaStyle: {
+            color: ['rgba(255, 250, 240, 0.3)', 'rgba(255, 250, 240, 0.5)'],
+          },
+        },
+        axisLine: {
+          lineStyle: {
+            color: 'rgba(139, 115, 85, 0.3)',
+          },
+        },
+      },
+      series: [
+        {
+          type: 'radar',
+          data: [
+            {
+              value: data,
+              name: 'VibeID',
+              areaStyle: {
+                color: 'rgba(138, 79, 125, 0.3)',
+              },
+              lineStyle: {
+                color: '#8A4F7D',
+                width: 2,
+              },
+              itemStyle: {
+                color: (params: { dataIndex: number }) => {
+                  const archetype = archetypes[params.dataIndex];
+                  return highlightedIds.includes(archetype.id)
+                    ? archetype.color
+                    : '#8A4F7D';
+                },
+              },
+              symbol: 'circle',
+              symbolSize: (value: number, params: { dataIndex: number }) => {
+                const archetype = archetypes[params.dataIndex];
+                return highlightedIds.includes(archetype.id) ? 10 : 6;
+              },
+            },
+          ],
+        },
+      ],
+    };
+  }, [scores, highlighted]);
+
+  return (
+    <div className={className}>
+      <ReactECharts
+        option={option}
+        style={{ width: size, height: size }}
+        opts={{ renderer: 'svg' }}
+      />
+    </div>
+  );
+});
+```
+
+### 2.5 VibeID 工具卡片（聊天展示）
+
+```tsx
+// src/skills/vibe-id/tools/show-vibe-id.tsx
+
+import { memo } from 'react';
+import type { VibeIDProfile } from '@/types/vibe-id';
+import { VibeIDCard } from '../components/VibeIDCard';
+
+interface ShowVibeIDProps {
+  data: {
+    profile: VibeIDProfile;
+    analysis?: string;
+    recommendations?: string[];
+  };
+}
+
+/**
+ * Tool result card for displaying VibeID in chat
+ * Registered in CardRegistry as 'show_vibe_id'
+ */
+export const ShowVibeID = memo(function ShowVibeID({ data }: ShowVibeIDProps) {
+  const { profile, analysis, recommendations } = data;
+
+  return (
+    <div className="space-y-4 w-full md:max-w-md">
+      <VibeIDCard
+        profile={profile}
+        variant="full"
+        showWheel={false}
+      />
+
+      {analysis && (
+        <div className="p-4 bg-vellum-50 rounded-xl">
+          <h4 className="text-sm font-medium text-ink-700 mb-2">
+            原型解读
+          </h4>
+          <p className="text-sm text-ink-600 leading-relaxed">
+            {analysis}
+          </p>
+        </div>
+      )}
+
+      {recommendations && recommendations.length > 0 && (
+        <div className="p-4 bg-mystic-50 rounded-xl">
+          <h4 className="text-sm font-medium text-mystic-700 mb-2">
+            成长建议
+          </h4>
+          <ul className="space-y-1">
+            {recommendations.map((rec, i) => (
+              <li key={i} className="text-sm text-mystic-600 flex items-start gap-2">
+                <span className="text-mystic-400">•</span>
+                {rec}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+});
+
+// Export for CardRegistry
+export default ShowVibeID;
+```
+
+---
+
+## 3. 设计系统
+
+> **主题**: 「暖阳神秘」 - 融合古老智慧美学与现代清晰感的温暖神秘风格
+> **来源**: VibeLife-frontend-v6.md 第 3 节
+
+### 3.1 设计原则 (v7.1 升级)
+
+1. **精致克制**: 每个像素都有意义，避免装饰性元素
+2. **微妙层次**: 用阴影和透明度创造深度，而非边框
+3. **温暖亲切**: 在精致中保持人情味，不冷漠
+4. **流畅自然**: 动效服务于体验，不抢夺注意力
+5. **渐进揭示**: 信息逐步展现，尊重用户的探索旅程
+
+### 3.2 色彩系统 (v7.1 升级 - Linear 风格低饱和度)
+
+#### 3.2.1 CSS 变量
+
+```css
+/* src/styles/variables.css */
+/* v7.1 升级：降低饱和度，增加高级灰质感，保持温暖调性 */
+
+:root {
+  /* ====================================================================== */
+  /* 背景色系 (v7.1 升级)                                                     */
+  /* 更柔和的暖灰，减少黄色倾向，增加中性感                                     */
+  /* ====================================================================== */
+  --bg-primary: #F8F7F4;      /* 主背景 - 柔和暖灰 */
+  --bg-secondary: #F2F1EE;    /* 次级背景 */
+  --bg-tertiary: #ECEAE6;     /* 三级背景 */
+  --bg-elevated: #FFFFFF;     /* 悬浮元素背景 */
+  --bg-hover: #F5F4F1;        /* hover 状态背景 */
+  --bg-active: #EEEDEA;       /* active 状态背景 */
+  --bg-overlay: rgba(0, 0, 0, 0.4);  /* 遮罩层 */
+
+  /* ====================================================================== */
+  /* 墨色系列 (v7.1 升级)                                                     */
+  /* 更柔和的对比度，避免纯黑                                                  */
+  /* ====================================================================== */
+  --ink-50: #FAFAFA;
+  --ink-100: #F4F4F4;
+  --ink-200: #E4E4E4;
+  --ink-300: #D1D1D1;
+  --ink-400: #A1A1A1;
+  --ink-500: #717171;
+  --ink-600: #525252;
+  --ink-700: #3D3D3D;
+  --ink-800: #262626;         /* 主文字色 - 深灰而非纯黑 */
+  --ink-900: #171717;
+
+  /* ====================================================================== */
+  /* 强调色系 (v7.1 升级)                                                     */
+  /* 降低饱和度，更高级的棕色调                                                */
+  /* ====================================================================== */
+  --accent-primary: #7A6B5A;  /* 主强调色 - 高级灰棕 */
+  --accent-secondary: #8F8070; /* 次强调色 */
+  --accent-hover: #6B5C4B;    /* hover 状态 */
+  --accent-active: #5C4D3C;   /* active 状态 */
+  --accent-muted: rgba(122, 107, 90, 0.08);  /* 淡化背景 */
+  --accent-subtle: rgba(122, 107, 90, 0.12); /* 微妙强调 */
+
+  /* ====================================================================== */
+  /* 羊皮纸色系 (v7.1 调整)                                                   */
+  /* 降低饱和度，更接近中性                                                    */
+  /* ====================================================================== */
+  --vellum-50: #FDFCFA;
+  --vellum-100: #FAF8F5;
+  --vellum-200: #F5F2ED;
+  --vellum-300: #EDE9E2;
+  --vellum-400: #E2DDD4;
+  --vellum-500: #D4CEC3;
+  --vellum-600: #B8B1A4;
+  --vellum-700: #9A9285;
+  --vellum-800: #7C7568;
+  --vellum-900: #5E584D;
+
+  /* ====================================================================== */
+  /* 古金色系 (v7.1 调整)                                                     */
+  /* 更克制的金色，避免过于闪亮                                                */
+  /* ====================================================================== */
+  --gold-50: #FDFCF8;
+  --gold-100: #FAF7EE;
+  --gold-200: #F2ECDA;
+  --gold-300: #E6DCC0;
+  --gold-400: #D4C9A0;
+  --gold-500: #BBA978;        /* 主要金色 - 更沉稳 */
+  --gold-600: #A08F5C;
+  --gold-700: #857648;
+  --gold-800: #6A5D38;
+  --gold-900: #4F4528;
+
+  /* ====================================================================== */
+  /* 神秘紫色系 (v7.1 调整)                                                   */
+  /* 降低饱和度，更优雅                                                        */
+  /* ====================================================================== */
+  --mystic-50: #FAF9FB;
+  --mystic-100: #F3F1F5;
+  --mystic-200: #E5E1EB;
+  --mystic-300: #D2CBDC;
+  --mystic-400: #B5AAC5;
+  --mystic-500: #8E7FA0;      /* 主要神秘紫 - 更灰调 */
+  --mystic-600: #716480;
+  --mystic-700: #564B61;
+  --mystic-800: #3B3342;
+  --mystic-900: #201C24;
+
+  /* ====================================================================== */
+  /* 五行色系 (v7.1 调整)                                                     */
+  /* 降低饱和度，更和谐统一                                                    */
+  /* ====================================================================== */
+
+  /* 木 - 生长、创造力 */
+  --element-wood: #4A7C59;
+  --element-wood-light: #7BA889;
+  --element-wood-dark: #2D5A3A;
+
+  /* 火 - 激情、转化 */
+  --element-fire: #B85450;
+  --element-fire-light: #D4807C;
+  --element-fire-dark: #8B3A36;
+
+  /* 土 - 稳定、滋养 */
+  --element-earth: #B8A060;
+  --element-earth-light: #D4C490;
+  --element-earth-dark: #8B7840;
+
+  /* 金 - 精准、价值 */
+  --element-metal: #A8A8A8;
+  --element-metal-light: #D0D0D0;
+  --element-metal-dark: #787878;
+
+  /* 水 - 智慧、流动 */
+  --element-water: #5B7B9A;
+  --element-water-light: #8BA5BC;
+  --element-water-dark: #3D5A75;
+
+  /* ====================================================================== */
+  /* 语义色彩 (v7.1 调整)                                                     */
+  /* 降低饱和度，更柔和                                                        */
+  /* ====================================================================== */
+  --color-success: #5A9A6A;
+  --color-warning: #C4956A;
+  --color-error: #C46A6A;
+  --color-info: #6A8AC4;
+
+  /* ====================================================================== */
+  /* 阴影系统 (v7.1 重构 - Linear 风格多层阴影)                                */
+  /* 多层叠加，带微妙色彩倾向，创造真实深度感                                    */
+  /* ====================================================================== */
+
+  /* 最小阴影 - 用于微妙分隔 */
+  --shadow-xs:
+    0 1px 2px rgba(0, 0, 0, 0.02);
+
+  /* 小阴影 - 用于卡片默认状态 */
+  --shadow-sm:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 2px 4px rgba(0, 0, 0, 0.02);
+
+  /* 中等阴影 - 用于悬浮卡片 */
+  --shadow-md:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 2px 4px rgba(0, 0, 0, 0.02),
+    0 4px 8px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.02);
+
+  /* 大阴影 - 用于模态框、下拉菜单 */
+  --shadow-lg:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 4px 8px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.03),
+    0 16px 32px rgba(0, 0, 0, 0.04);
+
+  /* 超大阴影 - 用于重要弹窗 */
+  --shadow-xl:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.03),
+    0 16px 32px rgba(0, 0, 0, 0.04),
+    0 24px 48px rgba(0, 0, 0, 0.05);
+
+  /* 悬浮阴影 - 用于 hover 状态，带微妙上移感 */
+  --shadow-hover:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 4px 8px rgba(0, 0, 0, 0.03),
+    0 12px 24px rgba(0, 0, 0, 0.05);
+
+  /* 卡片阴影 - 带暖色调 */
+  --shadow-card:
+    0 0 0 1px rgba(122, 107, 90, 0.04),
+    0 2px 4px rgba(122, 107, 90, 0.02),
+    0 4px 12px rgba(122, 107, 90, 0.04);
+
+  /* 卡片悬浮阴影 */
+  --shadow-card-hover:
+    0 0 0 1px rgba(122, 107, 90, 0.06),
+    0 4px 8px rgba(122, 107, 90, 0.03),
+    0 8px 24px rgba(122, 107, 90, 0.06);
+
+  /* 聚焦环 - 带品牌色 */
+  --shadow-focus:
+    0 0 0 2px var(--bg-primary),
+    0 0 0 4px rgba(122, 107, 90, 0.3);
+
+  /* 神秘光晕 - 用于特殊强调 */
+  --shadow-glow:
+    0 0 20px rgba(142, 127, 160, 0.15),
+    0 0 40px rgba(142, 127, 160, 0.08);
+
+  /* ====================================================================== */
+  /* 间距                                                                    */
+  /* ====================================================================== */
+  --space-1: 0.25rem;   /* 4px */
+  --space-2: 0.5rem;    /* 8px */
+  --space-3: 0.75rem;   /* 12px */
+  --space-4: 1rem;      /* 16px */
+  --space-5: 1.25rem;   /* 20px */
+  --space-6: 1.5rem;    /* 24px */
+  --space-8: 2rem;      /* 32px */
+  --space-10: 2.5rem;   /* 40px */
+  --space-12: 3rem;     /* 48px */
+  --space-16: 4rem;     /* 64px */
+
+  /* ====================================================================== */
+  /* 字体排版 (v7.1 Linear 风格升级)                                          */
+  /* ====================================================================== */
+  --font-sans: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
+  --font-serif: 'Noto Serif SC', 'Songti SC', serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* 字号 - Linear 风格精简层级 */
+  --text-xs: 0.75rem;     /* 12px - 辅助信息 */
+  --text-sm: 0.8125rem;   /* 13px - Linear 特色小字号 */
+  --text-base: 0.875rem;  /* 14px - 正文基准 (Linear 风格) */
+  --text-lg: 1rem;        /* 16px - 强调正文 */
+  --text-xl: 1.125rem;    /* 18px - 小标题 */
+  --text-2xl: 1.25rem;    /* 20px - 中标题 */
+  --text-3xl: 1.5rem;     /* 24px - 大标题 */
+  --text-4xl: 2rem;       /* 32px - 页面标题 */
+
+  /* 字重 - 精细控制 */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+
+  /* 行高 - 紧凑但可读 */
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+
+  /* 字间距 - Linear 风格微调 */
+  --tracking-tighter: -0.02em;
+  --tracking-tight: -0.01em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.025em;
+
+  /* ====================================================================== */
+  /* 圆角                                                                    */
+  /* ====================================================================== */
+  --radius-sm: 0.25rem;   /* 4px */
+  --radius-md: 0.5rem;    /* 8px */
+  --radius-lg: 0.75rem;   /* 12px */
+  --radius-xl: 1rem;      /* 16px */
+  --radius-2xl: 1.5rem;   /* 24px */
+  --radius-full: 9999px;
+
+  /* ====================================================================== */
+  /* 层级                                                                    */
+  /* ====================================================================== */
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-fixed: 300;
+  --z-modal-backdrop: 400;
+  --z-modal: 500;
+  --z-popover: 600;
+  --z-tooltip: 700;
+  --z-toast: 800;
+}
+
+/* 深色模式覆盖 */
+[data-theme="dark"] {
+  --ink-50: #0F0F0F;
+  --ink-100: #1F1F1F;
+  --ink-200: #303030;
+  --ink-300: #404040;
+  --ink-400: #525252;
+  --ink-500: #737373;
+  --ink-600: #A3A3A3;
+  --ink-700: #D1D1D1;
+  --ink-800: #E8E8E8;
+  --ink-900: #F5F5F5;
+
+  --vellum-50: #1A1814;
+  --vellum-100: #252119;
+  --vellum-200: #302A1E;
+  --vellum-300: #3B3323;
+  --vellum-400: #463C28;
+}
+```
+
+#### 3.2.2 Tailwind 配置 (v7.1 升级)
+
+```typescript
+// tailwind.config.ts
+// v7.1 升级：Linear 风格动效 + 精致阴影 + Shimmer 效果
+
+import type { Config } from 'tailwindcss';
+
+const config: Config = {
+  content: [
+    './src/**/*.{js,ts,jsx,tsx,mdx}',
+  ],
+  theme: {
+    extend: {
+      colors: {
+        // 背景色系 (v7.1 新增)
+        bg: {
+          primary: 'var(--bg-primary)',
+          secondary: 'var(--bg-secondary)',
+          tertiary: 'var(--bg-tertiary)',
+          elevated: 'var(--bg-elevated)',
+          hover: 'var(--bg-hover)',
+          active: 'var(--bg-active)',
+        },
+        // 强调色系 (v7.1 新增)
+        accent: {
+          DEFAULT: 'var(--accent-primary)',
+          secondary: 'var(--accent-secondary)',
+          hover: 'var(--accent-hover)',
+          active: 'var(--accent-active)',
+          muted: 'var(--accent-muted)',
+          subtle: 'var(--accent-subtle)',
+        },
+        // Ink palette
+        ink: {
+          50: 'var(--ink-50)',
+          100: 'var(--ink-100)',
+          200: 'var(--ink-200)',
+          300: 'var(--ink-300)',
+          400: 'var(--ink-400)',
+          500: 'var(--ink-500)',
+          600: 'var(--ink-600)',
+          700: 'var(--ink-700)',
+          800: 'var(--ink-800)',
+          900: 'var(--ink-900)',
+        },
+        // Vellum palette
+        vellum: {
+          50: 'var(--vellum-50)',
+          100: 'var(--vellum-100)',
+          200: 'var(--vellum-200)',
+          300: 'var(--vellum-300)',
+          400: 'var(--vellum-400)',
+          500: 'var(--vellum-500)',
+          600: 'var(--vellum-600)',
+          700: 'var(--vellum-700)',
+          800: 'var(--vellum-800)',
+          900: 'var(--vellum-900)',
+        },
+        // Gold palette
+        gold: {
+          50: 'var(--gold-50)',
+          100: 'var(--gold-100)',
+          200: 'var(--gold-200)',
+          300: 'var(--gold-300)',
+          400: 'var(--gold-400)',
+          500: 'var(--gold-500)',
+          600: 'var(--gold-600)',
+          700: 'var(--gold-700)',
+          800: 'var(--gold-800)',
+          900: 'var(--gold-900)',
+        },
+        // Mystic palette
+        mystic: {
+          50: 'var(--mystic-50)',
+          100: 'var(--mystic-100)',
+          200: 'var(--mystic-200)',
+          300: 'var(--mystic-300)',
+          400: 'var(--mystic-400)',
+          500: 'var(--mystic-500)',
+          600: 'var(--mystic-600)',
+          700: 'var(--mystic-700)',
+          800: 'var(--mystic-800)',
+          900: 'var(--mystic-900)',
+        },
+        // Five elements
+        element: {
+          wood: 'var(--element-wood)',
+          'wood-light': 'var(--element-wood-light)',
+          'wood-dark': 'var(--element-wood-dark)',
+          fire: 'var(--element-fire)',
+          'fire-light': 'var(--element-fire-light)',
+          'fire-dark': 'var(--element-fire-dark)',
+          earth: 'var(--element-earth)',
+          'earth-light': 'var(--element-earth-light)',
+          'earth-dark': 'var(--element-earth-dark)',
+          metal: 'var(--element-metal)',
+          'metal-light': 'var(--element-metal-light)',
+          'metal-dark': 'var(--element-metal-dark)',
+          water: 'var(--element-water)',
+          'water-light': 'var(--element-water-light)',
+          'water-dark': 'var(--element-water-dark)',
+        },
+      },
+      fontFamily: {
+        sans: ['var(--font-sans)'],
+        serif: ['var(--font-serif)'],
+        mono: ['var(--font-mono)'],
+      },
+      // v7.1 升级：多层阴影系统
+      boxShadow: {
+        'xs': 'var(--shadow-xs)',
+        'sm': 'var(--shadow-sm)',
+        'md': 'var(--shadow-md)',
+        'lg': 'var(--shadow-lg)',
+        'xl': 'var(--shadow-xl)',
+        'hover': 'var(--shadow-hover)',
+        'card': 'var(--shadow-card)',
+        'card-hover': 'var(--shadow-card-hover)',
+        'focus': 'var(--shadow-focus)',
+        'glow': 'var(--shadow-glow)',
+      },
+      borderRadius: {
+        '2xl': 'var(--radius-2xl)',
+      },
+      // v7.1 升级：Linear 风格动效系统
+      animation: {
+        // 基础淡入 - 更快更微妙
+        'fade-in': 'fadeIn 0.15s ease-out',
+        'fade-in-up': 'fadeInUp 0.2s cubic-bezier(0.16, 1, 0.3, 1)',
+        'fade-in-down': 'fadeInDown 0.2s cubic-bezier(0.16, 1, 0.3, 1)',
+        'fade-in-scale': 'fadeInScale 0.2s cubic-bezier(0.16, 1, 0.3, 1)',
+
+        // Spring 弹性 - 用于交互反馈
+        'spring-in': 'springIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        'spring-scale': 'springScale 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        'spring-bounce': 'springBounce 0.5s cubic-bezier(0.34, 1.56, 0.64, 1)',
+
+        // Shimmer 微光 - 用于加载态 (v7.1 新增)
+        'shimmer': 'shimmer 2s ease-in-out infinite',
+        'shimmer-fast': 'shimmer 1.5s ease-in-out infinite',
+
+        // 呼吸 - 更微妙
+        'breath': 'breath 4s ease-in-out infinite',
+        'breath-subtle': 'breathSubtle 6s ease-in-out infinite',
+
+        // Pulse - 更柔和
+        'pulse-soft': 'pulseSoft 2s ease-in-out infinite',
+
+        // Glow - 光晕脉动
+        'glow-pulse': 'glowPulse 2s ease-in-out infinite',
+
+        // Float - 悬浮
+        'float': 'float 6s ease-in-out infinite',
+        'float-slow': 'float 8s ease-in-out infinite',
+
+        // Slide - 滑入
+        'slide-in-right': 'slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
+        'slide-in-left': 'slideInLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
+        'slide-in-up': 'slideInUp 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
+        'slide-in-down': 'slideInDown 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
+
+        // Typing cursor - 打字光标
+        'blink': 'blink 1s ease-in-out infinite',
+      },
+      keyframes: {
+        // 基础淡入
+        fadeIn: {
+          '0%': { opacity: '0' },
+          '100%': { opacity: '1' },
+        },
+        fadeInUp: {
+          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        fadeInDown: {
+          '0%': { opacity: '0', transform: 'translateY(-4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        fadeInScale: {
+          '0%': { opacity: '0', transform: 'scale(0.98)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+
+        // Spring 弹性
+        springIn: {
+          '0%': { opacity: '0', transform: 'scale(0.96)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+        springScale: {
+          '0%': { transform: 'scale(0.97)' },
+          '50%': { transform: 'scale(1.01)' },
+          '100%': { transform: 'scale(1)' },
+        },
+        springBounce: {
+          '0%': { transform: 'scale(0.95)' },
+          '40%': { transform: 'scale(1.02)' },
+          '70%': { transform: 'scale(0.99)' },
+          '100%': { transform: 'scale(1)' },
+        },
+
+        // Shimmer 微光 (v7.1 新增)
+        shimmer: {
+          '0%': { backgroundPosition: '-200% 0' },
+          '100%': { backgroundPosition: '200% 0' },
+        },
+
+        // 呼吸
+        breath: {
+          '0%, 100%': { transform: 'scale(1)', opacity: '0.8' },
+          '50%': { transform: 'scale(1.05)', opacity: '1' },
+        },
+        breathSubtle: {
+          '0%, 100%': { opacity: '0.4', transform: 'scale(1)' },
+          '50%': { opacity: '0.6', transform: 'scale(1.02)' },
+        },
+
+        // Pulse
+        pulseSoft: {
+          '0%, 100%': { opacity: '0.6' },
+          '50%': { opacity: '1' },
+        },
+
+        // Glow
+        glowPulse: {
+          '0%, 100%': { boxShadow: '0 0 20px rgba(142, 127, 160, 0.15)' },
+          '50%': { boxShadow: '0 0 40px rgba(142, 127, 160, 0.25)' },
+        },
+
+        // Float
+        float: {
+          '0%, 100%': { transform: 'translateY(0)' },
+          '50%': { transform: 'translateY(-8px)' },
+        },
+
+        // Slide
+        slideInRight: {
+          '0%': { transform: 'translateX(100%)', opacity: '0' },
+          '100%': { transform: 'translateX(0)', opacity: '1' },
+        },
+        slideInLeft: {
+          '0%': { transform: 'translateX(-100%)', opacity: '0' },
+          '100%': { transform: 'translateX(0)', opacity: '1' },
+        },
+        slideInUp: {
+          '0%': { transform: 'translateY(100%)', opacity: '0' },
+          '100%': { transform: 'translateY(0)', opacity: '1' },
+        },
+        slideInDown: {
+          '0%': { transform: 'translateY(-100%)', opacity: '0' },
+          '100%': { transform: 'translateY(0)', opacity: '1' },
+        },
+
+        // Blink
+        blink: {
+          '0%, 50%': { opacity: '1' },
+          '51%, 100%': { opacity: '0' },
+        },
+      },
+      // v7.1 升级：精调过渡曲线
+      transitionTimingFunction: {
+        'out-expo': 'cubic-bezier(0.16, 1, 0.3, 1)',
+        'spring': 'cubic-bezier(0.34, 1.56, 0.64, 1)',
+        'smooth': 'cubic-bezier(0.4, 0, 0.2, 1)',
+        'bounce': 'cubic-bezier(0.68, -0.55, 0.265, 1.55)',
+      },
+      // v7.1 升级：精调过渡时长
+      transitionDuration: {
+        '150': '150ms',
+        '200': '200ms',
+        '250': '250ms',
+        '300': '300ms',
+        '400': '400ms',
+      },
+    },
+  },
+  plugins: [],
+};
+
+export default config;
+```
+
+### 3.3 字体排版系统
+
+```css
+/* src/styles/typography.css */
+
+/* Heading styles */
+.heading-1 {
+  font-family: var(--font-serif);
+  font-size: var(--text-4xl);
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--ink-800);
+  letter-spacing: -0.02em;
+}
+
+.heading-2 {
+  font-family: var(--font-serif);
+  font-size: var(--text-3xl);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--ink-800);
+}
+
+.heading-3 {
+  font-family: var(--font-sans);
+  font-size: var(--text-2xl);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--ink-700);
+}
+
+.heading-4 {
+  font-family: var(--font-sans);
+  font-size: var(--text-xl);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--ink-700);
+}
+
+/* Body text */
+.body-large {
+  font-family: var(--font-sans);
+  font-size: var(--text-lg);
+  line-height: 1.6;
+  color: var(--ink-600);
+}
+
+.body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  color: var(--ink-600);
+}
+
+.body-small {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--ink-500);
+}
+
+/* Caption and labels */
+.caption {
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  color: var(--ink-400);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.label {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--ink-700);
+}
+
+/* Chinese-specific adjustments */
+:lang(zh) {
+  /* Slightly increase line height for Chinese text */
+  line-height: 1.8;
+  /* Use full-width punctuation */
+  font-feature-settings: "fwid";
+}
+```
+
+### 3.4 原型视觉系统
+
+每个原型都有独特的视觉标识，整合到设计系统中：
+
+```typescript
+// src/skills/vibe-id/styles/archetype-styles.ts
+
+import type { ArchetypeId } from '@/types/vibe-id';
+
+/**
+ * Archetype-specific CSS classes for visual theming
+ */
+export const ARCHETYPE_STYLES: Record<ArchetypeId, {
+  gradient: string;
+  glow: string;
+  border: string;
+  text: string;
+  bg: string;
+}> = {
+  innocent: {
+    gradient: 'bg-gradient-to-br from-pink-200 via-pink-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(255,183,197,0.4)]',
+    border: 'border-pink-200',
+    text: 'text-pink-600',
+    bg: 'bg-pink-50',
+  },
+  explorer: {
+    gradient: 'bg-gradient-to-br from-sky-200 via-sky-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(135,206,235,0.4)]',
+    border: 'border-sky-200',
+    text: 'text-sky-600',
+    bg: 'bg-sky-50',
+  },
+  sage: {
+    gradient: 'bg-gradient-to-br from-purple-200 via-purple-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(155,89,182,0.4)]',
+    border: 'border-purple-200',
+    text: 'text-purple-600',
+    bg: 'bg-purple-50',
+  },
+  hero: {
+    gradient: 'bg-gradient-to-br from-red-200 via-red-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(231,76,60,0.4)]',
+    border: 'border-red-200',
+    text: 'text-red-600',
+    bg: 'bg-red-50',
+  },
+  outlaw: {
+    gradient: 'bg-gradient-to-br from-rose-300 via-rose-200 to-rose-50',
+    glow: 'shadow-[0_0_20px_rgba(139,0,0,0.4)]',
+    border: 'border-rose-300',
+    text: 'text-rose-700',
+    bg: 'bg-rose-50',
+  },
+  magician: {
+    gradient: 'bg-gradient-to-br from-violet-200 via-violet-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(142,68,173,0.4)]',
+    border: 'border-violet-200',
+    text: 'text-violet-600',
+    bg: 'bg-violet-50',
+  },
+  regular: {
+    gradient: 'bg-gradient-to-br from-green-200 via-green-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(39,174,96,0.4)]',
+    border: 'border-green-200',
+    text: 'text-green-600',
+    bg: 'bg-green-50',
+  },
+  lover: {
+    gradient: 'bg-gradient-to-br from-fuchsia-200 via-fuchsia-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(233,30,99,0.4)]',
+    border: 'border-fuchsia-200',
+    text: 'text-fuchsia-600',
+    bg: 'bg-fuchsia-50',
+  },
+  jester: {
+    gradient: 'bg-gradient-to-br from-amber-200 via-amber-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(243,156,18,0.4)]',
+    border: 'border-amber-200',
+    text: 'text-amber-600',
+    bg: 'bg-amber-50',
+  },
+  caregiver: {
+    gradient: 'bg-gradient-to-br from-emerald-200 via-emerald-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(46,204,113,0.4)]',
+    border: 'border-emerald-200',
+    text: 'text-emerald-600',
+    bg: 'bg-emerald-50',
+  },
+  creator: {
+    gradient: 'bg-gradient-to-br from-blue-200 via-blue-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(52,152,219,0.4)]',
+    border: 'border-blue-200',
+    text: 'text-blue-600',
+    bg: 'bg-blue-50',
+  },
+  ruler: {
+    gradient: 'bg-gradient-to-br from-yellow-200 via-yellow-100 to-white',
+    glow: 'shadow-[0_0_20px_rgba(212,175,55,0.4)]',
+    border: 'border-yellow-300',
+    text: 'text-yellow-700',
+    bg: 'bg-yellow-50',
+  },
+};
+
+/**
+ * Get archetype style classes
+ */
+export function getArchetypeStyles(id: ArchetypeId) {
+  return ARCHETYPE_STYLES[id];
+}
+```
+
+### 3.5 动画模式
+
+```tsx
+// src/components/shared/animations.ts
+
+import { Variants } from 'framer-motion';
+
+/**
+ * Standard animation variants for consistent motion design
+ */
+
+// Fade and slide up (for content reveal)
+export const fadeInUp: Variants = {
+  initial: { opacity: 0, y: 20 },
+  animate: { opacity: 1, y: 0 },
+  exit: { opacity: 0, y: -10 },
+};
+
+// Fade and scale (for modals and cards)
+export const fadeInScale: Variants = {
+  initial: { opacity: 0, scale: 0.95 },
+  animate: { opacity: 1, scale: 1 },
+  exit: { opacity: 0, scale: 0.95 },
+};
+
+// Stagger children (for lists)
+export const staggerContainer: Variants = {
+  animate: {
+    transition: {
+      staggerChildren: 0.05,
+    },
+  },
+};
+
+// Slide in from right (for navigation)
+export const slideInRight: Variants = {
+  initial: { x: '100%' },
+  animate: { x: 0 },
+  exit: { x: '100%' },
+};
+
+// Spring physics for interactive elements
+export const springConfig = {
+  type: 'spring',
+  stiffness: 300,
+  damping: 30,
+};
+
+// Smooth easing for non-interactive animations
+export const smoothConfig = {
+  duration: 0.3,
+  ease: [0.4, 0, 0.2, 1],
+};
+
+/**
+ * BreathAura animation component
+ * Creates a subtle pulsing glow effect
+ */
+export const breathAuraVariants: Variants = {
+  animate: {
+    scale: [1, 1.02, 1],
+    opacity: [0.6, 0.8, 0.6],
+    transition: {
+      duration: 4,
+      repeat: Infinity,
+      ease: 'easeInOut',
+    },
+  },
+};
+```
+
+### 3.6 组件模式 (v7.1 升级 - Linear 风格)
+
+#### 3.6.1 卡片模式 (v7.1 重构)
+
+```tsx
+// src/components/ui/Card.tsx
+// v7.1 升级：无边框设计，多层阴影，微妙 hover 效果
+
+import { forwardRef, HTMLAttributes } from 'react';
+import { cn } from '@/utils/cn';
+
+interface CardProps extends HTMLAttributes<HTMLDivElement> {
+  variant?: 'default' | 'elevated' | 'interactive' | 'mystical' | 'outlined';
+  padding?: 'none' | 'sm' | 'md' | 'lg';
+  hover?: boolean;
+}
+
+/**
+ * v7.1 卡片变体
+ * - default: 微妙阴影，无边框，干净
+ * - elevated: 更强阴影，用于重要内容
+ * - interactive: 带 hover 效果，用于可点击卡片
+ * - mystical: 保留品牌特色，带光晕
+ * - outlined: 有边框版本，用于表单等
+ */
+const VARIANT_CLASSES = {
+  default: cn(
+    'bg-white rounded-xl',
+    'shadow-card',
+    'transition-all duration-200 ease-out-expo'
+  ),
+  elevated: cn(
+    'bg-white rounded-xl',
+    'shadow-md',
+    'transition-all duration-200 ease-out-expo'
+  ),
+  interactive: cn(
+    'bg-white rounded-xl',
+    'shadow-card',
+    'transition-all duration-150 ease-out-expo',
+    'hover:bg-bg-hover hover:shadow-card-hover hover:-translate-y-0.5',
+    'active:scale-[0.99] active:shadow-card',
+    'cursor-pointer'
+  ),
+  mystical: cn(
+    'bg-gradient-to-br from-white to-vellum-50',
+    'rounded-xl shadow-card',
+    'ring-1 ring-gold-200/30',
+    'transition-all duration-200',
+    'hover:shadow-card-hover hover:ring-gold-300/40'
+  ),
+  outlined: cn(
+    'bg-white rounded-xl',
+    'border border-ink-100',
+    'transition-all duration-200',
+    'hover:border-ink-200'
+  ),
+};
+
+const PADDING_CLASSES = {
+  none: '',
+  sm: 'p-3',
+  md: 'p-4',
+  lg: 'p-6',
+};
+
+export const Card = forwardRef<HTMLDivElement, CardProps>(
+  ({ variant = 'default', padding = 'md', hover, className, children, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        className={cn(
+          VARIANT_CLASSES[variant],
+          PADDING_CLASSES[padding],
+          // 额外 hover 效果（用于非 interactive 变体）
+          hover && variant !== 'interactive' && 'hover:shadow-card-hover hover:-translate-y-0.5',
+          className
+        )}
+        {...props}
+      >
+        {children}
+      </div>
+    );
+  }
+);
+
+Card.displayName = 'Card';
+
+/**
+ * CardHeader - 卡片头部
+ */
+export function CardHeader({ className, children, ...props }: HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn('flex items-center justify-between mb-4', className)} {...props}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * CardTitle - 卡片标题
+ */
+export function CardTitle({ className, children, ...props }: HTMLAttributes<HTMLHeadingElement>) {
+  return (
+    <h3 className={cn('text-lg font-medium text-ink-800', className)} {...props}>
+      {children}
+    </h3>
+  );
+}
+
+/**
+ * CardContent - 卡片内容
+ */
+export function CardContent({ className, children, ...props }: HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn('text-ink-600', className)} {...props}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * CardFooter - 卡片底部
+ */
+export function CardFooter({ className, children, ...props }: HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn('mt-4 pt-4 border-t border-ink-100 flex items-center gap-2', className)} {...props}>
+      {children}
+    </div>
+  );
+}
+```
+
+#### 3.6.2 按钮模式 (v7.1 重构)
+
+```tsx
+// src/components/ui/Button.tsx
+// v7.1 升级：精致交互反馈，微妙阴影，spring 动效
+
+import { forwardRef, ButtonHTMLAttributes } from 'react';
+import { cn } from '@/utils/cn';
+
+interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'ghost' | 'mystical' | 'danger';
+  size?: 'sm' | 'md' | 'lg';
+  loading?: boolean;
+  icon?: React.ReactNode;
+  iconPosition?: 'left' | 'right';
+}
+
+/**
+ * v7.1 按钮变体
+ * - primary: 主要操作，实心背景
+ * - secondary: 次要操作，淡色背景
+ * - ghost: 幽灵按钮，透明背景
+ * - mystical: 品牌特色，渐变背景
+ * - danger: 危险操作，红色调
+ */
+const VARIANT_CLASSES = {
+  primary: cn(
+    'bg-accent text-white',
+    'shadow-sm',
+    'transition-all duration-150 ease-out-expo',
+    'hover:bg-accent-hover hover:shadow-md hover:-translate-y-0.5',
+    'active:translate-y-0 active:shadow-sm active:scale-[0.99]',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30 focus-visible:ring-offset-2'
+  ),
+  secondary: cn(
+    'bg-bg-secondary text-accent',
+    'transition-all duration-150 ease-out-expo',
+    'hover:bg-bg-tertiary',
+    'active:scale-[0.99]',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/20 focus-visible:ring-offset-2'
+  ),
+  ghost: cn(
+    'text-ink-600',
+    'transition-all duration-150',
+    'hover:bg-accent-muted hover:text-ink-800',
+    'active:bg-accent-subtle',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/20'
+  ),
+  mystical: cn(
+    'bg-gradient-to-r from-mystic-500 to-gold-500 text-white',
+    'shadow-md',
+    'transition-all duration-200',
+    'hover:opacity-90 hover:shadow-lg hover:-translate-y-0.5',
+    'active:translate-y-0 active:scale-[0.99]',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mystic-300 focus-visible:ring-offset-2'
+  ),
+  danger: cn(
+    'bg-color-error text-white',
+    'shadow-sm',
+    'transition-all duration-150 ease-out-expo',
+    'hover:bg-red-600 hover:shadow-md',
+    'active:scale-[0.99]',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 focus-visible:ring-offset-2'
+  ),
+};
+
+const SIZE_CLASSES = {
+  sm: 'h-8 px-3 text-sm gap-1.5 rounded-lg',
+  md: 'h-10 px-4 text-base gap-2 rounded-lg',
+  lg: 'h-12 px-6 text-lg gap-2.5 rounded-xl',
+};
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
+  ({
+    variant = 'primary',
+    size = 'md',
+    loading,
+    icon,
+    iconPosition = 'left',
+    className,
+    disabled,
+    children,
+    ...props
+  }, ref) => {
+    return (
+      <button
+        ref={ref}
+        className={cn(
+          'inline-flex items-center justify-center',
+          'font-medium',
+          'disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none',
+          VARIANT_CLASSES[variant],
+          SIZE_CLASSES[size],
+          className
+        )}
+        disabled={disabled || loading}
+        {...props}
+      >
+        {/* Loading spinner */}
+        {loading && (
+          <svg
+            className="animate-spin h-4 w-4 flex-shrink-0"
+            viewBox="0 0 24 24"
+            fill="none"
+          >
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              strokeWidth="4"
+            />
+            <path
+              className="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+            />
+          </svg>
+        )}
+
+        {/* Left icon */}
+        {!loading && icon && iconPosition === 'left' && (
+          <span className="flex-shrink-0">{icon}</span>
+        )}
+
+        {/* Button text */}
+        {children}
+
+        {/* Right icon */}
+        {!loading && icon && iconPosition === 'right' && (
+          <span className="flex-shrink-0">{icon}</span>
+        )}
+      </button>
+    );
+  }
+);
+
+Button.displayName = 'Button';
+
+/**
+ * IconButton - 图标按钮
+ */
+interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'ghost' | 'secondary';
+  size?: 'sm' | 'md' | 'lg';
+}
+
+const ICON_SIZE_CLASSES = {
+  sm: 'w-8 h-8 rounded-lg',
+  md: 'w-10 h-10 rounded-lg',
+  lg: 'w-12 h-12 rounded-xl',
+};
+
+export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
+  ({ variant = 'ghost', size = 'md', className, children, ...props }, ref) => {
+    return (
+      <button
+        ref={ref}
+        className={cn(
+          'inline-flex items-center justify-center',
+          'transition-all duration-150',
+          variant === 'ghost' && 'text-ink-500 hover:bg-accent-muted hover:text-ink-700',
+          variant === 'secondary' && 'bg-bg-secondary text-ink-600 hover:bg-bg-tertiary',
+          'active:scale-95',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/20',
+          'disabled:opacity-50 disabled:cursor-not-allowed',
+          ICON_SIZE_CLASSES[size],
+          className
+        )}
+        {...props}
+      >
+        {children}
+      </button>
+    );
+  }
+);
+
+IconButton.displayName = 'IconButton';
+```
+
+#### 3.6.3 聊天气泡模式 (v7.1 重构)
+
+```tsx
+// src/components/chat/ChatBubble.tsx
+// v7.1 升级：精致气泡，渐变用户消息，无边框助手消息
+
+import { memo } from 'react';
+import { cn } from '@/utils/cn';
+
+interface ChatBubbleProps {
+  role: 'user' | 'assistant';
+  children: React.ReactNode;
+  isStreaming?: boolean;
+  className?: string;
+}
+
+/**
+ * v7.1 聊天气泡
+ * - 用户消息：渐变背景，右下角小圆角
+ * - 助手消息：白色背景，阴影分隔，左下角小圆角
+ */
+export const ChatBubble = memo(function ChatBubble({
+  role,
+  children,
+  isStreaming,
+  className,
+}: ChatBubbleProps) {
+  const isUser = role === 'user';
+
+  return (
+    <div
+      className={cn(
+        'max-w-[85%] px-4 py-3',
+        'animate-fade-in-up',
+        isUser ? [
+          // 用户消息样式
+          'ml-auto',
+          'bg-gradient-to-br from-accent to-accent-hover',
+          'text-white',
+          'rounded-2xl rounded-br-md',
+          'shadow-sm',
+        ] : [
+          // 助手消息样式
+          'mr-auto',
+          'bg-white',
+          'text-ink-700',
+          'rounded-2xl rounded-bl-md',
+          'shadow-card',
+        ],
+        className
+      )}
+    >
+      {/* 消息内容 */}
+      <div className="whitespace-pre-wrap leading-relaxed">
+        {children}
+      </div>
+
+      {/* 流式打字光标 */}
+      {isStreaming && !isUser && (
+        <span className="typing-cursor" />
+      )}
+    </div>
+  );
+});
+
+/**
+ * 流式打字光标样式 (添加到 globals.css)
+ */
+const typingCursorCSS = `
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--accent-primary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s ease-in-out infinite;
+}
+`;
+
+/**
+ * TypingIndicator - 打字指示器
+ */
+export function TypingIndicator({ className }: { className?: string }) {
+  return (
+    <div className={cn(
+      'flex items-center gap-1 px-4 py-3',
+      'bg-white rounded-2xl rounded-bl-md shadow-card',
+      'max-w-[80px]',
+      className
+    )}>
+      <span className="w-2 h-2 rounded-full bg-ink-300 animate-bounce" style={{ animationDelay: '0ms' }} />
+      <span className="w-2 h-2 rounded-full bg-ink-300 animate-bounce" style={{ animationDelay: '150ms' }} />
+      <span className="w-2 h-2 rounded-full bg-ink-300 animate-bounce" style={{ animationDelay: '300ms' }} />
+    </div>
+  );
+}
+```
+
+#### 3.6.4 输入框模式 (v7.1 新增)
+
+```tsx
+// src/components/ui/Input.tsx
+// v7.1 新增：精致输入框，微妙聚焦效果
+
+import { forwardRef, InputHTMLAttributes } from 'react';
+import { cn } from '@/utils/cn';
+
+interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
+  variant?: 'default' | 'filled' | 'ghost';
+  inputSize?: 'sm' | 'md' | 'lg';
+  error?: boolean;
+  icon?: React.ReactNode;
+}
+
+const VARIANT_CLASSES = {
+  default: cn(
+    'bg-white',
+    'border border-ink-200',
+    'focus:border-accent focus:ring-2 focus:ring-accent/10',
+    'hover:border-ink-300'
+  ),
+  filled: cn(
+    'bg-bg-secondary',
+    'border border-transparent',
+    'focus:bg-white focus:border-accent focus:ring-2 focus:ring-accent/10',
+    'hover:bg-bg-tertiary'
+  ),
+  ghost: cn(
+    'bg-transparent',
+    'border border-transparent',
+    'focus:bg-bg-secondary focus:border-ink-200',
+    'hover:bg-bg-hover'
+  ),
+};
+
+const SIZE_CLASSES = {
+  sm: 'h-8 px-3 text-sm rounded-lg',
+  md: 'h-10 px-4 text-base rounded-lg',
+  lg: 'h-12 px-4 text-lg rounded-xl',
+};
+
+export const Input = forwardRef<HTMLInputElement, InputProps>(
+  ({ variant = 'default', inputSize = 'md', error, icon, className, ...props }, ref) => {
+    return (
+      <div className="relative">
+        {icon && (
+          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400">
+            {icon}
+          </span>
+        )}
+        <input
+          ref={ref}
+          className={cn(
+            'w-full',
+            'text-ink-800 placeholder:text-ink-400',
+            'transition-all duration-150',
+            'outline-none',
+            'disabled:opacity-50 disabled:cursor-not-allowed',
+            VARIANT_CLASSES[variant],
+            SIZE_CLASSES[inputSize],
+            icon && 'pl-10',
+            error && 'border-color-error focus:border-color-error focus:ring-red-100',
+            className
+          )}
+          {...props}
+        />
+      </div>
+    );
+  }
+);
+
+Input.displayName = 'Input';
+
+/**
+ * Textarea - 多行输入框
+ */
+interface TextareaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
+  variant?: 'default' | 'filled';
+  error?: boolean;
+}
+
+export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
+  ({ variant = 'default', error, className, ...props }, ref) => {
+    return (
+      <textarea
+        ref={ref}
+        className={cn(
+          'w-full px-4 py-3',
+          'text-ink-800 placeholder:text-ink-400',
+          'rounded-xl',
+          'transition-all duration-150',
+          'outline-none resize-none',
+          'disabled:opacity-50 disabled:cursor-not-allowed',
+          variant === 'default' && [
+            'bg-white border border-ink-200',
+            'focus:border-accent focus:ring-2 focus:ring-accent/10',
+            'hover:border-ink-300',
+          ],
+          variant === 'filled' && [
+            'bg-bg-secondary border border-transparent',
+            'focus:bg-white focus:border-accent focus:ring-2 focus:ring-accent/10',
+          ],
+          error && 'border-color-error focus:border-color-error focus:ring-red-100',
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
+
+Textarea.displayName = 'Textarea';
+```
+
+---
+
+## 4. 性能优化
+
+> **来源**: Vercel React Best Practices (45条规则)
+> **优先级**: 按影响程度排序，CRITICAL > HIGH > MEDIUM > LOW
+
+### 4.1 规则总览
+
+| 优先级 | 类别 | 影响程度 | 前缀 | 规则数 |
+|--------|------|----------|------|--------|
+| 1 | 消除瀑布流 | CRITICAL | `async-` | 5 |
+| 2 | 包体积优化 | CRITICAL | `bundle-` | 5 |
+| 3 | 服务端性能 | HIGH | `server-` | 5 |
+| 4 | 客户端数据获取 | MEDIUM-HIGH | `client-` | 2 |
+| 5 | 重渲染优化 | MEDIUM | `rerender-` | 7 |
+| 6 | 渲染性能 | MEDIUM | `rendering-` | 7 |
+| 7 | JavaScript 性能 | LOW-MEDIUM | `js-` | 12 |
+| 8 | 高级模式 | LOW | `advanced-` | 2 |
+
+### 4.2 CRITICAL: 消除瀑布流 (async-*)
+
+瀑布流是性能的头号杀手。每个顺序执行的 await 都会增加完整的网络延迟。
+
+#### 4.2.1 async-parallel: 并行执行独立操作
+
+```typescript
+// ❌ 错误: 顺序执行造成瀑布流
+async function loadDashboard(userId: string) {
+  const profile = await fetchProfile(userId);      // 200ms
+  const vibeId = await fetchVibeId(userId);        // 150ms
+  const history = await fetchChatHistory(userId);  // 180ms
+  // 总计: 530ms
+  return { profile, vibeId, history };
+}
+
+// ✅ 正确: 使用 Promise.all 并行执行
+async function loadDashboard(userId: string) {
+  const [profile, vibeId, history] = await Promise.all([
+    fetchProfile(userId),      // ┐
+    fetchVibeId(userId),       // ├─ 并行执行
+    fetchChatHistory(userId),  // ┘
+  ]);
+  // 总计: max(200, 150, 180) = 200ms
+  return { profile, vibeId, history };
+}
+```
+
+#### 4.2.2 async-defer-await: 延迟 await 到实际使用时
+
+```typescript
+// ❌ 错误: 立即 await
+async function getInsight(userId: string) {
+  const profile = await fetchProfile(userId);  // 立即阻塞
+
+  if (someCondition) {
+    return cachedInsight;  // profile 从未使用
+  }
+
+  return generateInsight(profile);
+}
+
+// ✅ 正确: 延迟 await 到使用分支
+async function getInsight(userId: string) {
+  const profilePromise = fetchProfile(userId);  // 启动但不等待
+
+  if (someCondition) {
+    return cachedInsight;  // 无需等待 profile
+  }
+
+  const profile = await profilePromise;  // 仅在需要时等待
+  return generateInsight(profile);
+}
+```
+
+#### 4.2.3 async-suspense-boundaries: 使用 Suspense 流式传输
+
+```tsx
+// ❌ 错误: 整个页面等待所有数据
+async function VibeIDPage() {
+  const profile = await fetchVibeID();
+  const insights = await fetchInsights();
+
+  return (
+    <div>
+      <VibeIDCard profile={profile} />
+      <InsightsList insights={insights} />
+    </div>
+  );
+}
+
+// ✅ 正确: 使用 Suspense 边界流式传输
+function VibeIDPage() {
+  return (
+    <div>
+      <Suspense fallback={<VibeIDSkeleton />}>
+        <VibeIDSection />  {/* 独立加载 */}
+      </Suspense>
+      <Suspense fallback={<InsightsSkeleton />}>
+        <InsightsSection />  {/* 独立加载 */}
+      </Suspense>
+    </div>
+  );
+}
+
+async function VibeIDSection() {
+  const profile = await fetchVibeID();
+  return <VibeIDCard profile={profile} />;
+}
+```
+
+### 4.3 CRITICAL: 包体积优化 (bundle-*)
+
+减少初始包体积可改善 Time to Interactive 和 Largest Contentful Paint。
+
+#### 4.3.1 bundle-barrel-imports: 避免桶文件导入
+
+```typescript
+// ❌ 错误: 从桶文件导入 (可能导入整个库)
+import { Button } from '@/components/ui';
+import { useVibeID } from '@/hooks';
+
+// ✅ 正确: 直接从源文件导入
+import { Button } from '@/components/ui/Button';
+import { useVibeID } from '@/skills/vibe-id/hooks/useVibeID';
+```
+
+#### 4.3.2 bundle-dynamic-imports: 动态导入重型组件
+
+```tsx
+// ❌ 错误: 静态导入大型图表库
+import { ArchetypeWheel } from '@/skills/vibe-id/components/ArchetypeWheel';
+
+// ✅ 正确: 使用 next/dynamic 动态导入
+import dynamic from 'next/dynamic';
+
+const ArchetypeWheel = dynamic(
+  () => import('@/skills/vibe-id/components/ArchetypeWheel'),
+  {
+    loading: () => <WheelSkeleton />,
+    ssr: false,  // ECharts 不支持 SSR
+  }
+);
+```
+
+#### 4.3.3 bundle-defer-third-party: 延迟加载第三方脚本
+
+```tsx
+// ❌ 错误: 在 hydration 前加载分析脚本
+useEffect(() => {
+  initAnalytics();  // 阻塞 hydration
+}, []);
+
+// ✅ 正确: 使用 requestIdleCallback 延迟加载
+useEffect(() => {
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => {
+      initAnalytics();
+    });
+  } else {
+    setTimeout(initAnalytics, 1000);
+  }
+}, []);
+```
+
+#### 4.3.4 bundle-conditional: 条件加载模块
+
+```tsx
+// ❌ 错误: 总是加载塔罗牌组件
+import { TarotDeck } from '@/skills/tarot/components/TarotDeck';
+
+function SkillPanel({ skill }) {
+  return skill === 'tarot' ? <TarotDeck /> : <OtherSkill />;
+}
+
+// ✅ 正确: 仅在需要时加载
+function SkillPanel({ skill }) {
+  const [TarotDeck, setTarotDeck] = useState(null);
+
+  useEffect(() => {
+    if (skill === 'tarot' && !TarotDeck) {
+      import('@/skills/tarot/components/TarotDeck')
+        .then(mod => setTarotDeck(() => mod.TarotDeck));
+    }
+  }, [skill]);
+
+  if (skill === 'tarot') {
+    return TarotDeck ? <TarotDeck /> : <TarotSkeleton />;
+  }
+  return <OtherSkill />;
+}
+```
+
+#### 4.3.5 bundle-preload: 悬停时预加载
+
+```tsx
+// ✅ 预加载以提升感知速度
+function SkillNav() {
+  const prefetchSkill = (skillId: string) => {
+    // 预取数据
+    router.prefetch(`/skills/${skillId}`);
+    // 预加载组件
+    import(`@/skills/${skillId}/components`);
+  };
+
+  return (
+    <nav>
+      {SKILLS.map(skill => (
+        <Link
+          key={skill.id}
+          href={`/skills/${skill.id}`}
+          onMouseEnter={() => prefetchSkill(skill.id)}
+          onFocus={() => prefetchSkill(skill.id)}
+        >
+          {skill.name}
+        </Link>
+      ))}
+    </nav>
+  );
+}
+```
+
+### 4.4 HIGH: 服务端性能 (server-*)
+
+优化服务端渲染和数据获取可消除服务端瀑布流并减少响应时间。
+
+#### 4.4.1 server-cache-react: 使用 React.cache() 请求级去重
+
+```typescript
+// ❌ 错误: 同一请求内多次获取相同数据
+// 组件 A
+const user = await fetchUser(userId);
+// 组件 B
+const user = await fetchUser(userId);  // 重复请求!
+
+// ✅ 正确: 使用 React.cache 包装
+import { cache } from 'react';
+
+export const getUser = cache(async (userId: string) => {
+  const res = await fetch(`/api/users/${userId}`);
+  return res.json();
+});
+
+// 组件 A 和 B 现在共享同一个缓存的 Promise
+```
+
+#### 4.4.2 server-parallel-fetching: 重构组件以并行获取
+
+```tsx
+// ❌ 错误: 组件嵌套导致顺序获取
+async function ParentComponent() {
+  const user = await fetchUser();  // 等待
+  return <ChildComponent userId={user.id} />;  // 然后才开始子组件获取
+}
+
+async function ChildComponent({ userId }) {
+  const vibeId = await fetchVibeId(userId);  // 又一次等待
+  return <VibeIDCard profile={vibeId} />;
+}
+
+// ✅ 正确: 在父组件并行启动所有获取
+async function ParentComponent() {
+  const [user, vibeId] = await Promise.all([
+    fetchUser(),
+    fetchVibeId(),  // 使用认证中间件获取当前用户ID
+  ]);
+
+  return (
+    <>
+      <UserProfile user={user} />
+      <VibeIDCard profile={vibeId} />
+    </>
+  );
+}
+```
+
+#### 4.4.3 server-serialization: 最小化传递给客户端组件的数据
+
+```tsx
+// ❌ 错误: 传递整个大对象
+async function VibeIDPage() {
+  const fullProfile = await fetchFullVibeIDProfile();  // 包含大量数据
+  return <VibeIDClient profile={fullProfile} />;  // 全部序列化到客户端
+}
+
+// ✅ 正确: 仅传递必要数据
+async function VibeIDPage() {
+  const fullProfile = await fetchFullVibeIDProfile();
+
+  // 仅提取客户端需要的字段
+  const clientData = {
+    archetypes: fullProfile.archetypes,
+    confidence: fullProfile.confidence,
+    calculatedAt: fullProfile.calculatedAt,
+  };
+
+  return <VibeIDClient profile={clientData} />;
+}
+```
+
+### 4.5 MEDIUM-HIGH: 客户端数据获取 (client-*)
+
+#### 4.5.1 client-swr-dedup: 使用 SWR 自动去重
+
+```tsx
+// ❌ 错误: 手动管理请求状态，可能重复请求
+function useVibeID(userId: string) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`/api/vibe-id/${userId}`)
+      .then(res => res.json())
+      .then(setData)
+      .finally(() => setLoading(false));
+  }, [userId]);
+
+  return { data, loading };
+}
+
+// ✅ 正确: SWR 自动处理去重、缓存、重验证
+import useSWR from 'swr';
+
+function useVibeID(userId: string) {
+  const { data, error, isLoading, mutate } = useSWR(
+    userId ? `/api/vibe-id/${userId}` : null,
+    fetcher,
+    {
+      dedupingInterval: 60000,  // 1分钟内去重
+      revalidateOnFocus: false,
+    }
+  );
+
+  return { data, error, isLoading, refresh: mutate };
+}
+```
+
+### 4.6 MEDIUM: 重渲染优化 (rerender-*)
+
+#### 4.6.1 rerender-memo: 提取昂贵计算到 memo 组件
+
+```tsx
+// ❌ 错误: 每次父组件更新都重新渲染
+function VibeIDDisplay({ profile, onUpdate }) {
+  return (
+    <div>
+      <ExpensiveChart data={profile.scores} />  {/* 昂贵! */}
+      <button onClick={onUpdate}>刷新</button>
+    </div>
+  );
+}
+
+// ✅ 正确: memo 包装昂贵组件
+const ExpensiveChart = memo(function ExpensiveChart({ data }) {
+  // 仅在 data 变化时重新渲染
+  return <ReactECharts option={buildChartOption(data)} />;
+});
+
+function VibeIDDisplay({ profile, onUpdate }) {
+  return (
+    <div>
+      <ExpensiveChart data={profile.scores} />
+      <button onClick={onUpdate}>刷新</button>
+    </div>
+  );
+}
+```
+
+#### 4.6.2 rerender-functional-setstate: 使用函数式 setState 创建稳定回调
+
+```tsx
+// ❌ 错误: 每次渲染创建新函数
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  // 每次渲染都是新函数
+  const increment = () => setCount(count + 1);
+
+  return <Button onClick={increment}>+1</Button>;
+}
+
+// ✅ 正确: 使用函数式更新
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  // 稳定引用，不依赖 count
+  const increment = useCallback(() => {
+    setCount(prev => prev + 1);
+  }, []);
+
+  return <Button onClick={increment}>+1</Button>;
+}
+```
+
+#### 4.6.3 rerender-lazy-state-init: 惰性初始化昂贵状态
+
+```tsx
+// ❌ 错误: 每次渲染都计算初始值
+function VibeIDEditor() {
+  // computeInitialState() 每次渲染都调用!
+  const [state, setState] = useState(computeInitialState());
+  return <Editor state={state} />;
+}
+
+// ✅ 正确: 传递函数实现惰性初始化
+function VibeIDEditor() {
+  // 函数仅在首次渲染时调用
+  const [state, setState] = useState(() => computeInitialState());
+  return <Editor state={state} />;
+}
+```
+
+#### 4.6.4 rerender-derived-state: 订阅派生布尔值而非原始值
+
+```tsx
+// ❌ 错误: 订阅整个 profile，任何字段变化都触发重渲染
+function ProfileBadge() {
+  const profile = useVibeIDStore(state => state.profile);
+  const hasVibeID = profile !== null;
+
+  return hasVibeID ? <Badge /> : null;
+}
+
+// ✅ 正确: 仅订阅派生的布尔值
+function ProfileBadge() {
+  const hasVibeID = useVibeIDStore(state => state.profile !== null);
+
+  return hasVibeID ? <Badge /> : null;
+}
+```
+
+#### 4.6.5 rerender-transitions: 使用 startTransition 处理非紧急更新
+
+```tsx
+// ❌ 错误: 大型列表过滤阻塞输入
+function ArchetypeFilter() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+
+  const handleChange = (e) => {
+    setQuery(e.target.value);
+    setResults(filterArchetypes(e.target.value));  // 阻塞!
+  };
+
+  return (
+    <input value={query} onChange={handleChange} />
+  );
+}
+
+// ✅ 正确: 使用 transition 延迟非紧急更新
+function ArchetypeFilter() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  const handleChange = (e) => {
+    setQuery(e.target.value);  // 紧急: 立即更新输入
+    startTransition(() => {
+      setResults(filterArchetypes(e.target.value));  // 非紧急: 可中断
+    });
+  };
+
+  return (
+    <>
+      <input value={query} onChange={handleChange} />
+      {isPending && <Spinner />}
+      <Results items={results} />
+    </>
+  );
+}
+```
+
+### 4.7 MEDIUM: 渲染性能 (rendering-*)
+
+#### 4.7.1 rendering-hoist-jsx: 提取静态 JSX 到组件外部
+
+```tsx
+// ❌ 错误: 每次渲染创建新的 JSX 对象
+function VibeIDCard({ profile }) {
+  const header = (
+    <div className="header">
+      <h3>你的 VibeID</h3>
+    </div>
+  );
+
+  return (
+    <Card>
+      {header}
+      <Content profile={profile} />
+    </Card>
+  );
+}
+
+// ✅ 正确: 静态 JSX 提升到外部
+const CardHeader = (
+  <div className="header">
+    <h3>你的 VibeID</h3>
+  </div>
+);
+
+function VibeIDCard({ profile }) {
+  return (
+    <Card>
+      {CardHeader}  {/* 稳定引用 */}
+      <Content profile={profile} />
+    </Card>
+  );
+}
+```
+
+#### 4.7.2 rendering-content-visibility: 使用 content-visibility 优化长列表
+
+```css
+/* 对于超出视口的内容 */
+.archetype-list-item {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 80px;  /* 预估高度 */
+}
+```
+
+#### 4.7.3 rendering-conditional-render: 使用三元运算符而非 &&
+
+```tsx
+// ❌ 可能出问题: && 可能渲染 falsy 值
+function Badge({ count }) {
+  return (
+    <div>
+      {count && <span>{count}</span>}  {/* count=0 时渲染 "0" */}
+    </div>
+  );
+}
+
+// ✅ 正确: 使用三元运算符明确处理
+function Badge({ count }) {
+  return (
+    <div>
+      {count > 0 ? <span>{count}</span> : null}
+    </div>
+  );
+}
+```
+
+### 4.8 LOW-MEDIUM: JavaScript 性能 (js-*)
+
+#### 4.8.1 js-set-map-lookups: 使用 Set/Map 实现 O(1) 查找
+
+```typescript
+// ❌ 错误: O(n) 数组查找
+const selectedIds = ['explorer', 'sage', 'creator'];
+const isSelected = (id) => selectedIds.includes(id);  // O(n)
+
+// ✅ 正确: O(1) Set 查找
+const selectedIds = new Set(['explorer', 'sage', 'creator']);
+const isSelected = (id) => selectedIds.has(id);  // O(1)
+```
+
+#### 4.8.2 js-combine-iterations: 合并多次迭代
+
+```typescript
+// ❌ 错误: 多次遍历数组
+const activeArchetypes = archetypes.filter(a => a.score > 50);
+const sortedArchetypes = activeArchetypes.sort((a, b) => b.score - a.score);
+const topNames = sortedArchetypes.slice(0, 4).map(a => a.name);
+
+// ✅ 正确: 单次遍历 + 高效排序
+const topNames = archetypes
+  .reduce((acc, a) => {
+    if (a.score > 50) {
+      // 插入排序，保持前4个
+      const idx = acc.findIndex(x => x.score < a.score);
+      if (idx !== -1) acc.splice(idx, 0, a);
+      else if (acc.length < 4) acc.push(a);
+      if (acc.length > 4) acc.pop();
+    }
+    return acc;
+  }, [])
+  .map(a => a.name);
+```
+
+#### 4.8.3 js-early-exit: 提前返回
+
+```typescript
+// ❌ 错误: 不必要的嵌套
+function processArchetype(archetype) {
+  if (archetype) {
+    if (archetype.isValid) {
+      if (archetype.score > 0) {
+        return calculateInsight(archetype);
+      }
+    }
+  }
+  return null;
+}
+
+// ✅ 正确: 提前返回减少嵌套
+function processArchetype(archetype) {
+  if (!archetype) return null;
+  if (!archetype.isValid) return null;
+  if (archetype.score <= 0) return null;
+
+  return calculateInsight(archetype);
+}
+```
+
+#### 4.8.4 js-cache-function-results: 缓存函数结果
+
+```typescript
+// ❌ 错误: 每次调用都重新计算
+function getArchetypeMeta(id: ArchetypeId) {
+  return ARCHETYPE_META[id];  // 简单查找还好
+}
+
+// 对于复杂计算，使用模块级缓存
+const insightCache = new Map<string, Insight>();
+
+function getInsight(archetypeId: string, dimension: string): Insight {
+  const key = `${archetypeId}:${dimension}`;
+
+  if (!insightCache.has(key)) {
+    insightCache.set(key, computeInsight(archetypeId, dimension));
+  }
+
+  return insightCache.get(key)!;
+}
+```
+
+### 4.9 VibeLife 特定优化策略
+
+基于以上规则，VibeLife 前端应实施以下具体优化:
+
+#### 4.9.1 聊天流处理优化
+
+```typescript
+// src/hooks/useVibeChat.ts
+
+export function useVibeChat() {
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  // 使用 useCallback 稳定回调 (rerender-functional-setstate)
+  const appendMessage = useCallback((msg: Message) => {
+    setMessages(prev => [...prev, msg]);
+  }, []);
+
+  // 使用 startTransition 处理大量文本更新 (rerender-transitions)
+  const handleStreamChunk = useCallback((chunk: string) => {
+    startTransition(() => {
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant') {
+          return [...prev.slice(0, -1), { ...last, content: last.content + chunk }];
+        }
+        return prev;
+      });
+    });
+  }, []);
+
+  return { messages, appendMessage, handleStreamChunk };
+}
+```
+
+#### 4.9.2 工具卡片动态加载
+
+```typescript
+// src/skills/CardRegistry.ts
+
+type CardLoader = () => Promise<{ default: React.ComponentType<any> }>;
+
+const CARD_LOADERS: Record<string, CardLoader> = {
+  // 按需加载，避免初始包体积过大 (bundle-dynamic-imports)
+  'show_bazi_chart': () => import('@/skills/bazi/tools/show-bazi-chart'),
+  'show_zodiac_chart': () => import('@/skills/zodiac/tools/show-zodiac-chart'),
+  'show_vibe_id': () => import('@/skills/vibe-id/tools/show-vibe-id'),
+  'show_tarot_spread': () => import('@/skills/tarot/tools/show-tarot-spread'),
+};
+
+// 组件缓存 (js-cache-function-results)
+const cardCache = new Map<string, React.ComponentType<any>>();
+
+export async function getCard(toolName: string): Promise<React.ComponentType<any> | null> {
+  if (cardCache.has(toolName)) {
+    return cardCache.get(toolName)!;
+  }
+
+  const loader = CARD_LOADERS[toolName];
+  if (!loader) return null;
+
+  const module = await loader();
+  cardCache.set(toolName, module.default);
+  return module.default;
+}
+```
+
+#### 4.9.3 VibeID 数据预加载
+
+```tsx
+// 在用户登录后预加载 VibeID 数据 (bundle-preload)
+function useVibeIDPrefetch() {
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (user?.id) {
+      // 预热 SWR 缓存
+      preload(`/api/vibe-id/${user.id}`, fetcher);
+    }
+  }, [user?.id]);
+}
+```
+
+---
+
+## 5. 组件库与卡片系统
+
+### 5.1 组件库架构
+
+```
+src/
+├── components/
+│   ├── ui/                    # 基础 UI 组件
+│   │   ├── Button.tsx
+│   │   ├── Card.tsx
+│   │   ├── Input.tsx
+│   │   ├── Modal.tsx
+│   │   ├── Skeleton.tsx
+│   │   ├── Toast.tsx
+│   │   └── index.ts
+│   │
+│   ├── layout/                # 布局组件
+│   │   ├── Header.tsx
+│   │   ├── Sidebar.tsx
+│   │   ├── BottomNav.tsx
+│   │   ├── Container.tsx
+│   │   └── index.ts
+│   │
+│   ├── chat/                  # 聊天组件
+│   │   ├── ChatContainer.tsx
+│   │   ├── ChatMessage.tsx
+│   │   ├── MessageInput.tsx
+│   │   ├── ToolResultCard.tsx
+│   │   └── index.ts
+│   │
+│   └── shared/                # 共享装饰组件
+│       ├── BreathAura.tsx     # 呼吸光环效果
+│       ├── VibeGlyph.tsx      # 神秘符文
+│       ├── InsightSeal.tsx    # 洞见印章
+│       └── index.ts
+│
+├── skills/                    # 技能模块
+│   ├── bazi/
+│   │   ├── components/        # 八字专用组件
+│   │   │   ├── BaziChart.tsx
+│   │   │   ├── PillarCard.tsx
+│   │   │   └── ElementBalance.tsx
+│   │   └── tools/             # 工具结果卡片
+│   │       ├── index.ts
+│   │       ├── show-bazi-chart.tsx
+│   │       └── show-daily-fortune.tsx
+│   │
+│   ├── zodiac/
+│   │   ├── components/
+│   │   │   ├── ZodiacChart.tsx
+│   │   │   ├── PlanetCard.tsx
+│   │   │   └── AspectLine.tsx
+│   │   └── tools/
+│   │       ├── index.ts
+│   │       ├── show-zodiac-chart.tsx
+│   │       └── show-transit.tsx
+│   │
+│   ├── tarot/
+│   │   ├── components/
+│   │   │   ├── TarotCard.tsx
+│   │   │   ├── SpreadLayout.tsx
+│   │   │   └── CardReveal.tsx
+│   │   └── tools/
+│   │       ├── index.ts
+│   │       └── show-tarot-spread.tsx
+│   │
+│   ├── vibe-id/
+│   │   ├── components/
+│   │   │   ├── VibeIDCard.tsx
+│   │   │   ├── ArchetypeBadge.tsx
+│   │   │   ├── ArchetypeWheel.tsx
+│   │   │   └── DimensionRow.tsx
+│   │   └── tools/
+│   │       ├── index.ts
+│   │       └── show-vibe-id.tsx
+│   │
+│   ├── CardRegistry.ts        # 卡片注册表
+│   └── initCards.ts           # 卡片初始化
+```
+
+### 5.2 卡片注册系统
+
+#### 5.2.1 CardRegistry 实现
+
+```typescript
+// src/skills/CardRegistry.ts
+
+import { ComponentType, lazy, Suspense } from 'react';
+
+/**
+ * 工具卡片组件的 Props 接口
+ */
+export interface ToolCardProps<T = unknown> {
+  data: T;
+  toolId: string;
+  skillId?: string;
+}
+
+/**
+ * 卡片加载器类型
+ */
+type CardLoader = () => Promise<{ default: ComponentType<ToolCardProps<any>> }>;
+
+/**
+ * 卡片注册表
+ * 使用动态导入实现按需加载 (Vercel: bundle-dynamic-imports)
+ */
+class CardRegistryClass {
+  private loaders = new Map<string, CardLoader>();
+  private cache = new Map<string, ComponentType<ToolCardProps<any>>>();
+
+  /**
+   * 注册工具卡片
+   */
+  register(toolName: string, loader: CardLoader): void {
+    this.loaders.set(toolName, loader);
+  }
+
+  /**
+   * 批量注册
+   */
+  registerAll(cards: Record<string, CardLoader>): void {
+    Object.entries(cards).forEach(([name, loader]) => {
+      this.register(name, loader);
+    });
+  }
+
+  /**
+   * 获取卡片组件 (带缓存)
+   */
+  async getCard(toolName: string): Promise<ComponentType<ToolCardProps<any>> | null> {
+    // 优先从缓存获取 (Vercel: js-cache-function-results)
+    if (this.cache.has(toolName)) {
+      return this.cache.get(toolName)!;
+    }
+
+    const loader = this.loaders.get(toolName);
+    if (!loader) {
+      console.warn(`[CardRegistry] 未找到工具卡片: ${toolName}`);
+      return null;
+    }
+
+    try {
+      const module = await loader();
+      this.cache.set(toolName, module.default);
+      return module.default;
+    } catch (error) {
+      console.error(`[CardRegistry] 加载卡片失败: ${toolName}`, error);
+      return null;
+    }
+  }
+
+  /**
+   * 创建懒加载组件
+   */
+  getLazyCard(toolName: string): ComponentType<ToolCardProps<any>> | null {
+    const loader = this.loaders.get(toolName);
+    if (!loader) return null;
+
+    return lazy(loader);
+  }
+
+  /**
+   * 预加载卡片 (用于悬停预加载)
+   */
+  preload(toolName: string): void {
+    if (!this.cache.has(toolName)) {
+      this.getCard(toolName);  // 触发加载
+    }
+  }
+
+  /**
+   * 检查卡片是否已注册
+   */
+  has(toolName: string): boolean {
+    return this.loaders.has(toolName);
+  }
+
+  /**
+   * 获取所有已注册的工具名
+   */
+  getRegisteredTools(): string[] {
+    return Array.from(this.loaders.keys());
+  }
+}
+
+// 单例导出
+export const CardRegistry = new CardRegistryClass();
+```
+
+#### 5.2.2 卡片初始化
+
+```typescript
+// src/skills/initCards.ts
+
+import { CardRegistry } from './CardRegistry';
+
+/**
+ * 初始化所有工具卡片
+ * 在应用启动时调用一次
+ */
+export function initializeCards(): void {
+  CardRegistry.registerAll({
+    // ========================================
+    // VibeID 工具卡片
+    // ========================================
+    'show_vibe_id': () => import('./vibe-id/tools/show-vibe-id'),
+
+    // ========================================
+    // 八字工具卡片
+    // ========================================
+    'show_bazi_chart': () => import('./bazi/tools/show-bazi-chart'),
+    'show_daily_fortune': () => import('./bazi/tools/show-daily-fortune'),
+    'show_bazi_analysis': () => import('./bazi/tools/show-bazi-analysis'),
+
+    // ========================================
+    // 星盘工具卡片
+    // ========================================
+    'show_zodiac_chart': () => import('./zodiac/tools/show-zodiac-chart'),
+    'show_transit': () => import('./zodiac/tools/show-transit'),
+    'show_lunar_phase': () => import('./zodiac/tools/show-lunar-phase'),
+
+    // ========================================
+    // 塔罗工具卡片
+    // ========================================
+    'show_tarot_spread': () => import('./tarot/tools/show-tarot-spread'),
+    'show_tarot_card': () => import('./tarot/tools/show-tarot-card'),
+
+    // ========================================
+    // 职业工具卡片
+    // ========================================
+    'show_career_analysis': () => import('./career/tools/show-career-analysis'),
+  });
+
+  console.log('[CardRegistry] 已注册工具卡片:', CardRegistry.getRegisteredTools());
+}
+```
+
+### 5.3 聊天中渲染工具卡片
+
+```tsx
+// src/components/chat/ToolResultCard.tsx
+
+import { memo, useState, useEffect, Suspense } from 'react';
+import { CardRegistry, ToolCardProps } from '@/skills/CardRegistry';
+import { Card } from '@/components/ui/Card';
+import { Skeleton } from '@/components/ui/Skeleton';
+
+interface ToolResultCardProps {
+  toolName: string;
+  toolId: string;
+  result: unknown;
+  skillId?: string;
+}
+
+/**
+ * 工具结果卡片渲染器
+ * 动态加载对应的卡片组件
+ */
+export const ToolResultCard = memo(function ToolResultCard({
+  toolName,
+  toolId,
+  result,
+  skillId,
+}: ToolResultCardProps) {
+  const [CardComponent, setCardComponent] = useState<React.ComponentType<ToolCardProps> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    CardRegistry.getCard(toolName)
+      .then(component => {
+        if (!cancelled) {
+          if (component) {
+            setCardComponent(() => component);
+          } else {
+            setError(`未知的工具类型: ${toolName}`);
+          }
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setError(`加载卡片失败: ${err.message}`);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [toolName]);
+
+  // 加载中状态
+  if (!CardComponent && !error) {
+    return <ToolCardSkeleton />;
+  }
+
+  // 错误状态
+  if (error) {
+    return (
+      <Card variant="outlined\" className="p-4 text-ink-500">
+        <p className="text-sm">{error}</p>
+        <pre className="mt-2 text-xs bg-ink-50 p-2 rounded overflow-auto">
+          {JSON.stringify(result, null, 2)}
+        </pre>
+      </Card>
+    );
+  }
+
+  // 渲染卡片
+  return (
+    <Suspense fallback={<ToolCardSkeleton />}>
+      <CardComponent
+        data={result}
+        toolId={toolId}
+        skillId={skillId}
+      />
+    </Suspense>
+  );
+});
+
+/**
+ * 卡片骨架屏
+ */
+function ToolCardSkeleton() {
+  return (
+    <Card className="p-4 space-y-3">
+      <Skeleton className="h-6 w-1/3" />
+      <Skeleton className="h-32 w-full" />
+      <div className="flex gap-2">
+        <Skeleton className="h-8 w-20" />
+        <Skeleton className="h-8 w-20" />
+      </div>
+    </Card>
+  );
+}
+```
+
+### 5.4 工具卡片开发规范
+
+#### 5.4.1 卡片组件模板
+
+```tsx
+// src/skills/{skill}/tools/{tool-name}.tsx
+
+import { memo } from 'react';
+import type { ToolCardProps } from '@/skills/CardRegistry';
+import { Card } from '@/components/ui/Card';
+
+/**
+ * 工具结果数据接口
+ */
+interface ToolResultData {
+  // 定义工具返回的数据结构
+  title: string;
+  content: Record<string, unknown>;
+}
+
+/**
+ * 工具卡片组件
+ *
+ * @description 在聊天中展示工具执行结果
+ * @vercel-rule rerender-memo - 使用 memo 防止不必要的重渲染
+ */
+const ToolNameCard = memo(function ToolNameCard({
+  data,
+  toolId,
+  skillId,
+}: ToolCardProps<ToolResultData>) {
+  const { title, content } = data;
+
+  return (
+    <Card variant="elevated" className="w-full md:max-w-md">
+      {/* 卡片头部 */}
+      <div className="flex items-center gap-2 mb-4">
+        <span className="text-xl">🔮</span>
+        <h3 className="font-medium text-ink-800">{title}</h3>
+      </div>
+
+      {/* 卡片内容 */}
+      <div className="space-y-3">
+        {/* 根据数据结构渲染内容 */}
+      </div>
+
+      {/* 卡片操作 (可选) */}
+      <div className="mt-4 pt-3 border-t border-ink-100 flex gap-2">
+        <button className="text-sm text-mystic-600 hover:text-mystic-700">
+          查看详情
+        </button>
+      </div>
+    </Card>
+  );
+});
+
+export default ToolNameCard;
+```
+
+#### 5.4.2 卡片开发检查清单
+
+```markdown
+## 工具卡片开发检查清单
+
+### 必须项
+- [ ] 使用 memo() 包装组件
+- [ ] 定义明确的 TypeScript 接口
+- [ ] 使用 default export 导出组件
+- [ ] 在 CardRegistry 中注册
+
+### 性能优化
+- [ ] 图表组件使用 dynamic import
+- [ ] 大型数据使用虚拟滚动
+- [ ] 图片使用 next/image 优化
+
+### 样式规范
+- [ ] 使用设计系统的颜色变量
+- [ ] 响应式宽度限制 (Mobile 全宽 `w-full`, PC 限制 `md:max-w-md` 或 `md:max-w-lg`)
+- [ ] 响应式适配移动端 (使用 `md:` 断点)
+
+### 可访问性
+- [ ] 添加 aria-label
+- [ ] 支持键盘导航
+- [ ] 颜色对比度符合 WCAG 2.1
+```
+
+### 5.5 共享装饰组件
+
+#### 5.5.1 BreathAura - 呼吸光环
+
+```tsx
+// src/components/shared/BreathAura.tsx
+
+import { memo } from 'react';
+import { motion } from 'framer-motion';
+import { cn } from '@/utils/cn';
+
+interface BreathAuraProps {
+  color?: string;
+  size?: number;
+  intensity?: 'subtle' | 'normal' | 'strong';
+  className?: string;
+}
+
+const INTENSITY_CONFIG = {
+  subtle: { scale: [1, 1.02, 1], opacity: [0.3, 0.4, 0.3] },
+  normal: { scale: [1, 1.05, 1], opacity: [0.4, 0.6, 0.4] },
+  strong: { scale: [1, 1.08, 1], opacity: [0.5, 0.8, 0.5] },
+};
+
+/**
+ * 呼吸光环效果
+ * 为元素添加神秘的脉动光晕
+ */
+export const BreathAura = memo(function BreathAura({
+  color = 'rgba(138, 79, 125, 0.3)',
+  size = 100,
+  intensity = 'normal',
+  className,
+}: BreathAuraProps) {
+  const config = INTENSITY_CONFIG[intensity];
+
+  return (
+    <motion.div
+      className={cn('absolute rounded-full blur-xl pointer-events-none', className)}
+      style={{
+        width: size,
+        height: size,
+        background: `radial-gradient(circle, ${color} 0%, transparent 70%)`,
+      }}
+      animate={{
+        scale: config.scale,
+        opacity: config.opacity,
+      }}
+      transition={{
+        duration: 4,
+        repeat: Infinity,
+        ease: 'easeInOut',
+      }}
+    />
+  );
+});
+```
+
+#### 5.5.2 InsightSeal - 洞见印章
+
+```tsx
+// src/components/shared/InsightSeal.tsx
+
+import { memo } from 'react';
+import { motion } from 'framer-motion';
+import { cn } from '@/utils/cn';
+
+interface InsightSealProps {
+  type: 'bazi' | 'zodiac' | 'tarot' | 'vibe-id';
+  size?: 'sm' | 'md' | 'lg';
+  animated?: boolean;
+  className?: string;
+}
+
+const SEAL_CONFIG = {
+  'bazi': { icon: '命', color: 'gold' },
+  'zodiac': { icon: '星', color: 'mystic' },
+  'tarot': { icon: '占', color: 'mystic' },
+  'vibe-id': { icon: '灵', color: 'gold' },
+};
+
+const SIZE_CLASSES = {
+  sm: 'w-8 h-8 text-sm',
+  md: 'w-12 h-12 text-lg',
+  lg: 'w-16 h-16 text-2xl',
+};
+
+/**
+ * 洞见印章
+ * 标识不同技能的专属印记
+ */
+export const InsightSeal = memo(function InsightSeal({
+  type,
+  size = 'md',
+  animated = true,
+  className,
+}: InsightSealProps) {
+  const config = SEAL_CONFIG[type];
+  const colorClass = config.color === 'gold' ? 'text-gold-600 border-gold-300' : 'text-mystic-600 border-mystic-300';
+
+  const seal = (
+    <div
+      className={cn(
+        'rounded-full border-2 flex items-center justify-center',
+        'bg-vellum-50 font-serif',
+        SIZE_CLASSES[size],
+        colorClass,
+        className
+      )}
+    >
+      {config.icon}
+    </div>
+  );
+
+  if (!animated) return seal;
+
+  return (
+    <motion.div
+      initial={{ scale: 0, rotate: -180 }}
+      animate={{ scale: 1, rotate: 0 }}
+      transition={{ type: 'spring', stiffness: 200, damping: 15 }}
+    >
+      {seal}
+    </motion.div>
+  );
+});
+```
+
+### 5.6 Skeleton 组件系统 (v7.1 升级 - Linear 风格 Shimmer)
+
+```tsx
+// src/components/ui/Skeleton.tsx
+// v7.1 升级：Linear 风格 Shimmer 效果，更精致的加载态
+
+import { cn } from '@/utils/cn';
+
+interface SkeletonProps {
+  className?: string;
+  variant?: 'text' | 'circular' | 'rectangular' | 'rounded';
+  animation?: 'shimmer' | 'pulse' | 'none';
+}
+
+/**
+ * v7.1 骨架屏组件
+ * - shimmer: Linear 风格微光扫过效果（默认）
+ * - pulse: 传统脉冲效果
+ * - none: 无动画
+ */
+export function Skeleton({
+  className,
+  variant = 'rectangular',
+  animation = 'shimmer',
+}: SkeletonProps) {
+  return (
+    <div
+      className={cn(
+        // 基础样式
+        'bg-bg-tertiary',
+
+        // 变体样式
+        variant === 'circular' && 'rounded-full',
+        variant === 'rectangular' && 'rounded-md',
+        variant === 'rounded' && 'rounded-xl',
+        variant === 'text' && 'rounded h-4',
+
+        // 动画样式
+        animation === 'pulse' && 'animate-pulse',
+        animation === 'shimmer' && [
+          'relative overflow-hidden',
+          'before:absolute before:inset-0',
+          'before:bg-gradient-to-r before:from-transparent before:via-white/60 before:to-transparent',
+          'before:animate-shimmer',
+          'before:bg-[length:200%_100%]',
+        ],
+
+        className
+      )}
+    />
+  );
+}
+
+/**
+ * ShimmerBlock - 带容器的 Shimmer 块
+ * 用于更复杂的加载态布局
+ */
+interface ShimmerBlockProps {
+  className?: string;
+  children?: React.ReactNode;
+}
+
+export function ShimmerBlock({ className, children }: ShimmerBlockProps) {
+  return (
+    <div
+      className={cn(
+        'relative overflow-hidden rounded-xl bg-bg-secondary',
+        className
+      )}
+    >
+      {/* Shimmer 光效层 */}
+      <div
+        className={cn(
+          'absolute inset-0',
+          'bg-gradient-to-r from-transparent via-white/40 to-transparent',
+          'animate-shimmer bg-[length:200%_100%]',
+        )}
+      />
+      {/* 内容 */}
+      {children}
+    </div>
+  );
+}
+
+/**
+ * VibeIDSkeleton - VibeID 卡片骨架屏
+ */
+export function VibeIDSkeleton() {
+  return (
+    <div className="p-4 space-y-4 bg-white rounded-xl shadow-card">
+      {/* 头部 */}
+      <div className="flex items-center justify-between">
+        <Skeleton className="h-5 w-24" />
+        <Skeleton className="h-4 w-16" />
+      </div>
+
+      {/* 四个原型徽章 */}
+      <div className="flex justify-around py-4">
+        {[1, 2, 3, 4].map(i => (
+          <div key={i} className="flex flex-col items-center gap-2">
+            <Skeleton variant="circular" className="w-14 h-14" />
+            <Skeleton className="h-3 w-10" />
+            <Skeleton className="h-3 w-12" />
+          </div>
+        ))}
+      </div>
+
+      {/* 维度行 */}
+      <div className="space-y-2">
+        {[1, 2, 3, 4].map(i => (
+          <div key={i} className="flex items-center gap-3 p-3 bg-bg-secondary rounded-lg">
+            <Skeleton variant="circular" className="w-8 h-8" />
+            <div className="flex-1 space-y-1">
+              <Skeleton className="h-4 w-20" />
+              <Skeleton className="h-3 w-32" />
+            </div>
+            <Skeleton variant="rounded" className="w-16 h-8" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * ChatMessageSkeleton - 聊天消息骨架屏
+ */
+export function ChatMessageSkeleton({ isUser = false }: { isUser?: boolean }) {
+  return (
+    <div className={cn(
+      'flex gap-3 p-4',
+      isUser && 'flex-row-reverse'
+    )}>
+      {!isUser && (
+        <Skeleton variant="circular" className="w-8 h-8 flex-shrink-0" />
+      )}
+      <div className={cn(
+        'space-y-2',
+        isUser ? 'items-end' : 'items-start',
+        'flex flex-col'
+      )}>
+        <Skeleton
+          variant="rounded"
+          className={cn(
+            'h-16',
+            isUser ? 'w-48' : 'w-64'
+          )}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * ToolCardSkeleton - 工具卡片骨架屏
+ */
+export function ToolCardSkeleton() {
+  return (
+    <div className="p-4 rounded-xl bg-white shadow-card space-y-3">
+      {/* 头部 */}
+      <div className="flex items-center gap-3">
+        <Skeleton variant="rounded" className="w-10 h-10" />
+        <div className="space-y-1 flex-1">
+          <Skeleton className="h-4 w-24" />
+          <Skeleton className="h-3 w-32" />
+        </div>
+      </div>
+
+      {/* 内容区 */}
+      <Skeleton variant="rounded" className="h-32 w-full" />
+
+      {/* 操作按钮 */}
+      <div className="flex gap-2 pt-2">
+        <Skeleton variant="rounded" className="h-8 w-20" />
+        <Skeleton variant="rounded" className="h-8 w-20" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * CardSkeleton - 通用卡片骨架屏
+ */
+export function CardSkeleton({ lines = 3 }: { lines?: number }) {
+  return (
+    <div className="p-4 rounded-xl bg-white shadow-card space-y-3">
+      <Skeleton className="h-5 w-1/3" />
+      <div className="space-y-2">
+        {Array.from({ length: lines }).map((_, i) => (
+          <Skeleton
+            key={i}
+            className={cn(
+              'h-4',
+              i === lines - 1 ? 'w-2/3' : 'w-full'
+            )}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * ListSkeleton - 列表骨架屏
+ */
+export function ListSkeleton({ count = 5 }: { count?: number }) {
+  return (
+    <div className="space-y-2">
+      {Array.from({ length: count }).map((_, i) => (
+        <div key={i} className="flex items-center gap-3 p-3 bg-white rounded-lg shadow-xs">
+          <Skeleton variant="circular" className="w-10 h-10" />
+          <div className="flex-1 space-y-1">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-48" />
+          </div>
+          <Skeleton variant="rounded" className="w-8 h-8" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * PageSkeleton - 页面级骨架屏
+ */
+export function PageSkeleton() {
+  return (
+    <div className="space-y-6 p-4">
+      {/* 页面标题 */}
+      <div className="space-y-2">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-4 w-64" />
+      </div>
+
+      {/* 主要内容区 */}
+      <div className="grid gap-4 md:grid-cols-2">
+        <CardSkeleton lines={4} />
+        <CardSkeleton lines={3} />
+      </div>
+
+      {/* 列表区 */}
+      <ListSkeleton count={3} />
+    </div>
+  );
+}
+```
+
+### 5.7 Shimmer CSS 样式 (v7.1 新增)
+
+```css
+/* 添加到 globals.css */
+
+/* ====================================================================== */
+/* Shimmer 动画 - Linear 风格微光效果                                       */
+/* ====================================================================== */
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-shimmer {
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+/* Shimmer 渐变背景 */
+.shimmer-gradient {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.4) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+}
+
+/* 骨架屏基础样式 */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--bg-tertiary);
+}
+
+.skeleton::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.5) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+/* 打字光标 */
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--accent-primary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* 流式文字加载点 */
+.streaming-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 4px;
+}
+
+.streaming-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+  animation: pulse-soft 1.4s ease-in-out infinite;
+}
+
+.streaming-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.streaming-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+```
+
+### 5.8 响应式设计规范 (v7.1)
+
+**设计原则**: Mobile First，基于 `VibeLife-PageLayouts-v7.md`
+
+#### 5.8.1 Onboarding 页面
+
+| 步骤 | Mobile (<768px) | PC (≥768px) | 实现 |
+|------|----------------|-------------|------|
+| LandingStep | 全宽 | 600px | `w-full md:max-w-[600px]` |
+| LoadingStep | 全宽 | 500px | `w-full md:max-w-[500px]` |
+| AhaStep | 全宽 | 500px | `w-full md:max-w-[500px]` |
+| ConversionStep | 全宽 | 500px | `w-full md:max-w-[500px]` |
+
+#### 5.8.2 聊天与卡片组件
+
+| 组件 | Mobile (<768px) | PC (≥768px) | 实现 |
+|------|----------------|-------------|------|
+| VibeID 工具卡片 | 全宽 | 448px (max-w-md) | `w-full md:max-w-md` |
+| 工具结果卡片 | 全宽 | 448px (max-w-md) | `w-full md:max-w-md` |
+| 聊天消息气泡 | 85% | 85% | `max-w-[85%]` (无需断点) |
+| Typing 指示器 | 80px | 80px | `max-w-[80px]` (固定宽度) |
+
+#### 5.8.3 响应式实现要点
+
+**断点策略**:
+- `md:` (768px) - PC/Mobile 主要分界点
+- Mobile First - 默认样式为移动端，再用 `md:` 扩展
+
+**容器宽度模式**:
+```tsx
+// ✅ 正确: 响应式宽度
+<div className="w-full md:max-w-md">
+
+// ❌ 错误: 固定宽度
+<div className="max-w-md">
+
+// ✅ 例外: 百分比限制（适用于聊天气泡等）
+<div className="max-w-[85%]">
+
+// ✅ 例外: 小尺寸固定组件（图标、徽章等）
+<div className="max-w-[80px]">
+```
+
+**间距控制**:
+- Mobile: `px-4` (16px 水平边距)
+- PC: 容器自带 padding + max-width 居中
+
+---
+
+## 6. API 对接与数据流
+
+### 6.1 后端 API 概览
+
+> **来源**: SPEC-v7.md
+
+#### 6.1.1 核心端点
+
+| 端点 | 方法 | 描述 | 认证 |
+|------|------|------|------|
+| `/chat/v5/stream` | POST | 聊天流式响应 | Required |
+| `/skills/{id}/{action}` | POST | 技能执行 | Required |
+| `/tools/schema` | GET | 获取工具 Schema | Optional |
+| `/vibe-id/{user_id}` | GET | 获取 VibeID | Required |
+| `/account/profile` | GET/PUT | 用户资料 | Required |
+| `/account/usage` | GET | 使用统计 | Required |
+| `/commerce/products` | GET | 商品列表 | Optional |
+| `/commerce/orders` | POST | 创建订单 | Required |
+| `/notifications/subscribe` | POST | 推送订阅 | Required |
+
+#### 6.1.2 聊天流事件类型
+
+```typescript
+// src/types/chat.ts
+
+/**
+ * SSE 流事件类型
+ */
+export type StreamEventType =
+  | 'text'           // 文本内容块
+  | 'tool_call'      // 工具调用开始
+  | 'tool_result'    // 工具执行结果
+  | 'thinking'       // Agent 思考过程
+  | 'error'          // 错误信息
+  | 'done';          // 流结束
+
+/**
+ * 流事件基础结构
+ */
+export interface StreamEvent<T = unknown> {
+  type: StreamEventType;
+  data: T;
+  timestamp: number;
+}
+
+/**
+ * 文本事件
+ */
+export interface TextEvent extends StreamEvent<string> {
+  type: 'text';
+}
+
+/**
+ * 工具调用事件
+ */
+export interface ToolCallEvent extends StreamEvent<{
+  tool_name: string;
+  tool_id: string;
+  arguments: Record<string, unknown>;
+}> {
+  type: 'tool_call';
+}
+
+/**
+ * 工具结果事件
+ */
+export interface ToolResultEvent extends StreamEvent<{
+  tool_name: string;
+  tool_id: string;
+  result: Record<string, unknown>;
+  skill_id?: string;
+}> {
+  type: 'tool_result';
+}
+
+/**
+ * 消息类型
+ */
+export interface Message {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  toolCalls?: ToolCall[];
+  toolResults?: ToolResult[];
+  createdAt: string;
+}
+
+export interface ToolCall {
+  toolId: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  status: 'pending' | 'running' | 'completed' | 'error';
+}
+
+export interface ToolResult {
+  toolId: string;
+  toolName: string;
+  result: Record<string, unknown>;
+  skillId?: string;
+}
+```
+
+### 6.2 API 客户端
+
+```typescript
+// src/services/api.ts
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+/**
+ * API 错误类
+ */
+export class APIError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public code?: string
+  ) {
+    super(message);
+    this.name = 'APIError';
+  }
+}
+
+/**
+ * 基础 fetch 封装
+ */
+async function baseFetch<T>(
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const url = `${API_BASE}${endpoint}`;
+
+  const response = await fetch(url, {
+    ...options,
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ message: 'Unknown error' }));
+    throw new APIError(
+      error.message || `HTTP ${response.status}`,
+      response.status,
+      error.code
+    );
+  }
+
+  return response.json();
+}
+
+/**
+ * API 客户端
+ */
+export const api = {
+  get: <T>(endpoint: string) => baseFetch<T>(endpoint, { method: 'GET' }),
+  post: <T>(endpoint: string, body: unknown) =>
+    baseFetch<T>(endpoint, { method: 'POST', body: JSON.stringify(body) }),
+  put: <T>(endpoint: string, body: unknown) =>
+    baseFetch<T>(endpoint, { method: 'PUT', body: JSON.stringify(body) }),
+  delete: <T>(endpoint: string) => baseFetch<T>(endpoint, { method: 'DELETE' }),
+};
+```
+
+### 6.3 聊天流处理
+
+```typescript
+// src/hooks/useVibeChat.ts
+
+import { useState, useCallback, useRef } from 'react';
+import type { Message, StreamEvent, ToolCall, ToolResult } from '@/types/chat';
+
+interface UseChatOptions {
+  skillId?: string;
+  onToolCall?: (toolCall: ToolCall) => void;
+  onToolResult?: (result: ToolResult) => void;
+  onError?: (error: Error) => void;
+}
+
+interface UseChatReturn {
+  messages: Message[];
+  isLoading: boolean;
+  error: Error | null;
+  sendMessage: (content: string) => Promise<void>;
+  clearMessages: () => void;
+  stopGeneration: () => void;
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+export function useVibeChat(options: UseChatOptions = {}): UseChatReturn {
+  const { skillId, onToolCall, onToolResult, onError } = options;
+
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  /**
+   * 发送消息并处理流式响应
+   */
+  const sendMessage = useCallback(async (content: string) => {
+    // 添加用户消息
+    const userMessage: Message = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content,
+      createdAt: new Date().toISOString(),
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    setIsLoading(true);
+    setError(null);
+
+    // 创建助手消息占位
+    const assistantMessageId = crypto.randomUUID();
+    const assistantMessage: Message = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      toolCalls: [],
+      toolResults: [],
+      createdAt: new Date().toISOString(),
+    };
+
+    setMessages(prev => [...prev, assistantMessage]);
+
+    // 创建 AbortController 用于取消
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const response = await fetch(`${API_BASE}/chat/v5/stream`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        signal: abortControllerRef.current.signal,
+        body: JSON.stringify({
+          messages: [...messages, userMessage].map(m => ({
+            role: m.role,
+            content: m.content,
+          })),
+          skill_id: skillId,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // 解析 SSE 事件
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';  // 保留未完成的行
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const event: StreamEvent = JSON.parse(data);
+            handleStreamEvent(event, assistantMessageId);
+          } catch {
+            // 忽略解析错误
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        setError(err);
+        onError?.(err);
+      }
+    } finally {
+      setIsLoading(false);
+      abortControllerRef.current = null;
+    }
+  }, [messages, skillId, onToolCall, onToolResult, onError]);
+
+  /**
+   * 处理流事件
+   */
+  const handleStreamEvent = useCallback((
+    event: StreamEvent,
+    messageId: string
+  ) => {
+    switch (event.type) {
+      case 'text':
+        // 使用 startTransition 处理文本更新 (Vercel: rerender-transitions)
+        setMessages(prev => prev.map(m =>
+          m.id === messageId
+            ? { ...m, content: m.content + (event.data as string) }
+            : m
+        ));
+        break;
+
+      case 'tool_call':
+        const toolCallData = event.data as ToolCall;
+        setMessages(prev => prev.map(m =>
+          m.id === messageId
+            ? { ...m, toolCalls: [...(m.toolCalls || []), { ...toolCallData, status: 'running' }] }
+            : m
+        ));
+        onToolCall?.(toolCallData);
+        break;
+
+      case 'tool_result':
+        const toolResultData = event.data as ToolResult;
+        setMessages(prev => prev.map(m =>
+          m.id === messageId
+            ? { ...m, toolResults: [...(m.toolResults || []), toolResultData] }
+            : m
+        ));
+        onToolResult?.(toolResultData);
+        break;
+
+      case 'error':
+        setError(new Error(event.data as string));
+        break;
+    }
+  }, [onToolCall, onToolResult]);
+
+  /**
+   * 清空消息
+   */
+  const clearMessages = useCallback(() => {
+    setMessages([]);
+    setError(null);
+  }, []);
+
+  /**
+   * 停止生成
+   */
+  const stopGeneration = useCallback(() => {
+    abortControllerRef.current?.abort();
+    setIsLoading(false);
+  }, []);
+
+  return {
+    messages,
+    isLoading,
+    error,
+    sendMessage,
+    clearMessages,
+    stopGeneration,
+  };
+}
+```
+
+### 6.4 数据获取 Hooks
+
+#### 6.4.1 通用 SWR 配置
+
+```typescript
+// src/services/swr-config.ts
+
+import { SWRConfiguration } from 'swr';
+
+/**
+ * 全局 SWR 配置
+ * 应用 Vercel 最佳实践
+ */
+export const swrConfig: SWRConfiguration = {
+  // 去重间隔 (client-swr-dedup)
+  dedupingInterval: 60000,
+
+  // 禁用聚焦时自动重验证 (避免不必要的请求)
+  revalidateOnFocus: false,
+
+  // 网络恢复时重验证
+  revalidateOnReconnect: true,
+
+  // 错误重试配置
+  errorRetryCount: 3,
+  errorRetryInterval: 1000,
+
+  // 自定义 fetcher
+  fetcher: async (url: string) => {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) {
+      const error = new Error('Failed to fetch');
+      throw error;
+    }
+    return res.json();
+  },
+};
+```
+
+#### 6.4.2 VibeID Hook
+
+```typescript
+// src/skills/vibe-id/hooks/useVibeID.ts
+
+import useSWR from 'swr';
+import type { VibeIDProfile } from '@/types/vibe-id';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+interface UseVibeIDOptions {
+  userId?: string;
+  enabled?: boolean;
+}
+
+export function useVibeID({ userId, enabled = true }: UseVibeIDOptions = {}) {
+  const { data, error, isLoading, mutate } = useSWR<VibeIDProfile>(
+    enabled && userId ? `${API_BASE}/vibe-id/${userId}` : null,
+    {
+      dedupingInterval: 300000,  // 5分钟去重
+      revalidateOnFocus: false,
+    }
+  );
+
+  return {
+    profile: data,
+    isLoading,
+    error,
+    refresh: mutate,
+  };
+}
+```
+
+#### 6.4.3 工具 Schema Hook
+
+```typescript
+// src/hooks/useToolSchema.ts
+
+import useSWR from 'swr';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+interface ToolSchema {
+  name: string;
+  description: string;
+  parameters: {
+    type: string;
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+}
+
+interface UseToolSchemaReturn {
+  schemas: Record<string, ToolSchema> | undefined;
+  isLoading: boolean;
+  error: Error | undefined;
+}
+
+/**
+ * 获取工具 Schema
+ * 用于前端动态渲染工具卡片
+ */
+export function useToolSchema(): UseToolSchemaReturn {
+  const { data, error, isLoading } = useSWR<Record<string, ToolSchema>>(
+    `${API_BASE}/tools/schema`,
+    {
+      dedupingInterval: 3600000,  // 1小时缓存
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    }
+  );
+
+  return {
+    schemas: data,
+    isLoading,
+    error,
+  };
+}
+```
+
+### 6.5 状态管理
+
+#### 6.5.1 Zustand Store 结构
+
+```typescript
+// src/stores/userStore.ts
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar?: string;
+}
+
+interface UserState {
+  user: User | null;
+  isAuthenticated: boolean;
+
+  // Actions
+  setUser: (user: User) => void;
+  logout: () => void;
+}
+
+export const useUserStore = create<UserState>()(
+  persist(
+    (set) => ({
+      user: null,
+      isAuthenticated: false,
+
+      setUser: (user) => set({ user, isAuthenticated: true }),
+      logout: () => set({ user: null, isAuthenticated: false }),
+    }),
+    {
+      name: 'user-storage',
+      partialize: (state) => ({ user: state.user }),  // 仅持久化 user
+    }
+  )
+);
+```
+
+#### 6.5.2 聊天 Store
+
+```typescript
+// src/stores/chatStore.ts
+
+import { create } from 'zustand';
+import type { Message } from '@/types/chat';
+
+interface ChatState {
+  // 状态
+  currentSessionId: string | null;
+  sessions: Record<string, Message[]>;
+
+  // Actions
+  setCurrentSession: (sessionId: string) => void;
+  addMessage: (sessionId: string, message: Message) => void;
+  updateMessage: (sessionId: string, messageId: string, updates: Partial<Message>) => void;
+  clearSession: (sessionId: string) => void;
+}
+
+export const useChatStore = create<ChatState>((set) => ({
+  currentSessionId: null,
+  sessions: {},
+
+  setCurrentSession: (sessionId) => set({ currentSessionId: sessionId }),
+
+  addMessage: (sessionId, message) => set((state) => ({
+    sessions: {
+      ...state.sessions,
+      [sessionId]: [...(state.sessions[sessionId] || []), message],
+    },
+  })),
+
+  updateMessage: (sessionId, messageId, updates) => set((state) => ({
+    sessions: {
+      ...state.sessions,
+      [sessionId]: (state.sessions[sessionId] || []).map((m) =>
+        m.id === messageId ? { ...m, ...updates } : m
+      ),
+    },
+  })),
+
+  clearSession: (sessionId) => set((state) => {
+    const { [sessionId]: _, ...rest } = state.sessions;
+    return { sessions: rest };
+  }),
+}));
+```
+
+### 6.6 数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              用户操作                                    │
+│                          (输入消息/点击按钮)                              │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           React 组件层                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  ChatContainer                                                   │   │
+│  │  ├─ 调用 useVibeChat().sendMessage()                            │   │
+│  │  └─ 渲染 messages + ToolResultCard                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+┌───────────────────────┐ ┌─────────────────┐ ┌─────────────────────────┐
+│     useVibeChat       │ │   useChatStore  │ │       SWR Cache         │
+│  ├─ 管理流状态        │ │  ├─ 会话状态    │ │  ├─ VibeID Profile      │
+│  ├─ 处理 SSE 事件     │ │  └─ 消息历史    │ │  ├─ Tool Schemas        │
+│  └─ 更新消息          │ │                 │ │  └─ 用户数据            │
+└───────────────────────┘ └─────────────────┘ └─────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           API 调用层                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  fetch('/chat/v5/stream', { ... })                              │   │
+│  │  ├─ SSE 流                                                       │   │
+│  │  └─ 事件: text | tool_call | tool_result | done                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           后端 V7 API                                    │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  CoreAgent (Agentic Loop)                                        │   │
+│  │  ├─ SkillServiceRegistry                                         │   │
+│  │  ├─ ToolRegistry                                                 │   │
+│  │  └─ KnowledgeStore (Qdrant)                                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. 实施计划与验证
+
+### 7.1 实施阶段
+
+#### 阶段一：基础架构
+
+**目标**: 搭建核心基础设施和设计系统
+
+| 任务 | 优先级 | 依赖 |
+|------|--------|------|
+| 项目初始化 (Next.js 14 + TypeScript) | P0 | - |
+| 设计系统 CSS 变量配置 | P0 | 项目初始化 |
+| Tailwind 配置扩展 | P0 | 设计系统 |
+| 基础 UI 组件 (Button, Card, Input) | P0 | Tailwind |
+| API 客户端封装 | P0 | 项目初始化 |
+| SWR 全局配置 | P1 | API 客户端 |
+| Zustand Store 结构 | P1 | 项目初始化 |
+
+**验收标准**:
+- [ ] `npm run build` 成功
+- [ ] 设计系统颜色在 Storybook 中正确展示
+- [ ] API 客户端能正确处理错误
+- [ ] TypeScript 严格模式无报错
+
+#### 阶段二：核心功能
+
+**目标**: 实现聊天流和工具卡片系统
+
+| 任务 | 优先级 | 依赖 |
+|------|--------|------|
+| useVibeChat Hook | P0 | API 客户端 |
+| ChatContainer 组件 | P0 | useVibeChat |
+| ChatMessage 组件 | P0 | 基础 UI |
+| CardRegistry 实现 | P0 | - |
+| ToolResultCard 渲染器 | P0 | CardRegistry |
+| Skeleton 组件系统 | P1 | 基础 UI |
+| 消息输入组件 | P1 | 基础 UI |
+
+**验收标准**:
+- [ ] 能与后端建立 SSE 连接
+- [ ] 文本流式显示正常
+- [ ] 工具调用事件正确处理
+- [ ] 工具卡片动态加载成功
+
+#### 阶段三：VibeID 模块
+
+**目标**: 完整实现四维原型系统
+
+| 任务 | 优先级 | 依赖 |
+|------|--------|------|
+| VibeID TypeScript 类型定义 | P0 | - |
+| ARCHETYPE_META 常量 | P0 | 类型定义 |
+| ArchetypeBadge 组件 | P0 | 设计系统 |
+| DimensionRow 组件 | P0 | ArchetypeBadge |
+| VibeIDCard 组件 | P0 | DimensionRow |
+| ArchetypeWheel 图表 | P1 | ECharts |
+| useVibeID Hook | P1 | SWR |
+| show_vibe_id 工具卡片 | P0 | VibeIDCard, CardRegistry |
+
+**验收标准**:
+- [ ] 12 个原型正确展示
+- [ ] 四维布局清晰
+- [ ] 雷达图数据准确
+- [ ] 卡片在聊天中正确渲染
+
+#### 阶段四：技能卡片
+
+**目标**: 实现各技能的工具卡片
+
+| 任务 | 优先级 | 依赖 |
+|------|--------|------|
+| 八字图表组件 | P1 | ECharts |
+| show_bazi_chart 卡片 | P1 | CardRegistry |
+| 星盘图表组件 | P1 | ECharts |
+| show_zodiac_chart 卡片 | P1 | CardRegistry |
+| 塔罗牌组件 | P2 | 动画系统 |
+| show_tarot_spread 卡片 | P2 | CardRegistry |
+| 卡片注册初始化 | P0 | 所有卡片 |
+
+**验收标准**:
+- [ ] 各技能卡片正确渲染
+- [ ] 图表交互流畅
+- [ ] 动态导入正常工作
+- [ ] 移动端适配良好
+
+#### 阶段五：性能优化
+
+**目标**: 应用 Vercel 最佳实践
+
+| 任务 | 优先级 | 依赖 |
+|------|--------|------|
+| Bundle 分析和优化 | P0 | Phase 4 完成 |
+| 动态导入重型组件 | P0 | Bundle 分析 |
+| SWR 去重配置优化 | P1 | - |
+| React.memo 应用 | P1 | - |
+| 虚拟滚动 (长列表) | P2 | - |
+| 预加载策略实现 | P2 | - |
+
+**验收标准**:
+- [ ] 初始包体积 < 200KB (gzipped)
+- [ ] LCP < 2.5s
+- [ ] FID < 100ms
+- [ ] CLS < 0.1
+
+### 7.2 性能验证指标
+
+#### 7.2.1 核心网页指标目标
+
+| 指标 | 目标值 | 测量方法 |
+|------|--------|----------|
+| **LCP** (Largest Contentful Paint) | < 2.5s | Lighthouse |
+| **FID** (First Input Delay) | < 100ms | Web Vitals |
+| **CLS** (Cumulative Layout Shift) | < 0.1 | Lighthouse |
+| **TTFB** (Time to First Byte) | < 800ms | Chrome DevTools |
+| **TTI** (Time to Interactive) | < 3.8s | Lighthouse |
+
+#### 7.2.2 包体积目标
+
+| 资源 | 目标 (gzipped) |
+|------|----------------|
+| 初始 JS Bundle | < 200KB |
+| 初始 CSS | < 50KB |
+| 首屏总资源 | < 500KB |
+| 各技能模块 | < 80KB each |
+
+#### 7.2.3 运行时性能
+
+| 指标 | 目标 |
+|------|------|
+| 聊天消息渲染 | < 16ms/帧 |
+| 工具卡片加载 | < 200ms |
+| 图表渲染 | < 500ms |
+| 列表滚动 | 60fps |
+
+### 7.3 测试策略
+
+#### 7.3.1 单元测试
+
+```typescript
+// 示例：VibeID 类型测试
+// src/types/__tests__/vibe-id.test.ts
+
+import { describe, it, expect } from 'vitest';
+import type { ArchetypeId, VibeIDProfile } from '../vibe-id';
+import { ARCHETYPE_META, getArchetypeMeta } from '@/skills/vibe-id/constants/archetypes';
+
+describe('VibeID Types', () => {
+  it('所有 12 个原型都有元数据', () => {
+    const archetypeIds: ArchetypeId[] = [
+      'innocent', 'explorer', 'sage', 'hero', 'outlaw', 'magician',
+      'regular', 'lover', 'jester', 'caregiver', 'creator', 'ruler'
+    ];
+
+    archetypeIds.forEach(id => {
+      const meta = getArchetypeMeta(id);
+      expect(meta).toBeDefined();
+      expect(meta.name).toBeTruthy();
+      expect(meta.nameCn).toBeTruthy();
+      expect(meta.emoji).toBeTruthy();
+    });
+  });
+
+  it('原型元数据包含所有必需字段', () => {
+    Object.values(ARCHETYPE_META).forEach(meta => {
+      expect(meta.id).toBeTruthy();
+      expect(meta.color).toMatch(/^#[0-9A-Fa-f]{6}$/);
+      expect(meta.slogan).toBeTruthy();
+      expect(meta.superpower).toBeTruthy();
+      expect(meta.growthPoints).toHaveLength(2);
+    });
+  });
+});
+```
+
+#### 7.3.2 组件测试
+
+```typescript
+// 示例：ArchetypeBadge 组件测试
+// src/skills/vibe-id/components/__tests__/ArchetypeBadge.test.tsx
+
+import { render, screen } from '@testing-library/react';
+import { describe, it, expect } from 'vitest';
+import { ArchetypeBadge } from '../ArchetypeBadge';
+
+describe('ArchetypeBadge', () => {
+  it('渲染正确的 emoji', () => {
+    render(<ArchetypeBadge archetypeId="explorer" />);
+    expect(screen.getByRole('img', { name: 'Explorer' })).toHaveTextContent('🧭');
+  });
+
+  it('显示维度标签', () => {
+    render(<ArchetypeBadge archetypeId="sage" dimension="core" showDimension />);
+    expect(screen.getByText('核心')).toBeInTheDocument();
+  });
+
+  it('显示原型名称', () => {
+    render(<ArchetypeBadge archetypeId="hero" showLabel />);
+    expect(screen.getByText('英雄')).toBeInTheDocument();
+  });
+});
+```
+
+#### 7.3.3 集成测试
+
+```typescript
+// 示例：聊天流集成测试
+// src/hooks/__tests__/useVibeChat.integration.test.ts
+
+import { renderHook, act, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi } from 'vitest';
+import { useVibeChat } from '../useVibeChat';
+
+describe('useVibeChat Integration', () => {
+  it('处理完整的聊天流程', async () => {
+    const { result } = renderHook(() => useVibeChat());
+
+    // 发送消息
+    act(() => {
+      result.current.sendMessage('帮我看看我的 VibeID');
+    });
+
+    // 等待响应
+    await waitFor(() => {
+      expect(result.current.messages).toHaveLength(2);
+    });
+
+    // 验证消息结构
+    expect(result.current.messages[0].role).toBe('user');
+    expect(result.current.messages[1].role).toBe('assistant');
+  });
+
+  it('正确处理工具调用', async () => {
+    const onToolCall = vi.fn();
+    const { result } = renderHook(() => useVibeChat({ onToolCall }));
+
+    act(() => {
+      result.current.sendMessage('显示我的 VibeID');
+    });
+
+    await waitFor(() => {
+      expect(onToolCall).toHaveBeenCalledWith(
+        expect.objectContaining({ toolName: 'show_vibe_id' })
+      );
+    });
+  });
+});
+```
+
+#### 7.3.4 端到端测试
+
+```typescript
+// 示例：Playwright E2E 测试
+// e2e/vibe-id.spec.ts
+
+import { test, expect } from '@playwright/test';
+
+test.describe('VibeID 功能', () => {
+  test.beforeEach(async ({ page }) => {
+    // 登录
+    await page.goto('/login');
+    await page.fill('[name="email"]', 'test@example.com');
+    await page.fill('[name="password"]', 'password');
+    await page.click('button[type="submit"]');
+    await page.waitForURL('/');
+  });
+
+  test('显示 VibeID 卡片', async ({ page }) => {
+    await page.goto('/chat');
+
+    // 输入消息
+    await page.fill('[data-testid="message-input"]', '显示我的 VibeID');
+    await page.click('[data-testid="send-button"]');
+
+    // 等待卡片出现
+    const card = await page.waitForSelector('[data-testid="vibe-id-card"]');
+    expect(card).toBeTruthy();
+
+    // 验证四个维度
+    const badges = await page.$$('[data-testid="archetype-badge"]');
+    expect(badges).toHaveLength(4);
+  });
+
+  test('原型详情交互', async ({ page }) => {
+    await page.goto('/vibe-id');
+
+    // 点击维度行
+    await page.click('[data-testid="dimension-row-core"]');
+
+    // 验证展开内容
+    const expanded = await page.waitForSelector('[data-testid="dimension-expanded"]');
+    expect(expanded).toBeTruthy();
+  });
+});
+```
+
+### 7.4 部署检查清单
+
+#### 7.4.1 预发布检查
+
+```markdown
+## 预发布检查清单
+
+### 构建验证
+- [ ] `npm run build` 无错误
+- [ ] `npm run type-check` 通过
+- [ ] `npm run lint` 无错误
+- [ ] `npm run test` 全部通过
+
+### 性能验证
+- [ ] Lighthouse 分数 > 90
+- [ ] Bundle 分析无异常大依赖
+- [ ] 首屏加载 < 3s (3G)
+
+### 功能验证
+- [ ] 聊天流正常工作
+- [ ] 所有工具卡片渲染正确
+- [ ] VibeID 完整显示
+- [ ] 移动端适配正常
+
+### 安全检查
+- [ ] 无敏感信息泄露
+- [ ] API 调用正确处理认证
+- [ ] CORS 配置正确
+```
+
+#### 7.4.2 监控配置
+
+```typescript
+// src/utils/monitoring.ts
+
+import { getCLS, getFID, getLCP, getFCP, getTTFB } from 'web-vitals';
+
+/**
+ * 初始化性能监控
+ */
+export function initMonitoring() {
+  // Core Web Vitals
+  getCLS(metric => reportMetric('CLS', metric));
+  getFID(metric => reportMetric('FID', metric));
+  getLCP(metric => reportMetric('LCP', metric));
+  getFCP(metric => reportMetric('FCP', metric));
+  getTTFB(metric => reportMetric('TTFB', metric));
+}
+
+function reportMetric(name: string, metric: any) {
+  // 发送到监控服务
+  if (process.env.NODE_ENV === 'production') {
+    fetch('/api/metrics', {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        value: metric.value,
+        id: metric.id,
+        page: window.location.pathname,
+      }),
+    });
+  }
+
+  // 开发环境打印
+  console.log(`[Metric] ${name}:`, metric.value);
+}
+```
+
+---
+
+## 附录
+
+### A. Vercel 45 规则速查表
+
+| 规则ID | 类别 | 简述 |
+|--------|------|------|
+| `async-parallel` | 消除瀑布流 | Promise.all 并行执行 |
+| `async-defer-await` | 消除瀑布流 | 延迟 await 到使用分支 |
+| `async-suspense-boundaries` | 消除瀑布流 | Suspense 流式传输 |
+| `bundle-barrel-imports` | 包体积 | 避免桶文件导入 |
+| `bundle-dynamic-imports` | 包体积 | next/dynamic 懒加载 |
+| `bundle-defer-third-party` | 包体积 | 延迟加载第三方脚本 |
+| `server-cache-react` | 服务端 | React.cache 去重 |
+| `server-serialization` | 服务端 | 最小化客户端数据 |
+| `client-swr-dedup` | 客户端 | SWR 自动去重 |
+| `rerender-memo` | 重渲染 | memo 包装昂贵组件 |
+| `rerender-functional-setstate` | 重渲染 | 函数式 setState |
+| `rerender-transitions` | 重渲染 | startTransition |
+| `rendering-hoist-jsx` | 渲染 | 提升静态 JSX |
+| `js-set-map-lookups` | JS性能 | Set/Map O(1) 查找 |
+
+### B. 文件命名约定
+
+| 类型 | 约定 | 示例 |
+|------|------|------|
+| 组件 | PascalCase | `VibeIDCard.tsx` |
+| Hook | camelCase + use前缀 | `useVibeID.ts` |
+| 工具卡片 | kebab-case | `show-vibe-id.tsx` |
+| 类型文件 | kebab-case | `vibe-id.ts` |
+| 常量 | kebab-case | `archetypes.ts` |
+| 样式 | kebab-case | `archetype-styles.ts` |
+
+### C. 参考资源
+
+- [VibeID设计-v5.md](../prd/VibeID/VibeID设计-v5.md) - 四维原型系统设计
+- [SPEC-v7.md](./SPEC-v7.md) - 后端 API 架构
+- [Vercel React Best Practices](/.claude/skills/react-best-practices/AGENTS.md) - 45条性能规则
+- [Next.js 14 文档](https://nextjs.org/docs)
+- [SWR 文档](https://swr.vercel.app)
+- [Zustand 文档](https://zustand-demo.pmnd.rs)
+
+---
+
+> **文档版本**: 7.1
+> **最后更新**: 2026-01-17
+> **维护者**: AI Agent
+> **状态**: 草稿
+
+### v7.1 升级总结
+
+本次升级引入 Linear 风格设计语言，主要变更：
+
+1. **设计原则** - 新增 Linear 风格核心理念：克制、精致、流畅
+2. **色彩系统** - 低饱和度配色，新增 bg-primary/secondary/tertiary 语义色
+3. **阴影系统** - 多层阴影 (shadow-subtle/soft/elevated/float)，精致边框
+4. **动效系统** - Spring easing 物理动画，交互反馈优化
+5. **字体系统** - 14px 基准字号，紧凑行高，精细字间距
+6. **组件升级** - Card/Button/ChatMessage 全面 Linear 化
+7. **加载效果** - Shimmer 骨架屏、打字光标、流式加载点
+

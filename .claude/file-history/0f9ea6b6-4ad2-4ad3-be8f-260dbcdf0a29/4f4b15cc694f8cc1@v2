@@ -1,0 +1,491 @@
+"""
+Currency System Service.
+
+REQ: REQ-PAY-001 ~ REQ-PAY-005
+Design: §5.1.3
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from models.currency import (
+    CurrencyLedgerEntry,
+    CurrencyType,
+    EarningRule,
+    LedgerCategory,
+    UserBalance,
+)
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+class CurrencyServiceError(Exception):
+    """Base exception for currency service errors."""
+    pass
+
+
+class InsufficientBalanceError(CurrencyServiceError):
+    """Insufficient balance for operation."""
+    pass
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# =============================================================================
+# Earning Rules Configuration
+# =============================================================================
+
+EARNING_RULES: List[EarningRule] = [
+    EarningRule(
+        rule_id="commitment_complete",
+        name="完成承诺",
+        description="完成一个行动承诺获得能量",
+        currency_type=CurrencyType.AURA,
+        amount=10,
+        trigger="commitment_complete",
+        daily_limit=50,
+    ),
+    EarningRule(
+        rule_id="daily_checkin",
+        name="每日打卡",
+        description="每日情绪打卡获得能量",
+        currency_type=CurrencyType.AURA,
+        amount=5,
+        trigger="checkin",
+        cooldown_hours=20,
+    ),
+    EarningRule(
+        rule_id="chain_join",
+        name="参与接龙",
+        description="参与好运接龙获得能量",
+        currency_type=CurrencyType.AURA,
+        amount=10,  # Base, actual varies by formula
+        trigger="chain_join",
+    ),
+    EarningRule(
+        rule_id="streak_bonus",
+        name="连续打卡奖励",
+        description="连续7天打卡额外奖励",
+        currency_type=CurrencyType.AURA,
+        amount=50,
+        trigger="streak_7",
+        cooldown_hours=168,  # 7 days
+    ),
+    EarningRule(
+        rule_id="share_card",
+        name="分享卡片",
+        description="分享卡片到社交媒体获得能量",
+        currency_type=CurrencyType.AURA,
+        amount=5,
+        trigger="share",
+        daily_limit=15,
+    ),
+    EarningRule(
+        rule_id="plan_day_complete",
+        name="完成计划日",
+        description="完成成长计划的一天",
+        currency_type=CurrencyType.AURA,
+        amount=15,
+        trigger="plan_day_complete",
+    ),
+]
+
+
+def get_earning_rules() -> List[EarningRule]:
+    """Get all earning rules."""
+    return [r for r in EARNING_RULES if r.enabled]
+
+
+# =============================================================================
+# Balance Operations
+# =============================================================================
+
+def get_balance(user_id: int) -> UserBalance:
+    """
+    Get user's currency balance.
+
+    REQ: REQ-PAY-001
+    """
+    row = fortune_db.fetch_one(
+        "SELECT * FROM fortune_user_balance WHERE user_id = %s",
+        [user_id],
+    )
+
+    if not row:
+        # Create default balance
+        fortune_db.execute(
+            """
+            INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+            VALUES (%s, 0, 0, %s)
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            [user_id, _now_utc()],
+        )
+        return UserBalance(user_id=user_id, coins=0, aura=0)
+
+    return UserBalance(
+        user_id=row["user_id"],
+        coins=row["coins"],
+        aura=row["aura"],
+        updated_at=row.get("updated_at"),
+    )
+
+
+def ensure_balance_exists(user_id: int) -> None:
+    """Ensure user has a balance record."""
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+        VALUES (%s, 0, 0, %s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        [user_id, _now_utc()],
+    )
+
+
+# =============================================================================
+# Add Currency (TASK-7.1.2)
+# =============================================================================
+
+def add_currency(
+    user_id: int,
+    currency_type: CurrencyType,
+    amount: int,
+    category: LedgerCategory,
+    reason: str,
+    ref_type: Optional[str] = None,
+    ref_id: Optional[str] = None,
+    description: Optional[str] = None,
+) -> CurrencyLedgerEntry:
+    """
+    Add currency to user's balance.
+
+    REQ: REQ-PAY-003
+
+    Uses transaction to ensure atomicity:
+    - UPDATE balance and INSERT ledger in same transaction
+    - balance_after is accurate (no race condition)
+    """
+    if amount <= 0:
+        raise CurrencyServiceError("Amount must be positive")
+
+    ensure_balance_exists(user_id)
+    now = _now_utc()
+    column = "coins" if currency_type == CurrencyType.COINS else "aura"
+
+    # Use transaction to ensure atomicity
+    with fortune_db.transaction() as tx:
+        # Update balance and get new value in one operation
+        balance_row = tx.execute_returning_one(
+            f"""
+            UPDATE fortune_user_balance
+            SET {column} = {column} + %s, updated_at = %s
+            WHERE user_id = %s
+            RETURNING {column} as new_balance
+            """,
+            [amount, now, user_id],
+        )
+        new_balance = balance_row["new_balance"] if balance_row else amount
+
+        # Record ledger entry (within same transaction)
+        row = tx.execute_returning_one(
+            """
+            INSERT INTO fortune_currency_ledger (
+                user_id, currency_type, amount, balance_after, category, reason,
+                ref_type, ref_id, description, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING entry_id
+            """,
+            [user_id, currency_type.value, amount, new_balance, category.value,
+             reason, ref_type, ref_id, description, now],
+        )
+        entry_id = row["entry_id"] if row else None
+    # Transaction commits here
+
+    logger.info(
+        "currency_add user=%s type=%s amount=%s category=%s",
+        user_id, currency_type.value, amount, category.value
+    )
+
+    return CurrencyLedgerEntry(
+        entry_id=entry_id,
+        user_id=user_id,
+        currency_type=currency_type,
+        amount=amount,
+        balance_after=new_balance,
+        category=category,
+        reason=reason,
+        ref_type=ref_type,
+        ref_id=ref_id,
+        description=description,
+        created_at=now,
+    )
+
+
+# =============================================================================
+# Deduct Currency (TASK-7.1.3)
+# =============================================================================
+
+def deduct_currency(
+    user_id: int,
+    currency_type: CurrencyType,
+    amount: int,
+    category: LedgerCategory,
+    reason: str,
+    ref_type: Optional[str] = None,
+    ref_id: Optional[str] = None,
+    description: Optional[str] = None,
+) -> CurrencyLedgerEntry:
+    """
+    Deduct currency from user's balance.
+
+    REQ: REQ-PAY-004
+
+    Uses transaction to ensure atomicity:
+    - SELECT FOR UPDATE to lock row and check balance
+    - UPDATE balance and INSERT ledger in same transaction
+    - Prevents race condition where balance goes negative
+    """
+    if amount <= 0:
+        raise CurrencyServiceError("Amount must be positive")
+
+    now = _now_utc()
+    column = "coins" if currency_type == CurrencyType.COINS else "aura"
+
+    # Use transaction to ensure atomicity
+    with fortune_db.transaction() as tx:
+        # Lock row and check balance
+        balance_row = tx.fetch_one(
+            f"SELECT {column} as current FROM fortune_user_balance WHERE user_id = %s FOR UPDATE",
+            [user_id],
+        )
+
+        if not balance_row:
+            raise InsufficientBalanceError(
+                f"No balance record for user {user_id}"
+            )
+
+        current = balance_row["current"]
+        if current < amount:
+            raise InsufficientBalanceError(
+                f"Insufficient {currency_type.value}: have {current}, need {amount}"
+            )
+
+        # Update balance and get new value
+        update_row = tx.execute_returning_one(
+            f"""
+            UPDATE fortune_user_balance
+            SET {column} = {column} - %s, updated_at = %s
+            WHERE user_id = %s
+            RETURNING {column} as new_balance
+            """,
+            [amount, now, user_id],
+        )
+        new_balance = update_row["new_balance"] if update_row else (current - amount)
+
+        # Record ledger entry (negative amount)
+        row = tx.execute_returning_one(
+            """
+            INSERT INTO fortune_currency_ledger (
+                user_id, currency_type, amount, balance_after, category, reason,
+                ref_type, ref_id, description, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING entry_id
+            """,
+            [user_id, currency_type.value, -amount, new_balance, category.value,
+             reason, ref_type, ref_id, description, now],
+        )
+        entry_id = row["entry_id"] if row else None
+    # Transaction commits here
+
+    logger.info(
+        "currency_deduct user=%s type=%s amount=%s category=%s",
+        user_id, currency_type.value, amount, category.value
+    )
+
+    return CurrencyLedgerEntry(
+        entry_id=entry_id,
+        user_id=user_id,
+        currency_type=currency_type,
+        amount=-amount,
+        balance_after=new_balance,
+        category=category,
+        reason=reason,
+        ref_type=ref_type,
+        ref_id=ref_id,
+        description=description,
+        created_at=now,
+    )
+
+
+# =============================================================================
+# Transfer Currency
+# =============================================================================
+
+def transfer_currency(
+    from_user_id: int,
+    to_user_id: int,
+    currency_type: CurrencyType,
+    amount: int,
+    reason: str,
+    ref_type: Optional[str] = None,
+    ref_id: Optional[str] = None,
+) -> Dict[str, CurrencyLedgerEntry]:
+    """
+    Transfer currency between users.
+
+    REQ: REQ-PAY-004
+    """
+    if from_user_id == to_user_id:
+        raise CurrencyServiceError("Cannot transfer to yourself")
+
+    # Deduct from sender
+    sender_entry = deduct_currency(
+        user_id=from_user_id,
+        currency_type=currency_type,
+        amount=amount,
+        category=LedgerCategory.TRANSFER_OUT,
+        reason=reason,
+        ref_type=ref_type,
+        ref_id=ref_id,
+    )
+
+    # Add to receiver
+    receiver_entry = add_currency(
+        user_id=to_user_id,
+        currency_type=currency_type,
+        amount=amount,
+        category=LedgerCategory.TRANSFER_IN,
+        reason=reason,
+        ref_type=ref_type,
+        ref_id=ref_id,
+    )
+
+    return {
+        "sender": sender_entry,
+        "receiver": receiver_entry,
+    }
+
+
+# =============================================================================
+# Ledger History
+# =============================================================================
+
+def get_ledger_history(
+    user_id: int,
+    currency_type: Optional[CurrencyType] = None,
+    category: Optional[LedgerCategory] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Get user's ledger history.
+
+    REQ: REQ-PAY-005
+    """
+    conditions = ["user_id = %s"]
+    params: List[Any] = [user_id]
+
+    if currency_type:
+        conditions.append("currency_type = %s")
+        params.append(currency_type.value)
+
+    if category:
+        conditions.append("category = %s")
+        params.append(category.value)
+
+    where_clause = " AND ".join(conditions)
+
+    # Get total count
+    count_row = fortune_db.fetch_one(
+        f"SELECT COUNT(*) as cnt FROM fortune_currency_ledger WHERE {where_clause}",
+        params,
+    )
+    total_count = count_row["cnt"] if count_row else 0
+
+    # Get entries
+    params.extend([limit, offset])
+    rows = fortune_db.fetch_all(
+        f"""
+        SELECT * FROM fortune_currency_ledger
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        params,
+    )
+
+    entries = [
+        CurrencyLedgerEntry(
+            entry_id=row["entry_id"],
+            user_id=row["user_id"],
+            currency_type=CurrencyType(row["currency_type"]),
+            amount=row["amount"],
+            balance_after=row["balance_after"],
+            category=LedgerCategory(row["category"]),
+            reason=row["reason"],
+            ref_type=row.get("ref_type"),
+            ref_id=row.get("ref_id"),
+            description=row.get("description"),
+            created_at=row.get("created_at"),
+        )
+        for row in rows
+    ]
+
+    return {
+        "entries": entries,
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# =============================================================================
+# Earning Triggers
+# =============================================================================
+
+def trigger_earning(
+    user_id: int,
+    trigger: str,
+    ref_type: Optional[str] = None,
+    ref_id: Optional[str] = None,
+    custom_amount: Optional[int] = None,
+) -> Optional[CurrencyLedgerEntry]:
+    """
+    Trigger an earning event based on rules.
+
+    REQ: REQ-PAY-003
+    """
+    # Find matching rule
+    rule = None
+    for r in EARNING_RULES:
+        if r.trigger == trigger and r.enabled:
+            rule = r
+            break
+
+    if not rule:
+        return None
+
+    amount = custom_amount if custom_amount is not None else rule.amount
+
+    # TODO: Check cooldown and daily limits
+
+    entry = add_currency(
+        user_id=user_id,
+        currency_type=rule.currency_type,
+        amount=amount,
+        category=LedgerCategory.EARN,
+        reason=rule.name,
+        ref_type=ref_type,
+        ref_id=ref_id,
+        description=rule.description,
+    )
+
+    return entry

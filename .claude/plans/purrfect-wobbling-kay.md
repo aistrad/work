@@ -1,0 +1,352 @@
+# VibeLife 架构重构方案：实现 VibeInsight + VibeTarget
+
+> 基于 V9 VIBELIFE_TOPLEVEL_ARCHITECTURE.md
+> 预计时间：8 天 | 2026-01-21
+
+---
+
+## 一、方案概述
+
+### 核心目标
+
+将 VibeLife 从"对话工具"升级为"自我认知平台"，实现 V9 架构的四大支柱中的后两个：
+
+1. **Me + VibeInsight**：跨维度融合的自我认知（命理 + 对话 + 行为）
+2. **VibeTarget**：对话驱动的目标管理与成长陪伴
+
+### 当前差距 → 目标状态
+
+| 组件 | 当前 | 目标 |
+|------|------|------|
+| **数据层** | Layer 1-2 完整，Layer 3 表空，Layer 4 不存在 | 四层完整，ProfileExtractor 自动生成 |
+| **ProfileExtractor** | 基础抽取（facts/goals） | VibeInsight 三维 + VibeTarget 三维 |
+| **API** | /account/profile 基础 | /api/v1/me/dashboard + /api/v1/target/* |
+| **前端** | Settings 基础 | Me 页三维洞察 + Journey 页目标强化 |
+
+---
+
+## 二、技术设计
+
+### 2.1 数据结构
+
+#### VibeInsight 三维模型（存储在 unified_profiles.profile.vibe_insight）
+
+```json
+{
+  "essence": {
+    "archetype": {
+      "primary": "creator",
+      "secondary": "explorer",
+      "shadow": "ruler"
+    },
+    "traits": [
+      {"source": "bazi", "trait": "表达力强"},
+      {"source": "zodiac", "trait": "好奇心旺"}
+    ]
+  },
+  "dynamic": {
+    "emotion": {"current": "calm", "intensity": 0.6},
+    "energy": {"level": 0.7, "focus": ["career"]},
+    "active_archetype": "creator",
+    "trend": {
+      "archetype_shift": {"rising": "pioneer", "delta": 0.05},
+      "emotion_trend": "stable",
+      "direction": "expansion"
+    }
+  },
+  "pattern": {
+    "behaviors": [{"pattern": "晚间活跃", "confidence": 0.8}],
+    "insights": ["创意灵感常在深夜涌现"]
+  },
+  "updated_at": "2026-01-21T03:00:00Z"
+}
+```
+
+#### VibeTarget 三维模型（存储在 unified_profiles.profile.vibe_target）
+
+```json
+{
+  "goals": [
+    {
+      "id": "goal_001",
+      "title": "完成写作项目",
+      "source": "对话抽取",
+      "status": "in_progress",
+      "progress": 0.6,
+      "created_at": "2026-01-10",
+      "check_ins": [{"date": "2026-01-18", "note": "写了3章"}]
+    }
+  ],
+  "focus": {
+    "primary": "career",
+    "secondary": ["growth"],
+    "active_goal": "goal_001",
+    "heat_map": {"career": 0.8, "growth": 0.5}
+  },
+  "milestones": {
+    "achieved": [],
+    "streak": {"current": 7, "best": 14},
+    "moments": []
+  },
+  "updated_at": "2026-01-21T03:00:00Z"
+}
+```
+
+### 2.2 ProfileExtractor 升级
+
+#### 新增核心函数
+
+**文件**：`apps/api/workers/profile_extractor.py`
+
+1. **generate_vibe_insight(user_id)** - 生成 VibeInsight 三维模型
+   - essence：基础映射规则（bazi 日主 → 主原型） + LLM 融合微调
+   - dynamic：最近 7 天对话情绪分析 + 能量趋势
+   - pattern：历史时间分布 + 对话主题频率分析
+
+2. **generate_vibe_target(user_id)** - 生成 VibeTarget 三维模型
+   - goals：从 extracted.goals 结构化，补充进度和状态
+   - focus：基于对话关键词匹配计算热力图
+   - milestones：目标完成事件 + 连续打卡统计
+
+#### 原型映射策略（混合方式）
+
+```python
+# 1. 基础映射规则（硬编码表）
+BAZI_ARCHETYPE_MAP = {
+    "甲木": "creator",      # 创造者
+    "乙木": "innocent",     # 天真者
+    "丙火": "explorer",     # 探险家
+    "丁火": "lover",        # 恋人
+    "戊土": "caregiver",    # 照顾者
+    "己土": "ruler",        # 统治者
+    "庚金": "hero",         # 英雄
+    "辛金": "sage",         # 智者
+    "壬水": "magician",     # 魔术师
+    "癸水": "jester"        # 弄臣
+}
+
+# 2. LLM 微调 Prompt
+ARCHETYPE_REFINEMENT_PROMPT = """基于用户的八字日主 {daymaster} 和星座信息 {zodiac}，
+从荣格12原型中选择最符合的 primary、secondary 和 shadow 原型。
+
+参考基础映射：{daymaster} → {base_archetype}
+但可以根据星座信息微调选择。
+
+12原型：innocent, explorer, sage, hero, outlaw, magician,
+       lover, jester, caregiver, creator, ruler, everyman"""
+```
+
+### 2.3 API 设计
+
+#### Me API（新建 routes/me.py）
+
+```python
+@router.get("/v1/me/dashboard")
+async def get_me_dashboard(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    返回：
+    {
+      "primary_insight": "你的创造者特质正在显化，近期频繁讨论写作与此呼应",
+      "vibe_insight": {
+        "essence": {...},
+        "dynamic": {...},
+        "pattern": {...}
+      },
+      "data_level": "A"  // A=完整，B=基础，C=缺失
+    }
+    """
+```
+
+#### VibeTarget API（新建 routes/target.py）
+
+```python
+GET  /v1/target/dashboard           # 获取 VibeTarget 数据
+POST /v1/target/goals               # 手动添加目标
+PUT  /v1/target/goals/{id}/check-in # 打卡
+PUT  /v1/target/goals/{id}/complete # 完成目标
+DELETE /v1/target/goals/{id}        # 删除目标
+```
+
+### 2.4 前端设计
+
+#### Me 页面（升级现有 MePanel.tsx）
+
+**设计**：
+- 顶部：用户头像 + 一句话核心洞察
+- 主区域：三维画像卡片展开
+  - 本质卡片（原型 + 特质）
+  - 动态卡片（情绪 + 能量 + 趋势）
+  - 规律卡片（行为模式 + 洞察）
+- 底部：设置区域（保持现有功能）
+
+#### Journey 页面（强化目标功能）
+
+**升级点**：
+- 增加目标列表展示（从 vibe_target.goals 读取）
+- 目标打卡快捷入口
+- 里程碑回顾时间线
+- 聚焦领域热力图可视化
+
+---
+
+## 三、实施计划（8 天）
+
+### Phase 1: ProfileExtractor 升级（3天）
+
+| Day | 任务 | 关键文件 | 验证方式 |
+|-----|------|---------|---------|
+| **Day 1** | VibeInsight essence 生成 | `profile_extractor.py` | 手动运行，检查 profile.vibe_insight.essence |
+| | - 实现 BAZI_ARCHETYPE_MAP 映射表 | | |
+| | - 实现 LLM 融合微调逻辑 | | |
+| | - 从 skill_data.bazi + zodiac 读取 | | |
+| **Day 2** | VibeInsight dynamic + pattern 生成 | `profile_extractor.py` | 运行后检查 dynamic 和 pattern 字段 |
+| | - 最近 7 天对话情绪分析 | | |
+| | - 历史时间分布统计 | | |
+| | - 话题频率分析 | | |
+| **Day 3** | VibeTarget 三维模型生成 | `profile_extractor.py` | 检查 profile.vibe_target 完整性 |
+| | - goals 结构化 | | |
+| | - focus 热力图计算 | | |
+| | - milestones 统计 | | |
+
+### Phase 2: Me 页 + API（2天）
+
+| Day | 任务 | 关键文件 | 验证方式 |
+|-----|------|---------|---------|
+| **Day 4** | Me API 实现 | `routes/me.py`（新建） | curl 测试 API 返回结构 |
+| | - GET /v1/me/dashboard 端点 | | |
+| | - 数据完整度评估（A/B/C） | | |
+| | - 一句话洞察生成 | | |
+| | - 路由注册到 main.py | | |
+| **Day 5** | Me 页前端升级 | `MePanel.tsx` | 浏览器验证三维展示 |
+| | - 三维模型卡片组件 | | |
+| | - API 调用 hook | | |
+| | - 响应式布局调整 | | |
+| | - 数据缺失时的引导 | | |
+
+### Phase 3: VibeTarget 页 + API（3天）
+
+| Day | 任务 | 关键文件 | 验证方式 |
+|-----|------|---------|---------|
+| **Day 6** | VibeTarget API 实现 | `routes/target.py`（新建） | Postman 测试完整流程 |
+| | - GET /dashboard | | |
+| | - POST /goals | | |
+| | - PUT /goals/{id}/check-in | | |
+| | - PUT /goals/{id}/complete | | |
+| **Day 7** | Journey 页目标功能强化 | `JourneyPanel.tsx` | 验证目标列表和打卡 |
+| | - 目标列表组件 | | |
+| | - 打卡界面 | | |
+| | - API 集成 | | |
+| **Day 8** | 里程碑和热力图可视化 | `JourneyPanel.tsx` | 完整端到端测试 |
+| | - 里程碑时间线组件 | | |
+| | - 聚焦领域热力图 | | |
+| | - 交互优化和调试 | | |
+
+---
+
+## 四、关键文件清单
+
+### 后端（5 个文件）
+
+1. **`apps/api/workers/profile_extractor.py`** - ProfileExtractor 核心升级
+   - 添加 `generate_vibe_insight()` 和 `generate_vibe_target()`
+   - 实现原型映射表和 LLM 融合逻辑
+
+2. **`apps/api/routes/me.py`** - Me API（新建）
+   - GET /v1/me/dashboard
+   - 数据完整度评估
+
+3. **`apps/api/routes/target.py`** - VibeTarget API（新建）
+   - 目标 CRUD + 打卡 + 完成
+
+4. **`apps/api/stores/unified_profile_repo.py`** - 数据访问层（微调）
+   - 添加便捷方法：`get_vibe_insight()` 和 `get_vibe_target()`
+
+5. **`apps/api/main.py`** - 路由注册
+   - 注册 me.router 和 target.router
+
+### 前端（2 个文件）
+
+6. **`apps/web/src/components/layout/panels/MePanel.tsx`** - Me 页升级
+   - 三维模型卡片展示
+   - API 调用集成
+
+7. **`apps/web/src/components/layout/panels/JourneyPanel.tsx`** - Journey 页强化
+   - 目标列表和打卡
+   - 里程碑时间线
+   - 聚焦热力图
+
+---
+
+## 五、验证计划
+
+### 数据层验证
+
+```bash
+# 1. 运行 ProfileExtractor
+python apps/api/workers/profile_extractor.py 7
+
+# 2. 检查数据生成
+psql $VIBELIFE_DB_URL -c "
+  SELECT
+    user_id,
+    profile->'vibe_insight'->'essence'->'archetype'->>'primary' as archetype,
+    profile->'vibe_target'->'focus'->>'primary' as focus
+  FROM unified_profiles
+  WHERE profile ? 'vibe_insight'
+  LIMIT 5;
+"
+```
+
+### API 验证
+
+```bash
+# Me API
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8100/api/v1/me/dashboard
+
+# VibeTarget API
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "完成项目", "description": "..."}' \
+  http://localhost:8100/api/v1/target/goals
+```
+
+### 前端验证
+
+1. 访问 /me 页面，验证三维洞察展示
+2. 访问 /journey 页面，验证目标管理功能
+3. 执行打卡流程，验证数据更新
+4. 检查响应式布局（PC + 移动端）
+
+---
+
+## 六、风险与应对
+
+| 风险 | 影响 | 应对 |
+|------|------|------|
+| **LLM 成本** | essence 生成频繁调用 | 每日凌晨批量处理，非实时 |
+| **首次无数据** | 新用户洞察为空 | 提供默认值 + 引导填写 |
+| **原型映射主观** | archetype 不准确 | 基础规则 + LLM 微调 + 用户反馈 |
+| **目标抽取误判** | extracted.goals 包含非目标 | 用户确认 + 手动编辑 |
+| **前端集成复杂度** | Journey 页功能过载 | 渐进式加载 + 折叠设计 |
+
+---
+
+## 七、未解决问题（可延后）
+
+1. **连续打卡定义**：是否每天都要打卡，还是每周 3 次即可？
+   - **建议**：从简单开始（每周 3 次），后续可配置
+
+2. **命理与目标融合时机**：何时主动推荐命理视角？
+   - **建议**：用户在目标设定时可选"查看命理建议"
+
+3. **数据完整度阈值**：A/B/C 分级的具体标准？
+   - **建议**：A=有 bazi+zodiac+对话，B=有 bazi 或 zodiac，C=仅对话
+
+4. **洞察刷新频率**：是否允许用户手动刷新？
+   - **建议**：Phase 1 仅每日自动，Phase 2 可添加手动刷新
+
+---
+
+**最后更新**：2026-01-21
+**预计完成**：2026-01-29（8 个工作日）

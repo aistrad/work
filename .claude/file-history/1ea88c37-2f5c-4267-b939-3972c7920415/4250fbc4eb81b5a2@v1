@@ -1,0 +1,294 @@
+"""
+Onboarding Skill Tool Handlers - 首次相遇工具执行器
+
+V1.0 架构：
+- generate_insights: LLM 驱动的洞察生成（读取命盘，返回三个洞察）
+- show_insights: 展示洞察卡片（LLM 调用 show 工具）
+- show_guidance: 展示引导选择卡片（LLM 调用 show 工具）
+
+工具由 LLM 根据 SKILL.md 规则自主调用，无硬编码流程。
+"""
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+
+from services.agent.tool_registry import tool_handler, ToolContext
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 常量：洞察生成参考数据
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 日主特质映射
+DAYMASTER_TRAITS = {
+    "甲": {"core": "生发、进取、正直", "positive": "有抱负", "negative": "固执"},
+    "乙": {"core": "柔韧、适应、艺术", "positive": "灵活", "negative": "优柔"},
+    "丙": {"core": "热情、开朗、表达", "positive": "阳光", "negative": "冲动"},
+    "丁": {"core": "细腻、温暖、坚持", "positive": "专注", "negative": "内耗"},
+    "戊": {"core": "稳重、包容、信任", "positive": "可靠", "negative": "保守"},
+    "己": {"core": "务实、细心、服务", "positive": "踏实", "negative": "纠结"},
+    "庚": {"core": "果断、义气、执行", "positive": "有魄力", "negative": "太直"},
+    "辛": {"core": "精致、敏感、标准", "positive": "品味高", "negative": "挑剔"},
+    "壬": {"core": "智慧、自由、适应", "positive": "聪明", "negative": "散漫"},
+    "癸": {"core": "细腻、内敛、深沉", "positive": "敏锐", "negative": "多虑"},
+}
+
+# 太阳星座特质映射
+SUN_SIGN_TRAITS = {
+    "白羊座": {"element": "fire", "core": "行动、热情、自信", "conflict_a": "追求自由", "conflict_b": "渴望认可"},
+    "金牛座": {"element": "earth", "core": "稳定、务实、享受", "conflict_a": "追求安全", "conflict_b": "渴望改变"},
+    "双子座": {"element": "air", "core": "思考、好奇、多变", "conflict_a": "追求自由表达", "conflict_b": "渴望被理解"},
+    "巨蟹座": {"element": "water", "core": "情感、直觉、保护", "conflict_a": "渴望归属", "conflict_b": "害怕被伤害"},
+    "狮子座": {"element": "fire", "core": "自信、创造、领导", "conflict_a": "渴望闪耀", "conflict_b": "害怕被否定"},
+    "处女座": {"element": "earth", "core": "分析、服务、完美", "conflict_a": "追求完美", "conflict_b": "接受不完美"},
+    "天秤座": {"element": "air", "core": "和谐、审美、公正", "conflict_a": "追求和谐", "conflict_b": "表达真实想法"},
+    "天蝎座": {"element": "water", "core": "深度、掌控、转化", "conflict_a": "追求深度", "conflict_b": "恐惧暴露"},
+    "射手座": {"element": "fire", "core": "探索、乐观、自由", "conflict_a": "追求自由", "conflict_b": "承担责任"},
+    "摩羯座": {"element": "earth", "core": "野心、责任、成就", "conflict_a": "追求成就", "conflict_b": "享受当下"},
+    "水瓶座": {"element": "air", "core": "创新、独立、人道", "conflict_a": "追求独特", "conflict_b": "渴望归属"},
+    "双鱼座": {"element": "water", "core": "灵性、同理、艺术", "conflict_a": "追求理想", "conflict_b": "面对现实"},
+}
+
+# 时柱十神特质映射（职场/社交表现）
+HOUR_PILLAR_TRAITS = {
+    "偏官": {"domain": "职场", "positive": "执行力强、有魄力", "risk": "因为太直接得罪人"},
+    "七杀": {"domain": "职场", "positive": "执行力强、有魄力", "risk": "因为太直接得罪人"},
+    "偏财": {"domain": "职场", "positive": "资源整合能力强", "risk": "过于追求效率"},
+    "正财": {"domain": "社交", "positive": "踏实可靠", "risk": "不善于表达需求"},
+    "正印": {"domain": "社交", "positive": "受人尊敬、有威信", "risk": "过于在意形象"},
+    "偏印": {"domain": "与人相处时", "positive": "思维独特", "risk": "难以被理解"},
+    "食神": {"domain": "社交", "positive": "亲和力强、有创意", "risk": "过于在意他人看法"},
+    "伤官": {"domain": "社交", "positive": "表达能力强", "risk": "言语过于犀利"},
+    "比肩": {"domain": "与人相处时", "positive": "独立自主", "risk": "不善于求助"},
+    "劫财": {"domain": "职场", "positive": "竞争意识强", "risk": "过于好胜"},
+}
+
+# 流年状态映射
+FORTUNE_STATES = {
+    "克制期": "想要改变但不知道从哪开始",
+    "压力期": "感觉被困住了，需要突破",
+    "消耗期": "有很多想法但难以行动",
+    "扩展期": "对未来既期待又焦虑",
+    "调整期": "想要被理解但不知如何表达",
+    "转折期": "站在人生的十字路口",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 核心工具：generate_insights
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("generate_insights")
+async def execute_generate_insights(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    基于用户命盘生成三个精准洞察。
+
+    工具会从 profile 中读取 bazi_chart 和 zodiac_data，
+    生成三个维度的洞察：
+    1. 内在矛盾 (inner_conflict)
+    2. 外在表现 (external_expression)
+    3. 当下状态 (current_state)
+
+    返回数据供 show 工具展示。
+    """
+    # 从参数或 context.skill_data 获取命盘数据
+    bazi_chart = args.get("bazi_chart")
+    zodiac_data = args.get("zodiac_data")
+
+    # 如果参数中没有，从 profile 读取
+    if not bazi_chart or not zodiac_data:
+        profile = context.profile or {}
+        skills_data = profile.get("skills", {})
+
+        if not bazi_chart:
+            bazi_chart = skills_data.get("bazi", {}).get("chart", {})
+
+        if not zodiac_data:
+            zodiac_data = skills_data.get("zodiac", {}).get("chart", {})
+
+    # 验证必要数据
+    if not bazi_chart:
+        return {
+            "status": "error",
+            "error": "缺少八字命盘数据。请先完成出生信息收集。",
+        }
+
+    # 提取关键数据
+    day_master = bazi_chart.get("day_master", {})
+    day_master_element = day_master.get("element", "甲")  # 日主天干
+    month_pillar = bazi_chart.get("month_pillar", {})
+    hour_pillar = bazi_chart.get("hour_pillar", {})
+    pattern = bazi_chart.get("pattern", {})
+    pattern_name = pattern.get("name", "正官格")
+
+    # 太阳星座
+    sun_sign = "双子座"
+    if zodiac_data:
+        planets = zodiac_data.get("planets", {})
+        sun = planets.get("sun", {})
+        sun_sign = sun.get("sign", "双子座")
+
+    # 上升星座
+    rising_sign = "狮子座"
+    if zodiac_data:
+        rising = zodiac_data.get("ascendant", {})
+        rising_sign = rising.get("sign", "狮子座")
+
+    # 时柱十神
+    hour_god = hour_pillar.get("ten_god", "偏财")
+
+    # 生成三个洞察
+    insights = []
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 洞察 1: 内在矛盾
+    # ─────────────────────────────────────────────────────────────────────────
+    dm_traits = DAYMASTER_TRAITS.get(day_master_element, DAYMASTER_TRAITS["甲"])
+    sun_traits = SUN_SIGN_TRAITS.get(sun_sign, SUN_SIGN_TRAITS["双子座"])
+
+    inner_conflict = f"你的内在矛盾：{sun_traits['conflict_a']} vs {sun_traits['conflict_b']}"
+
+    insights.append({
+        "type": "inner_conflict",
+        "content": inner_conflict,
+        "basis": f"日主{day_master_element} + {sun_sign}特质",
+    })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 洞察 2: 外在表现
+    # ─────────────────────────────────────────────────────────────────────────
+    hour_traits = HOUR_PILLAR_TRAITS.get(hour_god, HOUR_PILLAR_TRAITS["偏财"])
+
+    external_expression = (
+        f"你在{hour_traits['domain']}：{hour_traits['positive']}，"
+        f"但可能{hour_traits['risk']}"
+    )
+
+    insights.append({
+        "type": "external_expression",
+        "content": external_expression,
+        "basis": f"时柱{hour_god} + {rising_sign}上升",
+    })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 洞察 3: 当下状态
+    # ─────────────────────────────────────────────────────────────────────────
+    # 简化版：根据格局类型推测当前状态
+    current_state = _infer_current_state(pattern_name, sun_sign)
+
+    insights.append({
+        "type": "current_state",
+        "content": f"你最近可能感到：{current_state}",
+        "basis": f"格局{pattern_name} + 当前运势周期",
+    })
+
+    return {
+        "status": "success",
+        "insights": insights,
+        "pattern_name": pattern_name,
+        "sun_sign": sun_sign,
+        "message": "洞察生成完成，请使用 show_insights 展示给用户",
+    }
+
+
+def _infer_current_state(pattern_name: str, sun_sign: str) -> str:
+    """根据格局和星座推测当前状态"""
+    # 简化逻辑：根据格局类型映射
+    if "杀" in pattern_name or "官" in pattern_name:
+        return FORTUNE_STATES.get("克制期", "想要改变但不知道从哪开始")
+    elif "印" in pattern_name:
+        return FORTUNE_STATES.get("调整期", "想要被理解但不知如何表达")
+    elif "财" in pattern_name:
+        return FORTUNE_STATES.get("扩展期", "对未来既期待又焦虑")
+    elif "食" in pattern_name or "伤" in pattern_name:
+        return FORTUNE_STATES.get("消耗期", "有很多想法但难以行动")
+    else:
+        return FORTUNE_STATES.get("转折期", "站在人生的十字路口")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 展示工具：show_insights
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_insights")
+async def execute_show_insights(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示首次相遇的三个洞察卡片。
+
+    返回 insights_card 类型的数据供前端渲染。
+    """
+    insights = args.get("insights", [])
+    pattern_name = args.get("pattern_name", "")
+    sun_sign = args.get("sun_sign", "")
+
+    if not insights:
+        return {
+            "status": "error",
+            "error": "缺少洞察数据，请先调用 generate_insights",
+        }
+
+    return {
+        "status": "success",
+        "cardType": "insights_card",
+        "insights": insights,
+        "pattern_name": pattern_name,
+        "sun_sign": sun_sign,
+        "feedback_buttons": [
+            {"id": "accurate", "label": "说得准", "emoji": "👍", "message": "准"},
+            {"id": "not_accurate", "label": "不太准", "emoji": "👎", "message": "不准"},
+            {"id": "want_to_talk", "label": "有话想说", "emoji": "💬", "message": "想说话"},
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 展示工具：show_guidance
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_guidance")
+async def execute_show_guidance(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示首次相遇的引导选择卡片。
+
+    返回 guidance_card 类型的数据供前端渲染。
+    """
+    question = args.get("question", "最近有什么让你困扰的事吗？")
+    custom_options = args.get("options")
+
+    # 默认三个选项
+    default_options = [
+        {
+            "id": "life_direction",
+            "label": "想找到人生方向",
+            "icon": "compass",
+            "emoji": "🧭",
+            "skills": ["lifecoach"],
+        },
+        {
+            "id": "career_finance",
+            "label": "想改善职场/财务",
+            "icon": "briefcase",
+            "emoji": "💼",
+            "skills": ["bazi", "career"],
+        },
+        {
+            "id": "relationship",
+            "label": "想改善感情/关系",
+            "icon": "heart",
+            "emoji": "❤️",
+            "skills": ["zodiac", "synastry"],
+        },
+    ]
+
+    options = custom_options if custom_options else default_options
+
+    return {
+        "status": "success",
+        "cardType": "guidance_card",
+        "question": question,
+        "options": options,
+        "allow_skip": True,
+        "skip_label": "我只是好奇",
+    }

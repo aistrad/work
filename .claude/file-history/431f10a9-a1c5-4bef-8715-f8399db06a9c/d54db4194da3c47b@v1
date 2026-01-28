@@ -1,0 +1,288 @@
+"""
+Memory System - Short-term and Long-term memory management
+"""
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from uuid import UUID
+from dataclasses import dataclass
+
+from stores import SkillRepository, KnowledgeRepository
+
+
+@dataclass
+class MemoryItem:
+    """A memory item"""
+    content: str
+    memory_type: str  # 'conversation', 'insight', 'fact', 'preference'
+    importance: float  # 0-1
+    created_at: datetime
+    skill_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class MemorySystem:
+    """
+    Memory system for managing conversation context and long-term memories.
+    """
+
+    # ─────────────────────────────────────────────────────────────────
+    # Short-term Memory (Conversation Context)
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_conversation_history(
+        conversation_id: UUID,
+        limit: int = 20
+    ) -> List[Dict[str, str]]:
+        """Get recent messages from conversation"""
+        messages = await SkillRepository.get_messages(conversation_id, limit)
+
+        return [
+            {
+                "role": msg["role"],
+                "content": msg["content"],
+                "created_at": str(msg["created_at"])
+            }
+            for msg in messages
+        ]
+
+    @staticmethod
+    async def get_recent_context(
+        user_id: UUID,
+        skill_id: str,
+        max_messages: int = 10
+    ) -> List[Dict[str, str]]:
+        """Get recent messages across recent conversations"""
+        messages = await SkillRepository.get_recent_messages(
+            user_id, skill_id, max_messages
+        )
+
+        return [
+            {
+                "role": msg["role"],
+                "content": msg["content"]
+            }
+            for msg in messages
+        ]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Long-term Memory (Insights & Facts)
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_user_insights(
+        user_id: UUID,
+        skill_id: Optional[str] = None,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Get user's stored insights"""
+        insights = await SkillRepository.get_user_insights(
+            user_id, skill_id, limit=limit
+        )
+
+        return [
+            {
+                "type": insight["insight_type"],
+                "content": insight["content"],
+                "confidence": insight["confidence"],
+                "created_at": str(insight["created_at"])
+            }
+            for insight in insights
+        ]
+
+    @staticmethod
+    async def get_user_profile_context(
+        user_id: UUID,
+        skill_id: str
+    ) -> Dict[str, Any]:
+        """Get user profile data for context"""
+        profile = await SkillRepository.get_or_create_profile(user_id, skill_id)
+        return profile.get("profile_data", {})
+
+    # ─────────────────────────────────────────────────────────────────
+    # Memory Retrieval (Semantic Search)
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def retrieve_relevant_memories(
+        query: str,
+        embedding: List[float],
+        user_id: UUID,
+        skill_id: str,
+        top_k: int = 5
+    ) -> List[MemoryItem]:
+        """
+        Retrieve relevant memories using semantic search.
+        Combines conversation history, insights, and knowledge.
+        """
+        memories = []
+
+        # Search knowledge base
+        knowledge_results = await KnowledgeRepository.vector_search(
+            embedding, skill_id, top_k
+        )
+
+        for chunk in knowledge_results:
+            memories.append(MemoryItem(
+                content=chunk["content"],
+                memory_type="knowledge",
+                importance=chunk.get("score", 0.5),
+                created_at=chunk["created_at"],
+                skill_id=skill_id,
+                metadata={
+                    "source": chunk.get("source_file"),
+                    "content_type": chunk.get("content_type")
+                }
+            ))
+
+        # Get recent insights
+        insights = await SkillRepository.get_user_insights(
+            user_id, skill_id, limit=3
+        )
+
+        for insight in insights:
+            memories.append(MemoryItem(
+                content=insight["content"],
+                memory_type="insight",
+                importance=insight.get("confidence", 0.7),
+                created_at=insight["created_at"],
+                skill_id=skill_id,
+                metadata={"insight_type": insight["insight_type"]}
+            ))
+
+        # Sort by importance and recency
+        memories.sort(
+            key=lambda m: (m.importance, m.created_at),
+            reverse=True
+        )
+
+        return memories[:top_k]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Context Building
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def build_context_string(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        conversation_id: Optional[UUID] = None,
+        query_embedding: Optional[List[float]] = None,
+        query: Optional[str] = None,
+        include_profile: bool = True,
+        include_insights: bool = True,
+        include_history: bool = True
+    ) -> str:
+        """Build comprehensive context string for LLM"""
+        context_parts = []
+
+        # User profile
+        if include_profile:
+            profile_data = await cls.get_user_profile_context(user_id, skill_id)
+            if profile_data:
+                context_parts.append(f"## User Profile\n{_format_profile(profile_data)}")
+
+        # Recent insights
+        if include_insights:
+            insights = await cls.get_user_insights(user_id, skill_id, limit=3)
+            if insights:
+                insights_text = "\n".join([
+                    f"- [{i['type']}] {i['content']}"
+                    for i in insights
+                ])
+                context_parts.append(f"## Recent Insights\n{insights_text}")
+
+        # Conversation history
+        if include_history and conversation_id:
+            history = await cls.get_conversation_history(conversation_id, limit=10)
+            if history:
+                history_text = "\n".join([
+                    f"{msg['role']}: {msg['content']}"
+                    for msg in history[-6:]  # Last 6 messages
+                ])
+                context_parts.append(f"## Recent Conversation\n{history_text}")
+
+        # Relevant memories (if embedding provided)
+        if query_embedding and query:
+            memories = await cls.retrieve_relevant_memories(
+                query, query_embedding, user_id, skill_id, top_k=3
+            )
+            if memories:
+                mem_text = "\n".join([
+                    f"- [{m.memory_type}] {m.content[:200]}..."
+                    for m in memories
+                ])
+                context_parts.append(f"## Relevant Knowledge\n{mem_text}")
+
+        return "\n\n".join(context_parts)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Memory Update
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def update_profile_memory(
+        user_id: UUID,
+        skill_id: str,
+        key: str,
+        value: Any
+    ) -> None:
+        """Update a specific memory in user profile"""
+        await SkillRepository.update_profile(
+            user_id, skill_id, {key: value}
+        )
+
+    @staticmethod
+    async def extract_facts_from_message(
+        message: str,
+        llm_orchestrator=None
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract factual information from a message.
+        Used for building long-term memory.
+        """
+        if not llm_orchestrator:
+            return []
+
+        from .llm_orchestrator import LLMMessage
+
+        prompt = f"""从以下消息中提取关于用户的事实信息。
+
+消息: "{message}"
+
+如果有事实信息，以JSON数组格式返回:
+[{{"fact_type": "preference|behavior|event|relationship", "content": "事实内容", "importance": 0.1-1.0}}]
+
+如果没有明显的事实信息，返回空数组: []
+
+只返回JSON，不要其他内容。"""
+
+        messages = [LLMMessage(role="user", content=prompt)]
+
+        try:
+            response = await llm_orchestrator.chat(
+                messages,
+                temperature=0.3,
+                max_tokens=512
+            )
+
+            import json
+            return json.loads(response.content)
+        except Exception:
+            return []
+
+
+def _format_profile(profile_data: Dict[str, Any]) -> str:
+    """Format profile data as readable string"""
+    lines = []
+    for key, value in profile_data.items():
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for k, v in value.items():
+                lines.append(f"  - {k}: {v}")
+        elif isinstance(value, list):
+            lines.append(f"{key}: {', '.join(str(v) for v in value)}")
+        else:
+            lines.append(f"{key}: {value}")
+    return "\n".join(lines)

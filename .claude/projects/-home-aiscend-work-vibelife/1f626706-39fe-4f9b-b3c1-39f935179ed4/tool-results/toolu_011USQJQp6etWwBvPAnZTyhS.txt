@@ -1,0 +1,600 @@
+     1→# VibeLife 架构决策文档
+     2→
+     3→> **访谈日期**: 2026-01-07
+     4→> **基于文档**: matrix-strategy-architecture.md, implementation-status-analysis.md
+     5→> **决策状态**: 已确认
+     6→
+     7→---
+     8→
+     9→## 1. 访谈结论汇总
+    10→
+    11→### 1.1 核心架构决策
+    12→
+    13→| 决策点 | 选择 | 说明 |
+    14→|--------|------|------|
+    15→| **前端框架** | Vercel AI SDK 6 | 全面采用 useChat + SSE + Generative UI |
+    16→| **后端框架** | Python FastAPI | 保留 Vibe Engine、Portrait Service、Knowledge Retrieval |
+    17→| **认证方案** | Clerk | Vercel 生态首选，webhook 写入 PostgreSQL |
+    18→| **数据库** | 统一 PostgreSQL | Clerk + 支付 + 业务数据全部在同一 DB |
+    19→| **子域名架构** | Phase 1 必须 | bazi.vibelife.app / zodiac.vibelife.app |
+    20→| **支付系统** | Phase 1 必须 | 参照 matrix 文档实现 |
+    21→| **时间线** | 无硬性 deadline | 质量优先 |
+    22→
+    23→### 1.2 功能决策
+    24→
+    25→| 功能 | 决策 | 说明 |
+    26→|------|------|------|
+    27→| **Voice Mode** | Bug，需修复 | 前端需传递 voice_mode 给后端 |
+    28→| **RAG 知识库** | Phase 1 必须启用 | 八字/星座知识库是核心竞争力 |
+    29→| **访谈流程** | 深度服务默认 + 可跳过 | 给用户选择权 |
+    30→| **报告生成** | lite + full 两种 | lite 免费 + full 付费解锁 |
+    31→| **多语言** | 中英双语 | Phase 1 支持切换 |
+    32→
+    33→### 1.3 UI 策略
+    34→
+    35→| 组件类型 | 来源 | 说明 |
+    36→|----------|------|------|
+    37→| 品牌特色组件 | 保留现有 | LuminousPaper、BreathAura、InsightCard |
+    38→| 聊天状态管理 | AI SDK useChat | 自动流式、重试、中断 |
+    39→| 动态卡片生成 | AI SDK Generative UI | LLM 返回结构化数据，前端渲染组件 |
+    40→| 命盘/星盘图表 | 保留现有 | 专业可视化已实现 |
+    41→
+    42→---
+    43→
+    44→## 2. 代码 Review 发现的问题
+    45→
+    46→### 2.1 Critical（必须修复）
+    47→
+    48→| # | 问题 | 位置 | 影响 |
+    49→|---|------|------|------|
+    50→| 1 | **API 字段不匹配** | 前端 `skill_id` vs 后端 `skill` | API 调用 400 错误 |
+    51→| 2 | **用户上下文缺失** | chat.py:164 `get_user_profile(None)` | 所有用户共享默认 profile |
+    52→| 3 | **Mock 支付暴露** | payment.py:245 `/mock-pay` | 任何人可标记支付完成 |
+    53→| 4 | **支付数据内存存储** | payment.py:136 `_payment_sessions = {}` | 重启丢失支付状态 |
+    54→
+    55→### 2.2 High（Phase 1 需修复）
+    56→
+    57→| # | 问题 | 位置 | 影响 |
+    58→|---|------|------|------|
+    59→| 5 | **voice_mode 未传递** | ChatContainer.tsx | 用户切换无效 |
+    60→| 6 | **流式未使用** | ChatContainer.tsx | 长响应体验差 |
+    61→| 7 | **报告持久化 stub** | report.py:123+ | 报告无法保存/检索 |
+    62→| 8 | **会话列表 stub** | chat.py:396-424 | 用户无法查看历史会话 |
+    63→| 9 | **RAG 未启用** | context.py | knowledge_chunks 参数未使用 |
+    64→
+    65→### 2.3 Medium（Phase 2 可修复）
+    66→
+    67→| # | 问题 | 位置 | 影响 |
+    68→|---|------|------|------|
+    69→| 10 | **Token 刷新竞态** | api.ts | 多个 401 同时触发刷新 |
+    70→| 11 | **错误处理不一致** | 所有 routes | HTTPException vs Response model 混用 |
+    71→| 12 | **Profile 大小无限制** | portrait.py | 可能超出 token 预算 |
+    72→| 13 | **deep_merge 重复** | portrait.py + profile_repo.py | 维护性问题 |
+    73→
+    74→---
+    75→
+    76→## 3. Vercel AI SDK 6 集成方案
+    77→
+    78→### 3.1 架构概览
+    79→
+    80→```
+    81→┌─────────────────────────────────────────────────────────────────────────┐
+    82→│                        Vercel AI SDK 6 集成架构                          │
+    83→├─────────────────────────────────────────────────────────────────────────┤
+    84→│                                                                          │
+    85→│   Frontend (Next.js + AI SDK 6)                                         │
+    86→│   ┌─────────────────────────────────────────────────────────┐           │
+    87→│   │                                                         │           │
+    88→│   │  useChat({                                              │           │
+    89→│   │    api: '/api/chat',        // Next.js Route Handler   │           │
+    90→│   │    streamProtocol: 'text',  // 或 'data' for tools     │           │
+    91→│   │  })                                                     │           │
+    92→│   │       │                                                 │           │
+    93→│   │       ▼                                                 │           │
+    94→│   │  /api/chat/route.ts (Next.js Route Handler)            │           │
+    95→│   │       │                                                 │           │
+    96→│   │       ▼ 转发请求到 Python 后端                          │           │
+    97→│   │  fetch('https://api.vibelife.app/chat/stream')         │           │
+    98→│   │       │                                                 │           │
+    99→│   │       ▼ 转换 SSE 格式为 AI SDK 协议                     │           │
+   100→│   │  return new StreamingTextResponse(transformedStream)   │           │
+   101→│   │                                                         │           │
+   102→│   └─────────────────────────────────────────────────────────┘           │
+   103→│                         │                                               │
+   104→│                         ▼                                               │
+   105→│   Python Backend (FastAPI)                                              │
+   106→│   ┌─────────────────────────────────────────────────────────┐           │
+   107→│   │                                                         │           │
+   108→│   │  POST /chat/stream                                      │           │
+   109→│   │       │                                                 │           │
+   110→│   │       ▼                                                 │           │
+   111→│   │  返回 AI SDK 兼容的 SSE 格式：                          │           │
+   112→│   │  data: {"type":"text-delta","textDelta":"你好"}        │           │
+   113→│   │  data: {"type":"text-delta","textDelta":"！"}          │           │
+   114→│   │  data: {"type":"finish","finishReason":"stop"}         │           │
+   115→│   │                                                         │           │
+   116→│   └─────────────────────────────────────────────────────────┘           │
+   117→│                                                                          │
+   118→└─────────────────────────────────────────────────────────────────────────┘
+   119→```
+   120→
+   121→### 3.2 后端 SSE 格式适配
+   122→
+   123→**当前格式** (自定义):
+   124→```
+   125→data: {"type": "chunk", "content": "你好"}
+   126→data: {"type": "done", "conversation_id": "..."}
+   127→```
+   128→
+   129→**AI SDK 要求格式**:
+   130→```
+   131→data: {"type": "text-delta", "textDelta": "你好"}
+   132→data: {"type": "finish", "finishReason": "stop", "usage": {...}}
+   133→```
+   134→
+   135→**适配方案** - 修改 `apps/api/routes/chat.py`:
+   136→
+   137→```python
+   138→# 新的 SSE 事件格式
+   139→async def stream_chat_sse(response_generator, conversation_id: str):
+   140→    async for chunk in response_generator:
+   141→        yield {
+   142→            "event": "message",
+   143→            "data": json.dumps({
+   144→                "type": "text-delta",
+   145→                "textDelta": chunk
+   146→            })
+   147→        }
+   148→
+   149→    # 结束事件
+   150→    yield {
+   151→        "event": "message",
+   152→        "data": json.dumps({
+   153→            "type": "finish",
+   154→            "finishReason": "stop",
+   155→            "metadata": {"conversationId": str(conversation_id)}
+   156→        })
+   157→    }
+   158→```
+   159→
+   160→### 3.3 前端 useChat 配置
+   161→
+   162→```typescript
+   163→// apps/web/src/hooks/useVibeChat.ts
+   164→import { useChat } from '@ai-sdk/react';
+   165→
+   166→export function useVibeChat(skillId: string, voiceMode: string) {
+   167→  return useChat({
+   168→    api: '/api/chat',
+   169→    body: {
+   170→      skill: skillId,           // 统一用 skill
+   171→      voice_mode: voiceMode,    // 传递 voice_mode
+   172→    },
+   173→    streamProtocol: 'data',     // AI SDK data stream protocol
+   174→    onFinish: (message) => {
+   175→      // 处理完成事件，提取 metadata
+   176→      const metadata = message.annotations?.[0];
+   177→      if (metadata?.conversationId) {
+   178→        // 更新会话 ID
+   179→      }
+   180→    },
+   181→    onError: (error) => {
+   182→      // 统一错误处理
+   183→      console.error('Chat error:', error);
+   184→    },
+   185→  });
+   186→}
+   187→```
+   188→
+   189→### 3.4 Generative UI 实现（动态卡片）
+   190→
+   191→```typescript
+   192→// apps/web/src/app/api/chat/route.ts
+   193→import { streamUI } from 'ai/rsc';
+   194→import { z } from 'zod';
+   195→import { InsightCard } from '@/components/core/InsightCard';
+   196→import { KLineChart } from '@/components/fortune/KLineChart';
+   197→
+   198→export async function POST(req: Request) {
+   199→  const { messages, skill, voice_mode } = await req.json();
+   200→
+   201→  const result = await streamUI({
+   202→    model: customModel, // 包装 Python 后端调用
+   203→    messages,
+   204→    tools: {
+   205→      showInsightCard: {
+   206→        description: '展示洞察卡片，用于呈现性格特点、运势分析等',
+   207→        parameters: z.object({
+   208→          title: z.string(),
+   209→          content: z.string(),
+   210→          type: z.enum(['personality', 'career', 'relationship', 'fortune']),
+   211→        }),
+   212→        generate: async ({ title, content, type }) => {
+   213→          return <InsightCard title={title} content={content} type={type} />;
+   214→        },
+   215→      },
+   216→      showKLine: {
+   217→        description: '展示人生K线图',
+   218→        parameters: z.object({
+   219→          userId: z.string(),
+   220→          startYear: z.number(),
+   221→          endYear: z.number(),
+   222→        }),
+   223→        generate: async ({ userId, startYear, endYear }) => {
+   224→          const data = await fetchKLineData(userId, startYear, endYear);
+   225→          return <KLineChart data={data} />;
+   226→        },
+   227→      },
+   228→      showRelationshipCard: {
+   229→        description: '展示关系分析卡片',
+   230→        parameters: z.object({
+   231→          score: z.number(),
+   232→          aspects: z.array(z.object({
+   233→            name: z.string(),
+   234→            score: z.number(),
+   235→            description: z.string(),
+   236→          })),
+   237→        }),
+   238→        generate: async ({ score, aspects }) => {
+   239→          return <RelationshipCard score={score} aspects={aspects} />;
+   240→        },
+   241→      },
+   242→    },
+   243→  });
+   244→
+   245→  return result.toDataStreamResponse();
+   246→}
+   247→```
+   248→
+   249→---
+   250→
+   251→## 4. 实施路线图
+   252→
+   253→### Phase 1 核心任务
+   254→
+   255→```
+   256→┌─────────────────────────────────────────────────────────────────────────┐
+   257→│                        Phase 1 实施顺序                                  │
+   258→├─────────────────────────────────────────────────────────────────────────┤
+   259→│                                                                          │
+   260→│   Week 1: 基础架构                                                       │
+   261→│   ─────────────────                                                      │
+   262→│   [ ] 1.1 修复 skill_id → skill 字段名                                  │
+   263→│   [ ] 1.2 集成 Clerk 认证                                               │
+   264→│   [ ] 1.3 后端 SSE 格式适配 AI SDK                                      │
+   265→│   [ ] 1.4 前端 useChat hook 集成                                        │
+   266→│                                                                          │
+   267→│   Week 2: 核心功能                                                       │
+   268→│   ─────────────────                                                      │
+   269→│   [ ] 2.1 voice_mode 完整链路                                           │
+   270→│   [ ] 2.2 RAG 知识库启用                                                │
+   271→│   [ ] 2.3 访谈流程前端集成                                              │
+   272→│   [ ] 2.4 用户 profile 持久化                                           │
+   273→│                                                                          │
+   274→│   Week 3: 子域名 + 支付                                                  │
+   275→│   ─────────────────                                                      │
+   276→│   [ ] 3.1 路由组重构 (bazi)/ (zodiac)/                                  │
+   277→│   [ ] 3.2 middleware.ts 子域名路由                                       │
+   278→│   [ ] 3.3 Stripe 支付集成                                               │
+   279→│   [ ] 3.4 订阅状态管理                                                  │
+   280→│                                                                          │
+   281→│   Week 4: 报告 + 打磨                                                    │
+   282→│   ─────────────────                                                      │
+   283→│   [ ] 4.1 报告持久化完成                                                │
+   284→│   [ ] 4.2 lite/full 报告流程                                            │
+   285→│   [ ] 4.3 Generative UI 动态卡片                                        │
+   286→│   [ ] 4.4 中英双语切换                                                  │
+   287→│                                                                          │
+   288→└─────────────────────────────────────────────────────────────────────────┘
+   289→```
+   290→
+   291→### 关键文件修改清单
+   292→
+   293→| 文件 | 修改内容 | 优先级 |
+   294→|------|----------|--------|
+   295→| `apps/web/src/lib/api.ts` | `skill_id` → `skill` | P0 |
+   296→| `apps/web/src/components/chat/ChatContainer.tsx` | 改用 useChat + 传递 voice_mode | P0 |
+   297→| `apps/api/routes/chat.py` | SSE 格式适配 + 认证集成 | P0 |
+   298→| `apps/api/routes/chat.py:164` | 获取真实用户 profile | P0 |
+   299→| `apps/api/routes/payment.py` | 删除 mock-pay，完善 Stripe | P0 |
+   300→| `apps/api/services/vibe_engine/context.py` | 启用 knowledge_chunks | P1 |
+   301→| `apps/web/src/middleware.ts` | 完善子域名路由 | P1 |
+   302→| `apps/api/stores/report_repo.py` | 报告持久化 | P1 |
+   303→
+   304→---
+   305→
+   306→## 5. 技术栈确认
+   307→
+   308→```
+   309→Frontend
+   310→────────
+   311→• Next.js 14+ (App Router)
+   312→• Vercel AI SDK 6
+   313→• TypeScript
+   314→• Tailwind CSS
+   315→• 现有品牌组件 (LuminousPaper, BreathAura, InsightCard)
+   316→
+   317→Backend
+   318→───────
+   319→• Python 3.11+
+   320→• FastAPI
+   321→• asyncpg (PostgreSQL)
+   322→• httpx (LLM 调用)
+   323→• Vibe Engine (Context, Portrait, LLM)
+   324→
+   325→Infrastructure
+   326→──────────────
+   327→• Vercel (Frontend)
+   328→• Railway/Render/自有服务器 (Python Backend)
+   329→• PostgreSQL (Supabase/Railway/自有)
+   330→• Clerk (认证)
+   331→• Stripe (支付)
+   332→
+   333→LLM Providers
+   334→─────────────
+   335→• Primary: Zhipu GLM-4-Plus
+   336→• Fallback: Claude Sonnet
+   337→• Vision: GLM-4V-Plus (可选)
+   338→```
+   339→
+   340→---
+   341→
+   342→## 6. 待确认事项
+   343→
+   344→以下问题在后续实施中需要确认：
+   345→
+   346→1. **Clerk webhook 端点**: 放在 Python 后端还是 Next.js API Routes？
+   347→2. **Stripe webhook 端点**: 同上
+   348→3. **子域名 Cookie 域名**: `.vibelife.app` 还是各子域名独立？
+   349→4. **报告 PDF 生成**: 服务端生成还是客户端生成？
+   350→5. **命盘/星盘计算**: 继续用 Python 还是迁移到前端 JS 库？
+   351→
+   352→---
+   353→
+   354→## 7. Nano Banana 海报图生成架构
+   355→
+   356→### 7.1 概述
+   357→
+   358→| 决策点 | 选择 | 说明 |
+   359→|--------|------|------|
+   360→| **图像生成 API** | Google Gemini Imagen (Nano Banana) | 图文一体输出，支持中文 |
+   361→| **服务集成** | VibeLife 调用 gemini_tool API | gemini_tool 作为独立微服务 |
+   362→| **生成模式** | 混合（简单同步 + 复杂异步） | 按场景选择 |
+   363→| **存储位置** | 自有服务器 | 文件系统存储 |
+   364→| **缓存策略** | 永久存储 | 生成后永久保存 |
+   365→
+   366→### 7.2 海报场景（Spec v3.0 定义）
+   367→
+   368→| 场景 | 模板名称 | 比例 | 说明 |
+   369→|------|----------|------|------|
+   370→| 个人报告（八字）| `bazi_personal_poster` | 16:9 | 东方神秘风格，五行意象 |
+   371→| 个人报告（星座）| `zodiac_personal_poster` | 16:9 | 星空主题，星座符号 |
+   372→| 关系匹配 | `relationship_poster` | 1:1 | 双人元素互动 |
+   373→| 运势卡片 | `fortune_card` | 9:16 | 月/周/日运势，手机壁纸尺寸 |
+   374→| 社交分享 | `social_share_card` | 1:1 或 4:5 | 简洁符号化设计 |
+   375→
+   376→### 7.3 集成架构
+   377→
+   378→```
+   379→┌─────────────────────────────────────────────────────────────────────────┐
+   380→│                        海报图生成架构                                    │
+   381→├─────────────────────────────────────────────────────────────────────────┤
+   382→│                                                                          │
+   383→│   VibeLife Backend (FastAPI)                                            │
+   384→│   ┌─────────────────────────────────────────────────────────┐           │
+   385→│   │                                                         │           │
+   386→│   │  POST /api/v1/report/image                              │           │
+   387→│   │       │                                                 │           │
+   388→│   │       ▼                                                 │           │
+   389→│   │  1. 根据 skill + scene 选择 prompt 模板                 │           │
+   390→│   │  2. 填充用户数据（五行/星座/关系等）                    │           │
+   391→│   │  3. 调用 gemini_tool API                               │           │
+   392→│   │                                                         │           │
+   393→│   └─────────────────────────────────────────────────────────┘           │
+   394→│                         │                                               │
+   395→│                         ▼ POST /create_gemini_job                       │
+   396→│   ┌─────────────────────────────────────────────────────────┐           │
+   397→│   │  gemini_tool (独立微服务 :6222)                         │           │
+   398→│   │                                                         │           │
+   399→│   │  GeminiJobRequest {                                     │           │
+   400→│   │    job_name: "report_poster_user123",                   │           │
+   401→│   │    tasks: [{                                            │           │
+   402→│   │      model: "gemini-imagen",                            │           │
+   403→│   │      task_name: "bazi_poster",                          │           │
+   404→│   │      prompt: "东方神秘风格垂直海报...",                 │           │
+   405→│   │      output_file_type: "png"                            │           │
+   406→│   │    }],                                                  │           │
+   407→│   │    priority: 50                                         │           │
+   408→│   │  }                                                      │           │
+   409→│   │                                                         │           │
+   410→│   │  → Playwright 自动化 → Gemini Web → 生成图片            │           │
+   411→│   │  → 保存到服务器文件系统                                 │           │
+   412→│   │                                                         │           │
+   413→│   └─────────────────────────────────────────────────────────┘           │
+   414→│                         │                                               │
+   415→│                         ▼ 同步返回 或 轮询/Webhook                      │
+   416→│   ┌─────────────────────────────────────────────────────────┐           │
+   417→│   │  返回图片 URL                                           │           │
+   418→│   │  https://api.vibelife.app/static/posters/xxx.png       │           │
+   419→│   └─────────────────────────────────────────────────────────┘           │
+   420→│                                                                          │
+   421→└─────────────────────────────────────────────────────────────────────────┘
+   422→```
+   423→
+   424→### 7.4 Prompt 模板示例（八字个人海报）
+   425→
+   426→```
+   427→东方神秘风格垂直海报，16:9 比例
+   428→
+   429→主视觉：{daymaster_element}属性的意象化人物剪影
+   430→- 甲木：参天大树的剪影，向上生长
+   431→- 丙火：太阳光芒，温暖明亮
+   432→- 戊土：山峦起伏，稳重厚实
+   433→- 庚金：月光剑影，锐利清冷
+   434→- 壬水：流水波纹，灵动深邃
+   435→
+   436→背景：水墨山水风格，{season}季节氛围
+   437→色调：{element_color}为主色调
+   438→- 木→青绿  火→朱红  土→赭黄  金→银白  水→玄黑
+   439→
+   440→文字区域（下方 1/3）：
+   441→- 主标题：「{user_name}的命格解读」
+   442→- 副标题：{daymaster}日主 · {pattern}格局
+   443→- 金句：{core_insight}
+   444→
+   445→风格要求：
+   446→- 东方美学，留白适度
+   447→- 意境深远，不写实
+   448→- 文字清晰可读
+   449→- 整体神秘而温暖
+   450→```
+   451→
+   452→### 7.5 实施任务
+   453→
+   454→| 任务 | 优先级 | 说明 |
+   455→|------|--------|------|
+   456→| VibeLife 后端添加 `/report/image` 端点 | P1 | 调用 gemini_tool |
+   457→| Prompt 模板管理（5 种场景） | P1 | 存储在数据库或配置文件 |
+   458→| gemini_tool 服务部署 | P1 | 确保 :6222 可访问 |
+   459→| 异步任务状态查询 | P2 | 前端轮询或 Webhook |
+   460→| 图片 CDN 加速 | P2 | 可选，提升加载速度 |
+   461→
+   462→---
+   463→
+   464→## 附录 A: Chat 流程技术参考
+   465→
+   466→### A.1 整体架构图
+   467→
+   468→```
+   469→┌─────────────────────────────────────────────────────────────────────────────┐
+   470→│                              FRONTEND (Next.js)                              │
+   471→├─────────────────────────────────────────────────────────────────────────────┤
+   472→│                                                                              │
+   473→│  ┌──────────────┐    onSend()    ┌──────────────────┐                       │
+   474→│  │  ChatInput   │ ─────────────► │  ChatContainer   │                       │
+   475→│  │  (textarea)  │                │   handleSend()   │                       │
+   476→│  └──────────────┘                └────────┬─────────┘                       │
+   477→│                                           │                                  │
+   478→│                                           ▼                                  │
+   479→│                                  ┌──────────────────┐                       │
+   480→│                                  │    api.ts        │                       │
+   481→│                                  │  sendMessage()   │                       │
+   482→│                                  └────────┬─────────┘                       │
+   483→│                                           │                                  │
+   484→└───────────────────────────────────────────┼─────────────────────────────────┘
+   485→                                            │ POST /api/v1/chat/
+   486→                                            │ Authorization: Bearer {token}
+   487→                                            ▼
+   488→┌─────────────────────────────────────────────────────────────────────────────┐
+   489→│                              BACKEND (FastAPI)                               │
+   490→├─────────────────────────────────────────────────────────────────────────────┤
+   491→│                                                                              │
+   492→│  ┌──────────────────┐                                                       │
+   493→│  │  routes/chat.py  │  POST /chat/                                          │
+   494→│  │  ───────────────                                                         │
+   495→│  │  1. parse_skill()                                                        │
+   496→│  │  2. get_user_profile()                                                   │
+   497→│  │  3. get_conversation_history()                                           │
+   498→│  │  4. save_message(user)                                                   │
+   499→│  └────────┬─────────┘                                                       │
+   500→│           │                                                                  │
+   501→│           ▼                                                                  │
+   502→│  ┌────────────────────────────────────────────────────────────┐             │
+   503→│  │              VIBE ENGINE (services/vibe_engine/)           │             │
+   504→│  │  ┌─────────────────┐      ┌─────────────────────────────┐  │             │
+   505→│  │  │  context.py     │      │  llm.py                     │  │             │
+   506→│  │  │  ContextBuilder │ ───► │  LLMService                 │  │             │
+   507→│  │  │  ─────────────  │      │  ────────────               │  │             │
+   508→│  │  │  • system_prompt│      │  • Zhipu (primary)         │  │             │
+   509→│  │  │  • topic分类    │      │  • Claude (fallback)       │  │             │
+   510→│  │  │  • profile选择  │      │  • Gemini (backup)         │  │             │
+   511→│  │  │  • history格式化│      └─────────────────────────────┘  │             │
+   512→│  │  └─────────────────┘                                       │             │
+   513→│  └────────────────────────────────────────────────────────────┘             │
+   514→│           │                                                                  │
+   515→│           ▼                                                                  │
+   516→│  ┌──────────────────┐                                                       │
+   517→│  │  5. save_message │  (assistant response)                                 │
+   518→│  │  6. return JSON  │                                                       │
+   519→│  └──────────────────┘                                                       │
+   520→│                                                                              │
+   521→└─────────────────────────────────────────────────────────────────────────────┘
+   522→```
+   523→
+   524→### A.2 数据流转
+   525→
+   526→```
+   527→用户输入          前端 Request            后端 Request
+   528→─────────         ────────────            ────────────
+   529→"我是90年         {                       ChatRequest(
+   530→ 5月15日           message: "...",         message="...",
+   531→ 出生的"           skill: "bazi",          skill="bazi",
+   532→                   conversation_id:null    conversation_id=None,
+   533→                 }                         voice_mode="warm"
+   534→                                         )
+   535→
+   536→═══════════════════════════════════════════════════════════════
+   537→
+   538→LLM Messages
+   539→────────────
+   540→[
+   541→  {role: "system", content: "# Vibe 人设\n你是Vibe..."},
+   542→  {role: "user", content: "[历史] 你好"},
+   543→  {role: "assistant", content: "[历史] 你好呀！..."},
+   544→  {role: "user", content: "我是90年5月15日出生的"}   ← current
+   545→]
+   546→
+   547→═══════════════════════════════════════════════════════════════
+   548→
+   549→后端 Response             前端 Response           UI 渲染
+   550→────────────              ────────────            ────────
+   551→ChatResponse(             {                       ┌──────────────────┐
+   552→  content="根据...",       content: "根据...",    │ 用户: 我是90年...│
+   553→  conversation_id=uuid,    conversation_id:uuid,  ├──────────────────┤
+   554→  skill="bazi",            skill: "bazi",         │ Vibe: 根据你的   │
+   555→  voice_mode="warm",       metadata: {...}        │      八字...     │
+   556→  metadata={...}         }                        └──────────────────┘
+   557→)
+   558→```
+   559→
+   560→### A.3 关键代码文件清单
+   561→
+   562→| 层级 | 文件路径 | 核心功能 |
+   563→|------|----------|----------|
+   564→| 前端输入 | `apps/web/src/components/chat/ChatInput.tsx` | 文本输入框组件 |
+   565→| 前端容器 | `apps/web/src/components/chat/ChatContainer.tsx` | 消息状态管理、API调用 |
+   566→| 前端消息 | `apps/web/src/components/chat/ChatMessage.tsx` | 消息气泡渲染 |
+   567→| API客户端 | `apps/web/src/lib/api.ts` | HTTP请求封装、token管理 |
+   568→| 后端路由 | `apps/api/routes/chat.py` | `/chat/` 端点处理 |
+   569→| 上下文构建 | `apps/api/services/vibe_engine/context.py` | system prompt、话题分类 |
+   570→| LLM调用 | `apps/api/services/vibe_engine/llm.py` | Zhipu/Claude 调用 |
+   571→| 用户画像 | `apps/api/services/vibe_engine/portrait.py` | profile 数据结构 |
+   572→| 会话存储 | `apps/api/stores/conversation_repo.py` | 会话持久化 |
+   573→| 消息存储 | `apps/api/stores/message_repo.py` | 消息持久化 |
+   574→
+   575→### A.4 配置参数
+   576→
+   577→| 参数 | 值 | 说明 |
+   578→|------|-----|------|
+   579→| 历史消息限制 | 20条 | get_conversation_history limit |
+   580→| Profile上下文 | ~1000 tokens | 画像片段大小限制 |
+   581→| 总Token预算 | 8000 | 完整上下文窗口 |
+   582→| 响应Token | 4096 | max_tokens 默认值 |
+   583→| Primary LLM | glm-4-plus | Zhipu 智谱 |
+   584→| Fallback LLM | claude-sonnet | Anthropic Claude |
+   585→
+   586→---
+   587→
+   588→## 参考资源
+   589→
+   590→- [AI SDK 6 Documentation](https://ai-sdk.dev/docs/introduction)
+   591→- [AI SDK 6 Blog Post](https://vercel.com/blog/ai-sdk-6)
+   592→- [AI Elements Components](https://vercel.com/changelog/introducing-ai-elements)
+   593→- [Clerk Documentation](https://clerk.com/docs)
+   594→- [Stripe Checkout](https://stripe.com/docs/payments/checkout)
+   595→- [gemini_tool 项目](~/work/gemini_tool/) - 海报图生成微服务
+   596→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,541 @@
+"""
+Extraction Service - LLM-powered information extraction
+Based on: vibelife spec v3.0, section 4.3
+
+Extraction Use Cases:
+1. BaZi/Zodiac Screenshots: Extract birth info, chart data
+2. Chat Records: Extract relationship patterns, communication style
+3. Resumes: Extract career trajectory, skills
+4. Diaries/Notes: Extract emotional patterns, values
+"""
+import json
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+from services.vibe_engine.llm import get_llm_service, create_user_message, LLMService
+from .file_processor import FileProcessor, ProcessedFile, FileType
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExtractionResult:
+    """Result of information extraction"""
+    success: bool
+    file_type: str
+    content_type: str  # bazi_chart | zodiac_chart | chat_record | resume | diary | general
+    extracted_data: Dict[str, Any]
+    profile_updates: Dict[str, Any]  # Fields to merge into profile
+    confidence: float  # 0-1 confidence score
+    summary: str  # Human-readable summary
+    error: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Extraction Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+CLASSIFY_CONTENT_PROMPT = """分析这段内容，判断它的类型。
+
+## 内容
+{content}
+
+## 可能的类型
+- bazi_chart: 八字排盘截图，包含天干地支、日主、十神等
+- zodiac_chart: 星盘截图，包含星座、宫位、行星等
+- chat_record: 聊天记录截图
+- resume: 简历或工作经历
+- diary: 日记、随笔、心情记录
+- general: 其他一般内容
+
+## 输出格式（只输出 JSON）
+{{
+  "content_type": "类型",
+  "confidence": 0.0-1.0,
+  "detected_elements": ["识别到的关键元素"]
+}}
+"""
+
+EXTRACT_BAZI_PROMPT = """从这个八字排盘内容中提取结构化信息。
+
+## 内容
+{content}
+
+## 提取字段
+- 出生日期时间（如果有）
+- 八字四柱（年柱、月柱、日柱、时柱）
+- 日主天干
+- 格局（如果提到）
+- 大运信息（如果有）
+
+## 输出格式（只输出 JSON）
+{{
+  "birth_info": {{
+    "year": "年份或null",
+    "month": "月份或null",
+    "day": "日期或null",
+    "hour": "时辰或null"
+  }},
+  "bazi_chart": {{
+    "year_pillar": {{"stem": "天干", "branch": "地支"}},
+    "month_pillar": {{"stem": "天干", "branch": "地支"}},
+    "day_pillar": {{"stem": "天干", "branch": "地支"}},
+    "hour_pillar": {{"stem": "天干", "branch": "地支"}}
+  }},
+  "day_master": "日主天干",
+  "pattern": "格局名称或null",
+  "major_fortunes": ["大运列表"],
+  "other_info": ["其他识别到的信息"]
+}}
+
+如果某个字段无法识别，设为 null。
+"""
+
+EXTRACT_CHAT_PROMPT = """分析这段聊天记录，提取关系和沟通相关的信息。
+
+## 聊天内容
+{content}
+
+## 分析维度
+1. 关系类型（恋人、朋友、家人、同事等）
+2. 用户的沟通风格
+3. 对方的沟通风格
+4. 情绪线索
+5. 可能的矛盾点
+
+## 输出格式（只输出 JSON）
+{{
+  "relationship_context": {{
+    "type": "romantic | friend | family | work | unknown",
+    "status": "和谐 | 有矛盾 | 紧张 | unknown",
+    "duration_hint": "关系持续时间提示"
+  }},
+  "communication_patterns": {{
+    "user_style": "用户沟通风格描述",
+    "partner_style": "对方沟通风格描述",
+    "interaction_pattern": "互动模式"
+  }},
+  "emotional_cues": {{
+    "user_emotion": "用户情绪状态",
+    "partner_emotion": "对方情绪状态",
+    "conflict_topics": ["矛盾话题"]
+  }},
+  "insights": ["从聊天中发现的洞察"]
+}}
+"""
+
+EXTRACT_RESUME_PROMPT = """从这份简历中提取职业相关信息。
+
+## 简历内容
+{content}
+
+## 提取维度
+1. 职业经历和发展轨迹
+2. 技能和专长
+3. 教育背景
+4. 职业特点
+
+## 输出格式（只输出 JSON）
+{{
+  "career": {{
+    "current_role": "当前职位",
+    "industry": "行业",
+    "years_experience": "工作年限",
+    "trajectory": ["职业经历列表"]
+  }},
+  "skills": ["技能列表"],
+  "education": {{
+    "highest_degree": "最高学历",
+    "field": "专业领域"
+  }},
+  "career_traits": ["从简历看出的职业特点"],
+  "potential_concerns": ["可能的职业关注点"]
+}}
+"""
+
+EXTRACT_DIARY_PROMPT = """分析这段日记/随笔，提取情绪和价值观相关的信息。
+
+## 日记内容
+{content}
+
+## 分析维度
+1. 情绪状态和模式
+2. 关注的话题
+3. 价值观线索
+4. 可能的困境
+
+## 输出格式（只输出 JSON）
+{{
+  "emotional_state": {{
+    "primary_emotion": "主要情绪",
+    "triggers": ["情绪触发因素"],
+    "coping_style": "应对方式"
+  }},
+  "focus_areas": ["关注的话题/领域"],
+  "value_hints": ["价值观线索"],
+  "current_concerns": ["当前困境或关注"],
+  "personality_hints": ["性格特点线索"]
+}}
+"""
+
+EXTRACT_GENERAL_PROMPT = """从这段内容中提取可以用于用户画像的信息。
+
+## 内容
+{content}
+
+## 提取任何可能有用的信息
+- 个人基本信息
+- 生活状态
+- 关注点和困境
+- 性格线索
+- 价值观
+
+## 输出格式（只输出 JSON）
+{{
+  "basic_info": {{}},
+  "life_context": {{}},
+  "concerns": [],
+  "personality_hints": [],
+  "other_insights": []
+}}
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Extraction Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ExtractionService:
+    """
+    AI-powered information extraction from uploaded files.
+
+    Features:
+    - Content type classification
+    - Specialized extraction for different content types
+    - Profile update generation
+    """
+
+    def __init__(self, llm: Optional[LLMService] = None):
+        self.llm = llm or get_llm_service()
+        self.file_processor = FileProcessor()
+
+    async def extract_from_file(
+        self,
+        file_data: bytes,
+        filename: str,
+        mime_type: Optional[str] = None,
+        context_hint: Optional[str] = None
+    ) -> ExtractionResult:
+        """
+        Extract information from an uploaded file.
+
+        Args:
+            file_data: Raw file bytes
+            filename: Original filename
+            mime_type: Optional MIME type
+            context_hint: Optional hint about what the file is
+
+        Returns:
+            ExtractionResult with structured data
+        """
+        # First, process the file
+        processed = await self.file_processor.process(file_data, filename, mime_type)
+
+        if processed.error:
+            return ExtractionResult(
+                success=False,
+                file_type=processed.file_type.value,
+                content_type="unknown",
+                extracted_data={},
+                profile_updates={},
+                confidence=0.0,
+                summary="文件处理失败",
+                error=processed.error
+            )
+
+        # Determine content to analyze
+        content_for_analysis = ""
+
+        if processed.has_text:
+            content_for_analysis = processed.text_content[:5000]  # Limit text length
+
+        if processed.has_image:
+            # For images, we'll use vision capabilities
+            content_for_analysis = "[图片内容]"  # Will be handled specially
+
+        if not content_for_analysis:
+            return ExtractionResult(
+                success=False,
+                file_type=processed.file_type.value,
+                content_type="unknown",
+                extracted_data={},
+                profile_updates={},
+                confidence=0.0,
+                summary="无法提取内容",
+                error="文件中没有可分析的内容"
+            )
+
+        # Extract based on file type
+        if processed.has_image:
+            return await self._extract_from_image(processed, context_hint)
+        else:
+            return await self._extract_from_text(content_for_analysis, processed, context_hint)
+
+    async def _extract_from_image(
+        self,
+        processed: ProcessedFile,
+        context_hint: Optional[str] = None
+    ) -> ExtractionResult:
+        """Extract information from an image using vision API"""
+        # Note: This requires a vision-capable model
+        # For now, we'll use OCR text if available, or return a placeholder
+
+        # In production, you'd call a vision API here:
+        # response = await self.llm.vision_chat(processed.image_base64, prompt)
+
+        # Simplified: Ask user to describe or use OCR
+        return ExtractionResult(
+            success=True,
+            file_type=processed.file_type.value,
+            content_type="image",
+            extracted_data={
+                "note": "图片已上传，需要视觉AI分析",
+                "image_size": processed.size_bytes,
+            },
+            profile_updates={},
+            confidence=0.5,
+            summary="图片已接收，将用于分析参考",
+        )
+
+    async def _extract_from_text(
+        self,
+        content: str,
+        processed: ProcessedFile,
+        context_hint: Optional[str] = None
+    ) -> ExtractionResult:
+        """Extract information from text content"""
+        try:
+            # Step 1: Classify content type
+            content_type, confidence, elements = await self._classify_content(content)
+
+            # Step 2: Extract based on type
+            if content_type == "bazi_chart":
+                extracted = await self._extract_bazi(content)
+            elif content_type == "zodiac_chart":
+                extracted = await self._extract_zodiac(content)
+            elif content_type == "chat_record":
+                extracted = await self._extract_chat(content)
+            elif content_type == "resume":
+                extracted = await self._extract_resume(content)
+            elif content_type == "diary":
+                extracted = await self._extract_diary(content)
+            else:
+                extracted = await self._extract_general(content)
+
+            # Step 3: Generate profile updates
+            profile_updates = self._generate_profile_updates(content_type, extracted)
+
+            # Generate summary
+            summary = self._generate_summary(content_type, extracted)
+
+            return ExtractionResult(
+                success=True,
+                file_type=processed.file_type.value,
+                content_type=content_type,
+                extracted_data=extracted,
+                profile_updates=profile_updates,
+                confidence=confidence,
+                summary=summary,
+            )
+
+        except Exception as e:
+            logger.error(f"Extraction failed: {e}")
+            return ExtractionResult(
+                success=False,
+                file_type=processed.file_type.value,
+                content_type="unknown",
+                extracted_data={},
+                profile_updates={},
+                confidence=0.0,
+                summary="提取失败",
+                error=str(e)
+            )
+
+    async def _classify_content(self, content: str) -> tuple:
+        """Classify the content type"""
+        prompt = CLASSIFY_CONTENT_PROMPT.format(content=content[:2000])
+
+        response = await self.llm.chat(
+            [create_user_message(prompt)],
+            temperature=0.2,
+            max_tokens=500
+        )
+
+        result = self._parse_json_response(response.content)
+
+        return (
+            result.get("content_type", "general"),
+            result.get("confidence", 0.5),
+            result.get("detected_elements", [])
+        )
+
+    async def _extract_bazi(self, content: str) -> Dict[str, Any]:
+        """Extract BaZi chart information"""
+        prompt = EXTRACT_BAZI_PROMPT.format(content=content)
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.2)
+        return self._parse_json_response(response.content)
+
+    async def _extract_zodiac(self, content: str) -> Dict[str, Any]:
+        """Extract Zodiac chart information"""
+        # Similar to bazi extraction but for zodiac
+        prompt = f"""从这个星盘内容中提取结构化信息：
+
+{content}
+
+输出JSON格式，包含：太阳星座、月亮星座、上升星座、行星位置等。"""
+
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.2)
+        return self._parse_json_response(response.content)
+
+    async def _extract_chat(self, content: str) -> Dict[str, Any]:
+        """Extract chat record information"""
+        prompt = EXTRACT_CHAT_PROMPT.format(content=content)
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.3)
+        return self._parse_json_response(response.content)
+
+    async def _extract_resume(self, content: str) -> Dict[str, Any]:
+        """Extract resume information"""
+        prompt = EXTRACT_RESUME_PROMPT.format(content=content)
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.2)
+        return self._parse_json_response(response.content)
+
+    async def _extract_diary(self, content: str) -> Dict[str, Any]:
+        """Extract diary/journal information"""
+        prompt = EXTRACT_DIARY_PROMPT.format(content=content)
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.3)
+        return self._parse_json_response(response.content)
+
+    async def _extract_general(self, content: str) -> Dict[str, Any]:
+        """Extract general information"""
+        prompt = EXTRACT_GENERAL_PROMPT.format(content=content)
+        response = await self.llm.chat([create_user_message(prompt)], temperature=0.3)
+        return self._parse_json_response(response.content)
+
+    def _parse_json_response(self, content: str) -> Dict[str, Any]:
+        """Parse JSON from LLM response"""
+        content = content.strip()
+
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse JSON: {content[:200]}")
+            return {}
+
+    def _generate_profile_updates(
+        self,
+        content_type: str,
+        extracted: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Generate profile updates from extracted data"""
+        updates = {}
+
+        if content_type == "bazi_chart":
+            # Extract birth info to basic
+            birth_info = extracted.get("birth_info", {})
+            if birth_info:
+                updates["basic"] = {"birth_info_extracted": birth_info}
+
+            # Store bazi chart
+            if extracted.get("bazi_chart"):
+                updates["charts"] = {"bazi": extracted.get("bazi_chart")}
+
+        elif content_type == "chat_record":
+            # Extract relationship info
+            rel_context = extracted.get("relationship_context", {})
+            if rel_context:
+                updates["life_context"] = {"relationship": rel_context}
+
+            # Extract communication patterns
+            comm_patterns = extracted.get("communication_patterns", {})
+            if comm_patterns:
+                updates["ai_insights"] = {
+                    "communication_style": comm_patterns.get("user_style")
+                }
+
+        elif content_type == "resume":
+            # Extract career info
+            career = extracted.get("career", {})
+            if career:
+                updates["life_context"] = {"career": career}
+                updates["basic"] = {"occupation": career.get("current_role")}
+
+        elif content_type == "diary":
+            # Extract emotional and personality info
+            emotional = extracted.get("emotional_state", {})
+            if emotional:
+                updates["ai_insights"] = {
+                    "emotional_patterns": emotional,
+                    "personality_hints": extracted.get("personality_hints", [])
+                }
+
+            concerns = extracted.get("current_concerns", [])
+            if concerns:
+                updates["life_context"] = {"current_focus": concerns}
+
+        return updates
+
+    def _generate_summary(
+        self,
+        content_type: str,
+        extracted: Dict[str, Any]
+    ) -> str:
+        """Generate human-readable summary"""
+        type_names = {
+            "bazi_chart": "八字排盘",
+            "zodiac_chart": "星盘",
+            "chat_record": "聊天记录",
+            "resume": "简历",
+            "diary": "日记",
+            "general": "文档"
+        }
+
+        base = f"已解析{type_names.get(content_type, '内容')}"
+
+        if content_type == "bazi_chart":
+            day_master = extracted.get("day_master", "")
+            if day_master:
+                base += f"，日主{day_master}"
+
+        elif content_type == "chat_record":
+            rel_type = extracted.get("relationship_context", {}).get("type", "")
+            if rel_type:
+                base += f"，识别为{rel_type}关系"
+
+        elif content_type == "resume":
+            role = extracted.get("career", {}).get("current_role", "")
+            if role:
+                base += f"，当前{role}"
+
+        return base
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Global Instance
+# ═══════════════════════════════════════════════════════════════════════════
+
+_extraction_service: Optional[ExtractionService] = None
+
+
+def get_extraction_service() -> ExtractionService:
+    """Get or create global extraction service instance"""
+    global _extraction_service
+    if _extraction_service is None:
+        _extraction_service = ExtractionService()
+    return _extraction_service

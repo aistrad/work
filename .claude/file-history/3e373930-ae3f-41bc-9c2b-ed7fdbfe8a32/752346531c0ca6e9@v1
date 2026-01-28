@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+import re
+from datetime import datetime, time, timezone
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from services import bento_service
+from stores import fortune_db
+
+
+router = APIRouter(prefix="/api/bento", tags=["bento"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+class CommitmentAcceptRequest(BaseModel):
+    task_id: str = Field(..., min_length=36, max_length=36)
+    commitment_type: Optional[str] = Field(None, description="start_task|schedule_task")
+
+
+class CommitmentDoneRequest(BaseModel):
+    task_id: str = Field(..., min_length=36, max_length=36)
+
+
+class CheckinRequest(BaseModel):
+    mood: str = Field(..., min_length=1, max_length=50)
+    intensity: int = Field(..., ge=0, le=10)
+    note: str = Field("", max_length=1000)
+
+
+def _end_of_today_utc(user_id: int) -> datetime:
+    prefs = fortune_db.fetch_one("SELECT push_timezone FROM fortune_user_preferences WHERE user_id=%s", (int(user_id),)) or {}
+    tz_name = str(prefs.get("push_timezone") or "Asia/Shanghai")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Shanghai")
+    now_local = datetime.now(tz)
+    end_local = datetime.combine(now_local.date(), time(23, 0, 0), tzinfo=tz)
+    return end_local.astimezone(timezone.utc)
+
+
+@router.get("/today")
+def today(request: Request):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    data = bento_service.get_today_guidance(user_id)
+    return _ok(data)
+
+
+@router.get("/actions")
+def actions(request: Request):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    items = bento_service.list_commitments(user_id, status=["suggested", "active"], limit=12)
+    return _ok({"tasks": items})
+
+
+@router.post("/commitment/accept")
+def accept_commitment(req: CommitmentAcceptRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    task_id = (req.task_id or "").strip()
+    if not _UUID_RE.match(task_id):
+        return _err(400, "invalid_request", "invalid_task_id")
+
+    ctype = (req.commitment_type or "").strip() if req.commitment_type else None
+    if ctype is not None and ctype not in ("start_task", "schedule_task"):
+        return _err(400, "invalid_request", "invalid_commitment_type")
+    due_at = _end_of_today_utc(user_id) if ctype == "schedule_task" else None
+
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_commitment
+        SET
+          status = 'active',
+          accepted_at = COALESCE(accepted_at, now()),
+          commitment_type = COALESCE(%s, commitment_type),
+          due_at = COALESCE(%s, due_at)
+        WHERE task_id=%s AND user_id=%s AND status IN ('suggested','active')
+        RETURNING task_id, status, accepted_at
+        """,
+        (ctype, due_at, task_id, user_id),
+    )
+    if not row:
+        return _err(404, "not_found", "task_not_found")
+    return _ok({"task_id": str(row["task_id"]), "status": str(row["status"]), "accepted_at": str(row.get("accepted_at") or "")})
+
+
+@router.post("/commitment/done")
+def done_commitment(req: CommitmentDoneRequest, request: Request):
+    """
+    Mark a commitment as done.
+
+    Implements the full feedback loop:
+    1. Update commitment status to 'done'
+    2. Award Aura points (currency)
+    3. Update twin growth_streak
+    4. Trigger L3 dimension recalculation
+
+    This closes the "做了事→属性变化→反馈" loop from BP v1.md.
+    """
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    task_id = (req.task_id or "").strip()
+    if not _UUID_RE.match(task_id):
+        return _err(400, "invalid_request", "invalid_task_id")
+
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_commitment
+        SET
+          status = 'done',
+          done_at = now()
+        WHERE task_id=%s AND user_id=%s AND status IN ('active','suggested')
+        RETURNING task_id, status, done_at, title
+        """,
+        (task_id, user_id),
+    )
+    if not row:
+        return _err(404, "not_found", "task_not_found")
+
+    # === Feedback Loop Implementation ===
+    aura_earned = 0
+    new_streak = 0
+
+    try:
+        # 1. Award Aura points
+        from services import currency_service
+        from models.currency import CurrencyType, LedgerCategory
+
+        entry = currency_service.add_currency(
+            user_id=user_id,
+            currency_type=CurrencyType.AURA,
+            amount=10,  # Base reward for completing a commitment
+            category=LedgerCategory.EARN,
+            reason="commitment_complete",
+            ref_type="commitment",
+            ref_id=task_id,
+            description=f"完成任务: {row.get('title', '')}",
+        )
+        aura_earned = entry.amount
+    except Exception as e:
+        # Log but don't fail the request
+        import logging
+        logging.getLogger(__name__).warning("Failed to award Aura for commitment: %s", str(e))
+
+    try:
+        # 2. Update twin growth_streak
+        from services import twin_service
+
+        new_streak = twin_service.increment_growth_streak(user_id)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to update growth_streak: %s", str(e))
+
+    try:
+        # 3. Update twin dynamic state (commitments completed this week)
+        from services import twin_service
+        from models.twin import TwinLayer, TwinUpdateEvent
+
+        twin_data = twin_service.get_twin(user_id)
+        current_completed = 0
+        if twin_data.dynamic_social:
+            current_completed = twin_data.dynamic_social.get("commitments_completed_week", 0)
+
+        twin_service.update_twin(TwinUpdateEvent(
+            user_id=user_id,
+            layer=TwinLayer.L2,
+            path="dynamic_social.commitments_completed_week",
+            new_value=current_completed + 1,
+            confidence=1.0,
+            source="system",
+            trigger="commitment_done",
+        ))
+        # Note: update_twin automatically triggers L3 recalculation for L2 updates
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to update twin for commitment: %s", str(e))
+
+    return _ok({
+        "task_id": str(row["task_id"]),
+        "status": str(row["status"]),
+        "done_at": str(row.get("done_at") or ""),
+        "rewards": {
+            "aura_earned": aura_earned,
+            "new_streak": new_streak,
+        },
+    })
+
+
+@router.post("/checkin")
+def checkin(req: CheckinRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    data = bento_service.create_checkin(user_id, mood=req.mood, intensity=int(req.intensity), note=req.note)
+    md = f"### 情绪打卡\n- 情绪：{req.mood}（{int(req.intensity)}/10）\n\n### 推荐动作\n- {data['recommended_action']}\n\n你愿意现在开始吗？"
+    a2ui = {
+        "meta": {"summary": "情绪打卡"},
+        "ui_components": [
+            {"type": "markdown_text", "title": "情绪打卡", "data": md},
+            {
+                "type": "action_buttons",
+                "title": "下一步",
+                "data": [
+                    {"label": "开始这个动作", "action": {"type": "start_task", "task_id": data["task_id"]}},
+                    {"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": data["task_id"]}},
+                    {"label": "先不需要", "action": {"type": "opt_out"}},
+                ],
+            },
+        ],
+    }
+    return _ok({"task_id": data["task_id"], "recommended_action": data["recommended_action"], "a2ui": a2ui})

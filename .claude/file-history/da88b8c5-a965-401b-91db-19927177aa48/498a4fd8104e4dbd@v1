@@ -1,0 +1,373 @@
+"""
+LLM Orchestrator - Multi-model LLM support with streaming
+"""
+import os
+import json
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from dataclasses import dataclass
+
+import httpx
+
+
+@dataclass
+class LLMMessage:
+    """LLM message format"""
+    role: str  # 'system', 'user', 'assistant'
+    content: str
+
+
+@dataclass
+class LLMResponse:
+    """LLM response"""
+    content: str
+    model: str
+    usage: Optional[Dict[str, int]] = None
+    finish_reason: Optional[str] = None
+
+
+class LLMOrchestrator:
+    """
+    Multi-model LLM orchestrator with streaming support.
+    Supports: GLM (primary), Claude (backup)
+    """
+
+    # ─────────────────────────────────────────────────────────────────
+    # Configuration
+    # ─────────────────────────────────────────────────────────────────
+
+    GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+    GLM_BASE_URL = os.getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+    GLM_CHAT_MODEL = os.getenv("GLM_CHAT_MODEL", "glm-4.7")
+
+    CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+    CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+
+    DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "glm")
+
+    # ─────────────────────────────────────────────────────────────────
+    # GLM Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def chat_glm(
+        cls,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs
+    ) -> LLMResponse:
+        """Chat with GLM model (non-streaming)"""
+        model = model or cls.GLM_CHAT_MODEL
+
+        formatted_messages = [
+            {"role": m.role, "content": m.content}
+            for m in messages
+        ]
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs
+        }
+
+        headers = {
+            "Authorization": f"Bearer {cls.GLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{cls.GLM_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=model,
+            usage=data.get("usage"),
+            finish_reason=data["choices"][0].get("finish_reason")
+        )
+
+    @classmethod
+    async def stream_glm(
+        cls,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Stream chat with GLM model"""
+        model = model or cls.GLM_CHAT_MODEL
+
+        formatted_messages = [
+            {"role": m.role, "content": m.content}
+            for m in messages
+        ]
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            **kwargs
+        }
+
+        headers = {
+            "Authorization": f"Bearer {cls.GLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST",
+                f"{cls.GLM_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                        except json.JSONDecodeError:
+                            continue
+
+    # ─────────────────────────────────────────────────────────────────
+    # Claude Methods (backup)
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def chat_claude(
+        cls,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        system: Optional[str] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """Chat with Claude model (non-streaming)"""
+        if not cls.CLAUDE_API_KEY:
+            raise ValueError("CLAUDE_API_KEY not configured")
+
+        model = model or cls.CLAUDE_MODEL
+
+        # Extract system message
+        formatted_messages = []
+        for m in messages:
+            if m.role == "system":
+                system = m.content
+            else:
+                formatted_messages.append({
+                    "role": m.role,
+                    "content": m.content
+                })
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "max_tokens": max_tokens,
+            **kwargs
+        }
+        if system:
+            payload["system"] = system
+
+        headers = {
+            "x-api-key": cls.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return LLMResponse(
+            content=data["content"][0]["text"],
+            model=model,
+            usage={
+                "input_tokens": data["usage"]["input_tokens"],
+                "output_tokens": data["usage"]["output_tokens"]
+            },
+            finish_reason=data.get("stop_reason")
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Unified Interface
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def chat(
+        cls,
+        messages: List[LLMMessage],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Unified chat interface.
+        Automatically falls back to alternative provider on error.
+        """
+        provider = provider or cls.DEFAULT_PROVIDER
+
+        try:
+            if provider == "glm":
+                return await cls.chat_glm(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            elif provider == "claude":
+                return await cls.chat_claude(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            else:
+                raise ValueError(f"Unknown provider: {provider}")
+
+        except Exception as e:
+            # Fallback to alternative provider
+            if provider == "glm" and cls.CLAUDE_API_KEY:
+                print(f"GLM failed ({e}), falling back to Claude")
+                return await cls.chat_claude(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            raise
+
+    @classmethod
+    async def stream(
+        cls,
+        messages: List[LLMMessage],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Unified streaming interface"""
+        provider = provider or cls.DEFAULT_PROVIDER
+
+        if provider == "glm":
+            async for chunk in cls.stream_glm(
+                messages, model, temperature, max_tokens, **kwargs
+            ):
+                yield chunk
+        else:
+            # Claude streaming would go here
+            response = await cls.chat_claude(
+                messages, model, temperature, max_tokens, **kwargs
+            )
+            yield response.content
+
+    # ─────────────────────────────────────────────────────────────────
+    # Vision Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def vision(
+        cls,
+        image_base64: str,
+        prompt: str,
+        model: Optional[str] = None
+    ) -> LLMResponse:
+        """Analyze image with vision model"""
+        model = model or cls.GLM_VISION_MODEL
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                }
+            ]
+        }]
+
+        payload = {
+            "model": model,
+            "messages": messages
+        }
+
+        headers = {
+            "Authorization": f"Bearer {cls.GLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{cls.GLM_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=model,
+            usage=data.get("usage")
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Prompt Building Helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def build_system_prompt(
+        persona: str,
+        skill_context: Optional[str] = None,
+        user_context: Optional[str] = None,
+        guidelines: Optional[str] = None
+    ) -> str:
+        """Build system prompt from components"""
+        parts = [persona]
+
+        if skill_context:
+            parts.append(f"\n\n## Skill Context\n{skill_context}")
+
+        if user_context:
+            parts.append(f"\n\n## User Context\n{user_context}")
+
+        if guidelines:
+            parts.append(f"\n\n## Response Guidelines\n{guidelines}")
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def build_messages(
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        user_message: str
+    ) -> List[LLMMessage]:
+        """Build message list from components"""
+        messages = [LLMMessage(role="system", content=system_prompt)]
+
+        for msg in history:
+            messages.append(LLMMessage(
+                role=msg["role"],
+                content=msg["content"]
+            ))
+
+        messages.append(LLMMessage(role="user", content=user_message))
+
+        return messages

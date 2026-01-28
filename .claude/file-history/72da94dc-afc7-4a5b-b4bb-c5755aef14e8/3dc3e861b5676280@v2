@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+Knowledge Base Importer
+知识库导入工具 - 从 Markdown 文件导入知识
+
+Usage:
+    python scripts/import_knowledge.py --skill bazi --source ./docs/bazi_knowledge.md
+    python scripts/import_knowledge.py --skill zodiac --dir ./docs/zodiac/
+"""
+
+import asyncio
+import argparse
+import os
+import sys
+import re
+from pathlib import Path
+from typing import List, Dict, Any
+import logging
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stores.db import get_db_pool, close_db_pool
+from services.knowledge import RetrievalService, EmbeddingService
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("importer")
+
+
+def split_markdown_to_chunks(content: str, source_file: str) -> List[Dict[str, Any]]:
+    """将 Markdown 文件分割成知识块"""
+    chunks = []
+    current_section = ""
+    current_content = []
+    current_level = 0
+
+    lines = content.split("\n")
+
+    for line in lines:
+        # 检测标题
+        header_match = re.match(r"^(#{1,3})\s+(.+)$", line)
+
+        if header_match:
+            # 保存之前的内容
+            if current_content:
+                text = "\n".join(current_content).strip()
+                if len(text) > 50:  # 只保存有意义的内容
+                    chunks.append({
+                        "content": text,
+                        "source_section": current_section,
+                        "source_file": source_file,
+                        "content_type": "knowledge"
+                    })
+                current_content = []
+
+            level = len(header_match.group(1))
+            title = header_match.group(2)
+            current_section = title
+            current_level = level
+        else:
+            current_content.append(line)
+
+    # 保存最后一块
+    if current_content:
+        text = "\n".join(current_content).strip()
+        if len(text) > 50:
+            chunks.append({
+                "content": text,
+                "source_section": current_section,
+                "source_file": source_file,
+                "content_type": "knowledge"
+            })
+
+    return chunks
+
+
+def extract_qa_pairs(content: str) -> List[Dict[str, str]]:
+    """从 Markdown 提取 Q&A 对"""
+    qa_pairs = []
+
+    # 匹配 Q: ... A: ... 格式
+    qa_pattern = r"Q[：:]\s*(.+?)\nA[：:]\s*(.+?)(?=\n\nQ[：:]|\n\n#|\Z)"
+    matches = re.findall(qa_pattern, content, re.DOTALL)
+
+    for question, answer in matches:
+        qa_pairs.append({
+            "question": question.strip(),
+            "answer": answer.strip()
+        })
+
+    return qa_pairs
+
+
+async def import_file(skill_id: str, filepath: str, dry_run: bool = False):
+    """导入单个文件"""
+    logger.info(f"Importing: {filepath}")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # 分割成知识块
+    chunks = split_markdown_to_chunks(content, os.path.basename(filepath))
+    logger.info(f"  Found {len(chunks)} knowledge chunks")
+
+    # 提取 QA 对
+    qa_pairs = extract_qa_pairs(content)
+    logger.info(f"  Found {len(qa_pairs)} QA pairs")
+
+    if dry_run:
+        for chunk in chunks[:3]:
+            logger.info(f"    Chunk: {chunk['source_section'][:50]}...")
+        return
+
+    # 导入知识块
+    for chunk in chunks:
+        try:
+            await RetrievalService.index_content(
+                skill_id=skill_id,
+                content=chunk["content"],
+                content_type=chunk["content_type"],
+                source_file=chunk["source_file"],
+                metadata={"section": chunk["source_section"]}
+            )
+        except Exception as e:
+            logger.error(f"    Error importing chunk: {e}")
+
+    # 导入 QA 对
+    for qa in qa_pairs:
+        try:
+            await RetrievalService.index_qa_pair(
+                skill_id=skill_id,
+                question=qa["question"],
+                answer=qa["answer"]
+            )
+        except Exception as e:
+            logger.error(f"    Error importing QA: {e}")
+
+    logger.info(f"  Imported {len(chunks)} chunks and {len(qa_pairs)} QA pairs")
+
+
+async def import_directory(skill_id: str, dirpath: str, dry_run: bool = False):
+    """导入目录下的所有 Markdown 文件"""
+    path = Path(dirpath)
+
+    if not path.exists():
+        logger.error(f"Directory not found: {dirpath}")
+        return
+
+    md_files = list(path.glob("*.md"))
+    logger.info(f"Found {len(md_files)} markdown files in {dirpath}")
+
+    for md_file in md_files:
+        await import_file(skill_id, str(md_file), dry_run)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Import knowledge to VibeLife")
+    parser.add_argument("--skill", required=True, help="Skill ID (bazi, zodiac, mbti)")
+    parser.add_argument("--source", help="Source markdown file")
+    parser.add_argument("--dir", help="Source directory")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run")
+
+    args = parser.parse_args()
+
+    if not args.source and not args.dir:
+        parser.error("Either --source or --dir is required")
+
+    pool = await get_db_pool()
+
+    try:
+        if args.source:
+            await import_file(args.skill, args.source, args.dry_run)
+        elif args.dir:
+            await import_directory(args.skill, args.dir, args.dry_run)
+
+        logger.info("Import complete!")
+    finally:
+        await close_db_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

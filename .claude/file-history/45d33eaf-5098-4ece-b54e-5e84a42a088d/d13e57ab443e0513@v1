@@ -1,0 +1,473 @@
+-- Fortune AI Final MVP schema (PostgreSQL, DB=fortune_ai)
+--
+-- Usage:
+--   1) Create database (once): CREATE DATABASE fortune_ai;
+--   2) Connect to fortune_ai and run this file with psql.
+--
+-- This file is idempotent (safe to re-run).
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Legacy schema compatibility
+-- Some existing environments already have a `fortune_user` table with an older schema
+-- (no auth, no email/password, different columns). To make this migration runnable on
+-- those DBs, we rename legacy objects out of the way (data preserved) and then create
+-- the Final MVP tables.
+DO $$
+BEGIN
+  IF to_regclass('public.fortune_user') IS NOT NULL
+     AND NOT EXISTS (
+       SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='fortune_user' AND column_name='email'
+     )
+  THEN
+    -- Avoid name collisions for constraints/indexes/sequences created by the new schema.
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname='fortune_user_pkey' AND conrelid='public.fortune_user'::regclass
+    ) AND NOT EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname='fortune_user_legacy_pkey'
+    ) THEN
+      ALTER TABLE public.fortune_user RENAME CONSTRAINT fortune_user_pkey TO fortune_user_legacy_pkey;
+    END IF;
+
+    IF to_regclass('public.idx_fortune_user_name') IS NOT NULL
+       AND to_regclass('public.idx_fortune_user_legacy_name') IS NULL
+    THEN
+      ALTER INDEX public.idx_fortune_user_name RENAME TO idx_fortune_user_legacy_name;
+    END IF;
+    IF to_regclass('public.idx_fortune_user_name_bday') IS NOT NULL
+       AND to_regclass('public.idx_fortune_user_legacy_name_bday') IS NULL
+    THEN
+      ALTER INDEX public.idx_fortune_user_name_bday RENAME TO idx_fortune_user_legacy_name_bday;
+    END IF;
+
+    IF to_regclass('public.fortune_user_user_id_seq') IS NOT NULL
+       AND to_regclass('public.fortune_user_legacy_user_id_seq') IS NULL
+    THEN
+      ALTER SEQUENCE public.fortune_user_user_id_seq RENAME TO fortune_user_legacy_user_id_seq;
+    END IF;
+
+    IF to_regclass('public.fortune_user_legacy') IS NULL THEN
+      ALTER TABLE public.fortune_user RENAME TO fortune_user_legacy;
+    END IF;
+  END IF;
+END $$;
+
+-- 6.2 用户与偏好
+
+CREATE TABLE IF NOT EXISTS fortune_user (
+  user_id BIGSERIAL PRIMARY KEY,
+  email TEXT NOT NULL,
+  password_hash TEXT NOT NULL,          -- bcrypt
+  name TEXT NOT NULL,                   -- 昵称/显示名
+  gender TEXT NOT NULL CHECK (gender IN ('男','女')),
+  birthday_local TIMESTAMP NOT NULL,    -- 用户当地标准时间（不含时区）
+  birthday_utc TIMESTAMPTZ NOT NULL,    -- 统一存 UTC 时间（由 birthday_local + tz_offset_hours 推导）
+  tz_offset_hours NUMERIC(4,1) NOT NULL DEFAULT 8.0,
+  location JSONB NOT NULL,              -- {name, longitude, latitude}
+  bazi_digest TEXT,
+  last_login_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fortune_user_email_lower
+  ON fortune_user ((lower(email)))
+  WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fortune_user_name
+  ON fortune_user (name)
+  WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS fortune_user_preferences (
+  user_id BIGINT PRIMARY KEY REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  persona_style TEXT NOT NULL DEFAULT 'warm' CHECK (persona_style IN ('standard','warm','roast')),
+  push_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  push_time TIME NOT NULL DEFAULT '08:00:00',
+  push_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+  quiet_hours_start TIME NOT NULL DEFAULT '22:00:00',
+  quiet_hours_end TIME NOT NULL DEFAULT '07:00:00',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS fortune_user_session (
+  session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,             -- sha256(base64url_token)
+  csrf_token_hash TEXT NOT NULL,        -- sha256(csrf_token)
+  ip TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,      -- now() + interval '30 days'
+  revoked_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_session_token_hash ON fortune_user_session (token_hash);
+CREATE INDEX IF NOT EXISTS idx_user_session_user_active ON fortune_user_session (user_id, expires_at DESC) WHERE revoked_at IS NULL;
+
+-- 6.3 会话与消息（SSOT，不落本地文件）
+
+CREATE TABLE IF NOT EXISTS fortune_conversation_session (
+  session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_conv_session_user_updated ON fortune_conversation_session (user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_conversation_message (
+  message_id BIGSERIAL PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES fortune_conversation_session(session_id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+  content TEXT NOT NULL,
+  a2ui JSONB,                            -- assistant 输出（可空）
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_conv_msg_session_time ON fortune_conversation_message (session_id, created_at);
+
+-- 6.4 八字事实快照（可追溯一致性）
+
+CREATE TABLE IF NOT EXISTS fortune_bazi_snapshot (
+  snapshot_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  compute_version TEXT NOT NULL,
+  facts JSONB NOT NULL,
+  facts_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, compute_version, facts_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_bazi_snapshot_user_time ON fortune_bazi_snapshot (user_id, created_at DESC);
+
+-- 6.5 承诺与行动（闭环核心）
+
+CREATE TABLE IF NOT EXISTS fortune_commitment (
+  task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  session_id UUID REFERENCES fortune_conversation_session(session_id) ON DELETE SET NULL,
+  card_id UUID,                         -- 生成该建议的交付卡 ID（可空）
+  source TEXT NOT NULL CHECK (source IN ('chat','bento','push')),
+  commitment_type TEXT NOT NULL CHECK (commitment_type IN ('start_task','schedule_task','ask_followup','opt_out')),
+  title TEXT NOT NULL,
+  details JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'suggested' CHECK (status IN ('suggested','active','done','skipped','canceled')),
+  accepted_at TIMESTAMPTZ,              -- 用户确认承诺的时间（commitment_made 以此判定）
+  due_at TIMESTAMPTZ,
+  done_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_commitment_user_status ON fortune_commitment (user_id, status, created_at DESC);
+
+-- 6.6 情绪打卡与复盘（反馈闭环）
+
+CREATE TABLE IF NOT EXISTS fortune_checkin (
+  checkin_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  mood TEXT NOT NULL,                    -- 例：焦虑/低落/平静/兴奋
+  intensity INTEGER NOT NULL CHECK (intensity BETWEEN 0 AND 10),
+  note TEXT NOT NULL DEFAULT '',
+  recommended_action TEXT NOT NULL,      -- 系统给出的 1 个动作（可执行）
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_user_time ON fortune_checkin (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_reflection (
+  reflection_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  period TEXT NOT NULL CHECK (period IN ('daily','weekly')),
+  reflection_date DATE NOT NULL,
+  input JSONB NOT NULL,                 -- 用户回答（结构化）
+  output_card JSONB NOT NULL,           -- Guidance Card
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, period, reflection_date)
+);
+
+-- 6.7 成长计划（4 个预设 + 用户进度）
+
+CREATE TABLE IF NOT EXISTS fortune_plan (
+  plan_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  duration_days INTEGER NOT NULL CHECK (duration_days > 0),
+  theory TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_day (
+  plan_id TEXT NOT NULL REFERENCES fortune_plan(plan_id) ON DELETE CASCADE,
+  day_no INTEGER NOT NULL CHECK (day_no > 0),
+  title TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  PRIMARY KEY (plan_id, day_no)
+);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_enrollment (
+  enrollment_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL REFERENCES fortune_plan(plan_id) ON DELETE RESTRICT,
+  start_date DATE NOT NULL,
+  current_day INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','completed','abandoned')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, plan_id, start_date)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_enroll_user_status ON fortune_plan_enrollment (user_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fortune_plan_record (
+  record_id BIGSERIAL PRIMARY KEY,
+  enrollment_id BIGINT NOT NULL REFERENCES fortune_plan_enrollment(enrollment_id) ON DELETE CASCADE,
+  day_no INTEGER NOT NULL,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (enrollment_id, day_no)
+);
+
+INSERT INTO fortune_plan (plan_id, name, duration_days, theory) VALUES
+  ('gratitude_21', '21天感恩练习', 21, '积极心理学'),
+  ('mindfulness_7', '7天正念入门', 7, '正念冥想'),
+  ('habit_30', '30天习惯养成挑战', 30, '行为科学/原子习惯'),
+  ('strength_14', '14天优势发现之旅', 14, 'VIA优势理论')
+ON CONFLICT (plan_id) DO NOTHING;
+
+-- 21天感恩练习
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('gratitude_21', 1, '启动：三件好事', '写下今天发生的3件值得感恩/欣赏的小事；每件用1句话写清“发生了什么”和“我为什么感激”。'),
+('gratitude_21', 2, '细化：把好事写具体', '从昨天的3件好事里任选1件，补充3个细节（人/地点/动作/感受），让它更可回忆。'),
+('gratitude_21', 3, '人际：感谢一个人', '给一个人发一条感谢信息（不需长），明确说出：对方做了什么→对你产生了什么影响。'),
+('gratitude_21', 4, '逆境：找出一个转折', '回想最近一个不顺，写下：最难的点是什么？我从中学到的一件事是什么？'),
+('gratitude_21', 5, '身体：感谢身体', '写下今天身体为你做好的3件事（例如呼吸、走路、恢复），并做一次1分钟伸展。'),
+('gratitude_21', 6, '环境：感谢一处空间', '选一个你常待的空间（工位/卧室），写下它带给你的1个好处，并整理1个小角落。'),
+('gratitude_21', 7, '一周复盘：我更容易看见什么', '写下这一周你更容易注意到的“好”是什么（人/事/能力/资源），以及下周你想继续强化的1点。'),
+('gratitude_21', 8, '行为：把感谢变成行动', '选择一个你感激的人或资源，做一个5分钟的小行动来回馈（例如主动帮一次忙）。'),
+('gratitude_21', 9, '优势：感谢自己的一个优点', '写下你最近做对的一件事，并标注它体现了你哪种能力/品质（例如专注、勇气、耐心）。'),
+('gratitude_21', 10, '情绪：感谢一次情绪提醒', '回想今天一次负面情绪，写下：它提醒了我什么需求？我能用一个健康方式满足它是什么？'),
+('gratitude_21', 11, '关系：修复一个小摩擦', '选择一个小摩擦场景，写下你能做的一个小修复动作（例如道歉、解释、感谢）。'),
+('gratitude_21', 12, '时间：感谢一次坚持', '写下你最近坚持了3天以上的一件事，并说明它让你得到的一个好处。'),
+('gratitude_21', 13, '工作：感谢一个机会', '写下你当前工作/学习里一个可利用的机会或资源，并写下你明天会做的一个最小利用动作。'),
+('gratitude_21', 14, '两周复盘：我的变化', '用0-10分给“情绪稳定/行动一致/关系满意”各打分，并写下各自提升/下降的原因。'),
+('gratitude_21', 15, '表达：把感谢说出口', '当面或语音对一个人表达感谢（30秒即可）：具体行为→影响→你的感受。'),
+('gratitude_21', 16, '愿景：感谢未来的自己', '写一段给30天后的自己的话：你希望他/她保持什么？你感谢他/她会做到什么？'),
+('gratitude_21', 17, '学习：感谢一次输入', '选一段你今天学到的内容（文章/视频/对话），写下1句可执行的收获（明天怎么用）。'),
+('gratitude_21', 18, '金钱：感谢一笔支出', '挑一笔你最近的支出，写下它解决了什么问题/带来了什么价值；避免自责式语言。'),
+('gratitude_21', 19, '勇气：感谢一次不完美行动', '写下你做过的一次“虽然不完美但仍然去做”的行动；标注它体现的勇气。'),
+('gratitude_21', 20, '整合：我的感谢清单', '把前19天里你最想保留的5条感谢整理成清单，并写下你将如何持续（每周一次）。'),
+('gratitude_21', 21, '毕业：把感谢变成习惯', '写下：这21天最有效的一个做法；以及你未来4周的最小维持频率（例如每周3天）。')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 7天正念入门
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('mindfulness_7', 1, '呼吸锚点（3分钟）', '计时3分钟：只关注呼吸的进出；走神时温和拉回；结束后给自己一句鼓励。'),
+('mindfulness_7', 2, '身体扫描（5分钟）', '从头到脚扫描身体感受；只描述“紧/松/热/冷”，不评判好坏。'),
+('mindfulness_7', 3, '情绪命名（2分钟）', '当下情绪用一个词命名（例如焦虑/烦躁）；再用一句话描述它在身体的感觉。'),
+('mindfulness_7', 4, '正念进食（5分钟）', '选一小口食物：观察颜色/气味/口感；放慢咀嚼；注意冲动与满足的变化。'),
+('mindfulness_7', 5, '正念行走（5分钟）', '走5分钟：注意脚掌触地、身体重心移动；不听信息流。'),
+('mindfulness_7', 6, '3分钟降噪协议', '遇到强情绪时执行：1分钟呼吸→1分钟身体感受→1分钟选择下一步（一个小动作）。'),
+('mindfulness_7', 7, '毕业复盘', '写下：本周最有效的练习是哪一个？你准备在未来两周以什么频率继续？')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 30天习惯养成挑战
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('habit_30', 1, '定义一个最小习惯', '选择一个你想养成的习惯，把它缩小到“2分钟版本”（例如做5个俯卧撑/写50字）。'),
+('habit_30', 2, '设置触发器', '为习惯选择一个固定触发器（起床后/刷牙后/下班到家后），写成一句话，例如：“当我刷牙后，我就做2分钟版本”。'),
+('habit_30', 3, '准备环境', '把执行习惯需要的物品/环境准备好（例如把瑜伽垫放出来）；让开始成本≤30秒。'),
+('habit_30', 4, '记录一次完成', '今天完成一次2分钟版本，并记录：我在什么时刻做的？完成后感觉如何（0-10）？'),
+('habit_30', 5, '加入一个奖励', '为完成后加一个小奖励（1分钟伸展/一杯热水/听一首歌），强化闭环。'),
+('habit_30', 6, '识别阻碍', '写下你今天最可能失败的原因（时间/情绪/环境），并给一个应对预案。'),
+('habit_30', 7, '一周复盘', '统计本周完成天数；写下最有效的触发器与最大阻碍；调整一次触发器或时间。'),
+('habit_30', 8, '提高可见性', '把习惯放到更可见的位置（便签/桌面/日历），让你更容易想起它。'),
+('habit_30', 9, '缩短启动时间', '把“开始动作”进一步缩短（例如只做1个俯卧撑也算开始），确保今天不会零。'),
+('habit_30', 10, '提高一致性', '把习惯固定到同一时间段；如果做不到，就固定“同一触发器”。'),
+('habit_30', 11, '建立替代方案', '准备一个“低能量版本”（例如累时做30秒），保证情绪低谷也能完成。'),
+('habit_30', 12, '消除一个摩擦', '找到一个让你不想做的摩擦点（准备麻烦/太远），今天把它消掉。'),
+('habit_30', 13, '把习惯和身份绑定', '写一句身份宣言：我是谁→我会做什么（例如“我是重视健康的人，所以我每天动2分钟”）。'),
+('habit_30', 14, '两周复盘', '统计14天完成率；写下你最常见的失败场景，并更新一个更现实的预案。'),
+('habit_30', 15, '提升一点难度', '把2分钟版本提升10%-20%（仍然很小），例如从写50字到写60字。'),
+('habit_30', 16, '让它更有趣', '给习惯加一点乐趣（音乐/计时挑战/打卡视觉化），让你更愿意开始。'),
+('habit_30', 17, '建立“如果-那么”计划', '写下两条：如果我加班→那么我做低能量版本；如果我忘了→那么我睡前补一次。'),
+('habit_30', 18, '加入社交承诺', '找一个朋友或对话里做一个承诺：我将坚持到第30天；并写下你希望被如何提醒。'),
+('habit_30', 19, '连续3天挑战', '目标：连续3天不间断完成（允许低能量版本）。'),
+('habit_30', 20, '复盘奖励机制', '写下奖励是否有效；如果无效，换一个更适合你的奖励（不靠刷短视频）。'),
+('habit_30', 21, '三周复盘', '统计21天完成率；写下你完成最多的时间段；把习惯固定到那个时间段。'),
+('habit_30', 22, '减少自责', '写下：我失败时常说的自责句；把它改写成教练句（例如“下一次我做更小”）。'),
+('habit_30', 23, '优化提醒', '设置一个具体提醒（闹钟/日历），并写上行动文案（不是“别忘了”，而是“现在做2分钟版本”）。'),
+('habit_30', 24, '把习惯连到目标', '写下：这个习惯最终服务什么目标？它让你更接近目标的证据是什么？'),
+('habit_30', 25, '应对突发', '假设明天有突发事件，写下你仍能完成的最小动作是什么，并承诺执行。'),
+('habit_30', 26, '连续7天维护', '目标：连续7天都完成（允许低能量版本）；只追求“不断”。'),
+('habit_30', 27, '整理成果', '写下本月你累计完成了多少次；你感觉最大的变化是什么（哪怕很小）。'),
+('habit_30', 28, '建立复盘仪式', '选择一个每周固定的复盘时刻（例如周日20:00），写下你将检查的3个问题。'),
+('habit_30', 29, '准备长期版本', '为下个月定义一个可持续版本（不比现在更难），并确定触发器与提醒方式。'),
+('habit_30', 30, '毕业：写一封给自己的信', '写下：我靠什么坚持了30天？我下个月继续的最小频率是多少？')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 14天优势发现之旅
+INSERT INTO fortune_plan_day (plan_id, day_no, title, instruction) VALUES
+('strength_14', 1, '列出5次高光时刻', '写下你过去1-2年里5次“做得很顺/很投入”的时刻；每次写清场景与结果。'),
+('strength_14', 2, '提炼3个优势', '从高光时刻里提炼3个反复出现的优势（例如组织、表达、洞察、执行），并各写一句证据。'),
+('strength_14', 3, '优势命名', '给每个优势起一个你喜欢的名字（更个人化），并写下它在你身上的表现。'),
+('strength_14', 4, '优势应用：工作', '选择一个工作/学习任务，刻意用一个优势完成它；记录结果与感受。'),
+('strength_14', 5, '优势应用：关系', '选择一个关系场景，用一个优势改善沟通（例如倾听/表达/边界），并记录反馈。'),
+('strength_14', 6, '识别优势的阴影面', '为每个优势写下它的“过度使用”会带来的问题（例如过度负责、过度挑剔）。'),
+('strength_14', 7, '一周复盘：优势最有用的时刻', '写下本周优势最有帮助的一次经历；以及下一周你想在哪个场景继续用它。'),
+('strength_14', 8, '优势组合', '挑两个优势做组合：它们如何互补？写下一个你想尝试的组合行动。'),
+('strength_14', 9, '优势补短', '选一个你经常卡住的弱项，写下用哪个优势可以“绕过去”（例如用结构化代替拖延）。'),
+('strength_14', 10, '优势与目标对齐', '写下你当前一个目标；把它拆成3步，并标注每步使用哪个优势最省力。'),
+('strength_14', 11, '请求支持', '找一个人描述你的一个优势，并请对方给一个你可以更好发挥的建议。'),
+('strength_14', 12, '优势表达为价值', '写一段30秒自我介绍：我擅长什么→能为别人带来什么价值（避免空话）。'),
+('strength_14', 13, '优势在压力下的使用', '回想一次压力情境，写下你可以如何用优势稳定自己，并设计一个下次的应对句。'),
+('strength_14', 14, '毕业：优势使用计划', '写下未来4周你要刻意使用的1个优势；设定每周至少2次的应用场景。')
+ON CONFLICT (plan_id, day_no) DO UPDATE SET title = EXCLUDED.title, instruction = EXCLUDED.instruction;
+
+-- 6.8 每日指引（今日卡 SSOT）
+
+CREATE TABLE IF NOT EXISTS fortune_daily_guidance (
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  guidance_date DATE NOT NULL,
+  card JSONB NOT NULL,                    -- Guidance Card
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, guidance_date)
+);
+
+-- 6.9 推送调度与发送记录（可审计）
+
+CREATE TABLE IF NOT EXISTS fortune_push_event (
+  push_id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  push_type TEXT NOT NULL CHECK (push_type IN ('plan_daily','weekly_reflection','milestone')),
+  scheduled_at TIMESTAMPTZ NOT NULL,
+  sent_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','sent','skipped','failed')),
+  payload JSONB NOT NULL,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_push_user_scheduled ON fortune_push_event (user_id, scheduled_at DESC);
+
+-- 6.10 八字知识库（PDF 入库 → PostgreSQL 检索）
+
+CREATE TABLE IF NOT EXISTS bazi_kb_document (
+  doc_id BIGSERIAL PRIMARY KEY,
+  file_name TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (sha256)
+);
+
+CREATE TABLE IF NOT EXISTS bazi_kb_chunk (
+  chunk_id BIGSERIAL PRIMARY KEY,
+  doc_id BIGINT NOT NULL REFERENCES bazi_kb_document(doc_id) ON DELETE CASCADE,
+  page_no INTEGER NOT NULL CHECK (page_no > 0),
+  chunk_no INTEGER NOT NULL CHECK (chunk_no > 0),
+  content TEXT NOT NULL,
+  content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (doc_id, page_no, chunk_no)
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_tsv ON bazi_kb_chunk USING GIN (content_tsv);
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_trgm ON bazi_kb_chunk USING GIN (content gin_trgm_ops);
+
+-- 6.11 规则库（rule_ids SSOT，可追溯）
+
+CREATE TABLE IF NOT EXISTS fortune_rule (
+  rule_id TEXT PRIMARY KEY,
+  category TEXT NOT NULL,
+  name TEXT NOT NULL,
+  body JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rule_category ON fortune_rule (category);
+
+INSERT INTO fortune_rule (rule_id, category, name, body) VALUES
+('RULE-STRENGTH-SCORE-V1', 'bazi_strength', '旺衰评分算法', '{
+  "season_map": {"寅":"木","卯":"木","辰":"木","巳":"火","午":"火","未":"火","申":"金","酉":"金","戌":"金","亥":"水","子":"水","丑":"水"},
+  "day_master_map": {"甲":"木","乙":"木","丙":"火","丁":"火","戊":"土","己":"土","庚":"金","辛":"金","壬":"水","癸":"水"},
+  "threshold": {"strong": 2, "weak": -2}
+}'::jsonb),
+('RULE-SHENSHA-TAOHUA-V1', 'bazi_shensha', '桃花（咸池）', '{
+  "group_map": {"申子辰":"酉","亥卯未":"子","寅午戌":"卯","巳酉丑":"午"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-YIMA-V1', 'bazi_shensha', '驿马', '{
+  "group_map": {"申子辰":"寅","亥卯未":"巳","寅午戌":"申","巳酉丑":"亥"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-HUAGAI-V1', 'bazi_shensha', '华盖', '{
+  "group_map": {"申子辰":"辰","亥卯未":"未","寅午戌":"戌","巳酉丑":"丑"},
+  "basis": "year_or_day_branch"
+}'::jsonb),
+('RULE-SHENSHA-TIANYI-V1', 'bazi_shensha', '天乙贵人', '{
+  "day_gan_map": {"甲":["丑","未"],"戊":["丑","未"],"庚":["丑","未"],"乙":["子","申"],"己":["子","申"],"丙":["亥","酉"],"丁":["亥","酉"],"辛":["寅","午"],"壬":["卯","巳"],"癸":["卯","巳"]}
+}'::jsonb),
+('RULE-SHENSHA-WENCHANG-V1', 'bazi_shensha', '文昌', '{
+  "day_gan_map": {"甲":["巳","午"],"乙":["巳","午"],"丙":["申","酉"],"丁":["申","酉"],"戊":["申","酉"],"己":["申","酉"],"庚":["亥","子"],"辛":["亥","子"],"壬":["寅","卯"],"癸":["寅","卯"]}
+}'::jsonb)
+ON CONFLICT (rule_id) DO UPDATE SET
+  category = EXCLUDED.category,
+  name = EXCLUDED.name,
+  body = EXCLUDED.body,
+  updated_at = now();
+
+-- 6.12 外部任务映射（Gemini 报告 Job）
+
+CREATE TABLE IF NOT EXISTS fortune_external_job (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES fortune_user(user_id) ON DELETE CASCADE,
+  session_id UUID REFERENCES fortune_conversation_session(session_id) ON DELETE SET NULL,
+  provider TEXT NOT NULL CHECK (provider IN ('cli','gemini')),
+  job_type TEXT NOT NULL CHECK (job_type IN ('bazi_report')),
+  provider_job_id BIGINT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('processing','completed','error')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_polled_at TIMESTAMPTZ,
+  output_url TEXT NOT NULL DEFAULT '',
+  output_a2ui JSONB,
+  error TEXT NOT NULL DEFAULT '',
+  UNIQUE (provider, provider_job_id)
+);
+
+-- Upgrade path: legacy constraint may only allow provider='gemini'
+DO $$
+BEGIN
+  IF to_regclass('public.fortune_external_job') IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid='public.fortune_external_job'::regclass
+      AND conname='fortune_external_job_provider_check'
+  ) THEN
+    ALTER TABLE public.fortune_external_job DROP CONSTRAINT fortune_external_job_provider_check;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid='public.fortune_external_job'::regclass
+      AND conname='fortune_external_job_provider_check_v2'
+  ) THEN
+    ALTER TABLE public.fortune_external_job DROP CONSTRAINT fortune_external_job_provider_check_v2;
+  END IF;
+
+  BEGIN
+    ALTER TABLE public.fortune_external_job
+      ADD CONSTRAINT fortune_external_job_provider_check
+      CHECK (provider IN ('cli','gemini'));
+  EXCEPTION WHEN duplicate_object THEN
+    NULL;
+  END;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_external_job_user_time ON fortune_external_job (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_job_status ON fortune_external_job (status, updated_at DESC);

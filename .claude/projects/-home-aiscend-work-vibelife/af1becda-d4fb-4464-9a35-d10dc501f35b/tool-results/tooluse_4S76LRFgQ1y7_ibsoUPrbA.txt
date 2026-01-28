@@ -1,0 +1,461 @@
+     1→"""
+     2→Payment API Routes
+     3→Based on: vibelife spec v3.0
+     4→
+     5→Endpoints:
+     6→- POST /api/v1/payment/create-checkout - Create checkout session
+     7→- POST /api/v1/payment/verify - Verify payment completion
+     8→- GET /api/v1/payment/products - Get available products
+     9→- POST /api/v1/payment/unlock-report - Unlock a report after payment
+    10→- GET /api/v1/payment/subscription - Get user's subscription status
+    11→"""
+    12→
+    13→import os
+    14→import logging
+    15→from typing import Optional
+    16→from uuid import UUID
+    17→from fastapi import APIRouter, HTTPException, Query, Request
+    18→from pydantic import BaseModel, Field
+    19→
+    20→logger = logging.getLogger(__name__)
+    21→router = APIRouter(prefix="/payment", tags=["payment"])
+    22→
+    23→
+    24→# ═══════════════════════════════════════════════════════════════════════════
+    25→# Request/Response Models
+    26→# ═══════════════════════════════════════════════════════════════════════════
+    27→
+    28→class Product(BaseModel):
+    29→    """Product for purchase"""
+    30→    id: str
+    31→    name: str
+    32→    description: str
+    33→    price: float
+    34→    currency: str = "CNY"
+    35→    type: str  # "report", "subscription", "relationship_card"
+    36→
+    37→
+    38→class CreateCheckoutRequest(BaseModel):
+    39→    """Request to create checkout session"""
+    40→    user_id: str
+    41→    product_id: str
+    42→    metadata: dict = Field(default_factory=dict)
+    43→    success_url: Optional[str] = None
+    44→    cancel_url: Optional[str] = None
+    45→
+    46→
+    47→class CheckoutResponse(BaseModel):
+    48→    """Response with checkout info"""
+    49→    success: bool
+    50→    checkout_url: Optional[str] = None
+    51→    session_id: Optional[str] = None
+    52→    error: Optional[str] = None
+    53→
+    54→
+    55→class VerifyPaymentRequest(BaseModel):
+    56→    """Request to verify payment"""
+    57→    session_id: str
+    58→    user_id: str
+    59→
+    60→
+    61→class PaymentVerifyResponse(BaseModel):
+    62→    """Response for payment verification"""
+    63→    success: bool
+    64→    paid: bool = False
+    65→    product_id: Optional[str] = None
+    66→    metadata: dict = Field(default_factory=dict)
+    67→    error: Optional[str] = None
+    68→
+    69→
+    70→class UnlockReportRequest(BaseModel):
+    71→    """Request to unlock a report"""
+    72→    user_id: str
+    73→    report_id: str
+    74→    payment_session_id: str
+    75→
+    76→
+    77→class UnlockResponse(BaseModel):
+    78→    """Response for unlock operation"""
+    79→    success: bool
+    80→    unlocked: bool = False
+    81→    report_url: Optional[str] = None
+    82→    error: Optional[str] = None
+    83→
+    84→
+    85→class SubscriptionResponse(BaseModel):
+    86→    """Response for subscription status"""
+    87→    success: bool
+    88→    has_subscription: bool = False
+    89→    subscription: Optional[dict] = None
+    90→    error: Optional[str] = None
+    91→
+    92→
+    93→# ═══════════════════════════════════════════════════════════════════════════
+    94→# Products Definition
+    95→# ═══════════════════════════════════════════════════════════════════════════
+    96→
+    97→# Based on spec: 19.9 = 完整报告 + 高清海报 + 首月订阅权益
+    98→PRODUCTS = [
+    99→    Product(
+   100→        id="report_full",
+   101→        name="完整报告 + 高清海报",
+   102→        description="完整深度分析报告、高清AI海报、永久保存、首月订阅权益",
+   103→        price=19.9,
+   104→        type="report",
+   105→    ),
+   106→    Product(
+   107→        id="relationship_card_premium",
+   108→        name="高级关系卡",
+   109→        description="完整关系分析、匹配度可视化、AI关系海报",
+   110→        price=9.9,
+   111→        type="relationship_card",
+   112→    ),
+   113→    Product(
+   114→        id="subscription_monthly",
+   115→        name="月度订阅",
+   116→        description="无限对话、深度分析、专属功能",
+   117→        price=19.9,
+   118→        type="subscription",
+   119→    ),
+   120→    Product(
+   121→        id="subscription_yearly",
+   122→        name="年度订阅",
+   123→        description="无限对话、深度分析、专属功能、年度特惠",
+   124→        price=159.0,
+   125→        type="subscription",
+   126→    ),
+   127→]
+   128→
+   129→PRODUCTS_MAP = {p.id: p for p in PRODUCTS}
+   130→
+   131→
+   132→# ═══════════════════════════════════════════════════════════════════════════
+   133→# Database-backed payment tracking
+   134→# ═══════════════════════════════════════════════════════════════════════════
+   135→
+   136→from stores import payment_repo
+   137→
+   138→
+   139→# ═══════════════════════════════════════════════════════════════════════════
+   140→# Routes
+   141→# ═══════════════════════════════════════════════════════════════════════════
+   142→
+   143→@router.get("/products")
+   144→async def get_products():
+   145→    """Get list of available products"""
+   146→    return {
+   147→        "success": True,
+   148→        "products": [p.dict() for p in PRODUCTS],
+   149→    }
+   150→
+   151→
+   152→@router.post("/create-checkout", response_model=CheckoutResponse)
+   153→async def create_checkout(request: CreateCheckoutRequest):
+   154→    """
+   155→    Create a checkout session.
+   156→
+   157→    Uses Stripe in production, or creates a database-backed session for development.
+   158→    """
+   159→    try:
+   160→        from uuid import UUID as UUIDType
+   161→
+   162→        # Validate product
+   163→        product = PRODUCTS_MAP.get(request.product_id)
+   164→        if not product:
+   165→            raise HTTPException(status_code=400, detail="Invalid product ID")
+   166→
+   167→        # Check for Stripe integration
+   168→        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+   169→
+   170→        if stripe_key:
+   171→            # Real Stripe integration
+   172→            import stripe
+   173→            stripe.api_key = stripe_key
+   174→
+   175→            # Create Stripe checkout session
+   176→            base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+   177→            session = stripe.checkout.Session.create(
+   178→                payment_method_types=["card"],
+   179→                line_items=[{
+   180→                    "price_data": {
+   181→                        "currency": product.currency.lower(),
+   182→                        "product_data": {
+   183→                            "name": product.name,
+   184→                            "description": product.description,
+   185→                        },
+   186→                        "unit_amount": int(product.price * 100),
+   187→                    },
+   188→                    "quantity": 1,
+   189→                }],
+   190→                mode="payment",
+   191→                success_url=request.success_url or f"{base_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+   192→                cancel_url=request.cancel_url or f"{base_url}/payment/cancel",
+   193→                metadata={
+   194→                    "user_id": request.user_id,
+   195→                    "product_id": request.product_id,
+   196→                    **request.metadata
+   197→                }
+   198→            )
+   199→
+   200→            # Create payment record in database
+   201→            await payment_repo.create_payment(
+   202→                user_id=UUIDType(request.user_id) if request.user_id else None,
+   203→                product_type=product.type,
+   204→                product_id=None,  # Will be filled when payment completes
+   205→                amount_cents=int(product.price * 100),
+   206→                currency=product.currency,
+   207→                provider="stripe",
+   208→                provider_payment_id=session.id,
+   209→                provider_metadata={"checkout_session_id": session.id}
+   210→            )
+   211→
+   212→            return CheckoutResponse(
+   213→                success=True,
+   214→                checkout_url=session.url,
+   215→                session_id=session.id,
+   216→            )
+   217→
+   218→        # Development mode: create database-backed session without Stripe
+   219→        import uuid
+   220→        session_id = f"dev_{uuid.uuid4().hex[:16]}"
+   221→
+   222→        # Create payment record in database (pending status)
+   223→        await payment_repo.create_payment(
+   224→            user_id=UUIDType(request.user_id) if request.user_id else None,
+   225→            product_type=product.type,
+   226→            product_id=None,
+   227→            amount_cents=int(product.price * 100),
+   228→            currency=product.currency,
+   229→            provider="development",
+   230→            provider_payment_id=session_id,
+   231→            provider_metadata={"product_id": request.product_id, **request.metadata}
+   232→        )
+   233→
+   234→        # In development, return a mock checkout URL
+   235→        base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+   236→        checkout_url = f"{base_url}/checkout/{session_id}"
+   237→
+   238→        logger.warning(f"Development mode: Created mock checkout session {session_id}")
+   239→
+   240→        return CheckoutResponse(
+   241→            success=True,
+   242→            checkout_url=checkout_url,
+   243→            session_id=session_id,
+   244→        )
+   245→
+   246→    except HTTPException:
+   247→        raise
+   248→    except Exception as e:
+   249→        logger.error(f"Create checkout failed: {e}")
+   250→        return CheckoutResponse(
+   251→            success=False,
+   252→            error=str(e),
+   253→        )
+   254→
+   255→
+   256→@router.post("/verify", response_model=PaymentVerifyResponse)
+   257→async def verify_payment(request: VerifyPaymentRequest):
+   258→    """
+   259→    Verify payment completion.
+   260→
+   261→    Checks database for payment status, and optionally verifies with Stripe.
+   262→    """
+   263→    try:
+   264→        # Get payment from database
+   265→        payment = await payment_repo.get_payment_by_provider_id(
+   266→            provider="stripe" if request.session_id.startswith("cs_") else "development",
+   267→            provider_payment_id=request.session_id
+   268→        )
+   269→
+   270→        if not payment:
+   271→            return PaymentVerifyResponse(
+   272→                success=False,
+   273→                error="Session not found",
+   274→            )
+   275→
+   276→        if str(payment["user_id"]) != request.user_id:
+   277→            return PaymentVerifyResponse(
+   278→                success=False,
+   279→                error="User mismatch",
+   280→            )
+   281→
+   282→        # For Stripe payments, optionally verify with Stripe
+   283→        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+   284→        if stripe_key and request.session_id.startswith("cs_"):
+   285→            import stripe
+   286→            stripe.api_key = stripe_key
+   287→            try:
+   288→                session = stripe.checkout.Session.retrieve(request.session_id)
+   289→                if session.payment_status == "paid" and payment["status"] != "success":
+   290→                    # Update database status
+   291→                    await payment_repo.mark_payment_success(payment["id"])
+   292→                    payment["status"] = "success"
+   293→            except Exception as e:
+   294→                logger.warning(f"Stripe verification failed: {e}")
+   295→
+   296→        is_paid = payment["status"] == "success"
+   297→        metadata = payment.get("provider_metadata") or {}
+   298→
+   299→        return PaymentVerifyResponse(
+   300→            success=True,
+   301→            paid=is_paid,
+   302→            product_id=metadata.get("product_id"),
+   303→            metadata=metadata,
+   304→        )
+   305→
+   306→    except Exception as e:
+   307→        logger.error(f"Verify payment failed: {e}")
+   308→        return PaymentVerifyResponse(
+   309→            success=False,
+   310→            error=str(e),
+   311→        )
+   312→
+   313→
+   314→@router.post("/unlock-report", response_model=UnlockResponse)
+   315→async def unlock_report(request: UnlockReportRequest):
+   316→    """
+   317→    Unlock a full report after payment verification.
+   318→
+   319→    This endpoint:
+   320→    1. Verifies the payment session from database
+   321→    2. Marks the report as unlocked for the user
+   322→    3. Returns the full report URL
+   323→    """
+   324→    try:
+   325→        # Get payment from database
+   326→        payment = await payment_repo.get_payment_by_provider_id(
+   327→            provider="stripe" if request.payment_session_id.startswith("cs_") else "development",
+   328→            provider_payment_id=request.payment_session_id
+   329→        )
+   330→
+   331→        if not payment:
+   332→            return UnlockResponse(
+   333→                success=False,
+   334→                error="Payment session not found",
+   335→            )
+   336→
+   337→        if payment["status"] != "success":
+   338→            return UnlockResponse(
+   339→                success=False,
+   340→                error="Payment not completed",
+   341→            )
+   342→
+   343→        if str(payment["user_id"]) != request.user_id:
+   344→            return UnlockResponse(
+   345→                success=False,
+   346→                error="User mismatch",
+   347→            )
+   348→
+   349→        # TODO: Update report in database to mark as unlocked
+   350→        # TODO: Grant subscription if included in product
+   351→
+   352→        base_url = os.getenv("APP_BASE_URL", "http://localhost:3000")
+   353→        report_url = f"{base_url}/report/{request.report_id}?full=true"
+   354→
+   355→        return UnlockResponse(
+   356→            success=True,
+   357→            unlocked=True,
+   358→            report_url=report_url,
+   359→        )
+   360→
+   361→    except Exception as e:
+   362→        logger.error(f"Unlock report failed: {e}")
+   363→        return UnlockResponse(
+   364→            success=False,
+   365→            error=str(e),
+   366→        )
+   367→
+   368→
+   369→@router.get("/subscription", response_model=SubscriptionResponse)
+   370→async def get_subscription(user_id: str = Query(...)):
+   371→    """
+   372→    Get user's current subscription status.
+   373→    """
+   374→    try:
+   375→        # TODO: Load from database via SubscriptionService
+   376→        # For now, return mock data
+   377→
+   378→        return SubscriptionResponse(
+   379→            success=True,
+   380→            has_subscription=False,
+   381→            subscription=None,
+   382→        )
+   383→
+   384→    except Exception as e:
+   385→        logger.error(f"Get subscription failed: {e}")
+   386→        return SubscriptionResponse(
+   387→            success=False,
+   388→            error=str(e),
+   389→        )
+   390→
+   391→
+   392→@router.post("/webhook")
+   393→async def payment_webhook(request: Request):
+   394→    """
+   395→    Handle Stripe webhook events.
+   396→
+   397→    Processes:
+   398→    - checkout.session.completed -> mark payment as success
+   399→    - payment_intent.succeeded -> backup confirmation
+   400→    - payment_intent.failed -> mark payment as failed
+   401→    """
+   402→    try:
+   403→        payload = await request.body()
+   404→        sig_header = request.headers.get("Stripe-Signature")
+   405→
+   406→        stripe_key = os.getenv("STRIPE_SECRET_KEY")
+   407→        webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+   408→
+   409→        if not stripe_key:
+   410→            logger.warning("Stripe not configured, skipping webhook")
+   411→            return {"received": True}
+   412→
+   413→        if webhook_secret and sig_header:
+   414→            import stripe
+   415→            stripe.api_key = stripe_key
+   416→
+   417→            try:
+   418→                event = stripe.Webhook.construct_event(
+   419→                    payload, sig_header, webhook_secret
+   420→                )
+   421→            except stripe.error.SignatureVerificationError as e:
+   422→                logger.error(f"Invalid webhook signature: {e}")
+   423→                raise HTTPException(status_code=400, detail="Invalid signature")
+   424→        else:
+   425→            # Development mode: parse without verification
+   426→            import json
+   427→            event = json.loads(payload)
+   428→            logger.warning("Webhook signature verification skipped (dev mode)")
+   429→
+   430→        # Handle events
+   431→        event_type = event.get("type") if isinstance(event, dict) else event.type
+   432→        data = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
+   433→
+   434→        logger.info(f"Processing webhook event: {event_type}")
+   435→
+   436→        if event_type == "checkout.session.completed":
+   437→            session_id = data.get("id") if isinstance(data, dict) else data.id
+   438→            payment = await payment_repo.get_payment_by_provider_id("stripe", session_id)
+   439→            if payment:
+   440→                await payment_repo.mark_payment_success(payment["id"])
+   441→                logger.info(f"Payment {payment['id']} marked as success")
+   442→
+   443→        elif event_type == "payment_intent.payment_failed":
+   444→            payment_intent_id = data.get("id") if isinstance(data, dict) else data.id
+   445→            payment = await payment_repo.get_payment_by_provider_id("stripe", payment_intent_id)
+   446→            if payment:
+   447→                await payment_repo.update_payment_status(payment["id"], "failed")
+   448→                logger.info(f"Payment {payment['id']} marked as failed")
+   449→
+   450→        return {"received": True}
+   451→
+   452→    except HTTPException:
+   453→        raise
+   454→    except Exception as e:
+   455→        logger.error(f"Webhook processing failed: {e}")
+   456→        raise HTTPException(status_code=400, detail=str(e))
+   457→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

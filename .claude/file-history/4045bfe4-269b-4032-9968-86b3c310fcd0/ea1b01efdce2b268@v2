@@ -1,0 +1,380 @@
+"""
+Mentis OS v3.0 - JWT 认证服务
+
+提供 JWT token 生成、验证和刷新功能。
+"""
+from __future__ import annotations
+
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+from uuid import UUID
+
+import jwt
+from passlib.context import CryptContext
+
+from stores import mentis_db
+
+
+# 配置
+JWT_SECRET = os.getenv("MENTIS_JWT_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("MENTIS_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("MENTIS_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
+# 密码加密
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+class AuthError(Exception):
+    """认证错误"""
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def hash_password(password: str) -> str:
+    """加密密码"""
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """验证密码"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(
+    user_id: str,
+    additional_claims: Optional[Dict[str, Any]] = None,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """
+    创建访问令牌
+
+    Args:
+        user_id: 用户 ID
+        additional_claims: 额外声明
+        expires_delta: 过期时间
+
+    Returns:
+        JWT token
+    """
+    to_encode = {
+        "sub": user_id,
+        "type": "access",
+        "iat": datetime.now(timezone.utc),
+    }
+
+    if additional_claims:
+        to_encode.update(additional_claims)
+
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode["exp"] = expire
+
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token(user_id: str) -> str:
+    """
+    创建刷新令牌
+
+    Args:
+        user_id: 用户 ID
+
+    Returns:
+        JWT refresh token
+    """
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+    to_encode = {
+        "sub": user_id,
+        "type": "refresh",
+        "iat": datetime.now(timezone.utc),
+        "exp": expire,
+        "jti": secrets.token_hex(16),  # 唯一标识符
+    }
+
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    """
+    解码并验证 token
+
+    Args:
+        token: JWT token
+
+    Returns:
+        解码后的 payload
+
+    Raises:
+        AuthError: token 无效或过期
+    """
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise AuthError("auth/token-expired", "Token 已过期")
+    except jwt.InvalidTokenError as e:
+        raise AuthError("auth/invalid-token", f"Token 无效: {str(e)}")
+
+
+def verify_access_token(token: str) -> Dict[str, Any]:
+    """
+    验证访问令牌
+
+    Args:
+        token: JWT access token
+
+    Returns:
+        包含 user_id 的 payload
+
+    Raises:
+        AuthError: token 无效
+    """
+    payload = decode_token(token)
+
+    if payload.get("type") != "access":
+        raise AuthError("auth/invalid-token-type", "无效的 token 类型")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise AuthError("auth/invalid-token", "Token 缺少用户信息")
+
+    return {"user_id": user_id, "payload": payload}
+
+
+def verify_refresh_token(token: str) -> Dict[str, Any]:
+    """
+    验证刷新令牌
+
+    Args:
+        token: JWT refresh token
+
+    Returns:
+        包含 user_id 的 payload
+
+    Raises:
+        AuthError: token 无效
+    """
+    payload = decode_token(token)
+
+    if payload.get("type") != "refresh":
+        raise AuthError("auth/invalid-token-type", "无效的 token 类型")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise AuthError("auth/invalid-token", "Token 缺少用户信息")
+
+    return {"user_id": user_id, "jti": payload.get("jti")}
+
+
+def refresh_tokens(refresh_token: str) -> Dict[str, str]:
+    """
+    使用刷新令牌获取新的访问令牌
+
+    Args:
+        refresh_token: 刷新令牌
+
+    Returns:
+        新的 access_token 和 refresh_token
+
+    Raises:
+        AuthError: 刷新失败
+    """
+    result = verify_refresh_token(refresh_token)
+    user_id = result["user_id"]
+
+    # 验证用户是否存在
+    user = mentis_db.fetch_one(
+        "SELECT id FROM mentis_user WHERE id = %s",
+        (user_id,),
+    )
+    if not user:
+        raise AuthError("auth/user-not-found", "用户不存在")
+
+    # 生成新 token
+    new_access_token = create_access_token(user_id)
+    new_refresh_token = create_refresh_token(user_id)
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+def register_user(email: str, password: str, name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    注册新用户
+
+    Args:
+        email: 邮箱
+        password: 密码
+        name: 用户名
+
+    Returns:
+        用户信息和 token
+
+    Raises:
+        AuthError: 注册失败
+    """
+    # 检查邮箱是否已存在
+    existing = mentis_db.fetch_one(
+        "SELECT id FROM mentis_user WHERE lower(email) = lower(%s)",
+        (email,),
+    )
+    if existing:
+        raise AuthError("auth/email-exists", "邮箱已被注册")
+
+    # 加密密码
+    hashed_password = hash_password(password)
+
+    # 创建用户
+    import json
+    user = mentis_db.execute_returning_one(
+        """
+        INSERT INTO mentis_user (email, name)
+        VALUES (%s, %s)
+        RETURNING id, email, name, tier, created_at
+        """,
+        (email, name),
+    )
+
+    if not user:
+        raise AuthError("auth/registration-failed", "注册失败")
+
+    user_id = str(user["id"])
+
+    # 存储密码哈希（需要在 user_profile 或单独的表中）
+    mentis_db.execute(
+        """
+        INSERT INTO user_profile (user_id, preferences)
+        VALUES (%s, %s::jsonb)
+        ON CONFLICT (user_id) DO UPDATE SET preferences = user_profile.preferences
+        """,
+        (user_id, json.dumps({"password_hash": hashed_password})),
+    )
+
+    # 创建用户状态
+    mentis_db.execute(
+        """
+        INSERT INTO user_state (user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+
+    # 生成 token
+    access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token(user_id)
+
+    return {
+        "user": {
+            "id": user_id,
+            "email": user["email"],
+            "name": user["name"],
+            "tier": user["tier"],
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+def login_user(email: str, password: str) -> Dict[str, Any]:
+    """
+    用户登录
+
+    Args:
+        email: 邮箱
+        password: 密码
+
+    Returns:
+        用户信息和 token
+
+    Raises:
+        AuthError: 登录失败
+    """
+    # 查找用户
+    user = mentis_db.fetch_one(
+        "SELECT id, email, name, tier FROM mentis_user WHERE lower(email) = lower(%s)",
+        (email,),
+    )
+    if not user:
+        raise AuthError("auth/invalid-credentials", "邮箱或密码错误")
+
+    user_id = str(user["id"])
+
+    # 获取密码哈希
+    profile = mentis_db.fetch_one(
+        "SELECT preferences FROM user_profile WHERE user_id = %s",
+        (user_id,),
+    )
+
+    if not profile or not profile.get("preferences"):
+        raise AuthError("auth/invalid-credentials", "邮箱或密码错误")
+
+    preferences = profile["preferences"]
+    password_hash = preferences.get("password_hash", "") if isinstance(preferences, dict) else ""
+
+    if not password_hash or not verify_password(password, password_hash):
+        raise AuthError("auth/invalid-credentials", "邮箱或密码错误")
+
+    # 生成 token
+    access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token(user_id)
+
+    return {
+        "user": {
+            "id": user_id,
+            "email": user["email"],
+            "name": user["name"],
+            "tier": user["tier"],
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+def get_current_user(token: str) -> Dict[str, Any]:
+    """
+    获取当前用户信息
+
+    Args:
+        token: 访问令牌
+
+    Returns:
+        用户信息
+
+    Raises:
+        AuthError: 获取失败
+    """
+    result = verify_access_token(token)
+    user_id = result["user_id"]
+
+    user = mentis_db.fetch_one(
+        "SELECT id, email, name, tier, created_at FROM mentis_user WHERE id = %s",
+        (user_id,),
+    )
+    if not user:
+        raise AuthError("auth/user-not-found", "用户不存在")
+
+    return {
+        "id": str(user["id"]),
+        "email": user["email"],
+        "name": user["name"],
+        "tier": user["tier"],
+        "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
+    }

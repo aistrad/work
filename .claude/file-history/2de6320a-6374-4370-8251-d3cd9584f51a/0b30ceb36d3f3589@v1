@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+Knowledge Folder Sync Script
+
+Scans knowledge source folders, detects changes, and queues documents for processing.
+Run daily at 4:00 AM via crontab:
+    0 4 * * * cd /path/to/vibelife && python -m apps.api.scripts.sync_knowledge
+
+Usage:
+    python -m apps.api.scripts.sync_knowledge [--skill SKILL_ID] [--force]
+"""
+import asyncio
+import hashlib
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+# Add project root to path
+project_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(project_root / "apps" / "api"))
+
+from dotenv import load_dotenv
+load_dotenv(project_root / ".env")
+
+from stores.db import init_db, close_db, get_connection
+from workers.converters import DocumentConverter
+
+# Configuration
+KNOWLEDGE_ROOT = os.getenv(
+    "VIBELIFE_KNOWLEDGE_ROOT",
+    str(project_root / "knowledge")
+)
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf", ".epub", ".docx", ".doc", ".html", ".htm"}
+
+
+def get_file_hash(file_path: str) -> str:
+    """Calculate MD5 hash of file"""
+    with open(file_path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def get_file_type(file_path: str) -> str:
+    """Get normalized file type"""
+    ext = Path(file_path).suffix.lower()
+    type_map = {
+        ".md": "md", ".markdown": "md", ".txt": "txt",
+        ".pdf": "pdf", ".epub": "epub",
+        ".docx": "docx", ".doc": "docx",
+        ".html": "html", ".htm": "html",
+    }
+    return type_map.get(ext, "unknown")
+
+
+async def scan_skill_folder(skill_id: str, folder_path: Path) -> dict:
+    """
+    Scan a skill's knowledge folder and sync with database
+
+    Returns:
+        dict with counts: new, updated, archived, unchanged
+    """
+    stats = {"new": 0, "updated": 0, "archived": 0, "unchanged": 0, "errors": 0}
+
+    if not folder_path.exists():
+        print(f"  Folder not found: {folder_path}")
+        return stats
+
+    # Find all supported files
+    files_found = []
+    for ext in SUPPORTED_EXTENSIONS:
+        files_found.extend(folder_path.glob(f"*{ext}"))
+        files_found.extend(folder_path.glob(f"**/*{ext}"))  # Recursive
+
+    # Remove duplicates and sort
+    files_found = sorted(set(files_found))
+    filenames = [f.name for f in files_found]
+
+    print(f"  Found {len(files_found)} files")
+
+    async with get_connection() as conn:
+        # Process each file
+        for file_path in files_found:
+            try:
+                file_hash = get_file_hash(str(file_path))
+                file_type = get_file_type(str(file_path))
+                file_size = file_path.stat().st_size
+
+                # Check if document exists and if hash changed
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, file_hash, status
+                    FROM knowledge_documents
+                    WHERE skill_id = $1 AND filename = $2
+                    """,
+                    skill_id, file_path.name
+                )
+
+                if existing is None:
+                    # New file
+                    await conn.execute(
+                        """
+                        INSERT INTO knowledge_documents (
+                            skill_id, filename, file_path, file_hash,
+                            file_type, file_size_bytes, status
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+                        """,
+                        skill_id, file_path.name, str(file_path.absolute()),
+                        file_hash, file_type, file_size
+                    )
+                    stats["new"] += 1
+                    print(f"    + NEW: {file_path.name}")
+
+                elif existing["file_hash"] != file_hash:
+                    # File changed
+                    await conn.execute(
+                        """
+                        UPDATE knowledge_documents
+                        SET file_path = $3, file_hash = $4, file_size_bytes = $5,
+                            status = 'pending', retry_count = 0,
+                            error_message = NULL, updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        existing["id"], skill_id, str(file_path.absolute()),
+                        file_hash, file_size
+                    )
+                    # Delete old chunks
+                    await conn.execute(
+                        "DELETE FROM knowledge_chunks_v2 WHERE document_id = $1",
+                        existing["id"]
+                    )
+                    stats["updated"] += 1
+                    print(f"    ~ UPDATED: {file_path.name}")
+
+                elif existing["status"] == "archived":
+                    # Restore archived file
+                    await conn.execute(
+                        """
+                        UPDATE knowledge_documents
+                        SET status = 'pending', retry_count = 0,
+                            error_message = NULL, updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        existing["id"]
+                    )
+                    stats["new"] += 1
+                    print(f"    + RESTORED: {file_path.name}")
+
+                else:
+                    stats["unchanged"] += 1
+
+            except Exception as e:
+                stats["errors"] += 1
+                print(f"    ! ERROR: {file_path.name} - {e}")
+
+        # Archive missing files
+        if filenames:
+            result = await conn.execute(
+                """
+                UPDATE knowledge_documents
+                SET status = 'archived', updated_at = NOW()
+                WHERE skill_id = $1
+                  AND filename != ALL($2)
+                  AND status != 'archived'
+                """,
+                skill_id, filenames
+            )
+            archived_count = int(result.split()[-1]) if result else 0
+            stats["archived"] = archived_count
+            if archived_count > 0:
+                print(f"    - ARCHIVED: {archived_count} files")
+
+    return stats
+
+
+async def sync_all(target_skill: Optional[str] = None, force: bool = False):
+    """
+    Sync all skill knowledge folders
+
+    Args:
+        target_skill: If specified, only sync this skill
+        force: If True, re-queue all documents (not just changed ones)
+    """
+    knowledge_root = Path(KNOWLEDGE_ROOT)
+
+    if not knowledge_root.exists():
+        print(f"Knowledge root not found: {knowledge_root}")
+        print("Creating directory structure...")
+        knowledge_root.mkdir(parents=True, exist_ok=True)
+        return
+
+    print(f"Knowledge root: {knowledge_root}")
+    print("-" * 50)
+
+    # Find skill folders (direct subdirectories)
+    skill_folders = [
+        d for d in knowledge_root.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    ]
+
+    if target_skill:
+        skill_folders = [d for d in skill_folders if d.name == target_skill]
+        if not skill_folders:
+            print(f"Skill folder not found: {target_skill}")
+            return
+
+    total_stats = {"new": 0, "updated": 0, "archived": 0, "unchanged": 0, "errors": 0}
+
+    for folder in sorted(skill_folders):
+        skill_id = folder.name
+        print(f"\nSkill: {skill_id}")
+
+        if force:
+            # Reset all documents to pending
+            async with get_connection() as conn:
+                await conn.execute(
+                    """
+                    UPDATE knowledge_documents
+                    SET status = 'pending', retry_count = 0
+                    WHERE skill_id = $1 AND status NOT IN ('pending', 'processing')
+                    """,
+                    skill_id
+                )
+            print("  (Force mode: all documents re-queued)")
+
+        stats = await scan_skill_folder(skill_id, folder)
+
+        for key in total_stats:
+            total_stats[key] += stats[key]
+
+    print("\n" + "=" * 50)
+    print("SYNC COMPLETE")
+    print(f"  New:       {total_stats['new']}")
+    print(f"  Updated:   {total_stats['updated']}")
+    print(f"  Archived:  {total_stats['archived']}")
+    print(f"  Unchanged: {total_stats['unchanged']}")
+    if total_stats["errors"]:
+        print(f"  Errors:    {total_stats['errors']}")
+
+
+async def show_stats():
+    """Show current knowledge base statistics"""
+    async with get_connection() as conn:
+        rows = await conn.fetch("SELECT * FROM knowledge_stats")
+
+        if not rows:
+            print("No knowledge data found.")
+            return
+
+        print("\nKnowledge Base Statistics:")
+        print("-" * 70)
+        print(f"{'Skill':<12} {'Pending':<10} {'Processing':<12} {'Completed':<12} {'Failed':<8} {'Chunks':<10}")
+        print("-" * 70)
+
+        for row in rows:
+            print(
+                f"{row['skill_id']:<12} "
+                f"{row['pending_docs'] or 0:<10} "
+                f"{row['processing_docs'] or 0:<12} "
+                f"{row['completed_docs'] or 0:<12} "
+                f"{row['failed_docs'] or 0:<8} "
+                f"{row['total_chunks'] or 0:<10}"
+            )
+
+
+async def main():
+    """Main entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Sync knowledge folders")
+    parser.add_argument("--skill", help="Only sync specific skill")
+    parser.add_argument("--force", action="store_true", help="Re-queue all documents")
+    parser.add_argument("--stats", action="store_true", help="Show statistics only")
+    args = parser.parse_args()
+
+    await init_db()
+
+    try:
+        if args.stats:
+            await show_stats()
+        else:
+            await sync_all(target_skill=args.skill, force=args.force)
+            await show_stats()
+    finally:
+        await close_db()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

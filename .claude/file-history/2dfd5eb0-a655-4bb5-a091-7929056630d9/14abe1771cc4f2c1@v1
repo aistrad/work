@@ -1,0 +1,716 @@
+"""
+Synastry Skill 工具执行器
+
+实现合盘功能的核心工具：
+- collect_synastry_info: 收集对方信息
+- select_relationship: 选择已保存的关系对象
+- calculate_synastry: 计算合盘
+- show_synastry_overview: 展示合盘总览
+- save_relationship: 保存关系对象
+- save_synastry_insight: 保存合盘洞察
+"""
+
+import logging
+from typing import Dict, Any
+from datetime import datetime, timezone
+
+from services.tool_registry import tool_handler, ToolContext, ToolRegistry
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Collect Tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("collect_synastry_info")
+async def execute_collect_synastry_info(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    收集合盘对象的出生信息
+
+    展示 CollectSynastryInfoCard 表单
+    """
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "collect_synastry_info",
+        "title": "告诉我 TA 的信息",
+        "fields": [
+            {
+                "name": "relationship_type",
+                "type": "select",
+                "label": "TA 是你的...",
+                "required": True,
+                "options": [
+                    {"value": "romantic", "label": "恋人/约会对象", "icon": "💕"},
+                    {"value": "spouse", "label": "配偶/伴侣", "icon": "💍"},
+                    {"value": "parent_child", "label": "亲子", "icon": "👨‍👧"},
+                    {"value": "sibling", "label": "兄弟姐妹", "icon": "👫"},
+                    {"value": "business", "label": "合伙人/同事", "icon": "🤝"},
+                    {"value": "friend", "label": "朋友", "icon": "👥"},
+                ]
+            },
+            {
+                "name": "person_name",
+                "type": "text",
+                "label": "TA 叫什么？",
+                "placeholder": "姓名或昵称",
+                "required": True
+            },
+            {
+                "name": "birth_date",
+                "type": "date",
+                "label": "TA 什么时候出生？",
+                "required": True
+            },
+            {
+                "name": "birth_time",
+                "type": "time",
+                "label": "出生时间（可选）",
+                "required": False,
+                "placeholder": "不确定可以不填"
+            },
+            {
+                "name": "birth_place",
+                "type": "location",
+                "label": "TA 在哪里出生？",
+                "placeholder": "搜索城市...",
+                "required": True
+            },
+            {
+                "name": "save_relationship",
+                "type": "checkbox",
+                "label": "保存 TA，方便下次查看",
+                "default": True
+            }
+        ],
+        "submitLabel": "开始分析"
+    }, context)
+
+
+@tool_handler("select_relationship")
+async def execute_select_relationship(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示已保存的关系对象列表
+
+    让用户选择已有对象或添加新的
+    """
+    # 从 VibeRelationship 获取关系列表
+    user_id = context.user_id
+    relationships = await UnifiedProfileRepository.get_vibe_relationships(user_id)
+
+    # 格式化关系列表
+    formatted_relationships = []
+    for rel in relationships:
+        formatted_relationships.append({
+            "id": rel.get("id"),
+            "name": rel.get("name"),
+            "type": rel.get("type"),
+            "typeLabel": _get_relationship_type_label(rel.get("type")),
+            "typeIcon": _get_relationship_type_icon(rel.get("type")),
+            "lastSynastryAt": rel.get("last_synastry_at"),
+            "hasSynastry": bool(rel.get("synastry"))
+        })
+
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "select_relationship",
+        "title": "你想看和谁的合盘？",
+        "relationships": formatted_relationships,
+        "allowAddNew": True,
+        "addNewLabel": "添加新的人"
+    }, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compute Tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("calculate_synastry")
+async def execute_calculate_synastry(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    计算合盘分析
+
+    根据用户已订阅的 Skill 自动计算对应维度
+    """
+    from skills.synastry.services.synastry_engine import SynastryEngine
+
+    user_id = context.user_id
+    profile = context.profile
+
+    # 解析参数
+    person2_birth_info = args.get("person2_birth_info", {})
+    relationship_type = args.get("relationship_type", "romantic")
+    relationship_id = args.get("relationship_id")
+    person_name = args.get("person_name", "TA")
+    save_relationship = args.get("save_relationship", True)
+
+    # 获取用户出生信息
+    identity = profile.get("identity", {})
+    user_birth_info = identity.get("birth_info", {})
+
+    if not user_birth_info.get("date"):
+        return {
+            "success": False,
+            "error": "请先完善你的出生信息",
+            "_hint": {"action": "collect_birth_info"}
+        }
+
+    if not person2_birth_info.get("date"):
+        return {
+            "success": False,
+            "error": "需要对方的出生日期才能计算合盘"
+        }
+
+    # 获取用户已订阅的 Skill（MVP 只需要 zodiac）
+    subscribed_skills = await UnifiedProfileRepository.get_subscribed_skill_ids(user_id)
+
+    # 确保 zodiac 在订阅列表中（合盘基础功能）
+    if "zodiac" not in subscribed_skills:
+        subscribed_skills.append("zodiac")
+
+    # 计算合盘
+    engine = SynastryEngine()
+    result = await engine.calculate(
+        user_birth_info=user_birth_info,
+        partner_birth_info=person2_birth_info,
+        relationship_type=relationship_type,
+        subscribed_skills=subscribed_skills
+    )
+
+    # 如果需要保存关系对象
+    if save_relationship and not relationship_id:
+        relationship_id = await UnifiedProfileRepository.add_vibe_relationship(
+            user_id,
+            {
+                "name": person_name,
+                "type": relationship_type,
+                "birth_info": person2_birth_info
+            }
+        )
+
+    # 保存合盘洞察到关系对象
+    if relationship_id and result.dimensions:
+        for dim in result.dimensions:
+            await UnifiedProfileRepository.save_synastry_insight(
+                user_id,
+                relationship_id,
+                dim.skill_id,
+                {
+                    "overall_score": dim.score,
+                    "summary": dim.summary,
+                    "categories": dim.data.get("categories", []),
+                    "aspects": dim.data.get("aspects", []),
+                    "strengths": dim.data.get("strengths", []),
+                    "challenges": dim.data.get("challenges", []),
+                    "advice": dim.data.get("advice", "")
+                }
+            )
+
+    # 构建返回数据
+    user_name = profile.get("identity", {}).get("display_name") or "你"
+
+    return {
+        "success": True,
+        "result": {
+            "person1": {
+                "name": user_name,
+            },
+            "person2": {
+                "name": person_name,
+                "birthInfo": person2_birth_info
+            },
+            "relationshipType": relationship_type,
+            "overallScore": result.overall_score,
+            "overallLabel": engine.get_score_label(result.overall_score),
+            "dimensions": [
+                {
+                    "skill": dim.skill_id,
+                    "name": _get_skill_display_name(dim.skill_id),
+                    "icon": _get_skill_icon(dim.skill_id),
+                    "score": dim.score,
+                    "summary": dim.summary,
+                    "data": dim.data
+                }
+                for dim in result.dimensions
+            ],
+            "strengths": result.strengths,
+            "challenges": result.challenges,
+            "advice": result.advice,
+            "relationshipId": relationship_id
+        },
+        "_hint": {
+            "action": "show_synastry_results",
+            "message": "合盘计算完成，请展示 SynastryOverviewCard"
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Display Tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_synastry_overview")
+async def execute_show_synastry_overview(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示合盘总览卡片
+    """
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "synastry_overview",
+        "person1": args.get("person1"),
+        "person2": args.get("person2"),
+        "relationshipType": args.get("relationship_type"),
+        "overallScore": args.get("overall_score"),
+        "overallLabel": args.get("overall_label") or _get_score_label(args.get("overall_score", 0)),
+        "dimensions": args.get("dimensions", []),
+        "strengths": args.get("strengths", []),
+        "challenges": args.get("challenges", []),
+        "advice": args.get("advice", [])
+    }, context)
+
+
+@tool_handler("show_zodiac_synastry")
+async def execute_show_zodiac_synastry(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    展示星座合盘详情
+    """
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "zodiac_synastry_detail",
+        **args.get("synastry_data", {})
+    }, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Action Tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("save_relationship")
+async def execute_save_relationship(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    保存关系对象到 VibeRelationship
+    """
+    user_id = context.user_id
+
+    relationship_data = {
+        "name": args.get("name"),
+        "type": args.get("relationship_type"),
+        "birth_info": args.get("birth_info")
+    }
+
+    relationship_id = await UnifiedProfileRepository.add_vibe_relationship(
+        user_id, relationship_data
+    )
+
+    return {
+        "success": True,
+        "relationshipId": relationship_id,
+        "message": f"已保存 {args.get('name')} 的信息"
+    }
+
+
+@tool_handler("save_synastry_insight")
+async def execute_save_synastry_insight(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    保存合盘洞察到 VibeRelationship
+    """
+    user_id = context.user_id
+    relationship_id = args.get("relationship_id")
+    skill_id = args.get("skill_id", "zodiac")
+    insight = args.get("insight", {})
+
+    if not relationship_id:
+        return {"success": False, "error": "relationship_id 是必需的"}
+
+    success = await UnifiedProfileRepository.save_synastry_insight(
+        user_id, relationship_id, skill_id, insight
+    )
+
+    if not success:
+        return {"success": False, "error": "关系对象不存在"}
+
+    return {
+        "success": True,
+        "message": "合盘洞察已保存"
+    }
+
+
+@tool_handler("get_synastry_history")
+async def execute_get_synastry_history(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    获取与某人的合盘历史
+    """
+    user_id = context.user_id
+    relationship_id = args.get("relationship_id")
+
+    if not relationship_id:
+        return {"success": False, "error": "relationship_id 是必需的"}
+
+    relationship = await UnifiedProfileRepository.get_vibe_relationship_by_id(
+        user_id, relationship_id
+    )
+
+    if not relationship:
+        return {"success": False, "error": "关系对象不存在"}
+
+    synastry = relationship.get("synastry", {})
+
+    return {
+        "success": True,
+        "relationship": {
+            "id": relationship.get("id"),
+            "name": relationship.get("name"),
+            "type": relationship.get("type"),
+            "typeLabel": _get_relationship_type_label(relationship.get("type")),
+            "lastSynastryAt": relationship.get("last_synastry_at")
+        },
+        "synastry": synastry
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_relationship_type_label(rel_type: str) -> str:
+    """获取关系类型的显示标签"""
+    labels = {
+        "romantic": "恋人",
+        "spouse": "伴侣",
+        "parent_child": "亲子",
+        "sibling": "兄弟姐妹",
+        "business": "合伙人",
+        "friend": "朋友"
+    }
+    return labels.get(rel_type, rel_type)
+
+
+def _get_relationship_type_icon(rel_type: str) -> str:
+    """获取关系类型的图标"""
+    icons = {
+        "romantic": "💕",
+        "spouse": "💍",
+        "parent_child": "👨‍👧",
+        "sibling": "👫",
+        "business": "🤝",
+        "friend": "👥"
+    }
+    return icons.get(rel_type, "👤")
+
+
+def _get_skill_display_name(skill_id: str) -> str:
+    """获取 Skill 的显示名称"""
+    names = {
+        "zodiac": "星座契合",
+        "bazi": "八字配对",
+        "jungastro": "心理契合"
+    }
+    return names.get(skill_id, skill_id)
+
+
+def _get_skill_icon(skill_id: str) -> str:
+    """获取 Skill 的图标"""
+    icons = {
+        "zodiac": "♈",
+        "bazi": "☯",
+        "jungastro": "🧠"
+    }
+    return icons.get(skill_id, "✨")
+
+
+def _get_score_label(score: int) -> str:
+    """根据分数获取评价标签"""
+    if score >= 85:
+        return "天作之合"
+    elif score >= 70:
+        return "默契组合"
+    elif score >= 55:
+        return "需要磨合"
+    elif score >= 40:
+        return "互补成长"
+    else:
+        return "挑战较多"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Privacy Pairing Tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_pairing_code")
+async def execute_show_pairing_code(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    显示用户的 Vibe 配对码
+
+    展示 PairingCodeCard
+    """
+    from services.pairing import PairingService
+
+    user_id = context.user_id
+    vibe_id = await PairingService.get_user_vibe_id(user_id)
+
+    if not vibe_id:
+        return {
+            "success": False,
+            "error": "无法获取配对码"
+        }
+
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "pairing_code",
+        "vibeId": vibe_id,
+        "hint": "分享此配对码给对方，TA 可以向你发起合盘请求"
+    }, context)
+
+
+@tool_handler("show_pairing_requests")
+async def execute_show_pairing_requests(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    显示待处理的配对请求列表
+
+    展示 PairingRequestCard
+    """
+    from services.pairing import PairingService
+
+    user_id = context.user_id
+    requests = await PairingService.get_pending_requests(user_id)
+
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "pairing_request_list",
+        "requests": requests,
+        "count": len(requests)
+    }, context)
+
+
+@tool_handler("request_pairing")
+async def execute_request_pairing(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    向另一用户发起配对请求
+    """
+    from services.pairing import PairingService
+
+    user_id = context.user_id
+    target_vibe_id = args.get("target_vibe_id")
+    relationship_type = args.get("relationship_type", "romantic")
+    message = args.get("message")
+
+    if not target_vibe_id:
+        return {
+            "success": False,
+            "error": "请提供对方的配对码 (Vibe ID)"
+        }
+
+    try:
+        result = await PairingService.request_pairing(
+            requester_id=user_id,
+            target_vibe_id=target_vibe_id,
+            relationship_type=relationship_type,
+            message=message,
+        )
+        return result
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@tool_handler("accept_pairing_request")
+async def execute_accept_pairing_request(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    接受配对请求并计算合盘
+    """
+    from services.pairing import PairingService
+    from uuid import UUID
+
+    user_id = context.user_id
+    request_id = args.get("request_id")
+
+    if not request_id:
+        return {
+            "success": False,
+            "error": "请提供配对请求 ID"
+        }
+
+    try:
+        result = await PairingService.accept_pairing(
+            request_id=UUID(request_id),
+            user_id=user_id,
+        )
+
+        # 展示隐私安全的合盘结果卡片
+        if result.get("success"):
+            await ToolRegistry.execute("show_card", {
+                "cardType": "privacy_synastry_result",
+                **result
+            }, context)
+
+        return result
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@tool_handler("reject_pairing_request")
+async def execute_reject_pairing_request(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    拒绝配对请求
+    """
+    from services.pairing import PairingService
+    from uuid import UUID
+
+    user_id = context.user_id
+    request_id = args.get("request_id")
+
+    if not request_id:
+        return {
+            "success": False,
+            "error": "请提供配对请求 ID"
+        }
+
+    try:
+        result = await PairingService.reject_pairing(
+            request_id=UUID(request_id),
+            user_id=user_id,
+        )
+        return result
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@tool_handler("generate_invite_link")
+async def execute_generate_invite_link(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    生成一次性邀请链接
+    """
+    from services.pairing import PairingService
+    import os
+
+    user_id = context.user_id
+    relationship_type = args.get("relationship_type", "romantic")
+    message = args.get("message")
+    base_url = os.getenv("VIBELIFE_BASE_URL", "https://vibelife.app")
+
+    try:
+        result = await PairingService.generate_invite_link(
+            creator_id=user_id,
+            relationship_type=relationship_type,
+            message=message,
+            base_url=base_url,
+        )
+
+        # 展示邀请链接卡片
+        if result.get("success"):
+            await ToolRegistry.execute("show_card", {
+                "cardType": "pairing_invite",
+                "url": result["url"],
+                "token": result["token"],
+                "relationshipType": result["relationshipType"],
+                "relationshipLabel": result["relationshipLabel"],
+                "expiresAt": result.get("expiresAt"),
+            }, context)
+
+        return result
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@tool_handler("show_privacy_synastry_result")
+async def execute_show_privacy_synastry_result(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    显示隐私安全的合盘结果
+
+    结果不包含任何原始出生数据
+    """
+    return await ToolRegistry.execute("show_card", {
+        "cardType": "privacy_synastry_result",
+        "person1": args.get("person1"),
+        "person2": args.get("person2"),
+        "overallScore": args.get("overall_score"),
+        "overallLabel": args.get("overall_label") or _get_score_label(args.get("overall_score", 0)),
+        "dimensions": args.get("dimensions", []),
+        "strengths": args.get("strengths", []),
+        "challenges": args.get("challenges", []),
+        "advice": args.get("advice", [])
+    }, context)
+
+
+@tool_handler("delete_synastry_result")
+async def execute_delete_synastry_result(
+    args: Dict[str, Any],
+    context: ToolContext
+) -> Dict[str, Any]:
+    """
+    删除自己的合盘记录
+    """
+    from services.pairing import PairingService
+    from uuid import UUID
+
+    user_id = context.user_id
+    partner_id = args.get("partner_id")
+
+    if not partner_id:
+        return {
+            "success": False,
+            "error": "请提供对方的用户 ID"
+        }
+
+    try:
+        result = await PairingService.delete_synastry_result(
+            user_id=user_id,
+            partner_id=UUID(partner_id),
+        )
+        return result
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }

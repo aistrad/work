@@ -1,0 +1,204 @@
+     1→from __future__ import annotations
+     2→
+     3→import json
+     4→import os
+     5→from datetime import datetime, timedelta
+     6→from typing import Any, Dict, Optional
+     7→
+     8→from fastapi import APIRouter, Request
+     9→from fastapi.responses import JSONResponse
+    10→from pydantic import BaseModel, Field
+    11→
+    12→from api.deps import require_auth, require_csrf
+    13→from common.a2ui import ValidationError, validate_a2ui
+    14→from common.logging import get_logger
+    15→from integrations import backend_router as be
+    16→from services import task_service
+    17→from stores import fortune_db
+    18→
+    19→
+    20→logger = get_logger(__name__)
+    21→
+    22→
+    23→router = APIRouter(prefix="/api/report", tags=["report"])
+    24→
+    25→
+    26→def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    27→    return JSONResponse({"ok": True, "data": data or {}})
+    28→
+    29→
+    30→def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    31→    return JSONResponse(
+    32→        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+    33→        status_code=status,
+    34→    )
+    35→
+    36→
+    37→class ReportSubmitRequest(BaseModel):
+    38→    backend: str = Field("cli", description="cli|gemini")
+    39→    model: str = Field("standard", description="standard|deep_research")
+    40→    system_prompt: Optional[str] = Field(None, description="Optional system prompt override")
+    41→
+    42→
+    43→def _profile_to_birth_data(user: Dict[str, Any]) -> Dict[str, Any]:
+    44→    birthday_local = user["birthday_local"]
+    45→    return {
+    46→        "name": str(user.get("name") or ""),
+    47→        "gender": str(user.get("gender") or ""),
+    48→        "year": int(birthday_local.year),
+    49→        "month": int(birthday_local.month),
+    50→        "day": int(birthday_local.day),
+    51→        "hour": int(birthday_local.hour),
+    52→        "minute": int(birthday_local.minute),
+    53→        "longitude": float((user.get("location") or {}).get("longitude")),
+    54→        "latitude": float((user.get("location") or {}).get("latitude")),
+    55→        "location_name": str((user.get("location") or {}).get("name") or ""),
+    56→    }
+    57→
+    58→
+    59→def _wrap_text_as_a2ui(text: str, summary: str = "") -> Dict[str, Any]:
+    60→    s = (summary or "").strip() or (text.strip().splitlines()[0][:80] if text else "报告")
+    61→    return {"meta": {"summary": s}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": text or "（空）"}]}
+    62→
+    63→
+    64→@router.post("/bazi/submit")
+    65→def submit_bazi_report(req: ReportSubmitRequest, request: Request):
+    66→    auth = require_auth(request)
+    67→    require_csrf(request, auth)
+    68→    user_id = int(auth["user_id"])
+    69→
+    70→    user = fortune_db.fetch_one(
+    71→        "SELECT name, gender, birthday_local, location FROM fortune_user WHERE user_id=%s AND deleted_at IS NULL",
+    72→        (user_id,),
+    73→    )
+    74→    if not user:
+    75→        return _err(404, "not_found", "user_not_found")
+    76→
+    77→    backend = (req.backend or "cli").strip().lower()
+    78→    if backend not in ("cli", "gemini"):
+    79→        return _err(400, "invalid_request", "invalid_backend")
+    80→
+    81→    model = (req.model or "standard").strip().lower()
+    82→    if model not in ("standard", "deep_research"):
+    83→        return _err(400, "invalid_request", "invalid_model")
+    84→
+    85→    birth_data = _profile_to_birth_data(user)
+    86→    openid = f"fortune_uid:{user_id}"
+    87→
+    88→    correlation_id = f"report:{user_id}:{int(datetime.utcnow().timestamp())}"
+    89→    job_id, _gemini_user_id, used_default, bazi = task_service.submit_bazi_task_v2(
+    90→        {
+    91→            "openid": openid,
+    92→            "src": "web",
+    93→            "model": model,
+    94→            "system_prompt": (req.system_prompt or None),
+    95→            **birth_data,
+    96→        },
+    97→        correlation_id=correlation_id,
+    98→        backend_hint=backend,
+    99→        force_nonce=str(int(datetime.utcnow().timestamp())),
+   100→    )
+   101→
+   102→    fortune_db.execute(
+   103→        """
+   104→        INSERT INTO fortune_external_job (user_id, session_id, provider, job_type, provider_job_id, status)
+   105→        VALUES (%s, NULL, %s, 'bazi_report', %s, 'processing')
+   106→        ON CONFLICT (provider, provider_job_id) DO UPDATE SET
+   107→          user_id = EXCLUDED.user_id,
+   108→          status = 'processing',
+   109→          updated_at = now()
+   110→        """,
+   111→        (user_id, backend, int(job_id)),
+   112→    )
+   113→
+   114→    logger.info(
+   115→        "bazi report submit",
+   116→        extra={"operation": "bazi_report_submit", "user_id": user_id, "backend": backend, "provider_job_id": int(job_id), "model": model},
+   117→    )
+   118→    return _ok({"job_id": int(job_id), "backend": backend, "status": "processing", "used_default_location": bool(used_default)})
+   119→
+   120→
+   121→@router.get("/bazi/{job_id}")
+   122→def get_bazi_report(job_id: int, request: Request, backend: Optional[str] = None):
+   123→    auth = require_auth(request)
+   124→    user_id = int(auth["user_id"])
+   125→
+   126→    backend_q = (backend or "").strip().lower()
+   127→    if backend_q and backend_q not in ("cli", "gemini"):
+   128→        return _err(400, "invalid_request", "invalid_backend")
+   129→
+   130→    mapping = fortune_db.fetch_one(
+   131→        """
+   132→        SELECT id, provider, status, provider_job_id, output_url, output_a2ui
+   133→        FROM fortune_external_job
+   134→        WHERE user_id=%s AND job_type='bazi_report' AND provider_job_id=%s
+   135→          AND (%s = '' OR provider=%s)
+   136→        """,
+   137→        (user_id, int(job_id), backend_q, backend_q),
+   138→    )
+   139→    if not mapping:
+   140→        return _err(404, "not_found", "job_not_found")
+   141→
+   142→    provider = str(mapping.get("provider") or "")
+   143→    tasks = be.get_tasks_by_job_id(int(job_id), backend=provider) or []
+   144→    if not tasks:
+   145→        fortune_db.execute(
+   146→            "UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s",
+   147→            ("no_tasks", int(mapping["id"])),
+   148→        )
+   149→        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "no_tasks"})
+   150→
+   151→    main = tasks[0]
+   152→    st = int(main.get("status", 0) or 0)
+   153→    if st < 0:
+   154→        fortune_db.execute("UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s", ("task_failed", int(mapping["id"])))
+   155→        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "task_failed"})
+   156→    if st < 10:
+   157→        fortune_db.execute("UPDATE fortune_external_job SET status='processing', updated_at=now(), last_polled_at=now() WHERE id=%s", (int(mapping["id"]),))
+   158→        return _ok({"job_id": int(job_id), "backend": provider, "status": "processing"})
+   159→
+   160→    output_text = main.get("output_text") or ""
+   161→    output_url = main.get("output_url") or ""
+   162→    a2ui: Dict[str, Any]
+   163→    content = ""
+   164→
+   165→    if output_text:
+   166→        try:
+   167→            a2ui = json.loads(output_text)
+   168→            validate_a2ui(a2ui)
+   169→        except ValidationError:
+   170→            content = output_text
+   171→            a2ui = _wrap_text_as_a2ui(output_text, summary="模型返回非规范 A2UI，已按 Markdown 展示")
+   172→        except Exception:
+   173→            content = output_text
+   174→            a2ui = _wrap_text_as_a2ui(output_text)
+   175→    elif output_url:
+   176→        content = f"报告已生成，请点击下载：\n\n[下载报告]({output_url})"
+   177→        a2ui = _wrap_text_as_a2ui(content, summary="报告已生成（文档链接）")
+   178→    else:
+   179→        fortune_db.execute(
+   180→            "UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s",
+   181→            ("task_missing_output", int(mapping["id"])),
+   182→        )
+   183→        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "task_missing_output"})
+   184→
+   185→    fortune_db.execute(
+   186→        """
+   187→        UPDATE fortune_external_job
+   188→        SET
+   189→          status='completed',
+   190→          updated_at=now(),
+   191→          last_polled_at=now(),
+   192→          output_url=%s,
+   193→          output_a2ui=%s::jsonb
+   194→        WHERE id=%s
+   195→        """,
+   196→        (str(output_url or ""), json.dumps(a2ui, ensure_ascii=False), int(mapping["id"])),
+   197→    )
+   198→
+   199→    return _ok({"job_id": int(job_id), "backend": provider, "status": "completed", "output_url": str(output_url or ""), "a2ui": a2ui, "content": content})
+   200→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,364 @@
+"""
+Zodiac Skill Tool Handlers - 星座工具执行器
+
+使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+"""
+import logging
+from datetime import datetime
+from typing import Dict, Any
+
+from services.agent.tool_registry import tool_handler, ToolContext
+
+logger = logging.getLogger(__name__)
+
+
+@tool_handler("calculate_zodiac")
+async def execute_calculate_zodiac(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    计算用户星盘 - 使用 Swiss Ephemeris 精确计算
+
+    这是 SOP P2 阶段的核心工具，负责：
+    1. 从 args 或 profile 获取出生信息
+    2. 调用 Swiss Ephemeris 计算精确星盘
+    3. 返回计算结果供后续分析使用
+    """
+    from services.agent.tool_registry import ToolRegistry
+    from skills.zodiac.services import calculate_zodiac as calc_zodiac
+
+    profile = context.profile or {}
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+
+    # 优先使用 args 中的参数，否则从 profile 读取
+    birth_date = args.get("birth_date") or birth_info.get("date")
+    birth_time = args.get("birth_time") or birth_info.get("time", "12:00")
+    birth_place = args.get("birth_place") or birth_info.get("place", "Shanghai")
+    gender = args.get("gender") or birth_info.get("gender")
+
+    if not birth_date:
+        return {
+            "status": "error",
+            "error": "需要出生日期才能计算星盘",
+            "action": "collect_birth_info"
+        }
+
+    try:
+        # 检查用户是否已有出生信息
+        user_has_birth_info = bool(birth_info.get("date"))
+
+        # 使用 Swiss Ephemeris 计算精确星盘
+        chart = calc_zodiac(
+            birth_date=birth_date,
+            birth_time=birth_time,
+            birth_place=birth_place
+        )
+
+        logger.info(f"Calculated zodiac chart for user {context.user_id}: "
+                   f"Sun={chart.get('sun_sign')}, Moon={chart.get('moon_sign')}, "
+                   f"Rising={chart.get('rising_sign')}")
+
+        # 构建卡片数据用于展示
+        card_data = {
+            "userId": context.user_id,
+            "birthInfo": {
+                "date": birth_date,
+                "time": birth_time,
+                "place": birth_place,
+            },
+            "sunSign": chart.get("sun_sign_chinese", chart.get("sun_sign")),
+            "moonSign": chart.get("moon_sign_chinese", chart.get("moon_sign")),
+            "risingSign": chart.get("rising_sign_chinese", chart.get("rising_sign")),
+            "planets": chart.get("planets", []),
+            "aspects": chart.get("aspects", []),
+            "dominantElement": chart.get("dominant_element"),
+            "dominantModality": chart.get("dominant_modality"),
+            # 完整 chart 数据供后续使用
+            "_chart": chart,
+        }
+
+        # v9.2: 如果用户没有保存出生信息，添加提示
+        if not user_has_birth_info and context.user_id and context.user_id != "guest":
+            card_data["_hint"] = {
+                "action": "ask_save_birth_info",
+                "message": "用户尚未保存出生信息。请询问用户是否将此出生信息保存为个人档案，方便下次使用。如果用户同意，调用 save_birth_info 工具。",
+                "birth_info_to_save": {
+                    "date": birth_date,
+                    "time": birth_time,
+                    "gender": gender,
+                    "place": birth_place,
+                }
+            }
+
+        # 展示星盘卡片
+        return await ToolRegistry.execute(
+            "show_card",
+            {
+                "card_type": "custom",
+                "data_source": {"type": "inline", "data": card_data},
+                "options": {"componentId": "zodiac_chart"}
+            },
+            context
+        )
+
+    except Exception as e:
+        logger.error(f"calculate_zodiac failed: {e}")
+        return {
+            "status": "error",
+            "error": f"星盘计算失败: {str(e)}",
+        }
+
+
+@tool_handler("collect_zodiac_info")
+async def execute_collect_zodiac_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """收集用户出生信息用于星盘分析"""
+    fields = [
+        {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+        {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+        {"id": "birthPlace", "label": "出生地点", "type": "location", "required": True, "placeholder": "城市名"},
+    ]
+
+    return {
+        "status": "collecting",
+        "cardType": "collect_form",
+        "formType": "birth_info",
+        "title": "请填写出生信息",
+        "description": "准确的出生时间和地点对于星盘分析至关重要",
+        "fields": fields,
+    }
+
+
+@tool_handler("show_zodiac_chart")
+async def execute_show_zodiac_chart(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示星盘 - V7 委托模式
+
+    支持两种数据来源：
+    1. args 参数直接传入（优先）- LLM 从 calculate_zodiac 结果传递
+    2. skill_data 缓存（备用）- 从用户数据读取
+    """
+    from services.agent.tool_registry import ToolRegistry
+
+    profile = context.profile or {}
+    skill_data = context.skill_data or {}
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+
+    # 优先从 args 获取星盘数据（LLM 可以直接传递 calculate_zodiac 的结果）
+    chart = {}
+    if args.get("sun_sign") or args.get("sunSign"):
+        # 从 args 构建 chart
+        chart = {
+            "sun_sign": args.get("sun_sign") or args.get("sunSign"),
+            "moon_sign": args.get("moon_sign") or args.get("moonSign"),
+            "rising_sign": args.get("rising_sign") or args.get("risingSign"),
+            "planets": args.get("planets", []),
+            "aspects": args.get("aspects", []),
+            "dominant_element": args.get("dominant_element") or args.get("dominantElement"),
+            "dominant_modality": args.get("dominant_modality") or args.get("dominantModality"),
+        }
+        # 也更新 birth_info
+        if args.get("birth_date"):
+            birth_info = {
+                "date": args.get("birth_date"),
+                "time": args.get("birth_time"),
+                "place": args.get("birth_place"),
+            }
+
+    # 如果 args 没有，从 skill_data 读取
+    if not chart:
+        zodiac_data = skill_data.get("zodiac", {})
+        chart = zodiac_data.get("chart", {}) if zodiac_data else {}
+
+    # 如果仍然没有星盘数据，提示先计算
+    if not chart or not chart.get("sun_sign"):
+        return {
+            "status": "error",
+            "error": "尚未计算星盘，请先调用 calculate_zodiac",
+            "action": "calculate_zodiac"
+        }
+
+    # 构建卡片数据
+    card_data = {
+        "userId": context.user_id,
+        "birthInfo": {
+            "date": birth_info.get("date"),
+            "time": birth_info.get("time"),
+            "place": birth_info.get("place"),
+        },
+        "sunSign": chart.get("sun_sign_chinese") or chart.get("sun_sign"),
+        "moonSign": chart.get("moon_sign_chinese") or chart.get("moon_sign"),
+        "risingSign": chart.get("rising_sign_chinese") or chart.get("rising_sign"),
+        "planets": chart.get("planets", []),
+        "aspects": chart.get("aspects", []),
+        "dominantElement": chart.get("dominant_element"),
+        "dominantModality": chart.get("dominant_modality"),
+    }
+
+    logger.info(f"Showing zodiac chart via show_card for user {context.user_id}")
+
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": card_data},
+            "options": {"componentId": "zodiac_chart"}
+        },
+        context
+    )
+
+
+@tool_handler("show_zodiac_transit")
+async def execute_show_zodiac_transit(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示行运分析 - V7 委托模式"""
+    from services.agent.tool_registry import ToolRegistry
+    from skills.zodiac.services import calculate_transit, calculate_zodiac
+
+    profile = context.profile or {}
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+
+    # 获取出生信息
+    birth_date = birth_info.get("date")
+    birth_time = birth_info.get("time", "12:00")
+    birth_place = birth_info.get("place", "Shanghai")
+
+    transit_date = args.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+    # 如果没有出生信息，返回通用行运
+    if not birth_date:
+        card_data = {
+            "date": transit_date,
+            "transits": [],
+            "majorEvents": [],
+            "overallEnergy": "请先提供出生信息以获取个性化行运分析。",
+            "advice": "完善出生信息后，可以看到行星对你本命盘的具体影响。",
+            "needBirthInfo": True,
+        }
+        return await ToolRegistry.execute(
+            "show_card",
+            {
+                "card_type": "custom",
+                "data_source": {"type": "inline", "data": card_data},
+                "options": {"componentId": "zodiac_transit"}
+            },
+            context
+        )
+
+    try:
+        # 计算行运
+        transits = calculate_transit(
+            birth_date=birth_date,
+            birth_time=birth_time,
+            birth_place=birth_place,
+            transit_date=transit_date
+        )
+
+        # 生成整体能量描述
+        positive_count = sum(1 for t in transits if t.get("influence") == "positive")
+        challenging_count = sum(1 for t in transits if t.get("influence") == "challenging")
+
+        if positive_count > challenging_count:
+            overall_energy = "整体能量积极，适合推进重要事项。"
+            advice = "把握有利时机，主动出击。"
+        elif challenging_count > positive_count:
+            overall_energy = "整体能量需要调整，适合反思和准备。"
+            advice = "放慢脚步，处理好细节问题。"
+        else:
+            overall_energy = "能量平衡，稳中求进。"
+            advice = "保持节奏，按计划推进。"
+
+        card_data = {
+            "date": transit_date,
+            "transits": transits,
+            "majorEvents": [],
+            "overallEnergy": overall_energy,
+            "advice": advice,
+        }
+
+        logger.info(f"Showing zodiac transit via show_card for user {context.user_id}")
+
+        return await ToolRegistry.execute(
+            "show_card",
+            {
+                "card_type": "custom",
+                "data_source": {"type": "inline", "data": card_data},
+                "options": {"componentId": "zodiac_transit"}
+            },
+            context
+        )
+    except Exception as e:
+        logger.error(f"show_zodiac_transit failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("show_zodiac_synastry")
+async def execute_show_zodiac_synastry(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示合盘分析 - V7 委托模式"""
+    from services.agent.tool_registry import ToolRegistry
+    from skills.zodiac.services import calculate_synastry
+
+    profile = context.profile or {}
+    identity = profile.get("identity", {})
+    birth_info = identity.get("birth_info", {})
+
+    # 获取用户出生信息
+    person1_birth_date = birth_info.get("date")
+    person1_birth_time = birth_info.get("time", "12:00")
+    person1_birth_place = birth_info.get("place", "Shanghai")
+
+    # 获取对方出生信息
+    person2_birth_date = args.get("partner_birth_date")
+    person2_birth_time = args.get("partner_birth_time", "12:00")
+    person2_birth_place = args.get("partner_birth_place", "Shanghai")
+
+    # 检查必要信息
+    if not person1_birth_date:
+        return {
+            "status": "error",
+            "error": "请先提供你的出生信息",
+            "needBirthInfo": True,
+        }
+
+    if not person2_birth_date:
+        return {
+            "status": "error",
+            "error": "请提供对方的出生日期",
+            "needPartnerInfo": True,
+        }
+
+    try:
+        # 计算合盘
+        result = calculate_synastry(
+            person1_birth_date=person1_birth_date,
+            person1_birth_time=person1_birth_time,
+            person1_birth_place=person1_birth_place,
+            person2_birth_date=person2_birth_date,
+            person2_birth_time=person2_birth_time,
+            person2_birth_place=person2_birth_place,
+        )
+
+        if "error" in result:
+            return {
+                "status": "error",
+                "error": result["error"],
+            }
+
+        logger.info(f"Showing zodiac synastry via show_card for user {context.user_id}")
+
+        return await ToolRegistry.execute(
+            "show_card",
+            {
+                "card_type": "custom",
+                "data_source": {"type": "inline", "data": result},
+                "options": {"componentId": "zodiac_synastry"}
+            },
+            context
+        )
+    except Exception as e:
+        logger.error(f"show_zodiac_synastry failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }

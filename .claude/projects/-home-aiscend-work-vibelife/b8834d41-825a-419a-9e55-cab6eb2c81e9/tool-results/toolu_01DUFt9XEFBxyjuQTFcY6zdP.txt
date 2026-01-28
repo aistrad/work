@@ -1,0 +1,571 @@
+     1→"""
+     2→Model Router - Core Router
+     3→Main routing logic for model selection
+     4→
+     5→配置优先级：
+     6→1. 数据库动态规则（用户层级、A/B测试、配额）
+     7→2. YAML 配置文件（模型定义、默认路由、fallback 链）
+     8→3. 代码默认值（仅作为最终兜底）
+     9→"""
+    10→import os
+    11→import logging
+    12→import hashlib
+    13→from typing import Optional, List, Dict, Any
+    14→from datetime import datetime
+    15→import time
+    16→
+    17→from .models import (
+    18→    ModelContext, ModelSelection, ModelRoute, Model, ModelProvider,
+    19→    QuotaCheckResult, ModelCallLog, ExceedAction
+    20→)
+    21→from .repository import get_repository
+    22→from .cache import get_cache
+    23→from .quota import get_quota_manager
+    24→from .config import get_model_config, ModelConfig
+    25→
+    26→logger = logging.getLogger(__name__)
+    27→
+    28→
+    29→class ModelRouter:
+    30→    """
+    31→    模型路由器
+    32→
+    33→    职责：
+    34→    - 根据上下文选择最合适的模型
+    35→    - 处理配额超限降级
+    36→    - 执行 A/B 测试分流
+    37→    - 记录调用日志
+    38→    """
+    39→
+    40→    def __init__(self):
+    41→        self._repo = get_repository()
+    42→        self._cache = get_cache()
+    43→        self._quota = get_quota_manager()
+    44→
+    45→        # 模型缓存（内存中的快速查找表）
+    46→        self._models_map: Dict[str, Model] = {}
+    47→        self._providers_map: Dict[str, ModelProvider] = {}
+    48→
+    49→    async def resolve(
+    50→        self,
+    51→        context: ModelContext,
+    52→        required_capability: Optional[str] = None
+    53→    ) -> ModelSelection:
+    54→        """
+    55→        解析上下文，返回最终的模型选择
+    56→
+    57→        Args:
+    58→            context: 请求上下文
+    59→            required_capability: 必需的模型能力（如 "image_gen"）
+    60→
+    61→        Returns:
+    62→            ModelSelection 包含最终选择的模型和相关信息
+    63→        """
+    64→        start_time = time.time()
+    65→
+    66→        try:
+    67→            # 1. 加载配置（带缓存）
+    68→            await self._ensure_config_loaded()
+    69→
+    70→            # 2. 获取匹配的路由规则
+    71→            routes = await self._get_matching_routes(context)
+    72→
+    73→            if not routes:
+    74→                # 没有匹配的规则，使用全局默认
+    75→                return await self._get_default_selection(context, required_capability)
+    76→
+    77→            # 3. 遍历规则（按优先级），找到第一个可用的
+    78→            for route in routes:
+    79→                selection = await self._try_route(route, context, required_capability)
+    80→                if selection:
+    81→                    return selection
+    82→
+    83→            # 4. 所有规则都失败，使用默认
+    84→            return await self._get_default_selection(context, required_capability)
+    85→
+    86→        except Exception as e:
+    87→            logger.error(f"Model routing failed: {e}")
+    88→            # 出错时返回安全的默认值
+    89→            return self._get_fallback_selection()
+    90→
+    91→    async def resolve_with_logging(
+    92→        self,
+    93→        context: ModelContext,
+    94→        required_capability: Optional[str] = None
+    95→    ) -> ModelSelection:
+    96→        """
+    97→        解析并记录日志
+    98→
+    99→        与 resolve() 相同，但会自动记录调用日志
+   100→        """
+   101→        start_time = time.time()
+   102→        selection = await self.resolve(context, required_capability)
+   103→
+   104→        # 异步记录日志（不阻塞主流程）
+   105→        latency_ms = int((time.time() - start_time) * 1000)
+   106→        try:
+   107→            log = ModelCallLog(
+   108→                user_id=context.user_id,
+   109→                session_id=context.session_id,
+   110→                skill=context.skill,
+   111→                task=context.task,
+   112→                route_id=selection.route_id,
+   113→                requested_model=selection.original_model_id or selection.model_id,
+   114→                actual_model=selection.model_id,
+   115→                was_downgraded=selection.was_downgraded,
+   116→                downgrade_reason=selection.downgrade_reason,
+   117→                status="success",
+   118→                latency_ms=latency_ms
+   119→            )
+   120→            await self._repo.log_model_call(log)
+   121→        except Exception as e:
+   122→            logger.warning(f"Failed to log model call: {e}")
+   123→
+   124→        return selection
+   125→
+   126→    async def record_completion(
+   127→        self,
+   128→        selection: ModelSelection,
+   129→        context: ModelContext,
+   130→        input_tokens: int = 0,
+   131→        output_tokens: int = 0,
+   132→        status: str = "success",
+   133→        error_message: Optional[str] = None,
+   134→        latency_ms: Optional[int] = None
+   135→    ) -> None:
+   136→        """
+   137→        记录调用完成后的使用量
+   138→
+   139→        Args:
+   140→            selection: 之前的模型选择
+   141→            context: 请求上下文
+   142→            input_tokens: 输入 token 数
+   143→            output_tokens: 输出 token 数
+   144→            status: 状态 (success, error, timeout)
+   145→            error_message: 错误信息
+   146→            latency_ms: 延迟毫秒数
+   147→        """
+   148→        try:
+   149→            # 计算成本
+   150→            cost = await self._calculate_cost(
+   151→                selection.model_id,
+   152→                input_tokens,
+   153→                output_tokens
+   154→            )
+   155→
+   156→            # 更新配额使用量
+   157→            await self._quota.record_usage(
+   158→                context=context,
+   159→                model_id=selection.model_id,
+   160→                input_tokens=input_tokens,
+   161→                output_tokens=output_tokens,
+   162→                cost=cost
+   163→            )
+   164→
+   165→            # 记录调用日志
+   166→            log = ModelCallLog(
+   167→                user_id=context.user_id,
+   168→                session_id=context.session_id,
+   169→                skill=context.skill,
+   170→                task=context.task,
+   171→                route_id=selection.route_id,
+   172→                requested_model=selection.original_model_id or selection.model_id,
+   173→                actual_model=selection.model_id,
+   174→                was_downgraded=selection.was_downgraded,
+   175→                downgrade_reason=selection.downgrade_reason,
+   176→                input_tokens=input_tokens,
+   177→                output_tokens=output_tokens,
+   178→                estimated_cost=cost,
+   179→                status=status,
+   180→                latency_ms=latency_ms,
+   181→                error_message=error_message
+   182→            )
+   183→            await self._repo.log_model_call(log)
+   184→
+   185→        except Exception as e:
+   186→            logger.error(f"Failed to record completion: {e}")
+   187→
+   188→    # ═══════════════════════════════════════════════════════════════════════
+   189→    # Private Methods - Route Matching
+   190→    # ═══════════════════════════════════════════════════════════════════════
+   191→
+   192→    async def _ensure_config_loaded(self) -> None:
+   193→        """确保配置已加载到内存"""
+   194→        # 检查模型缓存
+   195→        if not self._models_map:
+   196→            models = await self._cache.get_models()
+   197→            if models is None:
+   198→                models = await self._repo.get_all_models()
+   199→                await self._cache.set_models(models)
+   200→            self._models_map = {m.id: m for m in models}
+   201→
+   202→        # 检查提供商缓存
+   203→        if not self._providers_map:
+   204→            providers = await self._cache.get_providers()
+   205→            if providers is None:
+   206→                providers = await self._repo.get_all_providers()
+   207→                await self._cache.set_providers(providers)
+   208→            self._providers_map = {p.id: p for p in providers}
+   209→
+   210→    async def _get_matching_routes(self, context: ModelContext) -> List[ModelRoute]:
+   211→        """获取匹配的路由规则"""
+   212→        # 先尝试缓存
+   213→        routes = await self._cache.get_routes()
+   214→        if routes is None:
+   215→            routes = await self._repo.get_all_routes()
+   216→            await self._cache.set_routes(routes)
+   217→
+   218→        # 过滤匹配的规则
+   219→        matching = []
+   220→        for route in routes:
+   221→            if self._route_matches(route, context):
+   222→                # A/B 测试检查
+   223→                if route.ab_test_group and route.ab_test_percentage:
+   224→                    if not self._ab_test_matches(route, context):
+   225→                        continue
+   226→                matching.append(route)
+   227→
+   228→        return matching
+   229→
+   230→    def _route_matches(self, route: ModelRoute, context: ModelContext) -> bool:
+   231→        """检查路由规则是否匹配上下文"""
+   232→        # NULL 表示不限制该条件
+   233→
+   234→        if route.match_user_id is not None:
+   235→            if context.user_id != route.match_user_id:
+   236→                return False
+   237→
+   238→        if route.match_user_tier is not None:
+   239→            if context.user_tier != route.match_user_tier:
+   240→                return False
+   241→
+   242→        if route.match_skill is not None:
+   243→            if context.skill != route.match_skill:
+   244→                return False
+   245→
+   246→        if route.match_task is not None:
+   247→            if context.task != route.match_task:
+   248→                return False
+   249→
+   250→        return True
+   251→
+   252→    def _ab_test_matches(self, route: ModelRoute, context: ModelContext) -> bool:
+   253→        """检查 A/B 测试是否命中"""
+   254→        if not context.user_id:
+   255→            return False
+   256→
+   257→        # 使用用户 ID 生成稳定的随机数（0-99）
+   258→        hash_input = f"{context.user_id}:{route.ab_test_group}"
+   259→        hash_value = int(hashlib.md5(hash_input.encode()).hexdigest()[:8], 16)
+   260→        bucket = hash_value % 100
+   261→
+   262→        return bucket < route.ab_test_percentage
+   263→
+   264→    async def _try_route(
+   265→        self,
+   266→        route: ModelRoute,
+   267→        context: ModelContext,
+   268→        required_capability: Optional[str] = None
+   269→    ) -> Optional[ModelSelection]:
+   270→        """
+   271→        尝试使用路由规则
+   272→
+   273→        Returns:
+   274→            成功则返回 ModelSelection，否则返回 None
+   275→        """
+   276→        model_id = route.model_id
+   277→
+   278→        # 检查能力要求
+   279→        if required_capability:
+   280→            model = self._models_map.get(model_id)
+   281→            if model and required_capability not in model.capabilities:
+   282→                # 模型不支持所需能力，尝试 fallback
+   283→                return await self._try_fallback(
+   284→                    route, context, required_capability,
+   285→                    reason=f"Model {model_id} does not support {required_capability}"
+   286→                )
+   287→
+   288→        # 检查配额
+   289→        quota_result = await self._quota.check_quota(context, model_id)
+   290→
+   291→        if quota_result.allowed:
+   292→            # 配额允许，返回选择
+   293→            return self._create_selection(model_id, route)
+   294→
+   295→        # 配额超限，根据策略处理
+   296→        if quota_result.exceed_action == ExceedAction.REJECT.value:
+   297→            # 拒绝请求
+   298→            logger.info(f"Quota exceeded, rejecting: {quota_result.message}")
+   299→            return None
+   300→
+   301→        if quota_result.exceed_action == ExceedAction.DOWNGRADE.value:
+   302→            # 降级到指定模型
+   303→            downgrade_to = quota_result.downgrade_to
+   304→            if downgrade_to:
+   305→                return await self._create_downgraded_selection(
+   306→                    original_model_id=model_id,
+   307→                    downgrade_to=downgrade_to,
+   308→                    route=route,
+   309→                    reason=quota_result.message or "Quota exceeded"
+   310→                )
+   311→
+   312→            # 没有指定降级模型，尝试 fallback 链
+   313→            return await self._try_fallback(
+   314→                route, context, required_capability,
+   315→                reason=quota_result.message or "Quota exceeded"
+   316→            )
+   317→
+   318→        # 其他情况（如 queue），暂不支持
+   319→        return None
+   320→
+   321→    async def _try_fallback(
+   322→        self,
+   323→        route: ModelRoute,
+   324→        context: ModelContext,
+   325→        required_capability: Optional[str] = None,
+   326→        reason: str = "Primary model unavailable"
+   327→    ) -> Optional[ModelSelection]:
+   328→        """尝试 fallback 链"""
+   329→        if not route.fallback_chain:
+   330→            return None
+   331→
+   332→        for fallback_model_id in route.fallback_chain:
+   333→            # 检查能力
+   334→            if required_capability:
+   335→                model = self._models_map.get(fallback_model_id)
+   336→                if model and required_capability not in model.capabilities:
+   337→                    continue
+   338→
+   339→            # 检查配额
+   340→            quota_result = await self._quota.check_quota(context, fallback_model_id)
+   341→            if quota_result.allowed:
+   342→                return await self._create_downgraded_selection(
+   343→                    original_model_id=route.model_id,
+   344→                    downgrade_to=fallback_model_id,
+   345→                    route=route,
+   346→                    reason=reason
+   347→                )
+   348→
+   349→        return None
+   350→
+   351→    # ═══════════════════════════════════════════════════════════════════════
+   352→    # Private Methods - Selection Building
+   353→    # ═══════════════════════════════════════════════════════════════════════
+   354→
+   355→    def _create_selection(
+   356→        self,
+   357→        model_id: str,
+   358→        route: Optional[ModelRoute] = None
+   359→    ) -> ModelSelection:
+   360→        """创建模型选择结果"""
+   361→        model = self._models_map.get(model_id)
+   362→        provider_id = model_id.split(":")[0] if ":" in model_id else ""
+   363→        provider = self._providers_map.get(provider_id)
+   364→
+   365→        # 获取 base_url（优先从环境变量读取）
+   366→        base_url = None
+   367→        if provider:
+   368→            if provider_id == "gemini":
+   369→                # Gemini 从环境变量读取
+   370→                base_url = os.getenv("GEMINI_BASE_URL", provider.base_url)
+   371→            else:
+   372→                base_url = provider.base_url
+   373→
+   374→        return ModelSelection(
+   375→            provider=provider_id,
+   376→            model=model.model_name if model else model_id.split(":")[-1],
+   377→            model_id=model_id,
+   378→            route_id=route.id if route else None,
+   379→            route_name=route.name if route else None,
+   380→            was_downgraded=False,
+   381→            max_tokens=model.max_tokens if model else 4096,
+   382→            base_url=base_url
+   383→        )
+   384→
+   385→    async def _create_downgraded_selection(
+   386→        self,
+   387→        original_model_id: str,
+   388→        downgrade_to: str,
+   389→        route: Optional[ModelRoute] = None,
+   390→        reason: str = "Downgraded"
+   391→    ) -> ModelSelection:
+   392→        """创建降级后的模型选择"""
+   393→        selection = self._create_selection(downgrade_to, route)
+   394→        selection.was_downgraded = True
+   395→        selection.original_model_id = original_model_id
+   396→        selection.downgrade_reason = reason
+   397→        return selection
+   398→
+   399→    async def _get_default_selection(
+   400→        self,
+   401→        context: ModelContext,
+   402→        required_capability: Optional[str] = None
+   403→    ) -> ModelSelection:
+   404→        """获取默认模型选择（从配置文件读取）"""
+   405→        # 从 YAML 配置获取默认路由
+   406→        config = get_model_config()
+   407→        capability = required_capability or context.task or "chat"
+   408→
+   409→        # 获取 fallback 链（包括 primary）
+   410→        fallback_chain = config.get_fallback_chain(capability, context.user_tier)
+   411→
+   412→        for model_id in fallback_chain:
+   413→            # 构建完整的 model_id（如果需要）
+   414→            full_model_id = model_id
+   415→            model_def = config.get_model(model_id)
+   416→
+   417→            if model_def:
+   418→                full_model_id = f"{model_def.provider}:{model_id}"
+   419→
+   420→                # 检查能力要求
+   421→                if required_capability and required_capability not in model_def.capabilities:
+   422→                    continue
+   423→
+   424→            # 检查配额
+   425→            quota_result = await self._quota.check_quota(context, full_model_id)
+   426→            if quota_result.allowed:
+   427→                return self._create_selection_from_config(model_id, model_def)
+   428→
+   429→            # 配额超限但有降级目标
+   430→            if quota_result.downgrade_to:
+   431→                return await self._create_downgraded_selection(
+   432→                    original_model_id=full_model_id,
+   433→                    downgrade_to=quota_result.downgrade_to,
+   434→                    reason="Default model quota exceeded"
+   435→                )
+   436→
+   437→        # 所有模型都不可用，使用全局兜底
+   438→        return self._get_fallback_selection()
+   439→
+   440→    def _get_fallback_selection(self) -> ModelSelection:
+   441→        """获取最终兜底选择（从配置文件读取）"""
+   442→        config = get_model_config()
+   443→        fallback_id = config.global_fallback
+   444→        model_def = config.get_model(fallback_id)
+   445→
+   446→        if model_def:
+   447→            provider_config = config.get_provider(model_def.provider)
+   448→            return ModelSelection(
+   449→                provider=model_def.provider,
+   450→                model=model_def.model_name,
+   451→                model_id=f"{model_def.provider}:{fallback_id}",
+   452→                was_downgraded=False,
+   453→                base_url=provider_config.base_url if provider_config else None
+   454→            )
+   455→
+   456→        # 最终兜底 - 使用配置中的 global_fallback
+   457→        config = get_model_config()
+   458→        global_fb = config.global_fallback or "glm-4-flash"
+   459→        logger.warning(f"Fallback model {fallback_id} not found in config, using global_fallback: {global_fb}")
+   460→        return ModelSelection(
+   461→            provider="glm",
+   462→            model=global_fb,
+   463→            model_id=f"glm:{global_fb}",
+   464→            was_downgraded=False
+   465→        )
+   466→
+   467→    def _create_selection_from_config(
+   468→        self,
+   469→        model_id: str,
+   470→        model_def = None
+   471→    ) -> ModelSelection:
+   472→        """从配置创建模型选择"""
+   473→        config = get_model_config()
+   474→
+   475→        if model_def is None:
+   476→            model_def = config.get_model(model_id)
+   477→
+   478→        if model_def:
+   479→            provider_config = config.get_provider(model_def.provider)
+   480→            return ModelSelection(
+   481→                provider=model_def.provider,
+   482→                model=model_def.model_name,
+   483→                model_id=f"{model_def.provider}:{model_id}",
+   484→                was_downgraded=False,
+   485→                base_url=provider_config.base_url if provider_config else None
+   486→            )
+   487→
+   488→        # 模型未在配置中定义，尝试从数据库查找
+   489→        return self._create_selection(model_id)
+   490→
+   491→    # ═══════════════════════════════════════════════════════════════════════
+   492→    # Private Methods - Cost Calculation
+   493→    # ═══════════════════════════════════════════════════════════════════════
+   494→
+   495→    async def _calculate_cost(
+   496→        self,
+   497→        model_id: str,
+   498→        input_tokens: int,
+   499→        output_tokens: int
+   500→    ) -> float:
+   501→        """计算调用成本"""
+   502→        model = self._models_map.get(model_id)
+   503→        if not model:
+   504→            return 0.0
+   505→
+   506→        cost = 0.0
+   507→
+   508→        if model.cost_per_1k_input and input_tokens:
+   509→            cost += (input_tokens / 1000) * float(model.cost_per_1k_input)
+   510→
+   511→        if model.cost_per_1k_output and output_tokens:
+   512→            cost += (output_tokens / 1000) * float(model.cost_per_1k_output)
+   513→
+   514→        return cost
+   515→
+   516→    # ═══════════════════════════════════════════════════════════════════════
+   517→    # Public Utility Methods
+   518→    # ═══════════════════════════════════════════════════════════════════════
+   519→
+   520→    async def get_available_models(
+   521→        self,
+   522→        capability: Optional[str] = None
+   523→    ) -> List[Model]:
+   524→        """获取可用的模型列表"""
+   525→        await self._ensure_config_loaded()
+   526→
+   527→        models = list(self._models_map.values())
+   528→
+   529→        if capability:
+   530→            models = [m for m in models if capability in m.capabilities]
+   531→
+   532→        return models
+   533→
+   534→    async def get_quota_status(
+   535→        self,
+   536→        context: ModelContext,
+   537→        model_id: str
+   538→    ) -> List[dict]:
+   539→        """获取配额状态"""
+   540→        return await self._quota.get_quota_status(context, model_id)
+   541→
+   542→    async def invalidate_cache(self) -> None:
+   543→        """使缓存失效（配置变更后调用）"""
+   544→        await self._cache.invalidate_all()
+   545→        self._models_map.clear()
+   546→        self._providers_map.clear()
+   547→        logger.info("Model router cache invalidated")
+   548→
+   549→    def get_cache_stats(self) -> Dict[str, Any]:
+   550→        """获取缓存统计"""
+   551→        return self._cache.get_stats()
+   552→
+   553→
+   554→# ═══════════════════════════════════════════════════════════════════════════
+   555→# Global Instance
+   556→# ═══════════════════════════════════════════════════════════════════════════
+   557→
+   558→_router: Optional[ModelRouter] = None
+   559→
+   560→
+   561→def get_model_router() -> ModelRouter:
+   562→    """获取模型路由器实例"""
+   563→    global _router
+   564→    if _router is None:
+   565→        _router = ModelRouter()
+   566→    return _router
+   567→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

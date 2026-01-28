@@ -1,0 +1,62 @@
+  P0 级错误（需尽快修复）
+
+  - vibe.goals 写入位置错误
+      - 现状：在 save handler 的 vibe.goals 分支对合并后的结果调用 update_vibe_profile(...)，实际写入的是 vibe.profile.goals，而 v2.0
+        预期目标是顶层 vibe.goals。这会导致顶层 goals 与 profile.goals 可能长期不一致。文件: apps/api/skills/core/tools/
+        handlers.py:257–283
+      - 建议修复：
+          - 列表合并后使用 update_by_path(user_id, "vibe.goals", merged[:10])
+          - 单条 upsert 同理，最终也写 update_by_path(user_id, "vibe.goals", updated_list)
+      - 同时保留读取侧对 profile.goals 的兜底即可（get_vibe() 已做）。
+
+  P1 一致性/健壮性问题
+
+  - merge 参数未被使用
+      - tools.yaml 暴露 merge: boolean（默认 true），但 save handler 未依据该参数调整合并/覆盖策略，易引导 LLM 误判。文件: apps/api/
+        skills/core/tools/tools.yaml:158–166, handlers.execute_save
+      - 建议：在 vibe.profile.*/vibe.state.*/vibe.goals 分支读取此参数：merge=false 时直接覆盖（goals 覆盖须显式约束），merge=true 执
+        行当前逻辑。
+  - 读取返回值的空值不一致
+      - vibe.profile.xxx 嵌套读取缺失时返回 {}，而 vibe.state.xxx 缺失时返回 None。文件: apps/api/skills/core/tools/handlers.py:400–
+        437
+      - 建议：统一缺失时返回 null（None）或统一为空对象，保持接口一致性（推荐 None）。
+  - 迁移脚本重复与使用指引
+      - 顶层 scripts/migrate_vibe_v2.py 与 apps/api/scripts/migrate_vibe_v2.py 同名/同职能并存，易混淆。建议在 README/设计文档标注“推
+        荐脚本路径”，或保留一个为别名并打印显式提示。
+      - 顶层脚本依赖 PYTHONPATH 才能导入 apps.api.stores.db。建议在脚本头部注入路径或在 docs 中固定运行命令：PYTHONPATH=$REPO python
+        scripts/migrate_vibe_v2.py。文件: scripts/migrate_vibe_v2.py:14–17
+  - 兼容便捷函数的遗留结构
+      - get_unified_profile_with_skill 仍返回 skill_data（旧键），而现行结构使用 skills。可能影响旧调用方数据感知。文件: apps/api/
+        stores/unified_profile_repo.py:2261
+      - 建议：在便捷函数中将 skills 赋给 skill_data 作兼容映射，或显式在注释中标注仅旧接口使用。
+  - 逐条 timeline 追加的开销
+      - list 传入时 for 循环逐条写库（多次 IO）。文件: apps/api/skills/core/tools/handlers.py:246–254
+      - 建议：新增仓储批量追加（一次读 + 合并 + 限长 + 一次写），或在 handler 中合并后单写，减少写放大。
+
+  P2 清洁度/文档同步
+
+  - 未使用导入：date 未用。文件: apps/api/stores/unified_profile_repo.py:42
+  - 注释/命名残留：get_vibe_profile/get_vibe_current docstring 仍含 v13/旧三层描述，建议更新为 v2.0 术语。
+  - 运行指引完善：
+      - 迁移脚本的 logging.basicConfig（apps 版本已有，顶层版本建议补上）与 dry-run 旗标（可选）。
+      - 在 DESIGN.md 增补“merge 参数语义”与“goals 顶层写入”作为刚性约束。
+
+  风险与后效建议
+
+  - 并发写入
+      - 目前 goals 的“读→合并→写”无版本控制，建议后续在仓储引入乐观锁（expected updated_at）或提供 upsert_by 动作（title 为键）。
+  - 缓存一致性
+      - handler 每次写后均 invalidate_profile_cache，符合预期。若未来引入批量追加，应确保只失效一次。
+  - 回归测试建议点位
+      - save vibe.goals 列表 + 单条 upsert 后使用 read 校验顶层 vibe.goals 变更（覆盖当前写入到 profile.goals 的错误）。
+      - vibe.profile.identity.*/vibe.profile.context.* 的 merge/覆盖在 merge=false/true 下的差异（修复后）。
+
+  快速修复清单（最小改动）
+
+  - apps/api/skills/core/tools/handlers.py:257 起的 vibe.goals 分支将所有 update_vibe_profile(user_uuid, {"goals": ...}) 调用替换为：
+      - 列表：await UnifiedProfileRepository.update_by_path(user_uuid, "vibe.goals", merged[:10])
+      - 单条：await UnifiedProfileRepository.update_by_path(user_uuid, "vibe.goals", current_goals[:10])
+  - handlers.execute_save 读取 merge 参数，并在 vibe.profile.*、vibe.state.* 分支（由通用 update_by_path 兜底）根据 merge 决定覆盖或
+    合并（profile.* 建议默认 merge；state.* 默认覆盖；goals 默认合并、允许显式覆盖时需额外标志）。
+  - 顶层迁移脚本头部加 logging.basicConfig 与使用提示；README 或 DESIGN.md 更新一处“如何运行迁移”的指引。
+  - 可选：统一 read 缺省返回值风格，清理未用导入与残留注释。

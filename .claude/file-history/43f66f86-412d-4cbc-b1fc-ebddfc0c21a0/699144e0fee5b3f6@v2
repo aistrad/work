@@ -1,0 +1,447 @@
+# 对话上下文丢失问题分析报告
+
+> 分析对象：用户提供出生信息后切换 Skill 时数据丢失的问题
+> 日期：2026-01-21
+
+---
+
+## 1. 问题复现
+
+### 对话流程
+
+| 轮次 | 用户输入 | 系统行为 | 问题 |
+|-----|---------|---------|------|
+| 1 | "我的生日" | 要求提供出生信息 | ✅ 正常 |
+| 2 | "1980-02-11 14:30" | 说还需要出生地点和性别 | ✅ 正常 |
+| 3 | "beijing, male" | 提供多个选择（八字、占星、VibeID） | ✅ 正常 |
+| 4 | "八字" | **再次要求填写出生信息** | ❌ 问题 |
+
+### 期望行为
+
+用户在第 3 轮已经提供了完整信息：
+- 日期：1980-02-11
+- 时间：14:30
+- 地点：beijing
+- 性别：male
+
+在第 4 轮选择"八字"后，系统应该**直接使用这些信息进行排盘**，而不是重新要求填写。
+
+---
+
+## 2. 技术原因分析
+
+### 2.1 CoreAgent 分阶段加载机制
+
+VibeLife 使用 **Phase 1 / Phase 2** 分阶段加载机制：
+
+```
+Phase 1 (无 Skill)           Phase 2 (有 Skill)
+──────────────────           ──────────────────
+轻量级 Prompt               完整 Prompt
+不加载 profile               加载 profile
+不加载 skill_data            加载 skill_data
+工具：路由工具               工具：专业工具
+```
+
+**核心代码**（`apps/api/services/agent/core.py:476-773`）：
+
+```python
+async def _build_system_prompt(self, message: str, context: AgentContext) -> str:
+    if self._active_skill:
+        # Phase 2: 完整上下文
+        user_ctx = dict(context.profile) if context.profile else {}
+        base_prompt = build_system_prompt(self._active_skill, self._active_scenario, user_ctx)
+    else:
+        # Phase 1: 轻量级路由
+        core_prompt = get_phase1_prompt()  # 从 routing.yaml 加载
+```
+
+### 2.2 数据传递链断裂
+
+**问题流程**：
+
+```
+1. 用户在 Phase 1 提供出生信息
+   └─ Core Skill 收到："1980-02-11 14:30, beijing, male"
+
+2. Core Skill 仅用文字回复
+   └─ ❌ 没有调用 save_birth_info 工具保存到数据库
+
+3. 用户说"八字" → activate_skill(skill='bazi')
+   └─ 触发 Phase 1 → Phase 2 切换
+
+4. activate_skill 从数据库加载 profile
+   └─ ❌ 数据库中 profile.identity.birth_info 为空（因为第 2 步没保存）
+
+5. Bazi Skill 检查 SOP 状态
+   └─ has_birth_info = False → 要求用户重新填写
+```
+
+**核心代码**（`apps/api/services/agent/core.py:849-916`）：
+
+```python
+async def _handle_activate_skill(self, args, context):
+    skill = args.get("skill")
+    self._active_skill = skill
+
+    # 从数据库加载 profile
+    result = await get_cached_profile_with_skill(user_id, skill)
+    self._context.profile = result.get("profile", {})  # ⚠️ 如果数据库没有，profile 为空
+    self._context.skill_data = result.get("skill_data", {})
+```
+
+**SOP 状态检查**（`apps/api/services/agent/core.py:502-541`）：
+
+```python
+def _compute_sop_status(self, context: AgentContext):
+    identity = context.profile.get("identity", {}) if context.profile else {}
+    birth_info = identity.get("birth_info", {})
+    has_birth = bool(birth_info.get("birth_date") or birth_info.get("date"))  # ⚠️ 为 False
+
+    return {
+        "has_birth_info": has_birth,  # False
+        "ready_for_analysis": (not needs_birth or has_birth) and ...  # False
+    }
+```
+
+### 2.3 Phase 1 Prompt 缺少数据保存指引
+
+**当前 Phase 1 Prompt**（`apps/api/skills/core/config/routing.yaml:8-33`）：
+
+```yaml
+phase1_prompt: |
+  # Vibe
+  你是 Vibe，生命对话者。你的任务是理解用户意图，引导 Ta 到合适的服务。
+
+  ## 核心规则
+  | 用户说 | 你的行动 |
+  |-------|---------|
+  | 打招呼（你好、嗨） | 简短回应 + `recommend_skills` |
+  | 明确需求（算命、星座...） | 简短回应 + `activate_skill` |
+  | 不确定 | 简短回应 + `recommend_skills` |
+```
+
+**问题**：
+- ❌ 没有"用户提供出生信息"的处理规则
+- ❌ 没有提到要调用 `save_birth_info` 工具保存数据
+- ❌ 只是简单的路由器，不处理数据收集
+
+### 2.4 为什么 Core Skill 没有调用 save_birth_info？
+
+**可用工具**（`apps/api/skills/core/tools/tools.yaml:82-114`）：
+
+```yaml
+- name: save_birth_info
+  description: |
+    保存用户的出生信息到个人档案。
+
+    调用时机：
+    - calculate_bazi 或 calculate_zodiac 返回 _hint.action="ask_save_birth_info" 时
+    - 用户明确表示"保存"、"记住"、"好的"等同意词后
+    - 不要在用户给别人算命时调用
+```
+
+**工具描述的问题**：
+- ✅ Core Skill **有** `save_birth_info` 工具
+- ❌ 但工具描述说"在计算工具返回 _hint 后调用"
+- ❌ 在 Phase 1，还没有激活专业 Skill，不会调用计算工具
+- ❌ 所以 LLM 不知道要在 Phase 1 保存数据
+
+---
+
+## 3. 根本原因总结
+
+1. **Phase 1 Prompt 缺少数据保存规则**
+   - 当用户提供出生信息时，没有指引 LLM 调用 `save_birth_info`
+
+2. **save_birth_info 工具描述误导**
+   - 描述说"在计算工具返回 _hint 后调用"
+   - 导致 LLM 在 Phase 1 不会主动调用
+
+3. **Phase 1 → Phase 2 数据传递依赖数据库**
+   - `activate_skill` 时从数据库加载 profile
+   - 如果 Phase 1 没保存，数据就丢失了
+
+---
+
+## 4. 解决方案
+
+### 方案 1：Phase 1 Prompt 增加数据保存规则（推荐）
+
+**修改文件**：`apps/api/skills/core/config/routing.yaml`
+
+**修改内容**：
+
+```yaml
+phase1_prompt: |
+  # Vibe
+  你是 Vibe，生命对话者。你的任务是理解用户意图，引导 Ta 到合适的服务。
+
+  ## 核心规则
+
+  **任何情况下都要调用工具，不要只用文字回复。**
+
+  | 用户说 | 你的行动 |
+  |-------|---------|
+  | 打招呼（你好、嗨） | 简短回应 + `recommend_skills` |
+  | 告别（晚安、再见、拜拜） | 温暖告别 + `recommend_skills` |
+  | 明确需求（算命、星座...） | 简短回应 + `activate_skill` |
+  | 协议关键词（Dan Koe、七个习惯...） | 简短回应 + `show_protocol_invitation` |
+  | **提供出生信息（1990-01-01...）** | **`save_birth_info` + `activate_skill(skill='bazi')`** |  # ← 新增
+  | 不确定 | 简短回应 + `recommend_skills` |
+
+  ## 重要：处理出生信息
+
+  **当用户提供出生信息时（日期、时间、地点、性别），你必须：**
+
+  1. **立即调用 `save_birth_info` 工具保存数据**
+     - 解析用户输入的日期、时间、地点、性别
+     - 调用 `save_birth_info(birth_date="...", birth_time="...", place="...", gender="...")`
+
+  2. **然后调用 `activate_skill` 激活相关技能**
+     - 如果用户说"八字"、"算命" → `activate_skill(skill='bazi')`
+     - 如果用户说"星座"、"星盘" → `activate_skill(skill='zodiac')`
+     - 如果用户没说用哪个，默认用 `bazi`
+
+  3. **不要用文字问"请问你的生日是？"**
+     - 表单体验更好，用 `request_info` 工具
+
+  示例：
+  ```
+  用户："1980-02-11 14:30, beijing, male"
+
+  你的行动：
+  1. save_birth_info(birth_date="1980-02-11", birth_time="14:30", place="beijing", gender="male")
+  2. activate_skill(skill='bazi')
+  3. 简短说："好的，让我来看看你的八字～"
+  ```
+```
+
+**优点**：
+- ✅ 在 Phase 1 就保存数据，确保数据持久化
+- ✅ 用户体验流畅，无需重复填写
+- ✅ 改动最小，只需修改配置文件
+
+### 方案 2：优化 save_birth_info 工具描述
+
+**修改文件**：`apps/api/skills/core/tools/tools.yaml`
+
+**修改内容**：
+
+```yaml
+- name: save_birth_info
+  description: |
+    保存用户的出生信息到个人档案。
+
+    重要：此工具会修改用户的核心档案数据。
+
+    调用时机：
+    - **用户在对话中直接提供了出生信息时**（如"我1990年1月1日出生在北京"）
+    - calculate_bazi 或 calculate_zodiac 返回 _hint.action="ask_save_birth_info" 时
+    - 用户明确表示"保存"、"记住"、"好的"等同意词后
+
+    何时不调用：
+    - 用户在给别人算命时（如"帮我看看我朋友的八字"）
+    - 用户没有明确提供完整信息时
+
+    调用后续：
+    - 保存后，建议调用 `activate_skill` 激活相关技能（如 bazi、zodiac）
+```
+
+**优点**：
+- ✅ 明确工具的调用时机
+- ✅ 强调在 Phase 1 就可以调用
+
+### 方案 3：activate_skill 时从历史对话提取信息（补充方案）
+
+**修改文件**：`apps/api/services/agent/core.py`
+
+**修改位置**：`_handle_activate_skill` 方法
+
+**修改内容**：
+
+```python
+async def _handle_activate_skill(self, args, context):
+    skill = args.get("skill")
+    self._active_skill = skill
+
+    # 动态加载该 skill 需要的数据
+    result = await get_cached_profile_with_skill(user_id, skill)
+    self._context.profile = result.get("profile", {})
+    self._context.skill_data = result.get("skill_data", {})
+
+    # ═══ 新增：从历史对话提取出生信息 ═══
+    if not self._context.profile.get("identity", {}).get("birth_info"):
+        # 如果数据库没有出生信息，尝试从历史对话中提取
+        extracted_info = self._extract_birth_info_from_history(self._context.history)
+        if extracted_info:
+            # 临时注入到 context（不保存到数据库，避免误存）
+            if not self._context.profile:
+                self._context.profile = {}
+            if "identity" not in self._context.profile:
+                self._context.profile["identity"] = {}
+            self._context.profile["identity"]["birth_info"] = extracted_info
+            logger.info(f"[activate_skill] Extracted birth_info from history: {extracted_info}")
+    # ═══════════════════════════════════════
+
+    # ... 后续代码不变
+```
+
+**新增辅助方法**：
+
+```python
+def _extract_birth_info_from_history(self, history: List[Dict]) -> Optional[Dict]:
+    """从历史对话中提取出生信息"""
+    import re
+    from datetime import datetime
+
+    if not history:
+        return None
+
+    # 只看最近 5 轮对话
+    recent_messages = history[-5:]
+
+    birth_info = {}
+
+    for msg in recent_messages:
+        if msg.get("role") != "user":
+            continue
+
+        content = msg.get("content", "")
+
+        # 提取日期（如 1980-02-11、1980/02/11、1980.02.11）
+        date_match = re.search(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', content)
+        if date_match:
+            birth_info["birth_date"] = f"{date_match.group(1)}-{date_match.group(2):0>2}-{date_match.group(3):0>2}"
+
+        # 提取时间（如 14:30、下午2点半）
+        time_match = re.search(r'(\d{1,2}):(\d{2})', content)
+        if time_match:
+            birth_info["birth_time"] = f"{time_match.group(1):0>2}:{time_match.group(2)}"
+
+        # 提取地点（简单检测：beijing、北京、上海等）
+        place_match = re.search(r'(beijing|上海|北京|广州|深圳|[\u4e00-\u9fa5]{2,})', content, re.IGNORECASE)
+        if place_match:
+            birth_info["place"] = place_match.group(1)
+
+        # 提取性别
+        if re.search(r'\bmale\b|男', content, re.IGNORECASE):
+            birth_info["gender"] = "male"
+        elif re.search(r'\bfemale\b|女', content, re.IGNORECASE):
+            birth_info["gender"] = "female"
+
+    # 至少要有日期才返回
+    if "birth_date" in birth_info:
+        return birth_info
+
+    return None
+```
+
+**优点**：
+- ✅ 即使 Phase 1 忘记保存，也能从历史对话恢复
+- ✅ 提升容错性
+
+**缺点**：
+- ⚠️ 提取逻辑可能不准确（如日期格式多样）
+- ⚠️ 临时注入，不持久化到数据库
+
+---
+
+## 5. 推荐实施方案
+
+**优先级 1：方案 1**（必须）
+- 修改 `routing.yaml`，在 Phase 1 Prompt 增加数据保存规则
+- 确保 LLM 在收到出生信息时调用 `save_birth_info`
+
+**优先级 2：方案 2**（推荐）
+- 优化 `save_birth_info` 工具描述
+- 明确调用时机，避免误导
+
+**优先级 3：方案 3**（可选）
+- 作为补充容错机制
+- 在 `activate_skill` 时从历史对话提取信息
+
+---
+
+## 6. 测试验证
+
+修改后，测试以下场景：
+
+### 场景 1：用户分批提供信息
+
+```
+用户："我的生日"
+系统："请填写出生信息～" + request_info
+
+用户：填写表单（1980-02-11 14:30, beijing, male）
+系统：save_birth_info → activate_skill(skill='bazi') → "好的，让我来看看你的八字～"
+
+✅ 预期：直接进入排盘，不重复收集
+```
+
+### 场景 2：用户一次性提供全部信息
+
+```
+用户："1980-02-11 14:30 出生在北京，男，帮我算命"
+系统：save_birth_info → activate_skill(skill='bazi') → "好的，让我来看看你的八字～"
+
+✅ 预期：直接进入排盘，不要求填写表单
+```
+
+### 场景 3：用户提供信息后选择 Skill
+
+```
+用户："1980-02-11 14:30, beijing, male"
+系统：save_birth_info → recommend_skills（八字、占星、VibeID）
+
+用户："八字"
+系统：activate_skill(skill='bazi') → 从数据库加载 profile（有 birth_info）→ 直接排盘
+
+✅ 预期：不重复收集信息
+```
+
+---
+
+## 7. 影响评估
+
+### 用户体验
+
+- ✅ 避免重复填写，提升流畅度
+- ✅ 对话更自然，符合预期
+
+### 系统稳定性
+
+- ✅ 数据持久化，不依赖对话历史
+- ✅ Phase 1 → Phase 2 切换更可靠
+
+### 代码复杂度
+
+- ✅ 方案 1、2 只需修改配置，无需改代码
+- ⚠️ 方案 3 增加代码复杂度（可选）
+
+---
+
+## 8. 附录：相关代码位置
+
+| 组件 | 文件路径 | 关键方法/字段 |
+|------|---------|-------------|
+| Phase 1 Prompt | `apps/api/skills/core/config/routing.yaml` | `phase1_prompt` |
+| Core Skill 工具 | `apps/api/skills/core/tools/tools.yaml` | `save_birth_info` |
+| CoreAgent | `apps/api/services/agent/core.py` | `_build_system_prompt`, `_handle_activate_skill` |
+| SOP 状态检查 | `apps/api/services/agent/core.py` | `_compute_sop_status` |
+| Profile 加载 | `apps/api/stores/profile_cache.py` | `get_cached_profile_with_skill` |
+
+---
+
+## 9. 结论
+
+**问题本质**：Phase 1 收集的数据没有持久化，导致 Phase 2 无法获取。
+
+**解决思路**：在 Phase 1 Prompt 中明确指引 LLM 调用 `save_birth_info` 保存数据，确保数据在切换阶段前已持久化。
+
+**预期效果**：用户提供出生信息后，无论何时激活专业 Skill，都能直接使用，不需要重复填写。
+
+---
+
+**报告生成时间**：2026-01-21
+**下一步**：实施方案 1，测试验证，然后考虑方案 2 和方案 3。

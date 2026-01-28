@@ -1,0 +1,645 @@
+"""
+Context Manager v10 - Context Engineering 核心
+
+管理 Agent 的"磁盘工作记忆"，实现：
+- 会话上下文持久化
+- 断点续传（checkpoint 机制）
+- 分析发现积累（findings）
+- 跨 Skill 共享上下文
+
+数据存储位置（映射到 VibeProfile）：
+- profile.state.active_session: 全局会话状态
+- profile.skills.{skill_id}._session: Skill 会话状态
+- profile.skills.{skill_id}._findings: 分析发现
+- profile.extracted + identity: 用户画像（跨 Skill 共享）
+"""
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Classes
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Checkpoint:
+    """执行检查点 - 支持断点续传"""
+    phase: Optional[int] = None
+    step: int = 0
+    total_steps: int = 0
+    collected_data: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Checkpoint":
+        return cls(
+            phase=data.get("phase"),
+            step=data.get("step", 0),
+            total_steps=data.get("total_steps", 0),
+            collected_data=data.get("collected_data", {})
+        )
+
+
+@dataclass
+class SkillSession:
+    """Skill 会话状态"""
+    active: bool = False
+    rule_id: Optional[str] = None
+    started_at: Optional[str] = None
+    last_activity: Optional[str] = None
+    checkpoint: Optional[Checkpoint] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "rule_id": self.rule_id,
+            "started_at": self.started_at,
+            "last_activity": self.last_activity,
+            "checkpoint": self.checkpoint.to_dict() if self.checkpoint else None,
+            "context": self.context
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SkillSession":
+        checkpoint_data = data.get("checkpoint")
+        return cls(
+            active=data.get("active", False),
+            rule_id=data.get("rule_id"),
+            started_at=data.get("started_at"),
+            last_activity=data.get("last_activity"),
+            checkpoint=Checkpoint.from_dict(checkpoint_data) if checkpoint_data else None,
+            context=data.get("context", {})
+        )
+
+
+@dataclass
+class Finding:
+    """分析发现"""
+    type: str  # insight | pattern | concern | goal | milestone
+    content: str
+    rule_id: Optional[str] = None
+    created_at: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Finding":
+        return cls(
+            type=data.get("type", "insight"),
+            content=data.get("content", ""),
+            rule_id=data.get("rule_id"),
+            created_at=data.get("created_at"),
+            metadata=data.get("metadata", {})
+        )
+
+
+@dataclass
+class SessionContext:
+    """会话上下文（用于传递给 LLM）"""
+    skill_id: str
+    rule_id: Optional[str] = None
+    session: Optional[SkillSession] = None
+    findings: List[Finding] = field(default_factory=list)
+    shared_context: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_checkpoint(self) -> bool:
+        """是否有可恢复的检查点"""
+        return (
+            self.session is not None and
+            self.session.checkpoint is not None and
+            self.session.checkpoint.step > 0
+        )
+
+    @property
+    def checkpoint(self) -> Optional[Checkpoint]:
+        """获取检查点"""
+        return self.session.checkpoint if self.session else None
+
+    def to_prompt_context(self) -> str:
+        """转换为 Prompt 上下文文本"""
+        if not self.has_checkpoint:
+            return ""
+
+        cp = self.checkpoint
+        lines = ["## 会话恢复上下文（断点续传）\n"]
+
+        # 会话信息
+        if self.session:
+            lines.append(f"**上次会话信息**：")
+            if self.rule_id:
+                lines.append(f"- 规则: {self.rule_id}")
+            lines.append(f"- 开始时间: {self.session.started_at}")
+            lines.append(f"- 上次活动: {self.session.last_activity}")
+            lines.append("")
+
+        # 进度信息
+        if cp:
+            lines.append(f"**当前进度**: 第 {cp.step}/{cp.total_steps} 步")
+            lines.append("")
+
+            # 已收集信息
+            if cp.collected_data:
+                lines.append("**已收集的信息**:")
+                for key, value in cp.collected_data.items():
+                    lines.append(f"- {key}: {value}")
+                lines.append("")
+
+        # 关键发现
+        if self.findings:
+            lines.append("**关键发现**:")
+            for finding in self.findings[-5:]:  # 只显示最近 5 条
+                lines.append(f"- [{finding.type}] {finding.content}")
+            lines.append("")
+
+        # 指引
+        if cp and cp.step > 0:
+            next_step = cp.step + 1
+            lines.append("---\n")
+            lines.append("**指引**:")
+            lines.append(f"1. 从第 {next_step} 个问题继续")
+            lines.append("2. 不要重复已问过的问题")
+            lines.append("3. 可以简短总结上次内容，但不要冗长")
+
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Context Manager
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ContextManager:
+    """
+    Context Engineering 核心 - 管理 Agent 的"磁盘工作记忆"
+
+    职责：
+    1. 加载会话上下文（断点续传核心）
+    2. 保存进度检查点
+    3. 记录分析发现
+    4. 获取跨 Skill 共享上下文
+    5. 清理会话状态
+    """
+
+    def __init__(self):
+        self._cache: Dict[str, SessionContext] = {}
+
+    async def load_session_context(
+        self,
+        user_id: str,
+        skill_id: str,
+        rule_id: Optional[str] = None
+    ) -> SessionContext:
+        """
+        加载会话上下文（断点续传核心）
+
+        从 VibeProfile 读取：
+        - profile.skills.{skill_id}._session
+        - profile.skills.{skill_id}._findings
+        - profile.extracted (共享上下文)
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return SessionContext(skill_id=skill_id, rule_id=rule_id)
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 获取 skill 状态
+            skill_state = await UnifiedProfileRepository.get_skill_state(user_uuid, skill_id)
+
+            # 解析 _session
+            session_data = skill_state.get("_session", {})
+            session = SkillSession.from_dict(session_data) if session_data else None
+
+            # 解析 _findings
+            findings_data = skill_state.get("_findings", [])
+            findings = [Finding.from_dict(f) for f in findings_data]
+
+            # 获取共享上下文
+            shared_context = await self.get_shared_context(user_id)
+
+            context = SessionContext(
+                skill_id=skill_id,
+                rule_id=rule_id or (session.rule_id if session else None),
+                session=session,
+                findings=findings,
+                shared_context=shared_context
+            )
+
+            logger.info(f"[ContextManager] Loaded session context: user={user_id}, skill={skill_id}, has_checkpoint={context.has_checkpoint}")
+
+            return context
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to load session context: {e}")
+            return SessionContext(skill_id=skill_id, rule_id=rule_id)
+
+    async def save_checkpoint(
+        self,
+        user_id: str,
+        skill_id: str,
+        step: int,
+        total_steps: int = 0,
+        phase: Optional[int] = None,
+        collected_data: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        保存进度检查点
+
+        写入 profile.skills.{skill_id}._session.checkpoint
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            logger.warning("[ContextManager] Cannot save checkpoint for guest user")
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+            now = datetime.now(timezone.utc).isoformat()
+
+            # 获取现有 session 或创建新的
+            skill_state = await UnifiedProfileRepository.get_skill_state(user_uuid, skill_id)
+            session_data = skill_state.get("_session", {})
+
+            # 更新 session
+            session_data["active"] = True
+            session_data["last_activity"] = now
+            if not session_data.get("started_at"):
+                session_data["started_at"] = now
+
+            # 更新 checkpoint
+            session_data["checkpoint"] = {
+                "phase": phase,
+                "step": step,
+                "total_steps": total_steps,
+                "collected_data": collected_data or {}
+            }
+
+            # 更新 context
+            if context:
+                session_data["context"] = {
+                    **session_data.get("context", {}),
+                    **context
+                }
+
+            # 写入数据库
+            await UnifiedProfileRepository.update_skill_state(
+                user_uuid, skill_id, "_session", session_data
+            )
+
+            logger.info(f"[ContextManager] Saved checkpoint: user={user_id}, skill={skill_id}, step={step}/{total_steps}")
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to save checkpoint: {e}")
+
+    async def add_finding(
+        self,
+        user_id: str,
+        skill_id: str,
+        finding_type: str,
+        content: str,
+        rule_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        记录分析发现
+
+        追加到 profile.skills.{skill_id}._findings
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+            now = datetime.now(timezone.utc).isoformat()
+
+            finding = {
+                "type": finding_type,
+                "content": content,
+                "rule_id": rule_id,
+                "created_at": now,
+                "metadata": metadata or {}
+            }
+
+            # 追加到 _findings 列表
+            await UnifiedProfileRepository.append_to_skill_list(
+                user_uuid, skill_id, "_findings", finding, max_items=50
+            )
+
+            logger.info(f"[ContextManager] Added finding: user={user_id}, skill={skill_id}, type={finding_type}")
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to add finding: {e}")
+
+    # 需要跨 skill_data 的特殊 Skill
+    CROSS_SKILL_DATA = {
+        "jungastro": ["bazi", "zodiac"],
+        "vibe_id": ["bazi", "zodiac"],
+    }
+
+    async def get_profile_context(
+        self,
+        user_id: str,
+        skill_id: str
+    ) -> Dict[str, Any]:
+        """
+        简化版 Profile 注入 - 两层架构
+
+        Layer 1: Base（所有 Skill 共享，~300 tokens）
+        - identity.birth_info
+        - identity.display_name
+        - extracted.goals[:3]
+        - extracted.facts[:5]
+
+        Layer 2: Skill（按命名约定自动，~200 tokens）
+        - skill_data.{skill_id}
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return {}
+
+        try:
+            user_uuid = UUID(user_id)
+            profile = await UnifiedProfileRepository.get_profile(user_uuid)
+
+            if not profile:
+                return {}
+
+            # Layer 1: Base（共享）
+            identity = profile.get("identity", {})
+            extracted = profile.get("extracted", {})
+
+            context = {
+                "user": {
+                    "name": identity.get("display_name"),
+                    "birth": identity.get("birth_info"),
+                },
+                "background": {
+                    "goals": extracted.get("goals", [])[:3],
+                    "facts": extracted.get("facts", [])[:5],
+                },
+            }
+
+            # Layer 2: Skill（按命名约定或跨 skill 映射）
+            skill_data_store = profile.get("skill_data", {})
+            skill_ids = self.CROSS_SKILL_DATA.get(skill_id, [skill_id])
+
+            if len(skill_ids) == 1:
+                # 单一 skill_data
+                context["skill_data"] = skill_data_store.get(skill_ids[0], {})
+            else:
+                # 跨 skill_data（如 jungastro 需要 bazi + zodiac）
+                context["skill_data"] = {
+                    sid: skill_data_store.get(sid, {})
+                    for sid in skill_ids
+                }
+
+            logger.debug(f"[ContextManager] Profile context for {skill_id}: user={bool(context.get('user', {}).get('name'))}, skill_data={bool(context.get('skill_data'))}")
+
+            return context
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to get profile context: {e}")
+            return {}
+
+    async def get_shared_context(self, user_id: str) -> Dict[str, Any]:
+        """
+        获取跨 Skill 共享的上下文（向后兼容，推荐使用 get_profile_context）
+
+        从 profile.extracted 和 profile.identity 提取：
+        - 用户基本信息（出生信息、性别等）
+        - 提取的用户画像（goals, concerns, patterns）
+        - 生活上下文
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return {}
+
+        try:
+            user_uuid = UUID(user_id)
+            profile = await UnifiedProfileRepository.get_profile(user_uuid)
+
+            if not profile:
+                return {}
+
+            shared = {}
+
+            # 身份信息
+            identity = profile.get("identity", {})
+            if identity:
+                shared["identity"] = {
+                    "birth_info": identity.get("birth_info", {}),
+                    "display_name": identity.get("display_name")
+                }
+
+            # 提取的用户画像
+            extracted = profile.get("extracted", {})
+            if extracted:
+                shared["extracted"] = {
+                    "goals": extracted.get("goals", []),
+                    "concerns": extracted.get("concerns", []),
+                    "patterns": extracted.get("patterns", []),
+                    "facts": extracted.get("facts", [])
+                }
+
+            # 当前状态
+            state = profile.get("state", {})
+            if state:
+                shared["state"] = {
+                    "focus": state.get("focus", [])
+                }
+
+            return shared
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to get shared context: {e}")
+            return {}
+
+    async def clear_session(
+        self,
+        user_id: str,
+        skill_id: str,
+        keep_findings: bool = True
+    ) -> None:
+        """
+        清理会话状态（完成或放弃时）
+
+        清除 profile.skills.{skill_id}._session
+        可选保留 _findings
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+
+            # 清除 _session
+            await UnifiedProfileRepository.update_skill_state(
+                user_uuid, skill_id, "_session", {
+                    "active": False,
+                    "last_activity": datetime.now(timezone.utc).isoformat(),
+                    "checkpoint": None,
+                    "context": {}
+                }
+            )
+
+            # 如果不保留 findings，也清除
+            if not keep_findings:
+                await UnifiedProfileRepository.update_skill_state(
+                    user_uuid, skill_id, "_findings", []
+                )
+
+            logger.info(f"[ContextManager] Cleared session: user={user_id}, skill={skill_id}, keep_findings={keep_findings}")
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to clear session: {e}")
+
+    async def start_session(
+        self,
+        user_id: str,
+        skill_id: str,
+        rule_id: Optional[str] = None,
+        goal: Optional[str] = None,
+        total_steps: int = 0
+    ) -> SkillSession:
+        """
+        开始新会话
+
+        初始化 profile.skills.{skill_id}._session
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return SkillSession(
+                active=True,
+                rule_id=rule_id,
+                started_at=datetime.now(timezone.utc).isoformat()
+            )
+
+        try:
+            user_uuid = UUID(user_id)
+            now = datetime.now(timezone.utc).isoformat()
+
+            session_data = {
+                "active": True,
+                "rule_id": rule_id,
+                "started_at": now,
+                "last_activity": now,
+                "checkpoint": {
+                    "phase": 1,
+                    "step": 0,
+                    "total_steps": total_steps,
+                    "collected_data": {}
+                },
+                "context": {
+                    "goal": goal
+                } if goal else {}
+            }
+
+            await UnifiedProfileRepository.update_skill_state(
+                user_uuid, skill_id, "_session", session_data
+            )
+
+            # 同时更新全局 active_session
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": {
+                    "skill_id": skill_id,
+                    "rule_id": rule_id,
+                    "conversation_id": None,  # 将在后续更新
+                    "started_at": now,
+                    "status": "in_progress",
+                    "goal": goal
+                }
+            })
+
+            logger.info(f"[ContextManager] Started session: user={user_id}, skill={skill_id}, rule={rule_id}")
+
+            return SkillSession.from_dict(session_data)
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to start session: {e}")
+            return SkillSession(active=True, rule_id=rule_id)
+
+    async def complete_session(
+        self,
+        user_id: str,
+        skill_id: str,
+        summary: Optional[str] = None
+    ) -> None:
+        """
+        完成会话
+
+        标记 session 为完成，清理 checkpoint，保留 findings
+        """
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        if user_id == "guest":
+            return
+
+        try:
+            user_uuid = UUID(user_id)
+            now = datetime.now(timezone.utc).isoformat()
+
+            # 更新 _session
+            await UnifiedProfileRepository.update_skill_state(
+                user_uuid, skill_id, "_session", {
+                    "active": False,
+                    "completed_at": now,
+                    "last_activity": now,
+                    "checkpoint": None,
+                    "summary": summary
+                }
+            )
+
+            # 清除全局 active_session
+            await UnifiedProfileRepository.update_state(user_uuid, {
+                "active_session": None
+            })
+
+            # 如果有 summary，添加到 findings
+            if summary:
+                await self.add_finding(
+                    user_id, skill_id,
+                    finding_type="milestone",
+                    content=f"会话完成: {summary}"
+                )
+
+            logger.info(f"[ContextManager] Completed session: user={user_id}, skill={skill_id}")
+
+        except Exception as e:
+            logger.error(f"[ContextManager] Failed to complete session: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_context_manager: Optional[ContextManager] = None
+
+
+def get_context_manager() -> ContextManager:
+    """获取 ContextManager 单例"""
+    global _context_manager
+    if _context_manager is None:
+        _context_manager = ContextManager()
+    return _context_manager

@@ -1,0 +1,369 @@
+"""
+Evolve 模块 API 路由
+
+提供任务管理、打卡、动量追踪等功能。
+"""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from stores import mentis_db
+from services import intervention_agent
+
+
+router = APIRouter(prefix="/v3/evolve", tags=["evolve"])
+
+
+def _request_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{uuid4().hex[:8]}"
+
+
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    payload: Dict[str, Any] = {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        }
+    }
+    if details:
+        payload["error"]["details"] = details
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _resolve_user_id(request: Request) -> str:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            UUID(token)
+            return token
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    header_user = (request.headers.get("X-Mentis-User-Id") or "").strip()
+    if header_user:
+        try:
+            UUID(header_user)
+            return header_user
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    raise HTTPException(status_code=401, detail="auth/missing-token")
+
+
+def _require_mentis_user(user_id: str) -> None:
+    row = mentis_db.fetch_one("SELECT id FROM mentis_user WHERE id = %s", (user_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="resource/user-not-found")
+
+
+class CheckinRequest(BaseModel):
+    task_id: Optional[str] = None
+    behavior_type: str = Field(..., min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+
+class TaskActionRequest(BaseModel):
+    task_id: str
+
+
+@router.get("/tasks")
+async def list_tasks(
+    request: Request,
+    status: str = "pending",
+    limit: int = 20,
+):
+    """获取任务列表"""
+    request_id = _request_id("tasks")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    valid_status = status if status in {"pending", "active", "done", "skipped"} else "pending"
+    safe_limit = max(1, min(50, int(limit)))
+
+    rows = mentis_db.fetch_all(
+        """
+        SELECT id, type, title, description, status, trigger_time, expires_at,
+               momentum_reward, source, created_at
+        FROM action_task
+        WHERE user_id = %s AND status = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (user_id, valid_status, safe_limit),
+    )
+
+    return {"items": rows, "count": len(rows)}
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(request: Request, task_id: str):
+    """获取单个任务详情"""
+    request_id = _request_id("task")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    row = mentis_db.fetch_one(
+        """
+        SELECT id, type, title, description, status, trigger_time, expires_at,
+               completed_at, momentum_reward, source, trigger_context, created_at
+        FROM action_task
+        WHERE id = %s AND user_id = %s
+        """,
+        (task_id, user_id),
+    )
+
+    if not row:
+        return _error_response(
+            status_code=404,
+            code="resource/task-not-found",
+            message="Task not found",
+            request_id=request_id,
+        )
+
+    return row
+
+
+@router.post("/tasks/{task_id}/complete")
+async def complete_task(request: Request, task_id: str):
+    """完成任务（干预卡确认）"""
+    request_id = _request_id("task-complete")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    result = intervention_agent.complete_intervention(task_id=task_id, user_id=user_id)
+
+    if not result.get("success"):
+        return _error_response(
+            status_code=404,
+            code="resource/task-not-found",
+            message=result.get("error", "Task not found or already completed"),
+            request_id=request_id,
+        )
+
+    return result
+
+
+@router.post("/tasks/{task_id}/skip")
+async def skip_task(request: Request, task_id: str):
+    """跳过任务"""
+    request_id = _request_id("task-skip")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    result = intervention_agent.skip_intervention(task_id=task_id, user_id=user_id)
+
+    if not result.get("success"):
+        return _error_response(
+            status_code=404,
+            code="resource/task-not-found",
+            message=result.get("error", "Task not found or already completed"),
+            request_id=request_id,
+        )
+
+    return result
+
+
+@router.post("/checkin")
+async def manual_checkin(request: Request, body: CheckinRequest):
+    """手动打卡"""
+    request_id = _request_id("checkin")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # 创建打卡记录
+    row = mentis_db.execute_returning_one(
+        """
+        INSERT INTO checkin_log (user_id, task_id, behavior_type, source, momentum_delta, note)
+        VALUES (%s, %s, %s, 'manual', 1, %s)
+        RETURNING id, behavior_type, momentum_delta, created_at
+        """,
+        (user_id, body.task_id, body.behavior_type, body.note),
+    )
+
+    if not row:
+        return _error_response(
+            status_code=500,
+            code="internal/checkin-failed",
+            message="Failed to create checkin",
+            request_id=request_id,
+        )
+
+    # 更新用户状态
+    state_row = mentis_db.fetch_one(
+        "SELECT momentum, streak_days, last_checkin_at FROM user_state WHERE user_id = %s",
+        (user_id,),
+    ) or {}
+
+    streak_days = int(state_row.get("streak_days") or 0)
+    last_checkin_at = state_row.get("last_checkin_at")
+
+    # 检查是否需要增加连续天数
+    if last_checkin_at is None or getattr(last_checkin_at, "date", lambda: None)() != now.date():
+        streak_days += 1
+
+    new_momentum = int(state_row.get("momentum") or 0) + 1
+
+    mentis_db.execute(
+        """
+        UPDATE user_state
+        SET momentum = %s,
+            streak_days = %s,
+            last_checkin_at = %s,
+            updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (new_momentum, streak_days, now, user_id),
+    )
+
+    return {
+        "success": True,
+        "checkin_id": row.get("id"),
+        "behavior_type": row.get("behavior_type"),
+        "momentum_earned": row.get("momentum_delta"),
+        "total_momentum": new_momentum,
+        "streak_days": streak_days,
+    }
+
+
+@router.get("/momentum")
+async def get_momentum_history(
+    request: Request,
+    days: int = 7,
+):
+    """获取动量历史"""
+    request_id = _request_id("momentum")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    safe_days = max(1, min(30, int(days)))
+
+    # 获取每日打卡统计
+    rows = mentis_db.fetch_all(
+        """
+        SELECT DATE(created_at) AS date,
+               SUM(momentum_delta) AS daily_momentum,
+               COUNT(*) AS checkin_count
+        FROM checkin_log
+        WHERE user_id = %s
+          AND created_at >= NOW() - INTERVAL '%s days'
+        GROUP BY DATE(created_at)
+        ORDER BY date DESC
+        """,
+        (user_id, safe_days),
+    )
+
+    # 获取当前状态
+    state = mentis_db.fetch_one(
+        "SELECT momentum, streak_days FROM user_state WHERE user_id = %s",
+        (user_id,),
+    ) or {}
+
+    return {
+        "current_momentum": int(state.get("momentum") or 0),
+        "streak_days": int(state.get("streak_days") or 0),
+        "daily_stats": rows,
+    }
+
+
+@router.get("/checkins")
+async def list_checkins(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """获取打卡历史"""
+    request_id = _request_id("checkins")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    safe_limit = max(1, min(100, int(limit)))
+    safe_offset = max(0, int(offset))
+
+    rows = mentis_db.fetch_all(
+        """
+        SELECT c.id, c.behavior_type, c.source, c.momentum_delta, c.note, c.created_at,
+               t.title AS task_title
+        FROM checkin_log c
+        LEFT JOIN action_task t ON c.task_id = t.id
+        WHERE c.user_id = %s
+        ORDER BY c.created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, safe_limit, safe_offset),
+    )
+
+    return {"items": rows, "count": len(rows)}

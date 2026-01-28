@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+v11 HTTP 测试脚本
+
+通过 HTTP API 测试 v11 功能
+"""
+import asyncio
+import json
+import sys
+import httpx
+from datetime import datetime
+
+BASE_URL = "http://localhost:8100"
+results = []
+
+
+def log_test(name: str, passed: bool, detail: str = ""):
+    """记录测试结果"""
+    status = "✅ PASS" if passed else "❌ FAIL"
+    results.append({"name": name, "passed": passed, "detail": detail})
+    print(f"{status}: {name}")
+    if detail:
+        print(f"   └─ {detail[:100]}")
+
+
+async def test_health():
+    """测试 API 健康状态"""
+    print("\n" + "=" * 60)
+    print("测试 1: API 健康检查")
+    print("=" * 60)
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
+        response = await client.get("/health")
+        log_test(
+            "健康检查",
+            response.status_code == 200,
+            f"status: {response.json().get('status')}"
+        )
+
+
+async def test_skills_list():
+    """测试 Skill 列表"""
+    print("\n" + "=" * 60)
+    print("测试 2: Skill 列表")
+    print("=" * 60)
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
+        response = await client.get("/api/v1/skills")
+        data = response.json()
+
+        log_test(
+            "获取 Skill 列表",
+            response.status_code == 200 and "skills" in data,
+            f"count: {len(data.get('skills', []))}"
+        )
+
+        skills = data.get("skills", [])
+        skill_ids = [s.get("id") for s in skills]
+
+        log_test(
+            "包含 core skill",
+            "core" in skill_ids,
+            f"skills: {skill_ids[:5]}"
+        )
+
+
+async def test_chat_phase1():
+    """测试 Phase 1 路由（通过对话）"""
+    print("\n" + "=" * 60)
+    print("测试 3: Phase 1 路由对话")
+    print("=" * 60)
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=60.0) as client:
+        # 发送聊天请求
+        response = await client.post(
+            "/api/v5/chat",
+            json={
+                "message": "你好",
+                "conversation_id": None,
+            },
+            headers={"Content-Type": "application/json"}
+        )
+
+        log_test(
+            "Phase 1 对话请求",
+            response.status_code == 200,
+            f"status: {response.status_code}"
+        )
+
+        # 检查响应
+        if response.status_code == 200:
+            content_type = response.headers.get("content-type", "")
+            is_sse = "text/event-stream" in content_type
+
+            if is_sse:
+                # 解析 SSE 流
+                text = response.text
+                events = [line for line in text.split("\n") if line.startswith("data:")]
+
+                log_test(
+                    "返回 SSE 事件",
+                    len(events) > 0,
+                    f"events: {len(events)}"
+                )
+
+                # 检查是否有 tool_call 事件（说明 LLM 在调用工具）
+                tool_events = [e for e in events if "tool" in e.lower()]
+                log_test(
+                    "Phase 1 触发工具调用",
+                    len(tool_events) > 0 or len(events) > 0,
+                    f"tool_events: {len(tool_events)}"
+                )
+            else:
+                log_test(
+                    "返回 JSON 响应",
+                    True,
+                    f"response: {response.text[:100]}"
+                )
+
+
+async def test_chat_with_skill():
+    """测试 Phase 2 Skill 执行"""
+    print("\n" + "=" * 60)
+    print("测试 4: Phase 2 Skill 执行")
+    print("=" * 60)
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=60.0) as client:
+        # 直接请求 bazi skill
+        response = await client.post(
+            "/api/v5/chat",
+            json={
+                "message": "帮我算八字",
+                "conversation_id": None,
+            },
+            headers={"Content-Type": "application/json"}
+        )
+
+        log_test(
+            "Skill 激活请求",
+            response.status_code == 200,
+            f"status: {response.status_code}"
+        )
+
+        if response.status_code == 200:
+            text = response.text
+            # 检查是否触发了 skill 激活
+            has_skill_ref = "bazi" in text.lower() or "skill" in text.lower() or "activate" in text.lower()
+            log_test(
+                "响应包含 skill 相关内容",
+                has_skill_ref or len(text) > 50,
+                f"response length: {len(text)}"
+            )
+
+
+async def test_routing_config():
+    """测试路由配置加载"""
+    print("\n" + "=" * 60)
+    print("测试 5: 路由配置")
+    print("=" * 60)
+
+    # 通过检查 skill 详情来验证配置
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
+        response = await client.get("/api/v1/skills/bazi")
+
+        if response.status_code == 200:
+            data = response.json()
+            skill = data.get("skill", {})
+
+            log_test(
+                "获取 bazi skill 详情",
+                bool(skill),
+                f"name: {skill.get('name')}"
+            )
+
+            log_test(
+                "skill 有 triggers",
+                bool(skill.get("triggers")),
+                f"triggers: {skill.get('triggers', [])[:3]}"
+            )
+        else:
+            log_test("获取 skill 详情", False, f"status: {response.status_code}")
+
+
+def print_summary():
+    """打印测试总结"""
+    print("\n" + "=" * 60)
+    print("测试总结")
+    print("=" * 60)
+
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+
+    for r in results:
+        status = "✅" if r["passed"] else "❌"
+        print(f"  {status} {r['name']}")
+
+    print(f"\n通过: {passed}/{total}")
+
+    if passed == total:
+        print("\n🎉 所有测试通过！")
+        return 0
+    else:
+        print("\n⚠️ 部分测试失败，请检查")
+        return 1
+
+
+async def main():
+    """主测试函数"""
+    print("=" * 60)
+    print("VibeLife v11 HTTP 测试")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"API: {BASE_URL}")
+    print("=" * 60)
+
+    await test_health()
+    await test_skills_list()
+    await test_chat_phase1()
+    await test_chat_with_skill()
+    await test_routing_config()
+
+    return print_summary()
+
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)

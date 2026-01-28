@@ -1,0 +1,466 @@
+"""
+Mentis OS v3.0 - Decode 模块 API 路由
+
+提供八字计算和运势预测功能。
+"""
+from __future__ import annotations
+
+import sys
+import os
+import time
+from datetime import date, datetime, timezone
+from typing import Any, Dict, Optional
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+# 添加包路径
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "packages", "decode-modules"))
+
+from bazi import calculate_bazi, calculate_daily_fortune, BaziChart
+from stores import mentis_db
+
+
+router = APIRouter(prefix="/v3/decode", tags=["decode"])
+
+
+def _request_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{uuid4().hex[:8]}"
+
+
+def _ok(data: Dict[str, Any]) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data})
+
+
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    payload: Dict[str, Any] = {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        }
+    }
+    if details:
+        payload["error"]["details"] = details
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _resolve_user_id(request: Request) -> str:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            UUID(token)
+            return token
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    header_user = (request.headers.get("X-Mentis-User-Id") or "").strip()
+    if header_user:
+        try:
+            UUID(header_user)
+            return header_user
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    raise HTTPException(status_code=401, detail="auth/missing-token")
+
+
+# =============================================================================
+# Request Models
+# =============================================================================
+
+class BaziCalculateRequest(BaseModel):
+    """八字计算请求"""
+    year: int = Field(..., ge=1900, le=2100, description="出生年")
+    month: int = Field(..., ge=1, le=12, description="出生月")
+    day: int = Field(..., ge=1, le=31, description="出生日")
+    hour: int = Field(..., ge=0, le=23, description="出生时")
+    minute: int = Field(default=0, ge=0, le=59, description="出生分")
+    location_name: Optional[str] = Field(None, description="出生地点名称")
+    longitude: Optional[float] = Field(None, description="出生地经度")
+    latitude: Optional[float] = Field(None, description="出生地纬度")
+
+
+class FortuneRequest(BaseModel):
+    """运势查询请求"""
+    target_date: Optional[str] = Field(None, description="目标日期 YYYY-MM-DD，默认今天")
+
+
+class SaveBirthInfoRequest(BaseModel):
+    """保存出生信息请求"""
+    year: int = Field(..., ge=1900, le=2100)
+    month: int = Field(..., ge=1, le=12)
+    day: int = Field(..., ge=1, le=31)
+    hour: int = Field(..., ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    location_name: Optional[str] = None
+    longitude: Optional[float] = None
+    latitude: Optional[float] = None
+    timezone: str = Field(default="Asia/Shanghai")
+
+
+# =============================================================================
+# 八字计算 API
+# =============================================================================
+
+@router.post("/bazi")
+async def calculate_bazi_api(body: BaziCalculateRequest):
+    """
+    计算八字命盘
+
+    不需要登录，用于即时计算。
+    返回完整的八字命盘信息。
+    """
+    request_id = _request_id("bazi")
+
+    try:
+        location = None
+        if body.longitude is not None:
+            location = {
+                "name": body.location_name or "",
+                "longitude": body.longitude,
+                "latitude": body.latitude or 0.0,
+            }
+
+        chart = calculate_bazi(
+            year=body.year,
+            month=body.month,
+            day=body.day,
+            hour=body.hour,
+            minute=body.minute,
+            location=location,
+        )
+
+        return _ok(chart.to_dict())
+
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="decode/calculation-error",
+            message=f"八字计算失败: {str(e)[:100]}",
+            request_id=request_id,
+        )
+
+
+@router.get("/bazi")
+async def get_my_bazi(request: Request):
+    """
+    获取当前用户的八字命盘
+
+    需要登录，从用户档案中读取出生信息并计算。
+    """
+    request_id = _request_id("bazi-get")
+
+    try:
+        user_id = _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    # 获取用户出生信息
+    profile = mentis_db.fetch_one(
+        """
+        SELECT birth_time, birth_location, bazi_data
+        FROM user_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    if not profile or not profile.get("birth_time"):
+        return _error_response(
+            status_code=404,
+            code="decode/birth-info-missing",
+            message="请先设置出生信息",
+            request_id=request_id,
+        )
+
+    # 如果已有缓存的八字数据，直接返回
+    if profile.get("bazi_data"):
+        return _ok(profile["bazi_data"])
+
+    # 计算八字
+    birth_time = profile["birth_time"]
+    location = profile.get("birth_location") or {}
+
+    chart = calculate_bazi(
+        year=birth_time.year,
+        month=birth_time.month,
+        day=birth_time.day,
+        hour=birth_time.hour,
+        minute=birth_time.minute,
+        location=location,
+    )
+
+    # 缓存八字数据
+    import json
+    mentis_db.execute(
+        """
+        UPDATE user_profile
+        SET bazi_data = %s::jsonb, updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (json.dumps(chart.to_dict(), ensure_ascii=False, default=str), user_id),
+    )
+
+    return _ok(chart.to_dict())
+
+
+# =============================================================================
+# 运势预测 API
+# =============================================================================
+
+@router.get("/fortune/today")
+async def get_today_fortune(request: Request):
+    """
+    获取今日运势
+
+    需要登录，基于用户八字计算今日运势。
+    """
+    request_id = _request_id("fortune-today")
+
+    try:
+        user_id = _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    # 获取用户八字
+    profile = mentis_db.fetch_one(
+        """
+        SELECT birth_time, birth_location, bazi_data
+        FROM user_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    if not profile or not profile.get("birth_time"):
+        return _error_response(
+            status_code=404,
+            code="decode/birth-info-missing",
+            message="请先设置出生信息",
+            request_id=request_id,
+        )
+
+    birth_time = profile["birth_time"]
+    location = profile.get("birth_location") or {}
+
+    # 计算八字
+    chart = calculate_bazi(
+        year=birth_time.year,
+        month=birth_time.month,
+        day=birth_time.day,
+        hour=birth_time.hour,
+        minute=birth_time.minute,
+        location=location,
+    )
+
+    # 计算今日运势
+    fortune = calculate_daily_fortune(chart, target_date=date.today())
+
+    return _ok(fortune.to_dict())
+
+
+@router.get("/fortune/{target_date}")
+async def get_fortune_by_date(request: Request, target_date: str):
+    """
+    获取指定日期运势
+
+    需要登录，target_date 格式: YYYY-MM-DD
+    """
+    request_id = _request_id("fortune-date")
+
+    try:
+        user_id = _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    # 解析日期
+    try:
+        target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except ValueError:
+        return _error_response(
+            status_code=400,
+            code="decode/invalid-date",
+            message="日期格式错误，请使用 YYYY-MM-DD",
+            request_id=request_id,
+        )
+
+    # 获取用户八字
+    profile = mentis_db.fetch_one(
+        """
+        SELECT birth_time, birth_location
+        FROM user_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    if not profile or not profile.get("birth_time"):
+        return _error_response(
+            status_code=404,
+            code="decode/birth-info-missing",
+            message="请先设置出生信息",
+            request_id=request_id,
+        )
+
+    birth_time = profile["birth_time"]
+    location = profile.get("birth_location") or {}
+
+    chart = calculate_bazi(
+        year=birth_time.year,
+        month=birth_time.month,
+        day=birth_time.day,
+        hour=birth_time.hour,
+        minute=birth_time.minute,
+        location=location,
+    )
+
+    fortune = calculate_daily_fortune(chart, target_date=target)
+
+    return _ok(fortune.to_dict())
+
+
+# =============================================================================
+# 用户档案 API
+# =============================================================================
+
+@router.post("/profile/birth")
+async def save_birth_info(request: Request, body: SaveBirthInfoRequest):
+    """
+    保存出生信息
+
+    需要登录。
+    """
+    request_id = _request_id("birth-save")
+
+    try:
+        user_id = _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    import json
+
+    birth_time = datetime(
+        body.year, body.month, body.day,
+        body.hour, body.minute,
+        tzinfo=timezone.utc,
+    )
+
+    birth_location = {
+        "name": body.location_name or "",
+        "longitude": body.longitude,
+        "latitude": body.latitude,
+        "timezone": body.timezone,
+    }
+
+    # 检查是否已有档案
+    existing = mentis_db.fetch_one(
+        "SELECT id FROM user_profile WHERE user_id = %s",
+        (user_id,),
+    )
+
+    if existing:
+        # 更新
+        mentis_db.execute(
+            """
+            UPDATE user_profile
+            SET birth_time = %s,
+                birth_location = %s::jsonb,
+                bazi_data = NULL,
+                updated_at = NOW()
+            WHERE user_id = %s
+            """,
+            (birth_time, json.dumps(birth_location, ensure_ascii=False), user_id),
+        )
+    else:
+        # 新建
+        mentis_db.execute(
+            """
+            INSERT INTO user_profile (user_id, birth_time, birth_location)
+            VALUES (%s, %s, %s::jsonb)
+            """,
+            (user_id, birth_time, json.dumps(birth_location, ensure_ascii=False)),
+        )
+
+    return _ok({
+        "saved": True,
+        "birth_time": birth_time.isoformat(),
+        "birth_location": birth_location,
+    })
+
+
+@router.get("/profile")
+async def get_decode_profile(request: Request):
+    """
+    获取 Decode 模块用户档案
+
+    包含出生信息和八字数据。
+    """
+    request_id = _request_id("profile-get")
+
+    try:
+        user_id = _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    profile = mentis_db.fetch_one(
+        """
+        SELECT birth_time, birth_location, bazi_data, mbti_type, jung_profile
+        FROM user_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    if not profile:
+        return _ok({
+            "has_birth_info": False,
+            "birth_time": None,
+            "birth_location": None,
+            "bazi_data": None,
+            "mbti_type": None,
+        })
+
+    return _ok({
+        "has_birth_info": profile.get("birth_time") is not None,
+        "birth_time": profile.get("birth_time").isoformat() if profile.get("birth_time") else None,
+        "birth_location": profile.get("birth_location"),
+        "bazi_data": profile.get("bazi_data"),
+        "mbti_type": profile.get("mbti_type"),
+        "jung_profile": profile.get("jung_profile"),
+    })

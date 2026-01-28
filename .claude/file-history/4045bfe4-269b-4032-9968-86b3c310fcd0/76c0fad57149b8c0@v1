@@ -1,0 +1,330 @@
+"""
+Mentis OS v3.0 - 媒体处理 API 路由
+
+提供语音识别和图片分析功能。
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, Optional
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from services import whisper_service, vision_service
+from services.whisper_service import WhisperError
+from services.vision_service import VisionError
+
+
+router = APIRouter(prefix="/v3/media", tags=["media"])
+
+
+def _request_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{uuid4().hex[:8]}"
+
+
+def _ok(data: Dict[str, Any]) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data})
+
+
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request_id,
+            },
+        },
+        status_code=status_code,
+    )
+
+
+def _resolve_user_id(request: Request) -> str:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            UUID(token)
+            return token
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    header_user = (request.headers.get("X-Mentis-User-Id") or "").strip()
+    if header_user:
+        try:
+            UUID(header_user)
+            return header_user
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    raise HTTPException(status_code=401, detail="auth/missing-token")
+
+
+# =============================================================================
+# Request Models
+# =============================================================================
+
+class TranscribeBase64Request(BaseModel):
+    """Base64 音频转录请求"""
+    audio: str = Field(..., description="Base64 编码的音频数据")
+    filename: str = Field(default="audio.webm", description="文件名")
+    language: Optional[str] = Field(None, description="语言代码（如 zh, en）")
+
+
+class AnalyzeImageBase64Request(BaseModel):
+    """Base64 图片分析请求"""
+    image: str = Field(..., description="Base64 编码的图片数据")
+    prompt: Optional[str] = Field(None, description="自定义分析提示词")
+
+
+class AnalyzeImageUrlRequest(BaseModel):
+    """URL 图片分析请求"""
+    url: str = Field(..., description="图片 URL")
+    prompt: Optional[str] = Field(None, description="自定义分析提示词")
+
+
+# =============================================================================
+# 语音识别 API
+# =============================================================================
+
+@router.post("/transcribe")
+async def transcribe_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """
+    语音转文字
+
+    上传音频文件进行转录。
+    支持格式: mp3, wav, webm, m4a, ogg, flac
+    """
+    request_id = _request_id("transcribe")
+
+    try:
+        _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    try:
+        audio_data = await file.read()
+        filename = file.filename or "audio.webm"
+
+        result = await whisper_service.transcribe_audio(
+            audio_data=audio_data,
+            filename=filename,
+            language=language,
+        )
+
+        return _ok(result.to_dict())
+
+    except WhisperError as e:
+        return _error_response(
+            status_code=500,
+            code=e.code,
+            message=e.message,
+            request_id=request_id,
+        )
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="media/transcribe-error",
+            message=str(e)[:100],
+            request_id=request_id,
+        )
+
+
+@router.post("/transcribe/base64")
+async def transcribe_base64(request: Request, body: TranscribeBase64Request):
+    """
+    Base64 音频转文字
+
+    上传 base64 编码的音频进行转录。
+    """
+    request_id = _request_id("transcribe-b64")
+
+    try:
+        _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    try:
+        result = await whisper_service.transcribe_base64(
+            base64_audio=body.audio,
+            filename=body.filename,
+            language=body.language,
+        )
+
+        return _ok(result.to_dict())
+
+    except WhisperError as e:
+        return _error_response(
+            status_code=500,
+            code=e.code,
+            message=e.message,
+            request_id=request_id,
+        )
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="media/transcribe-error",
+            message=str(e)[:100],
+            request_id=request_id,
+        )
+
+
+# =============================================================================
+# 图片分析 API
+# =============================================================================
+
+@router.post("/analyze/image")
+async def analyze_image(
+    request: Request,
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+):
+    """
+    分析上传的图片
+
+    返回图片描述、情绪检测、场景识别等信息。
+    """
+    request_id = _request_id("analyze-img")
+
+    try:
+        _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    try:
+        image_data = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+
+        result = await vision_service.analyze_image(
+            image_data=image_data,
+            mime_type=mime_type,
+            prompt=prompt,
+        )
+
+        return _ok(result.to_dict())
+
+    except VisionError as e:
+        return _error_response(
+            status_code=500,
+            code=e.code,
+            message=e.message,
+            request_id=request_id,
+        )
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="media/analyze-error",
+            message=str(e)[:100],
+            request_id=request_id,
+        )
+
+
+@router.post("/analyze/image/base64")
+async def analyze_image_base64(request: Request, body: AnalyzeImageBase64Request):
+    """
+    分析 Base64 编码的图片
+    """
+    request_id = _request_id("analyze-b64")
+
+    try:
+        _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    try:
+        result = await vision_service.analyze_base64(
+            base64_image=body.image,
+            prompt=body.prompt,
+        )
+
+        return _ok(result.to_dict())
+
+    except VisionError as e:
+        return _error_response(
+            status_code=500,
+            code=e.code,
+            message=e.message,
+            request_id=request_id,
+        )
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="media/analyze-error",
+            message=str(e)[:100],
+            request_id=request_id,
+        )
+
+
+@router.post("/analyze/image/url")
+async def analyze_image_url(request: Request, body: AnalyzeImageUrlRequest):
+    """
+    分析图片 URL
+    """
+    request_id = _request_id("analyze-url")
+
+    try:
+        _resolve_user_id(request)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized",
+            request_id=request_id,
+        )
+
+    try:
+        result = await vision_service.analyze_image_url(
+            image_url=body.url,
+            prompt=body.prompt,
+        )
+
+        return _ok(result.to_dict())
+
+    except VisionError as e:
+        return _error_response(
+            status_code=500,
+            code=e.code,
+            message=e.message,
+            request_id=request_id,
+        )
+    except Exception as e:
+        return _error_response(
+            status_code=500,
+            code="media/analyze-error",
+            message=str(e)[:100],
+            request_id=request_id,
+        )

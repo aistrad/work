@@ -1,0 +1,527 @@
+"""
+Reflection Service - 复盘模块
+
+基于 os_design_claude_mvp v1.md §4 设计：
+- 支持 daily/weekly/monthly/checkpoint 复盘类型
+- 包含四问心法结构
+- 与 Goal 关联形成完整 PDCA 闭环
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+from stores import fortune_db
+
+
+# 复盘引导问题模板
+REFLECTION_PROMPTS = {
+    "daily": {
+        "title": "每日复盘",
+        "questions": [
+            {
+                "id": "key_events",
+                "question": "今天发生了哪些重要事件？",
+                "type": "list",
+                "placeholder": "列出3-5个关键事件",
+            },
+            {
+                "id": "goals_vs_actual",
+                "question": "今天的计划完成情况如何？",
+                "type": "text",
+                "placeholder": "计划做什么，实际做了什么",
+            },
+            {
+                "id": "energy_level",
+                "question": "今天的能量状态如何（1-10）？",
+                "type": "slider",
+                "min": 1,
+                "max": 10,
+            },
+            {
+                "id": "one_thing_learned",
+                "question": "今天学到的一件事是什么？",
+                "type": "text",
+            },
+            {
+                "id": "tomorrow_focus",
+                "question": "明天最重要的一件事是什么？",
+                "type": "text",
+            },
+        ],
+    },
+    "weekly": {
+        "title": "周复盘",
+        "questions": [
+            {
+                "id": "key_events",
+                "question": "本周发生了哪些重要事件？",
+                "type": "list",
+                "placeholder": "列出5-7个关键事件",
+            },
+            {
+                "id": "goals_vs_actual",
+                "question": "本周目标完成情况如何？",
+                "type": "text",
+                "placeholder": "目标/实际/差距分析",
+            },
+            {
+                "id": "human_heart",
+                "question": "【人心】本周有哪些决策是被恐惧/贪婪驱动的？",
+                "type": "text",
+                "placeholder": "识别情绪驱动的决策",
+            },
+            {
+                "id": "dao_heart",
+                "question": "【道心】本周的行动与长期价值对齐吗？",
+                "type": "text",
+                "placeholder": "是否在做正确的事",
+            },
+            {
+                "id": "essence_one",
+                "question": "【精一】本周是否足够聚焦？分散在哪些地方？",
+                "type": "text",
+                "placeholder": "注意力分配分析",
+            },
+            {
+                "id": "middle_way",
+                "question": "【中道】本周各维度（工作/生活/健康/关系）是否平衡？",
+                "type": "text",
+                "placeholder": "平衡状态分析",
+            },
+            {
+                "id": "reinforce",
+                "question": "要强化的行为有哪些？",
+                "type": "list",
+            },
+            {
+                "id": "abandon",
+                "question": "要放弃的习惯有哪些？",
+                "type": "list",
+            },
+            {
+                "id": "next_focus",
+                "question": "下周最重要的焦点是什么？",
+                "type": "text",
+            },
+        ],
+    },
+    "monthly": {
+        "title": "月复盘",
+        "questions": [
+            {
+                "id": "key_events",
+                "question": "本月发生了哪些重要事件？",
+                "type": "list",
+            },
+            {
+                "id": "goals_vs_actual",
+                "question": "本月目标完成情况如何？",
+                "type": "text",
+            },
+            {
+                "id": "decision_review",
+                "question": "本月重要决策回顾（决策/信息质量/运气vs判断）",
+                "type": "complex",
+                "fields": ["decision", "info_quality", "luck_vs_judgment"],
+            },
+            {
+                "id": "four_questions",
+                "question": "四问心法总结",
+                "type": "complex",
+                "fields": ["human_heart", "dao_heart", "essence_one", "middle_way"],
+            },
+            {
+                "id": "system_log",
+                "question": "本月系统升级日志",
+                "type": "text",
+                "placeholder": "沉淀为可复用的原则/流程",
+            },
+            {
+                "id": "next_focus",
+                "question": "下月最重要的焦点是什么？",
+                "type": "text",
+            },
+        ],
+    },
+    "checkpoint": {
+        "title": "目标检查点复盘",
+        "questions": [
+            {
+                "id": "goal_progress",
+                "question": "目标进展如何？",
+                "type": "text",
+            },
+            {
+                "id": "obstacles",
+                "question": "遇到了哪些障碍？",
+                "type": "list",
+            },
+            {
+                "id": "learnings",
+                "question": "学到了什么？",
+                "type": "list",
+            },
+            {
+                "id": "adjustments",
+                "question": "需要做哪些调整？",
+                "type": "text",
+            },
+            {
+                "id": "next_milestone",
+                "question": "下一个里程碑是什么？",
+                "type": "text",
+            },
+        ],
+    },
+}
+
+
+def get_reflection_prompt(reflection_type: str) -> Dict[str, Any]:
+    """获取复盘引导问题"""
+    if reflection_type not in REFLECTION_PROMPTS:
+        reflection_type = "daily"
+    return REFLECTION_PROMPTS[reflection_type]
+
+
+def create_reflection(
+    user_id: int,
+    reflection_type: str,
+    period_start: date,
+    period_end: date,
+    *,
+    related_goal_id: Optional[str] = None,
+    facts: Optional[Dict[str, Any]] = None,
+    decision_review: Optional[Dict[str, Any]] = None,
+    four_questions: Optional[Dict[str, Any]] = None,
+    upgrades: Optional[Dict[str, Any]] = None,
+    next_focus: Optional[str] = None,
+    input_data: Optional[Dict[str, Any]] = None,
+    output_card: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    创建复盘记录
+
+    Args:
+        user_id: 用户ID
+        reflection_type: 复盘类型 (daily/weekly/monthly/checkpoint)
+        period_start: 复盘周期开始日期
+        period_end: 复盘周期结束日期
+        related_goal_id: 关联目标ID (可选)
+        facts: 事实层数据
+        decision_review: 决策回顾
+        four_questions: 四问心法
+        upgrades: 系统升级
+        next_focus: 下期焦点
+        input_data: 原始输入数据 (兼容旧版)
+        output_card: 输出卡片 (兼容旧版)
+
+    Returns:
+        创建的复盘记录
+    """
+    if reflection_type not in ("daily", "weekly", "monthly", "checkpoint"):
+        raise ValueError(f"Invalid reflection type: {reflection_type}")
+
+    with fortune_db.db_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO fortune_reflection (
+                user_id, type, period_start, period_end,
+                related_goal_id, facts, decision_review, four_questions,
+                upgrades, next_focus, input, output_card, reflection_date
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (user_id, period, reflection_date)
+            DO UPDATE SET
+                period_start = EXCLUDED.period_start,
+                period_end = EXCLUDED.period_end,
+                related_goal_id = EXCLUDED.related_goal_id,
+                facts = EXCLUDED.facts,
+                decision_review = EXCLUDED.decision_review,
+                four_questions = EXCLUDED.four_questions,
+                upgrades = EXCLUDED.upgrades,
+                next_focus = EXCLUDED.next_focus,
+                input = EXCLUDED.input,
+                output_card = EXCLUDED.output_card
+            RETURNING *
+            """,
+            (
+                user_id,
+                reflection_type,
+                period_start,
+                period_end,
+                related_goal_id,
+                json.dumps(facts or {}),
+                json.dumps(decision_review or {}),
+                json.dumps(four_questions or {}),
+                json.dumps(upgrades or {}),
+                next_focus,
+                json.dumps(input_data or {}),
+                json.dumps(output_card or {}),
+                period_end,  # reflection_date = period_end for compatibility
+            ),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else {}
+
+
+def get_reflection(reflection_id: int, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """获取单个复盘记录"""
+    if user_id:
+        row = fortune_db.fetch_one(
+            """
+            SELECT * FROM fortune_reflection
+            WHERE reflection_id = %s AND user_id = %s
+            """,
+            (reflection_id, user_id),
+        )
+    else:
+        row = fortune_db.fetch_one(
+            """
+            SELECT * FROM fortune_reflection
+            WHERE reflection_id = %s
+            """,
+            (reflection_id,),
+        )
+    return dict(row) if row else None
+
+
+def list_reflections(
+    user_id: int,
+    *,
+    reflection_type: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    获取用户复盘列表
+
+    Args:
+        user_id: 用户ID
+        reflection_type: 过滤复盘类型 (可选)
+        limit: 返回数量限制
+        offset: 偏移量
+
+    Returns:
+        复盘列表
+    """
+    conditions = ["user_id = %s"]
+    params: List[Any] = [user_id]
+
+    if reflection_type:
+        conditions.append("type = %s")
+        params.append(reflection_type)
+
+    where_clause = " AND ".join(conditions)
+    params.extend([limit, offset])
+
+    rows = fortune_db.fetch_all(
+        f"""
+        SELECT * FROM fortune_reflection
+        WHERE {where_clause}
+        ORDER BY period_start DESC
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params),
+    )
+    return [dict(r) for r in rows]
+
+
+def get_latest_reflection(
+    user_id: int,
+    reflection_type: str,
+) -> Optional[Dict[str, Any]]:
+    """获取用户最新的某类型复盘"""
+    row = fortune_db.fetch_one(
+        """
+        SELECT * FROM fortune_reflection
+        WHERE user_id = %s AND type = %s
+        ORDER BY period_start DESC
+        LIMIT 1
+        """,
+        (user_id, reflection_type),
+    )
+    return dict(row) if row else None
+
+
+def get_reflection_stats(user_id: int, days: int = 30) -> Dict[str, Any]:
+    """
+    获取用户复盘统计
+
+    Args:
+        user_id: 用户ID
+        days: 统计天数
+
+    Returns:
+        复盘统计信息
+    """
+    since_date = date.today() - timedelta(days=days)
+
+    rows = fortune_db.fetch_all(
+        """
+        SELECT type, COUNT(*) as count
+        FROM fortune_reflection
+        WHERE user_id = %s AND period_start >= %s
+        GROUP BY type
+        """,
+        (user_id, since_date),
+    )
+
+    stats = {r["type"]: r["count"] for r in rows}
+    total = sum(stats.values())
+
+    return {
+        "total": total,
+        "by_type": stats,
+        "daily_count": stats.get("daily", 0),
+        "weekly_count": stats.get("weekly", 0),
+        "monthly_count": stats.get("monthly", 0),
+        "period_days": days,
+    }
+
+
+def should_prompt_reflection(user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    检查是否应该提示用户进行复盘
+
+    Args:
+        user_id: 用户ID
+
+    Returns:
+        应该进行的复盘类型和原因，或 None
+    """
+    today = date.today()
+    now = datetime.now(timezone.utc)
+
+    if now.hour >= 21:
+        latest_daily = get_latest_reflection(user_id, "daily")
+        if not latest_daily or latest_daily.get("period_start") != today:
+            return {
+                "type": "daily",
+                "reason": "daily_evening",
+                "message": "今天还没有进行复盘，现在是个好时机。",
+            }
+
+    if today.weekday() == 6:
+        week_start = today - timedelta(days=6)
+        latest_weekly = get_latest_reflection(user_id, "weekly")
+        if not latest_weekly or latest_weekly.get("period_start") < week_start:
+            return {
+                "type": "weekly",
+                "reason": "weekly_sunday",
+                "message": "今天是周日，适合进行周复盘。",
+            }
+
+    if today.day >= 28:
+        month_start = today.replace(day=1)
+        latest_monthly = get_latest_reflection(user_id, "monthly")
+        if not latest_monthly or latest_monthly.get("period_start") < month_start:
+            return {
+                "type": "monthly",
+                "reason": "monthly_end",
+                "message": "月底了，适合进行月度复盘。",
+            }
+
+    return None
+
+
+def get_reflection_context(user_id: int, reflection_type: str) -> Dict[str, Any]:
+    """
+    获取复盘上下文信息
+
+    用于生成复盘引导时的参考数据
+
+    Args:
+        user_id: 用户ID
+        reflection_type: 复盘类型
+
+    Returns:
+        复盘上下文信息
+    """
+    today = date.today()
+
+    if reflection_type == "daily":
+        period_start = today
+        period_end = today
+    elif reflection_type == "weekly":
+        period_start = today - timedelta(days=6)
+        period_end = today
+    elif reflection_type == "monthly":
+        period_start = today.replace(day=1)
+        period_end = today
+    else:
+        period_start = today
+        period_end = today
+
+    checkins = fortune_db.fetch_all(
+        """
+        SELECT mood, intensity, note, created_at
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at::date >= %s
+        ORDER BY created_at DESC
+        """,
+        (user_id, period_start),
+    )
+
+    tasks = fortune_db.fetch_all(
+        """
+        SELECT title, status, created_at, done_at
+        FROM fortune_commitment
+        WHERE user_id = %s AND created_at >= %s
+        ORDER BY created_at DESC
+        """,
+        (user_id, period_start),
+    )
+
+    goals = fortune_db.fetch_all(
+        """
+        SELECT goal_id, title, type, status
+        FROM fortune_goal
+        WHERE user_id = %s AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT 5
+        """,
+        (user_id,),
+    )
+
+    return {
+        "period": {
+            "start": str(period_start),
+            "end": str(period_end),
+            "type": reflection_type,
+        },
+        "checkins": [
+            {
+                "mood": c["mood"],
+                "intensity": c["intensity"],
+                "note": c.get("note", ""),
+                "date": c["created_at"].isoformat() if c.get("created_at") else None,
+            }
+            for c in checkins
+        ],
+        "tasks": {
+            "total": len(tasks),
+            "done": sum(1 for t in tasks if t["status"] == "done"),
+            "active": sum(1 for t in tasks if t["status"] == "active"),
+            "recent": [
+                {
+                    "title": t["title"],
+                    "status": t["status"],
+                }
+                for t in tasks[:5]
+            ],
+        },
+        "active_goals": [
+            {
+                "goal_id": str(g["goal_id"]),
+                "title": g["title"],
+                "type": g["type"],
+            }
+            for g in goals
+        ],
+    }

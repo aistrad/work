@@ -1,0 +1,524 @@
+"""
+Agent Runtime - Main agent processing pipeline
+"""
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from uuid import UUID
+from dataclasses import dataclass
+
+from .persona import PersonaManager
+from .router import SkillRouter, Intent
+from services.vibe_engine import LLMOrchestrator, LLMMessage, EmotionEngine, MemorySystem, InsightGenerator
+from services.knowledge import RetrievalService, EmbeddingService
+from stores import SkillRepository, UserRepository
+
+
+@dataclass
+class AgentResponse:
+    """Agent response"""
+    content: str
+    conversation_id: UUID
+    intent: Optional[Intent] = None
+    tools_used: Optional[List[str]] = None
+    knowledge_used: bool = False
+    insight: Optional[Dict[str, Any]] = None
+    suggestions: Optional[List[str]] = None
+
+
+class AgentRuntime:
+    """
+    Main agent runtime - orchestrates the full processing pipeline.
+
+    Pipeline:
+    1. Context Assembly - Load user profile, history, memories
+    2. Intent Classification - Identify intent and route
+    3. Knowledge Retrieval - Get relevant knowledge
+    4. Tool Invocation - Call skill tools if needed
+    5. Insight Generation - Check for insight triggers
+    6. Response Composition - Generate response with persona
+    """
+
+    # ─────────────────────────────────────────────────────────────────
+    # Main Entry Point
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def process_message(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        message: str,
+        conversation_id: Optional[UUID] = None
+    ) -> AgentResponse:
+        """
+        Process a user message through the full pipeline.
+        """
+        # ─────────────────────────────────────────────────────────────
+        # 1. Context Assembly
+        # ─────────────────────────────────────────────────────────────
+
+        # Get or create conversation
+        if not conversation_id:
+            conv = await SkillRepository.create_conversation(user_id, skill_id)
+            conversation_id = conv["id"]
+
+        # Get user profile
+        profile = await SkillRepository.get_or_create_profile(user_id, skill_id)
+        user_data = await UserRepository.get_by_id(user_id)
+
+        user_context = {
+            "vibe_id": user_data.get("vibe_id") if user_data else None,
+            "display_name": user_data.get("display_name") if user_data else None,
+            "birth_datetime": user_data.get("birth_datetime") if user_data else None,
+            "birth_location": user_data.get("birth_location") if user_data else None,
+            **profile.get("profile_data", {})
+        }
+
+        # Get conversation history
+        history = await MemorySystem.get_conversation_history(conversation_id, limit=10)
+
+        # ─────────────────────────────────────────────────────────────
+        # 2. Intent Classification
+        # ─────────────────────────────────────────────────────────────
+
+        intent, intent_confidence = SkillRouter.classify_intent(message, skill_id)
+
+        # Check if required context is available
+        is_ready, missing = SkillRouter.check_context_ready(intent, user_context)
+
+        # ─────────────────────────────────────────────────────────────
+        # 3. Knowledge Retrieval
+        # ─────────────────────────────────────────────────────────────
+
+        knowledge_context = ""
+        knowledge_used = False
+
+        try:
+            knowledge_context = await RetrievalService.get_context_for_query(
+                message, skill_id
+            )
+            knowledge_used = bool(knowledge_context)
+        except Exception as e:
+            print(f"Knowledge retrieval failed: {e}")
+
+        # ─────────────────────────────────────────────────────────────
+        # 4. Tool Invocation (if needed)
+        # ─────────────────────────────────────────────────────────────
+
+        tools_used = []
+        tool_results = {}
+
+        required_tools = SkillRouter.get_tools_for_intent(intent)
+
+        if required_tools and is_ready:
+            for tool_name in required_tools:
+                try:
+                    result = await cls._invoke_tool(tool_name, user_context)
+                    if result:
+                        tool_results[tool_name] = result
+                        tools_used.append(tool_name)
+                except Exception as e:
+                    print(f"Tool {tool_name} failed: {e}")
+
+        # ─────────────────────────────────────────────────────────────
+        # 5. Emotion Analysis
+        # ─────────────────────────────────────────────────────────────
+
+        emotion_result = await EmotionEngine.analyze(message)
+
+        # ─────────────────────────────────────────────────────────────
+        # 6. Response Generation
+        # ─────────────────────────────────────────────────────────────
+
+        # Build system prompt
+        persona = PersonaManager.get_persona(skill_id)
+
+        system_prompt = LLMOrchestrator.build_system_prompt(
+            persona=persona,
+            skill_context=knowledge_context if knowledge_used else None,
+            user_context=cls._format_user_context(user_context),
+            guidelines=cls._get_situation_guideline(intent, emotion_result, is_ready, missing)
+        )
+
+        # Add tool results to context if any
+        if tool_results:
+            tool_context = "\n\n## 工具计算结果\n" + "\n".join([
+                f"### {name}\n{result}"
+                for name, result in tool_results.items()
+            ])
+            system_prompt += tool_context
+
+        # Build messages
+        messages = LLMOrchestrator.build_messages(
+            system_prompt,
+            [{"role": m["role"], "content": m["content"]} for m in history[-6:]],
+            message
+        )
+
+        # Generate response
+        response = await LLMOrchestrator.chat(messages)
+
+        # ─────────────────────────────────────────────────────────────
+        # 7. Save Message
+        # ─────────────────────────────────────────────────────────────
+
+        # Save user message
+        await SkillRepository.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=message,
+            intent=intent.value if intent else None
+        )
+
+        # Save assistant message
+        await SkillRepository.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=response.content,
+            tools_used=tools_used if tools_used else None,
+            knowledge_used=["knowledge_base"] if knowledge_used else None
+        )
+
+        # ─────────────────────────────────────────────────────────────
+        # 8. Insight Generation
+        # ─────────────────────────────────────────────────────────────
+
+        insight = await InsightGenerator.maybe_generate_insight(
+            user_id=user_id,
+            skill_id=skill_id,
+            message=message,
+            conversation_id=conversation_id,
+            emotion_result=emotion_result,
+            user_context=user_context,
+            llm_orchestrator=LLMOrchestrator
+        )
+
+        # ─────────────────────────────────────────────────────────────
+        # 9. Generate Suggestions
+        # ─────────────────────────────────────────────────────────────
+
+        suggestions = cls._generate_suggestions(intent, skill_id)
+
+        return AgentResponse(
+            content=response.content,
+            conversation_id=conversation_id,
+            intent=intent,
+            tools_used=tools_used if tools_used else None,
+            knowledge_used=knowledge_used,
+            insight=insight,
+            suggestions=suggestions
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Streaming Version
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def stream_message(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        message: str,
+        conversation_id: Optional[UUID] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Process message with streaming response.
+        """
+        # Setup (same as non-streaming)
+        if not conversation_id:
+            conv = await SkillRepository.create_conversation(user_id, skill_id)
+            conversation_id = conv["id"]
+
+        profile = await SkillRepository.get_or_create_profile(user_id, skill_id)
+        user_data = await UserRepository.get_by_id(user_id)
+
+        user_context = {
+            "birth_datetime": user_data.get("birth_datetime") if user_data else None,
+            "birth_location": user_data.get("birth_location") if user_data else None,
+            **profile.get("profile_data", {})
+        }
+
+        history = await MemorySystem.get_conversation_history(conversation_id, limit=10)
+        intent, _ = SkillRouter.classify_intent(message, skill_id)
+
+        # Knowledge retrieval
+        knowledge_context = ""
+        try:
+            knowledge_context = await RetrievalService.get_context_for_query(
+                message, skill_id
+            )
+        except Exception:
+            pass
+
+        # Build prompt
+        persona = PersonaManager.get_persona(skill_id)
+        system_prompt = LLMOrchestrator.build_system_prompt(
+            persona=persona,
+            skill_context=knowledge_context if knowledge_context else None,
+            user_context=cls._format_user_context(user_context)
+        )
+
+        messages = LLMOrchestrator.build_messages(
+            system_prompt,
+            [{"role": m["role"], "content": m["content"]} for m in history[-6:]],
+            message
+        )
+
+        # Save user message
+        await SkillRepository.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=message,
+            intent=intent.value if intent else None
+        )
+
+        # Stream response
+        full_response = ""
+        async for chunk in LLMOrchestrator.stream(messages):
+            full_response += chunk
+            yield chunk
+
+        # Save assistant message
+        await SkillRepository.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=full_response
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Helper Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_user_context(context: Dict[str, Any]) -> str:
+        """Format user context for prompt"""
+        parts = []
+        if context.get("display_name"):
+            parts.append(f"用户名: {context['display_name']}")
+        if context.get("birth_datetime"):
+            parts.append(f"出生时间: {context['birth_datetime']}")
+        if context.get("birth_location"):
+            parts.append(f"出生地点: {context['birth_location']}")
+
+        # Add skill-specific data
+        for key, value in context.items():
+            if key not in ["vibe_id", "display_name", "birth_datetime", "birth_location"]:
+                if value:
+                    parts.append(f"{key}: {value}")
+
+        return "\n".join(parts) if parts else "暂无用户信息"
+
+    @staticmethod
+    def _get_situation_guideline(
+        intent: Intent,
+        emotion_result,
+        is_ready: bool,
+        missing: List[str]
+    ) -> str:
+        """Get response guideline based on situation"""
+        guidelines = []
+
+        # Missing info
+        if not is_ready and missing:
+            missing_names = {
+                "birth_datetime": "出生日期时间",
+                "birth_location": "出生地点",
+                "bazi_chart": "八字命盘"
+            }
+            missing_str = "、".join([missing_names.get(m, m) for m in missing])
+            guidelines.append(f"需要询问用户: {missing_str}")
+
+        # Emotional state
+        if emotion_result and emotion_result.intensity > 0.6:
+            if emotion_result.primary.value in ["sadness", "anger", "fear"]:
+                guidelines.append("用户情绪较低落，先表达共情和理解")
+            elif emotion_result.primary.value == "joy":
+                guidelines.append("用户心情不错，可以更轻松地交流")
+
+        # Intent-specific
+        if intent == Intent.GREETING:
+            guidelines.append("这是开场，简短友好地介绍自己能帮什么")
+        elif intent == Intent.EMOTIONAL:
+            guidelines.append("用户需要情感支持，先倾听和共情")
+
+        return "\n".join(guidelines) if guidelines else ""
+
+    @staticmethod
+    def _generate_suggestions(intent: Intent, skill_id: str) -> List[str]:
+        """Generate follow-up suggestions"""
+        suggestions_map = {
+            "bazi": {
+                Intent.BAZI_CHART: ["看看今年运势", "分析性格特点", "事业发展建议"],
+                Intent.GREETING: ["帮我看看命盘", "今年运势如何", "分析我的性格"],
+            },
+            "zodiac": {
+                Intent.ZODIAC_NATAL: ["这周运势如何", "水逆对我影响大吗", "感情运怎么样"],
+                Intent.GREETING: ["看看我的星盘", "这周运势", "最近要注意什么"],
+            },
+            "mbti": {
+                Intent.MBTI_TYPE: ["我适合什么工作", "如何和XX类型相处", "我的成长方向"],
+                Intent.GREETING: ["帮我测一下类型", "INFP是什么样的", "我和XX合适吗"],
+            }
+        }
+
+        skill_suggestions = suggestions_map.get(skill_id, {})
+        return skill_suggestions.get(intent, skill_suggestions.get(Intent.GREETING, []))
+
+    @staticmethod
+    async def _invoke_tool(tool_name: str, context: Dict[str, Any]) -> Optional[str]:
+        """
+        Invoke a skill tool and return formatted result.
+
+        Supported tools:
+        - bazi.calculator.generate_chart
+        - bazi.transit.calculate_dayun
+        - bazi.transit.calculate_liunian
+        - bazi.analysis.analyze
+        - zodiac.chart.calculate_natal
+        - zodiac.transit.current
+        """
+        from datetime import datetime
+        from tools.bazi import BaziCalculator, TransitCalculator, BaziAnalysis
+        from tools.zodiac import ZodiacChart, ZodiacTransit
+
+        try:
+            # Parse birth_datetime from context
+            birth_dt_str = context.get("birth_datetime")
+            birth_datetime = None
+            if birth_dt_str:
+                if isinstance(birth_dt_str, datetime):
+                    birth_datetime = birth_dt_str
+                elif isinstance(birth_dt_str, str):
+                    # Try multiple formats
+                    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
+                        try:
+                            birth_datetime = datetime.strptime(birth_dt_str, fmt)
+                            break
+                        except ValueError:
+                            continue
+
+            gender = context.get("gender", "male")
+            birth_location = context.get("birth_location")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Bazi Tools
+            # ─────────────────────────────────────────────────────────────────
+
+            if tool_name == "bazi.calculator.generate_chart":
+                if not birth_datetime:
+                    return "需要出生日期时间才能排盘。请告诉我你的出生日期和时间。"
+
+                chart = BaziCalculator.calculate(birth_datetime)
+                chart_str = BaziCalculator.format_chart(chart)
+
+                # Add analysis
+                elements = BaziAnalysis.analyze_five_elements(chart)
+                personality = BaziAnalysis.analyze_personality(chart)
+
+                result = f"{chart_str}\n"
+                result += f"\n日主: {chart.day_master} ({personality.get('symbol', '')})\n"
+                result += f"五行分布: 木{elements['percentages']['木']}% 火{elements['percentages']['火']}% "
+                result += f"土{elements['percentages']['土']}% 金{elements['percentages']['金']}% 水{elements['percentages']['水']}%\n"
+                result += f"最强: {elements['strongest']}  最弱: {elements['weakest']}\n"
+
+                if personality:
+                    result += f"\n性格特质: {', '.join(personality.get('traits', []))}\n"
+                    result += f"优势: {personality.get('strengths', '')}\n"
+                    result += f"挑战: {personality.get('challenges', '')}\n"
+
+                return result
+
+            elif tool_name == "bazi.transit.calculate_dayun":
+                if not birth_datetime:
+                    return "需要出生日期时间才能计算大运。"
+
+                chart = BaziCalculator.calculate(birth_datetime)
+                dayun = TransitCalculator.calculate_dayun(
+                    birth_year=birth_datetime.year,
+                    month_stem=chart.month.stem,
+                    month_branch=chart.month.branch,
+                    gender=gender
+                )
+
+                return TransitCalculator.format_dayun(dayun)
+
+            elif tool_name == "bazi.transit.calculate_liunian":
+                current_year = datetime.now().year
+                liunian = TransitCalculator.calculate_liunian(current_year, count=5)
+                return TransitCalculator.format_liunian(liunian)
+
+            elif tool_name == "bazi.analysis.analyze":
+                if not birth_datetime:
+                    return "需要出生日期时间才能进行分析。"
+
+                chart = BaziCalculator.calculate(birth_datetime)
+                ten_gods = BaziAnalysis.calculate_ten_gods(chart)
+
+                result = "十神分析:\n"
+                for pos, god in ten_gods.items():
+                    if god:
+                        god_info = BaziAnalysis.TEN_GODS.get(god, {})
+                        result += f"  {pos}: {god} - {god_info.get('desc', '')}\n"
+
+                return result
+
+            # ─────────────────────────────────────────────────────────────────
+            # Zodiac Tools
+            # ─────────────────────────────────────────────────────────────────
+
+            elif tool_name == "zodiac.chart.calculate_natal":
+                if not birth_datetime:
+                    return "需要出生日期时间才能计算星盘。"
+
+                chart = ZodiacChart.calculate_natal(birth_datetime, birth_location)
+                chart_dict = ZodiacChart.to_dict(chart)
+
+                result = f"星盘解析:\n"
+                result += f"═══════════════════════════════════════\n"
+                result += f"  太阳星座: {chart.sun.sign}\n"
+                result += f"  月亮星座: {chart.moon.sign}\n"
+                result += f"  上升星座: {chart.ascendant}\n"
+                result += f"  水星: {chart.mercury.sign}\n"
+                result += f"  金星: {chart.venus.sign}\n"
+                result += f"  火星: {chart.mars.sign}\n"
+                result += f"═══════════════════════════════════════\n"
+                result += f"\n{chart_dict['summary']}\n"
+
+                # Add sun sign traits
+                sun_info = chart_dict['sun']['info']
+                if sun_info:
+                    result += f"\n太阳{chart.sun.sign}特质:\n"
+                    result += f"  元素: {sun_info.get('element', '')}  模式: {sun_info.get('modality', '')}\n"
+                    result += f"  守护星: {sun_info.get('ruler', '')}\n"
+                    result += f"  特点: {', '.join(sun_info.get('traits', []))}\n"
+
+                return result
+
+            elif tool_name == "zodiac.transit.current":
+                # Get current transits
+                today = datetime.now()
+                sun_sign = ZodiacChart.get_sun_sign(today)
+
+                result = f"当前行运 ({today.strftime('%Y-%m-%d')}):\n"
+                result += f"  太阳位于: {sun_sign}\n"
+
+                # Check for Mercury retrograde (simplified)
+                from tools.zodiac import ZodiacEvents
+                events = ZodiacEvents.get_upcoming_events(days=30)
+                if events:
+                    result += f"\n近期天象:\n"
+                    for event in events[:5]:
+                        result += f"  • {event.get('name', '')}: {event.get('date', '')}\n"
+
+                return result
+
+            # ─────────────────────────────────────────────────────────────────
+            # Unknown tool
+            # ─────────────────────────────────────────────────────────────────
+
+            return None
+
+        except Exception as e:
+            import traceback
+            print(f"Tool invocation error: {tool_name} - {e}")
+            traceback.print_exc()
+            return None

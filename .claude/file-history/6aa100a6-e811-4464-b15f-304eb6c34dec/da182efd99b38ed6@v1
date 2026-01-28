@@ -1,0 +1,252 @@
+"""
+Google Drive Worker - 内容上传 Worker
+
+运行模式:
+1. 单次运行: python workers/gdrive_worker.py --once
+2. 守护进程: python workers/gdrive_worker.py --daemon --interval 3600
+3. 测试模式: python workers/gdrive_worker.py --dry-run
+
+功能:
+- 扫描 vibelife-xhs/content/ 目录
+- 上传未同步的内容到 Google Drive
+- 更新 calendar.yaml 的 uploaded_at 字段
+
+建议 Cron:
+    0 * * * * python3 workers/gdrive_worker.py --once
+"""
+
+import argparse
+import asyncio
+import logging
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+# 添加项目根目录到 path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from services.gdrive.uploader import GDriveUploader
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# 路径配置
+SKILL_DIR = Path(__file__).parent.parent.parent.parent / ".claude/skills/vibelife-xhs"
+CONTENT_DIR = SKILL_DIR / "content"
+CALENDAR_FILE = SKILL_DIR / "data/calendar.yaml"
+CONFIG_FILE = SKILL_DIR / "config/gdrive.yaml"
+
+
+def load_config() -> dict:
+    """加载配置"""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def load_calendar() -> dict:
+    """加载日历数据"""
+    if CALENDAR_FILE.exists():
+        with open(CALENDAR_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def save_calendar(data: dict) -> None:
+    """保存日历数据"""
+    with open(CALENDAR_FILE, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def parse_content_filename(filename: str) -> dict | None:
+    """
+    解析内容文件名
+
+    格式：2026-01-27-afternoon.md 或 2026-01-27-afternoon-v2.md
+    """
+    pattern = r"^(\d{4}-\d{2}-\d{2})-(afternoon|evening|extra)(?:-(v\d+))?\.md$"
+    match = re.match(pattern, filename)
+    if match:
+        return {
+            "date": match.group(1),
+            "timeslot": match.group(2),
+            "version": match.group(3) or "v1",
+        }
+    return None
+
+
+def scan_content_files() -> list[dict]:
+    """扫描待上传的内容文件"""
+    files = []
+
+    if not CONTENT_DIR.exists():
+        logger.warning(f"Content directory not found: {CONTENT_DIR}")
+        return files
+
+    # 遍历月份文件夹
+    for month_dir in sorted(CONTENT_DIR.iterdir()):
+        if not month_dir.is_dir():
+            continue
+
+        month = month_dir.name  # 如 "2026-01"
+
+        # 遍历内容文件
+        for content_file in sorted(month_dir.glob("*.md")):
+            parsed = parse_content_filename(content_file.name)
+            if parsed:
+                files.append({
+                    "path": content_file,
+                    "month": month,
+                    "filename": content_file.name,
+                    **parsed,
+                })
+
+    return files
+
+
+def get_uploaded_files(calendar: dict) -> set[str]:
+    """获取已上传的文件列表"""
+    uploaded = set()
+
+    for date_str, slots in calendar.items():
+        if not isinstance(slots, dict):
+            continue
+
+        for timeslot, info in slots.items():
+            if isinstance(info, dict) and info.get("uploaded_at"):
+                # 标记为已上传
+                version = info.get("version", "v1")
+                uploaded.add(f"{date_str}-{timeslot}-{version}")
+
+    return uploaded
+
+
+async def run_once(dry_run: bool = False) -> dict:
+    """执行一次上传"""
+    logger.info(f"Starting Google Drive sync at {datetime.now()}")
+
+    # 加载配置
+    config = load_config()
+    calendar = load_calendar()
+
+    # 检查是否启用
+    uploader = GDriveUploader()
+    if not uploader.is_enabled and not dry_run:
+        logger.warning("Google Drive upload is disabled. Set GDRIVE_ENABLED=1 to enable.")
+        return {"uploaded": 0, "skipped": 0, "error": "disabled"}
+
+    # 扫描文件
+    files = scan_content_files()
+    logger.info(f"Found {len(files)} content files")
+
+    # 获取已上传文件
+    uploaded_files = get_uploaded_files(calendar)
+
+    # 统计
+    stats = {"uploaded": 0, "skipped": 0, "failed": 0}
+
+    for file_info in files:
+        # 检查是否已上传
+        file_key = f"{file_info['date']}-{file_info['timeslot']}-{file_info['version']}"
+        if file_key in uploaded_files:
+            logger.debug(f"Skipping already uploaded: {file_info['filename']}")
+            stats["skipped"] += 1
+            continue
+
+        # 构建远程路径
+        remote_path = f"{file_info['month']}/{file_info['filename']}"
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would upload: {file_info['filename']} -> {remote_path}")
+            stats["uploaded"] += 1
+            continue
+
+        # 上传文件
+        file_id = uploader.upload_file(file_info["path"], remote_path)
+
+        if file_id:
+            stats["uploaded"] += 1
+
+            # 更新 calendar.yaml
+            date_str = file_info["date"]
+            timeslot = file_info["timeslot"]
+
+            if date_str not in calendar:
+                calendar[date_str] = {}
+            if timeslot not in calendar[date_str]:
+                calendar[date_str][timeslot] = {}
+
+            calendar[date_str][timeslot]["uploaded_at"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            calendar[date_str][timeslot]["gdrive_file_id"] = file_id
+
+            logger.info(f"Uploaded: {file_info['filename']} -> {file_id}")
+        else:
+            stats["failed"] += 1
+            logger.error(f"Failed to upload: {file_info['filename']}")
+
+    # 保存更新后的 calendar
+    if not dry_run and stats["uploaded"] > 0:
+        save_calendar(calendar)
+        logger.info(f"Updated calendar.yaml with {stats['uploaded']} uploads")
+
+    return stats
+
+
+async def run_daemon(interval: int = 3600, dry_run: bool = False):
+    """守护进程模式"""
+    logger.info(f"Starting gdrive worker daemon (interval: {interval}s)")
+
+    while True:
+        try:
+            await run_once(dry_run)
+        except Exception as e:
+            logger.error(f"Error in gdrive worker: {e}")
+
+        logger.info(f"Sleeping for {interval} seconds...")
+        await asyncio.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Google Drive Worker - 内容上传")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="执行一次后退出",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="守护进程模式",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=3600,
+        help="守护进程模式下的扫描间隔（秒），默认 3600",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="测试模式，只扫描不上传",
+    )
+
+    args = parser.parse_args()
+
+    if args.daemon:
+        asyncio.run(run_daemon(args.interval, args.dry_run))
+    else:
+        stats = asyncio.run(run_once(args.dry_run))
+        logger.info(f"Completed: {stats}")
+
+
+if __name__ == "__main__":
+    main()

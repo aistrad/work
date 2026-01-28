@@ -1,0 +1,410 @@
+"""
+Knowledge Builder Routes 测试
+测试知识库构建 API 端点
+
+注意: knowledge_builder 路由目前未在 main.py 中注册
+这些测试主要验证路由模块本身的逻辑
+
+覆盖端点:
+- POST /api/knowledge/build - 启动构建流程
+- GET /api/knowledge/build/{task_id} - 获取构建状态
+- POST /api/knowledge/cases/extract - 提取案例
+- POST /api/knowledge/quality/check - 质量检查
+- GET /api/knowledge/stats/{skill_id} - 获取统计信息
+"""
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from fastapi import FastAPI
+from httpx import AsyncClient, ASGITransport
+
+pytestmark = pytest.mark.asyncio
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fixtures - 创建包含 knowledge_builder 路由的测试 app
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def kb_app():
+    """创建包含 knowledge_builder 路由的测试 app"""
+    from routes.knowledge_builder import router
+    app = FastAPI()
+    app.include_router(router)
+    return app
+
+
+@pytest.fixture
+async def kb_client(kb_app):
+    """Knowledge Builder 测试客户端"""
+    transport = ASGITransport(app=kb_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Build Pipeline Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestBuildPipelineEndpoint:
+    """构建流程端点测试"""
+
+    async def test_start_build_success(self, kb_client):
+        """测试启动构建流程成功"""
+        response = await kb_client.post(
+            "/api/knowledge/build",
+            json={
+                "skill_id": "bazi",
+                "stages": "all",
+                "limit": 100
+            }
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "started"
+        assert "task_id" in data
+        assert "bazi" in data["task_id"]
+
+    async def test_start_build_specific_stages(self, kb_client):
+        """测试启动特定阶段构建"""
+        response = await kb_client.post(
+            "/api/knowledge/build",
+            json={
+                "skill_id": "zodiac",
+                "stages": "4a,4b",
+                "limit": 50
+            }
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "started"
+
+    async def test_start_build_missing_skill_id(self, kb_client):
+        """测试缺少 skill_id"""
+        response = await kb_client.post(
+            "/api/knowledge/build",
+            json={"stages": "all"}
+        )
+
+        assert response.status_code == 422
+
+    async def test_start_build_default_values(self, kb_client):
+        """测试构建请求默认值"""
+        response = await kb_client.post(
+            "/api/knowledge/build",
+            json={"skill_id": "bazi"}
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "started"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Build Status Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestBuildStatusEndpoint:
+    """构建状态端点测试"""
+
+    async def test_get_build_status_not_found(self, kb_client):
+        """测试获取不存在的任务状态"""
+        response = await kb_client.get("/api/knowledge/build/nonexistent_task_123")
+
+        assert response.status_code == 404
+
+    async def test_get_build_status_after_start(self, kb_client):
+        """测试启动后获取任务状态"""
+        # 先启动一个任务
+        start_response = await kb_client.post(
+            "/api/knowledge/build",
+            json={"skill_id": "test_skill", "stages": "0"}
+        )
+        task_id = start_response.json()["task_id"]
+
+        # 查询状态
+        response = await kb_client.get(f"/api/knowledge/build/{task_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "status" in data
+        assert data["skill_id"] == "test_skill"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Case Extract Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCaseExtractEndpoint:
+    """案例提取端点测试"""
+
+    async def test_extract_cases_no_chunks(self, kb_client):
+        """测试无知识块时的案例提取"""
+        with patch("stores.db.get_connection") as mock_conn:
+            mock_context = AsyncMock()
+            mock_connection = MagicMock()
+            mock_connection.fetch = AsyncMock(return_value=[])
+            mock_context.__aenter__ = AsyncMock(return_value=mock_connection)
+            mock_context.__aexit__ = AsyncMock(return_value=None)
+            mock_conn.return_value = mock_context
+
+            response = await kb_client.post(
+                "/api/knowledge/cases/extract",
+                json={"skill_id": "bazi", "limit": 100}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "no_chunks"
+        assert data["extracted"] == 0
+
+    async def test_extract_cases_with_chunks(self, kb_client):
+        """测试有知识块时的案例提取"""
+        mock_chunks = [
+            {"id": 1, "content": "测试知识块内容1"},
+            {"id": 2, "content": "测试知识块内容2"}
+        ]
+
+        with patch("stores.db.get_connection") as mock_conn, \
+             patch("workers.case_extractor.CaseExtractor") as mock_extractor:
+
+            mock_context = AsyncMock()
+            mock_connection = MagicMock()
+            mock_connection.fetch = AsyncMock(return_value=mock_chunks)
+            mock_context.__aenter__ = AsyncMock(return_value=mock_connection)
+            mock_context.__aexit__ = AsyncMock(return_value=None)
+            mock_conn.return_value = mock_context
+
+            mock_extractor_instance = MagicMock()
+            mock_extractor_instance.extract_from_chunks = AsyncMock(return_value=[{"case": "data"}])
+            mock_extractor_instance.save_cases = AsyncMock(return_value=1)
+            mock_extractor.return_value = mock_extractor_instance
+
+            response = await kb_client.post(
+                "/api/knowledge/cases/extract",
+                json={"skill_id": "bazi", "limit": 100}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+
+    async def test_extract_cases_missing_skill_id(self, kb_client):
+        """测试缺少 skill_id"""
+        response = await kb_client.post(
+            "/api/knowledge/cases/extract",
+            json={"limit": 100}
+        )
+
+        assert response.status_code == 422
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Quality Check Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestQualityCheckEndpoint:
+    """质量检查端点测试"""
+
+    async def test_quality_check_success(self, kb_client):
+        """测试质量检查成功"""
+        mock_report = MagicMock(
+            skill_id="bazi",
+            overall_score=0.85,
+            coverage=MagicMock(coverage_score=0.90),
+            distribution=MagicMock(balance_score=0.80),
+            retrieval=MagicMock(retrieval_score=0.85),
+            warnings=["Warning 1"],
+            recommendations=["Recommendation 1"]
+        )
+
+        with patch("workers.quality_checker.QualityChecker") as mock_checker:
+            mock_checker_instance = MagicMock()
+            mock_checker_instance.generate_report = AsyncMock(return_value=mock_report)
+            mock_checker_instance.save_report = AsyncMock()
+            mock_checker.return_value = mock_checker_instance
+
+            response = await kb_client.post(
+                "/api/knowledge/quality/check",
+                json={"skill_id": "bazi", "save_report": True}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["skill_id"] == "bazi"
+        assert data["overall_score"] == 0.85
+        assert "warnings" in data
+        assert "recommendations" in data
+
+    async def test_quality_check_without_saving(self, kb_client):
+        """测试不保存报告的质量检查"""
+        mock_report = MagicMock(
+            skill_id="zodiac",
+            overall_score=0.75,
+            coverage=MagicMock(coverage_score=0.70),
+            distribution=MagicMock(balance_score=0.80),
+            retrieval=MagicMock(retrieval_score=0.75),
+            warnings=[],
+            recommendations=[]
+        )
+
+        with patch("workers.quality_checker.QualityChecker") as mock_checker:
+            mock_checker_instance = MagicMock()
+            mock_checker_instance.generate_report = AsyncMock(return_value=mock_report)
+            mock_checker_instance.save_report = AsyncMock()
+            mock_checker.return_value = mock_checker_instance
+
+            response = await kb_client.post(
+                "/api/knowledge/quality/check",
+                json={"skill_id": "zodiac", "save_report": False}
+            )
+
+        assert response.status_code == 200
+        # 验证 save_report 没有被调用
+        mock_checker_instance.save_report.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Skill Stats Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSkillStatsEndpoint:
+    """Skill 统计端点测试"""
+
+    async def test_get_skill_stats_success(self, kb_client):
+        """测试获取 Skill 统计成功"""
+        with patch("stores.db.get_connection") as mock_conn, \
+             patch("pathlib.Path") as mock_path:
+
+            mock_context = AsyncMock()
+            mock_connection = MagicMock()
+            mock_connection.fetchval = AsyncMock(side_effect=[100, 50, 10])
+            mock_context.__aenter__ = AsyncMock(return_value=mock_connection)
+            mock_context.__aexit__ = AsyncMock(return_value=None)
+            mock_conn.return_value = mock_context
+
+            mock_scenarios_dir = MagicMock()
+            mock_scenarios_dir.exists.return_value = True
+            mock_scenarios_dir.glob.return_value = [MagicMock() for _ in range(5)]
+            mock_path.return_value.__truediv__ = MagicMock(return_value=mock_scenarios_dir)
+
+            response = await kb_client.get("/api/knowledge/stats/bazi")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["skill_id"] == "bazi"
+        assert "chunks" in data
+        assert "cases_approved" in data
+        assert "cases_pending" in data
+        assert "scenarios" in data
+
+    async def test_get_skill_stats_empty(self, kb_client):
+        """测试空统计"""
+        with patch("stores.db.get_connection") as mock_conn, \
+             patch("pathlib.Path") as mock_path:
+
+            mock_context = AsyncMock()
+            mock_connection = MagicMock()
+            mock_connection.fetchval = AsyncMock(return_value=None)
+            mock_context.__aenter__ = AsyncMock(return_value=mock_connection)
+            mock_context.__aexit__ = AsyncMock(return_value=None)
+            mock_conn.return_value = mock_context
+
+            mock_scenarios_dir = MagicMock()
+            mock_scenarios_dir.exists.return_value = False
+            mock_path.return_value.__truediv__ = MagicMock(return_value=mock_scenarios_dir)
+
+            response = await kb_client.get("/api/knowledge/stats/nonexistent_skill")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["chunks"] == 0
+        assert data["cases_approved"] == 0
+        assert data["cases_pending"] == 0
+        assert data["scenarios"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request Model Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRequestModels:
+    """请求模型测试"""
+
+    def test_build_request_model(self):
+        """测试 BuildRequest 模型"""
+        from routes.knowledge_builder import BuildRequest
+
+        # 默认值测试
+        request = BuildRequest(skill_id="bazi")
+        assert request.skill_id == "bazi"
+        assert request.stages == "all"
+        assert request.limit == 100
+
+        # 自定义值测试
+        request = BuildRequest(skill_id="zodiac", stages="4a", limit=50)
+        assert request.skill_id == "zodiac"
+        assert request.stages == "4a"
+        assert request.limit == 50
+
+    def test_case_extract_request_model(self):
+        """测试 CaseExtractRequest 模型"""
+        from routes.knowledge_builder import CaseExtractRequest
+
+        request = CaseExtractRequest(skill_id="bazi")
+        assert request.skill_id == "bazi"
+        assert request.limit == 100
+
+    def test_quality_check_request_model(self):
+        """测试 QualityCheckRequest 模型"""
+        from routes.knowledge_builder import QualityCheckRequest
+
+        request = QualityCheckRequest(skill_id="bazi")
+        assert request.skill_id == "bazi"
+        assert request.save_report is True
+
+        request = QualityCheckRequest(skill_id="zodiac", save_report=False)
+        assert request.save_report is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Response Model Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestResponseModels:
+    """响应模型测试"""
+
+    def test_build_response_model(self):
+        """测试 BuildResponse 模型"""
+        from routes.knowledge_builder import BuildResponse
+
+        response = BuildResponse(
+            status="started",
+            message="Build pipeline started for bazi",
+            task_id="build_bazi_abc123"
+        )
+
+        assert response.status == "started"
+        assert "bazi" in response.message
+        assert response.task_id == "build_bazi_abc123"
+
+    def test_quality_report_response_model(self):
+        """测试 QualityReportResponse 模型"""
+        from routes.knowledge_builder import QualityReportResponse
+
+        response = QualityReportResponse(
+            skill_id="bazi",
+            overall_score=0.85,
+            coverage_score=0.90,
+            distribution_score=0.80,
+            retrieval_score=0.85,
+            warnings=["Low coverage in area X"],
+            recommendations=["Add more examples for Y"]
+        )
+
+        assert response.skill_id == "bazi"
+        assert response.overall_score == 0.85
+        assert len(response.warnings) == 1
+        assert len(response.recommendations) == 1

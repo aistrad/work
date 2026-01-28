@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+LLM 配置验证工具 - 从 models.yaml 读取配置并验证
+
+验证所有 LLM provider 的 API Key 和端点配置是否正确
+
+使用方法:
+    python scripts/validate_llm_config.py
+    python scripts/validate_llm_config.py --fix  # 显示修复建议
+"""
+import os
+import sys
+import asyncio
+import argparse
+from dataclasses import dataclass
+from typing import Optional, List
+import httpx
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv('/home/aiscend/work/vibelife/.env', override=True)
+
+# 从配置模块读取
+from services.llm.config import LLMConfig, ProviderConfig
+
+
+@dataclass
+class ValidationResult:
+    """验证结果"""
+    provider_id: str
+    name: str
+    status: str  # ok, error, warning, skip
+    message: str
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    fix_suggestion: Optional[str] = None
+
+
+def build_headers(provider: ProviderConfig, api_key: str) -> dict:
+    """根据 API 协议构建请求头"""
+    if provider.api_protocol == "anthropic":
+        return {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01"
+        }
+    else:  # openai
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+
+def build_payload(provider: ProviderConfig, model: str) -> dict:
+    """根据 API 协议构建请求体"""
+    if provider.api_protocol == "anthropic":
+        return {
+            "model": model,
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }
+    else:  # openai
+        return {
+            "model": model,
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }
+
+
+async def test_provider(provider_id: str, provider: ProviderConfig) -> ValidationResult:
+    """测试单个 provider"""
+    api_key = provider.api_key
+    base_url = provider.base_url
+
+    # 检查 API Key
+    if not api_key:
+        return ValidationResult(
+            provider_id=provider_id,
+            name=provider.name,
+            status="error",
+            message=f"API Key 未设置 ({provider.api_key_env})",
+            api_key="(empty)",
+            base_url=base_url,
+            fix_suggestion=f"在 .env 中设置 {provider.api_key_env}=your_api_key"
+        )
+
+    # Key 预览
+    key_preview = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else api_key
+
+    # 获取测试模型
+    models = LLMConfig.list_models(provider_id)
+    test_model = models[0] if models else provider_id
+    model_config = LLMConfig.get_model_config(test_model)
+    model_name = model_config.get("model_name", test_model) if model_config else test_model
+
+    # 构建请求
+    url = f"{base_url.rstrip('/')}{provider.test_endpoint}"
+    headers = build_headers(provider, api_key)
+    payload = build_payload(provider, model_name)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code == 200:
+                return ValidationResult(
+                    provider_id=provider_id,
+                    name=provider.name,
+                    status="ok",
+                    message="API 连接正常",
+                    api_key=key_preview,
+                    base_url=base_url
+                )
+            elif response.status_code == 401:
+                return ValidationResult(
+                    provider_id=provider_id,
+                    name=provider.name,
+                    status="error",
+                    message=f"API Key 无效 (401)",
+                    api_key=key_preview,
+                    base_url=base_url,
+                    fix_suggestion=f"检查 {provider.api_key_env} 是否正确"
+                )
+            elif response.status_code == 404:
+                return ValidationResult(
+                    provider_id=provider_id,
+                    name=provider.name,
+                    status="error",
+                    message=f"端点不存在 (404)",
+                    api_key=key_preview,
+                    base_url=base_url,
+                    fix_suggestion=f"检查 models.yaml 中 {provider_id}.base_url 配置"
+                )
+            else:
+                body = response.text[:200]
+                return ValidationResult(
+                    provider_id=provider_id,
+                    name=provider.name,
+                    status="warning",
+                    message=f"HTTP {response.status_code}: {body}",
+                    api_key=key_preview,
+                    base_url=base_url
+                )
+    except httpx.TimeoutException:
+        return ValidationResult(
+            provider_id=provider_id,
+            name=provider.name,
+            status="warning",
+            message="请求超时 (30s)",
+            api_key=key_preview,
+            base_url=base_url
+        )
+    except Exception as e:
+        return ValidationResult(
+            provider_id=provider_id,
+            name=provider.name,
+            status="error",
+            message=f"连接失败: {str(e)}",
+            api_key=key_preview,
+            base_url=base_url
+        )
+
+
+async def validate_all(show_fix: bool = False) -> List[ValidationResult]:
+    """验证所有 provider"""
+    print("=" * 70)
+    print("VibeLife LLM 配置验证")
+    print("配置源: config/models.yaml")
+    print("=" * 70)
+
+    # 强制重新加载配置
+    LLMConfig.reload()
+
+    results = []
+    provider_ids = LLMConfig.list_providers()
+
+    for provider_id in provider_ids:
+        provider = LLMConfig.get_provider(provider_id)
+        if not provider or not provider.enabled:
+            continue
+
+        print(f"\n检测 {provider.name}...", end=" ", flush=True)
+        result = await test_provider(provider_id, provider)
+        results.append(result)
+
+        icons = {"ok": "✅", "error": "❌", "warning": "⚠️", "skip": "⏭️"}
+        print(icons.get(result.status, "?"))
+
+    # 打印详细结果
+    print("\n" + "=" * 70)
+    print("验证结果")
+    print("=" * 70)
+
+    for r in results:
+        icon = {"ok": "✅", "error": "❌", "warning": "⚠️", "skip": "⏭️"}.get(r.status, "?")
+        print(f"\n{icon} {r.name} ({r.provider_id})")
+        print(f"   状态: {r.message}")
+        if r.api_key:
+            print(f"   Key:  {r.api_key}")
+        if r.base_url:
+            print(f"   URL:  {r.base_url}")
+        if show_fix and r.fix_suggestion:
+            print(f"   修复: {r.fix_suggestion}")
+
+    # 汇总
+    print("\n" + "=" * 70)
+    ok_count = sum(1 for r in results if r.status == "ok")
+    error_count = sum(1 for r in results if r.status == "error")
+    warning_count = sum(1 for r in results if r.status == "warning")
+
+    print(f"汇总: ✅ {ok_count} 正常 | ❌ {error_count} 错误 | ⚠️ {warning_count} 警告")
+
+    if error_count > 0:
+        print("\n提示: 使用 --fix 参数查看修复建议")
+
+    # 显示默认路由
+    print("\n" + "=" * 70)
+    print("默认路由配置 (from models.yaml)")
+    print("=" * 70)
+
+    for task in ["chat", "analysis", "vision", "image_gen", "tools"]:
+        selection = LLMConfig.resolve(user_tier="paid", task=task)
+        if selection:
+            chain = [selection.model] + selection.fallback_chain
+            print(f"  {task}: {' → '.join(chain)}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="验证 LLM 配置 (从 models.yaml 读取)")
+    parser.add_argument("--fix", action="store_true", help="显示修复建议")
+    args = parser.parse_args()
+
+    asyncio.run(validate_all(show_fix=args.fix))
+
+
+if __name__ == "__main__":
+    main()

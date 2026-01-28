@@ -1,0 +1,382 @@
+"""
+Vibe Link Service - Privacy-preserving relationship analysis
+Based on: vibelife spec v3.0, section 2.2.4
+
+Flow:
+1. User A creates a Vibe Link with disclosure level selection
+2. System generates a unique invite link
+3. User B clicks link, selects their disclosure level
+4. Both users receive personalized "How to treat them" advice
+5. Neither sees the other's raw data
+
+Disclosure Levels:
+- minimal: Only relationship analysis, no type info
+- standard: Show zodiac-level info (if both agree)
+- detailed: Show more personality traits (premium)
+"""
+
+import os
+import secrets
+import hashlib
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
+from uuid import UUID, uuid4
+from datetime import datetime, timedelta
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Enums and Types
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DisclosureLevel(str, Enum):
+    MINIMAL = "minimal"    # Only analysis, no type info
+    STANDARD = "standard"  # Show zodiac/element if agreed
+    DETAILED = "detailed"  # More traits (premium)
+
+
+class VibeLinkStatus(str, Enum):
+    PENDING = "pending"      # Waiting for User B
+    ACCEPTED = "accepted"    # User B joined
+    COMPLETED = "completed"  # Analysis done
+    EXPIRED = "expired"      # Link expired
+    CANCELLED = "cancelled"  # Cancelled by creator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class VibeLinkSession:
+    """A Vibe Link session between two users"""
+    id: UUID
+    code: str  # Short code for the link
+    status: VibeLinkStatus
+
+    # Creator (User A)
+    creator_id: UUID
+    creator_nickname: str
+    creator_disclosure: DisclosureLevel
+    creator_profile_hash: str  # Hashed profile for matching
+
+    # Acceptor (User B) - populated when they join
+    acceptor_id: Optional[UUID] = None
+    acceptor_nickname: Optional[str] = None
+    acceptor_disclosure: Optional[DisclosureLevel] = None
+    acceptor_profile_hash: Optional[str] = None
+
+    # Analysis results (per-user view)
+    creator_analysis: Optional[Dict[str, Any]] = None
+    acceptor_analysis: Optional[Dict[str, Any]] = None
+
+    # Metadata
+    relationship_type: str = "general"
+    created_at: datetime = field(default_factory=datetime.now)
+    expires_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "code": self.code,
+            "status": self.status.value,
+            "creator_nickname": self.creator_nickname,
+            "acceptor_nickname": self.acceptor_nickname,
+            "relationship_type": self.relationship_type,
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+    def get_invite_url(self, base_url: str = "") -> str:
+        """Generate the shareable invite URL"""
+        return f"{base_url}/vibe-link/{self.code}"
+
+    def is_expired(self) -> bool:
+        if self.expires_at is None:
+            return False
+        return datetime.now() > self.expires_at
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Vibe Link Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VibeLinkService:
+    """Service for managing Vibe Link sessions"""
+
+    def __init__(self):
+        self._sessions: Dict[str, VibeLinkSession] = {}  # In-memory storage
+        self._base_url = os.getenv("APP_BASE_URL", "https://vibelife.app")
+
+    def create_link(
+        self,
+        creator_id: UUID,
+        creator_nickname: str,
+        creator_profile: Dict[str, Any],
+        disclosure_level: str = "minimal",
+        relationship_type: str = "general",
+        expires_hours: int = 48,
+    ) -> VibeLinkSession:
+        """
+        Create a new Vibe Link.
+
+        Args:
+            creator_id: Creator's user ID
+            creator_nickname: Display name for the link
+            creator_profile: Creator's profile data
+            disclosure_level: How much to share
+            relationship_type: Type of relationship
+            expires_hours: Link expiration time
+
+        Returns:
+            VibeLinkSession with invite URL
+        """
+        # Generate unique code
+        code = self._generate_code()
+
+        # Hash profile for privacy
+        profile_hash = self._hash_profile(creator_profile)
+
+        session = VibeLinkSession(
+            id=uuid4(),
+            code=code,
+            status=VibeLinkStatus.PENDING,
+            creator_id=creator_id,
+            creator_nickname=creator_nickname,
+            creator_disclosure=DisclosureLevel(disclosure_level),
+            creator_profile_hash=profile_hash,
+            relationship_type=relationship_type,
+            created_at=datetime.now(),
+            expires_at=datetime.now() + timedelta(hours=expires_hours),
+        )
+
+        # Store session
+        self._sessions[code] = session
+
+        logger.info(f"Created Vibe Link: {code} for user {creator_id}")
+        return session
+
+    def get_session(self, code: str) -> Optional[VibeLinkSession]:
+        """Get a session by code"""
+        session = self._sessions.get(code)
+        if session and session.is_expired():
+            session.status = VibeLinkStatus.EXPIRED
+        return session
+
+    def accept_link(
+        self,
+        code: str,
+        acceptor_id: UUID,
+        acceptor_nickname: str,
+        acceptor_profile: Dict[str, Any],
+        disclosure_level: str = "minimal",
+    ) -> Optional[VibeLinkSession]:
+        """
+        Accept a Vibe Link invitation.
+
+        Args:
+            code: The link code
+            acceptor_id: Acceptor's user ID
+            acceptor_nickname: Acceptor's display name
+            acceptor_profile: Acceptor's profile data
+            disclosure_level: Acceptor's disclosure preference
+
+        Returns:
+            Updated VibeLinkSession or None if invalid
+        """
+        session = self.get_session(code)
+        if not session:
+            logger.warning(f"Vibe Link not found: {code}")
+            return None
+
+        if session.status != VibeLinkStatus.PENDING:
+            logger.warning(f"Vibe Link not pending: {code} ({session.status})")
+            return None
+
+        if session.is_expired():
+            session.status = VibeLinkStatus.EXPIRED
+            return None
+
+        # Prevent self-linking
+        if session.creator_id == acceptor_id:
+            logger.warning(f"Self-linking attempted: {code}")
+            return None
+
+        # Update session
+        session.acceptor_id = acceptor_id
+        session.acceptor_nickname = acceptor_nickname
+        session.acceptor_disclosure = DisclosureLevel(disclosure_level)
+        session.acceptor_profile_hash = self._hash_profile(acceptor_profile)
+        session.status = VibeLinkStatus.ACCEPTED
+
+        logger.info(f"Vibe Link accepted: {code} by user {acceptor_id}")
+        return session
+
+    async def complete_analysis(
+        self,
+        code: str,
+        creator_profile: Dict[str, Any],
+        acceptor_profile: Dict[str, Any],
+    ) -> Optional[VibeLinkSession]:
+        """
+        Generate analysis for both users after acceptance.
+
+        Args:
+            code: The link code
+            creator_profile: Full creator profile
+            acceptor_profile: Full acceptor profile
+
+        Returns:
+            Updated session with analysis results
+        """
+        session = self.get_session(code)
+        if not session or session.status != VibeLinkStatus.ACCEPTED:
+            return None
+
+        # Import here to avoid circular dependency
+        from .relationship_service import get_relationship_service
+
+        service = get_relationship_service()
+
+        # Generate analysis
+        analysis = await service.analyze(
+            user1_id=session.creator_id,
+            user1_profile=creator_profile,
+            user2_profile=acceptor_profile,
+            relationship_type=session.relationship_type,
+            user2_id=session.acceptor_id,
+        )
+
+        # Create per-user views based on disclosure levels
+        session.creator_analysis = self._create_user_view(
+            analysis.to_dict(),
+            session.acceptor_disclosure,
+            "creator",
+        )
+
+        session.acceptor_analysis = self._create_user_view(
+            analysis.to_dict(),
+            session.creator_disclosure,
+            "acceptor",
+        )
+
+        session.status = VibeLinkStatus.COMPLETED
+        session.completed_at = datetime.now()
+
+        return session
+
+    def cancel_link(self, code: str, user_id: UUID) -> bool:
+        """Cancel a pending link (creator only)"""
+        session = self.get_session(code)
+        if not session:
+            return False
+
+        if session.creator_id != user_id:
+            return False
+
+        if session.status == VibeLinkStatus.PENDING:
+            session.status = VibeLinkStatus.CANCELLED
+            return True
+
+        return False
+
+    def _generate_code(self, length: int = 8) -> str:
+        """Generate a unique, URL-safe code"""
+        while True:
+            code = secrets.token_urlsafe(length)[:length].upper()
+            if code not in self._sessions:
+                return code
+
+    def _hash_profile(self, profile: Dict[str, Any]) -> str:
+        """Create privacy-preserving hash of profile"""
+        # Extract key characteristics for matching
+        basic = profile.get("basic", {})
+        key_data = {
+            "element": basic.get("day_master_element"),
+            "zodiac": basic.get("zodiac_sign"),
+        }
+        data_str = str(sorted(key_data.items()))
+        return hashlib.sha256(data_str.encode()).hexdigest()[:16]
+
+    def _create_user_view(
+        self,
+        analysis: Dict[str, Any],
+        other_disclosure: DisclosureLevel,
+        perspective: str,
+    ) -> Dict[str, Any]:
+        """Create a personalized view of the analysis"""
+        view = {
+            "headline": analysis["headline"],
+            "communication_style": analysis["communication_style"],
+            "summary": analysis["summary"],
+            "prescriptions": analysis["prescriptions"],
+            "warnings": analysis["warnings"],
+        }
+
+        # Add scores only for standard+ disclosure
+        if other_disclosure in [DisclosureLevel.STANDARD, DisclosureLevel.DETAILED]:
+            view["scores"] = analysis.get("scores", [])
+            view["overall_score"] = analysis.get("overall_score")
+
+        # Add perspective-specific framing
+        if perspective == "creator":
+            view["perspective_label"] = "你该如何对待 TA"
+        else:
+            view["perspective_label"] = "你该如何对待 TA"
+
+        return view
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton and Convenience Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+_vibe_link_service: Optional[VibeLinkService] = None
+
+
+def get_vibe_link_service() -> VibeLinkService:
+    """Get singleton Vibe Link service"""
+    global _vibe_link_service
+    if _vibe_link_service is None:
+        _vibe_link_service = VibeLinkService()
+    return _vibe_link_service
+
+
+def create_vibe_link(
+    creator_id: UUID,
+    creator_nickname: str,
+    creator_profile: Dict[str, Any],
+    disclosure_level: str = "minimal",
+    relationship_type: str = "general",
+) -> VibeLinkSession:
+    """Convenience function to create a Vibe Link"""
+    service = get_vibe_link_service()
+    return service.create_link(
+        creator_id=creator_id,
+        creator_nickname=creator_nickname,
+        creator_profile=creator_profile,
+        disclosure_level=disclosure_level,
+        relationship_type=relationship_type,
+    )
+
+
+def accept_vibe_link(
+    code: str,
+    acceptor_id: UUID,
+    acceptor_nickname: str,
+    acceptor_profile: Dict[str, Any],
+    disclosure_level: str = "minimal",
+) -> Optional[VibeLinkSession]:
+    """Convenience function to accept a Vibe Link"""
+    service = get_vibe_link_service()
+    return service.accept_link(
+        code=code,
+        acceptor_id=acceptor_id,
+        acceptor_nickname=acceptor_nickname,
+        acceptor_profile=acceptor_profile,
+        disclosure_level=disclosure_level,
+    )

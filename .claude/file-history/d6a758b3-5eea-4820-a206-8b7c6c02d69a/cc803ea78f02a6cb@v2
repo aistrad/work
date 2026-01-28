@@ -1,0 +1,811 @@
+# VibeProfile 全面 Review 报告
+
+> 生成时间: 2026-01-19
+> 审查范围: 设计文档、代码实现、数据迁移、实际使用情况
+> 审查基准: /docs/components/VibeProfile + /docs/archive/v8/ARCHITECTURE.md
+
+---
+
+## 执行摘要
+
+VibeProfile 作为 V8 的核心重构，成功实现了 **WHO/WHAT 数据分离** 和 **JSONB 统一存储**，整合了 5 张历史表，显著简化了数据架构。但在 **文档与代码一致性**、**部分功能完整性** 方面存在问题，需要优先修复。
+
+**总体评分**: 7.5/10
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| 设计合理性 | 8/10 | WHO/WHAT 分离清晰，JSONB 灵活，局部更新优化到位 |
+| 实现完整性 | 6/10 | 核心功能完整，但文档描述的部分功能未实现 |
+| 文档一致性 | 5/10 | 多处文档与代码不一致，影响维护 |
+| 代码质量 | 8/10 | 实现规范，测试覆盖良好 |
+| 可维护性 | 7/10 | 结构清晰，但存在命名混乱和双重结构 |
+
+---
+
+## 1. 文档与代码一致性分析
+
+### 1.1 严重不一致 (需修复)
+
+#### ❌ Problem 1: `account` 字段缺失
+
+**SPEC.md 定义:**
+```yaml
+profile:
+  account: { vibe_id, display_name, email, tier, status }  # 从 vibe_users 同步
+```
+
+**ARCHITECTURE.md 定义:**
+```yaml
+account: { vibe_id, display_name, tier, status }  # 从 vibe_users 同步
+```
+
+**实际代码:** `unified_profile_repo.py` 中完全没有 `account` 字段
+
+**影响:**
+- 需要 JOIN `vibe_users` 表才能获取 `vibe_id`、`tier` 等基本信息
+- Proactive Engine 无法从 Profile 直接读取用户等级，影响个性化推送
+- 与文档承诺的"统一画像"设计理念不符
+
+**建议:**
+- 优先级: **P0**
+- 在 Profile 创建/更新时同步 `vibe_users` 的基本字段
+- 添加触发器或定期同步机制
+
+---
+
+#### ❌ Problem 2: `state` 字段完全缺失
+
+**SPEC.md 定义:**
+```yaml
+state:
+  emotion: "neutral"              # anxious | sad | neutral | content | excited
+  focus: ["career"]               # 当前关注的话题
+  life_stage: "career_growth"
+```
+
+**实际代码:** 完全未实现
+
+**影响:**
+- 无法存储用户当前情绪状态、关注点、生命阶段
+- Proactive Engine 无法基于用户状态进行情绪化触发（如 `emotion_based` 触发器）
+- Core Skill 无法记录和追踪用户状态变化
+
+**建议:**
+- 优先级: **P1**
+- 添加 `state` 顶层字段
+- 提供 `update_state()` 方法
+- 在 CoreAgent 对话中抽取并更新 `state`
+
+---
+
+#### ❌ Problem 3: `identity` vs `birth_info` 命名不一致
+
+**SPEC.md:** `identity.birth_info`
+**ARCHITECTURE.md:** `identity.birth_info`
+**实际代码:** `birth_info` (顶层字段)
+
+**影响:**
+- 文档与代码命名不一致
+- 如果未来扩展 `identity` 的其他子字段（如身份证信息），需要重构
+
+**建议:**
+- 优先级: **P2**
+- 统一命名为 `identity.birth_info`
+- 提供兼容层处理旧数据
+
+---
+
+#### ⚠️ Problem 4: `subscribed_skills` 数据结构不一致
+
+**SPEC.md 定义:** 数组
+```yaml
+subscribed_skills: ["core", "bazi", "zodiac"]
+```
+
+**ARCHITECTURE.md 定义:** 对象
+```yaml
+subscribed_skills:
+  bazi: { status, push_enabled, subscribed_at, trial_messages_used }
+```
+
+**实际代码:** 对象（与 ARCHITECTURE.md 一致）
+```python
+"subscribed_skills": {
+    "bazi": {
+        "status": "subscribed",
+        "push_enabled": true,
+        ...
+    }
+}
+```
+
+**影响:**
+- SPEC.md 误导开发者
+- 简化版（数组）无法存储订阅时间、推送开关等元数据
+
+**建议:**
+- 优先级: **P1**
+- 更新 SPEC.md 为对象结构
+- 统一两份文档
+
+---
+
+#### ⚠️ Problem 5: `push_enabled` 和 `push_hour` 位置不一致
+
+**SPEC.md:** 顶层 `preferences` 下
+```yaml
+preferences:
+  push_enabled: true
+  push_hour: 8
+```
+
+**实际代码:** 嵌套在 `push_settings` 对象内
+```python
+"preferences": {
+    "push_settings": {
+        "default_push_hour": 8,
+        "max_daily_pushes": 5,
+        "quiet_start_hour": 22,
+        "quiet_end_hour": 7
+    }
+}
+```
+
+**影响:**
+- SPEC 的扁平化设计无法支持静默时段等高级配置
+- 代码实现更合理，但文档需更新
+
+**建议:**
+- 优先级: **P1**
+- 更新 SPEC.md 使用 `push_settings` 对象
+
+---
+
+### 1.2 文档缺失 (需补充)
+
+#### 📝 Missing 1: `identity_prism` 字段无文档
+
+**实际代码:** 大量使用 `identity_prism` 字段
+```python
+# services/identity/prism_generator.py
+await UnifiedProfileRepository.update_identity_prism(user_id, fused_data)
+```
+
+**文档:** SPEC.md 和 ARCHITECTURE.md 均未提及
+
+**影响:**
+- 核心功能（多维度身份融合）缺乏设计文档
+- 开发者无法理解 `identity_prism` 的作用和数据结构
+
+**建议:**
+- 优先级: **P1**
+- 在 SPEC.md 补充 `identity_prism` 字段定义
+- 说明融合逻辑和使用场景
+
+---
+
+#### 📝 Missing 2: `life_context._paths` 机制无文档
+
+**实际代码:** 使用虚拟路径系统
+```python
+await UnifiedProfileRepository.read_life_context_path(user_id, "goals/2026/year")
+```
+
+**文档:** 未提及路径化存储机制
+
+**影响:**
+- 开发者不知道何时使用 `life_context.goals` vs `life_context._paths`
+- 双重结构容易混淆
+
+**建议:**
+- 优先级: **P1**
+- 在 SPEC.md 说明 `_paths` 机制的设计目的
+- 提供使用指南（何时用路径，何时用固定字段）
+
+---
+
+## 2. 实现完整性分析
+
+### 2.1 已完整实现 ✅
+
+| 功能模块 | 实现状态 | 代码位置 |
+|---------|---------|---------|
+| Profile CRUD | ✅ 完整 | `unified_profile_repo.py` |
+| Skill 订阅管理 | ✅ 完整 | `unified_profile_repo.py` L498-826 |
+| 推送偏好管理 | ✅ 完整 | `unified_profile_repo.py` L828-929 |
+| Skill 屏蔽 | ✅ 完整 | `unified_profile_repo.py` L931-1005 |
+| Life Context 路径 | ✅ 完整 | `unified_profile_repo.py` L1007-1190 |
+| 缓存系统 | ✅ 完整 | `profile_cache.py` |
+| 数据迁移 | ✅ 完整 | `scripts/migrate_to_unified_profile.py` |
+| Proactive Engine 集成 | ✅ 完整 | `services/proactive/engine.py` |
+| Skill API 集成 | ✅ 完整 | `skills/{bazi,zodiac,vibe_id}/services/api.py` |
+
+---
+
+### 2.2 部分实现 ⚠️
+
+#### ⚠️ Partial 1: Goals/Tasks/Checkins/Reminders
+
+**SPEC.md 定义:** 完整的生活管理 API
+```yaml
+life_context:
+  goals: [{ id, title, category, status, progress, deadline }]
+  tasks: [{ id, title, status, due_date, goal_id }]
+  checkins: { "2026-01-19": { mood, energy, notes } }
+  reminders: [{ id, type, title, schedule_type, trigger_hour }]
+```
+
+**实际实现:**
+- ✅ Repository 方法存在: `add_goal()`, `update_goal()`, `add_task()`, `add_checkin()`, `add_reminder()`
+- ❌ HTTP API 缺失: 未暴露 REST API 端点
+- ❌ 前端集成缺失: Web 端无法调用
+
+**影响:**
+- 功能可用但无入口
+- 用户无法通过界面管理目标、任务、打卡
+
+**建议:**
+- 优先级: **P2**
+- 添加 `/api/v1/profile/goals`, `/api/v1/profile/checkins` 等端点
+- 参考 SPEC.md Section 8 的 API 定义
+
+---
+
+#### ⚠️ Partial 2: Checkins 30天自动清理
+
+**SPEC.md 定义:** `checkins` 只保留 30 天
+
+**实际实现:**
+- ✅ Repository 方法存在: `cleanup_old_checkins(user_id, keep_days=30)`
+- ❌ Worker 未调用: 无定时任务执行清理
+
+**建议:**
+- 优先级: **P2**
+- 在 ProactiveWorker 或新建 CleanupWorker 中调用
+- 每日凌晨 05:00 执行
+
+---
+
+### 2.3 完全缺失 ❌
+
+#### ❌ Missing 1: `vibe_profile_insights` 表未使用
+
+**SPEC.md 定义:** Cold Layer，存储 AI 洞察
+```sql
+CREATE TABLE vibe_profile_insights (
+    insight_type VARCHAR(50),  -- discovery | pattern | timing | growth
+    content TEXT,
+    ...
+)
+```
+
+**实际情况:** 表已创建，但完全未使用
+
+**建议:**
+- 优先级: **P3**
+- 实现 AI 洞察生成逻辑
+- 在对话中抽取深度洞察并存储
+
+---
+
+#### ❌ Missing 2: `vibe_profile_timeline` 表未使用
+
+**SPEC.md 定义:** 重要事件时间线
+```sql
+CREATE TABLE vibe_profile_timeline (
+    event_type VARCHAR(50),  -- dayun_change | goal_completed | milestone
+    ...
+)
+```
+
+**实际情况:** 表已创建，但完全未使用
+
+**建议:**
+- 优先级: **P3**
+- 在关键事件（大运切换、目标完成）时记录
+- 提供时间线 API
+
+---
+
+#### ❌ Missing 3: `data_retention` 自动清理
+
+**SPEC.md 定义:** 用户可选对话保留策略
+```yaml
+data_retention:
+  conversations: "1y" | "3y" | "forever"
+```
+
+**实际实现:**
+- ✅ 配置字段存在
+- ❌ 清理逻辑缺失
+
+**影响:**
+- 配置无实际作用
+- 数据库持续增长
+
+**建议:**
+- 优先级: **P2**
+- 实现 `ConversationCleanupWorker`
+- 每周执行一次，按用户 `data_retention` 设置归档/删除
+
+---
+
+## 3. 设计合理性评估
+
+### 3.1 优秀设计 ✅
+
+#### ✅ Good 1: WHO/WHAT 数据分离
+
+清晰的领域划分：
+- VibeProfile (WHO): 用户画像
+- Operational (WHAT): 用户行为
+
+**优点:**
+- 关注点分离，易于理解和维护
+- Profile 更新不影响操作数据
+
+---
+
+#### ✅ Good 2: JSONB 局部更新
+
+使用 `jsonb_set()` 避免全量读写：
+```sql
+UPDATE unified_profiles
+SET profile = jsonb_set(
+    profile,
+    '{skill_data, bazi}',
+    $1::jsonb
+)
+WHERE user_id = $2
+```
+
+**优点:**
+- 性能优化，减少 DB 负载
+- 减少并发冲突
+
+---
+
+#### ✅ Good 3: 缓存失效策略
+
+```python
+await UnifiedProfileRepository._invalidate_cache(user_id, skill)
+```
+
+- Skill 级缓存失效：更新 `skill_data.bazi` 只失效 bazi 缓存
+- 全局失效：更新 `birth_info` 失效所有缓存
+
+**优点:**
+- 精细化控制，避免过度失效
+
+---
+
+#### ✅ Good 4: 试用机制
+
+```python
+"trial_messages_used": 3
+```
+
+- 内置试用次数追踪
+- 支持 Skill 灵活试用策略
+
+---
+
+#### ✅ Good 5: 深度合并
+
+```python
+def deep_merge(base: Dict, update: Dict) -> Dict:
+    """递归合并嵌套字典"""
+```
+
+- 支持部分更新嵌套数据
+- 保留未更新的字段
+
+---
+
+### 3.2 有问题的设计 ⚠️
+
+#### ⚠️ Issue 1: `life_context` 双重结构
+
+同时存在固定字段和 `_paths`:
+```python
+"life_context": {
+    "goals": [],           # 固定字段
+    "tasks": [],
+    "_paths": {            # 虚拟路径
+        "goals/2026/year": {...}
+    }
+}
+```
+
+**问题:**
+- 何时用固定字段，何时用 `_paths`？
+- 两者数据可能重复
+
+**建议:**
+- 明确使用场景：固定字段用于 Proactive 快速访问，`_paths` 用于灵活扩展
+- 添加数据一致性检查
+
+---
+
+#### ⚠️ Issue 2: `account` 缺失导致额外 JOIN
+
+```python
+# 需要 JOIN vibe_users 获取 vibe_id
+SELECT up.profile, vu.vibe_id, vu.tier
+FROM unified_profiles up
+JOIN vibe_users vu ON up.user_id = vu.id
+```
+
+**问题:**
+- 违背"统一画像"设计
+- 增加查询复杂度
+
+**建议:**
+- 在 Profile 中冗余存储 `account` 基本字段
+- 使用触发器保持同步
+
+---
+
+#### ⚠️ Issue 3: `subscribed_skills` vs 数组性能
+
+当前实现为对象:
+```python
+"subscribed_skills": {
+    "bazi": {...},
+    "zodiac": {...}
+}
+```
+
+**问题:**
+- 获取已订阅列表需遍历对象
+- 无法使用 PostgreSQL JSONB 数组操作符
+
+**优点:**
+- 支持元数据（`push_enabled`, `subscribed_at`）
+
+**结论:** 当前设计合理，SPEC.md 需更新
+
+---
+
+## 4. 代码质量评估
+
+### 4.1 优点 ✅
+
+- ✅ **类型注解完整**: 所有方法都有类型提示
+- ✅ **文档字符串清晰**: Docstring 说明参数和返回值
+- ✅ **错误处理完善**: 捕获异常并记录日志
+- ✅ **测试覆盖**: 200+ 行单元测试 (`test_unified_profile_repo.py`)
+- ✅ **数据类使用**: `SkillSubscription`, `UserPushPreferences` 提升可读性
+
+---
+
+### 4.2 改进空间 ⚠️
+
+#### ⚠️ Issue 1: 缺少访问控制
+
+```python
+async def update_skill_data(user_id: UUID, skill: str, data: Dict):
+    """无权限检查，任何调用方都可修改任意 Skill 数据"""
+```
+
+**建议:**
+- 添加 Skill 访问规则验证
+- 参考 SPEC.md Section 5 的访问矩阵
+
+---
+
+#### ⚠️ Issue 2: 缺少数据验证
+
+```python
+async def update_birth_info(user_id: UUID, birth_info: Dict):
+    """不验证 birth_info 字段，可能写入非法数据"""
+```
+
+**建议:**
+- 使用 Pydantic Model 验证输入
+- 检查必填字段和数据类型
+
+---
+
+#### ⚠️ Issue 3: 魔法数字和硬编码
+
+```python
+DEFAULT_TTL = 300  # 应提取为配置
+MAX_GOALS = 20     # 应在 SPEC.md 中明确
+```
+
+**建议:**
+- 移入配置文件
+- 在文档中说明限制理由
+
+---
+
+## 5. 迁移完整性检查
+
+### 5.1 迁移脚本分析
+
+**文件:** `scripts/migrate_to_unified_profile.py`
+
+#### ✅ 已完整迁移
+
+| 源表 | 目标字段 | 状态 |
+|------|---------|------|
+| user_skill_subscriptions | `preferences.subscribed_skills` | ✅ |
+| user_push_preferences | `preferences.push_settings` | ✅ |
+| user_data_store | `life_context._paths` | ✅ |
+| skill_recommendation_blocks | `preferences.blocked_skills` | ✅ |
+
+---
+
+### 5.2 清理脚本分析
+
+**文件:** `stores/migrations/017_drop_legacy_profile_tables.sql`
+
+#### ✅ 安全措施完善
+
+1. 事务包裹
+2. 数据验证（打印行数）
+3. CASCADE 删除依赖
+4. 迁移日志记录
+
+---
+
+## 6. Proactive 集成分析
+
+### 6.1 集成点 ✅
+
+**文件:** `services/proactive/engine.py`
+
+```python
+# 1. 获取 Profile
+profile = await UnifiedProfileRepository.get_profile(user_id)
+
+# 2. 检查订阅
+subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+
+# 3. 个性化内容
+content = await self.content_generator.generate(profile=profile, ...)
+```
+
+#### ✅ 设计合理
+
+- Profile 是唯一数据源
+- 支持 Skill 级推送开关
+- 支持用户本地时区和推送偏好
+
+---
+
+### 6.2 缺失功能 ⚠️
+
+#### ⚠️ Missing: `state` 字段触发器
+
+**ARCHITECTURE.md 定义:**
+```yaml
+触发器类型:
+  emotion_based: 情绪触发 - 检测到焦虑
+```
+
+**实际情况:** `state` 字段不存在，无法实现
+
+**建议:**
+- 实现 `state` 字段
+- 在 TriggerDetector 中添加情绪检测逻辑
+
+---
+
+#### ⚠️ Missing: `life_context.reminders` 触发
+
+**SPEC.md 流程:**
+```python
+reminders = profile["life_context"]["reminders"]
+for reminder in reminders:
+    if should_trigger_today(reminder):
+        create_notification(...)
+```
+
+**实际情况:** `reminders` 字段存在但未集成到 ProactiveEngine
+
+**建议:**
+- 在 `_detect_user_triggers()` 中检查 `life_context.reminders`
+- 生成用户自定义提醒
+
+---
+
+## 7. 性能评估
+
+### 7.1 缓存性能 ✅
+
+**实现:** `profile_cache.py`
+
+- TTL: 5 分钟
+- 命中率统计: `get_stats()`
+- 按前缀失效: 支持批量失效
+
+#### ✅ 设计合理
+
+- 分 Skill 缓存，减少失效范围
+- 异步锁保证并发安全
+
+---
+
+### 7.2 JSONB 性能 ⚠️
+
+#### ⚠️ Concern 1: 深层嵌套路径
+
+```sql
+jsonb_set(
+    jsonb_set(
+        profile,
+        '{preferences}',
+        ...
+    ),
+    '{preferences, subscribed_skills}',
+    ...
+)
+```
+
+**潜在问题:**
+- 多层嵌套可能影响性能
+- 建议监控慢查询
+
+---
+
+#### ⚠️ Concern 2: 无索引优化
+
+**当前索引:**
+```sql
+CREATE INDEX idx_unified_profiles_birth_info
+ON unified_profiles USING GIN (profile);
+```
+
+**问题:** GIN 索引覆盖整个 JSONB，未针对高频查询优化
+
+**建议:**
+- 添加特定字段索引：
+```sql
+CREATE INDEX idx_profiles_subscribed_skills
+ON unified_profiles ((profile -> 'preferences' -> 'subscribed_skills'));
+```
+
+---
+
+## 8. 改进建议优先级
+
+### P0 - 立即修复
+
+1. **补充 `account` 字段** (影响用户等级判断)
+   - 添加字段定义
+   - 实现同步逻辑
+   - 更新文档
+
+2. **统一文档命名** (`identity` vs `birth_info`)
+   - 统一为 `identity.birth_info`
+   - 提供迁移路径
+
+---
+
+### P1 - 近期完成 (1-2周)
+
+3. **实现 `state` 字段**
+   - 添加 emotion, focus, life_stage
+   - 集成到 CoreAgent 对话抽取
+   - 支持情绪化触发器
+
+4. **更新 SPEC.md**
+   - 修正 `subscribed_skills` 为对象
+   - 修正 `push_settings` 结构
+   - 补充 `identity_prism` 文档
+   - 补充 `life_context._paths` 说明
+
+5. **补充 `identity_prism` 文档**
+   - 说明融合逻辑
+   - 数据结构定义
+   - 使用示例
+
+---
+
+### P2 - 中期完成 (1个月)
+
+6. **实现 Goals/Tasks API**
+   - 添加 HTTP 端点
+   - 前端集成
+
+7. **实现数据清理 Worker**
+   - `data_retention` 对话清理
+   - `checkins` 30天清理
+
+8. **添加数据验证**
+   - Pydantic Models
+   - 字段类型和范围检查
+
+---
+
+### P3 - 长期优化 (3个月)
+
+9. **使用 `vibe_profile_insights` 表**
+   - AI 洞察生成
+   - 展示 API
+
+10. **使用 `vibe_profile_timeline` 表**
+    - 关键事件记录
+    - 时间线 API
+
+11. **性能优化**
+    - 添加 JSONB 特定字段索引
+    - 监控慢查询
+    - 优化深层嵌套更新
+
+---
+
+## 9. 总结
+
+### 9.1 主要成就 ✅
+
+1. **成功整合 5 张历史表** 到单一 JSONB Profile
+2. **WHO/WHAT 分离** 设计清晰，易于理解
+3. **局部更新优化** 显著提升性能
+4. **完整的迁移方案** 保证数据安全
+5. **Proactive 系统集成** 实现主动推送
+
+---
+
+### 9.2 关键问题 ⚠️
+
+1. **文档与代码严重不一致** (5+ 处)
+2. **核心字段缺失** (`account`, `state`)
+3. **部分功能未暴露** (Goals/Tasks API)
+4. **数据清理未实现** (`data_retention`, `checkins`)
+
+---
+
+### 9.3 行动计划
+
+#### 本周 (Week 1)
+
+- [ ] 修复 SPEC.md 所有不一致 (P1)
+- [ ] 补充 `account` 字段设计和实现 (P0)
+- [ ] 统一 `identity` 命名 (P0)
+
+#### 下周 (Week 2)
+
+- [ ] 实现 `state` 字段 (P1)
+- [ ] 补充 `identity_prism` 文档 (P1)
+- [ ] 补充 `life_context._paths` 文档 (P1)
+
+#### 下个月 (Month 1)
+
+- [ ] 实现 Goals/Tasks HTTP API (P2)
+- [ ] 实现数据清理 Worker (P2)
+- [ ] 添加数据验证层 (P2)
+
+---
+
+## 附录
+
+### A. 文档更新 Checklist
+
+- [ ] `/docs/components/VibeProfile/SPEC.md` - 修正 8 处不一致
+- [ ] `/docs/archive/v8/ARCHITECTURE.md` - 补充 3 处缺失
+- [ ] 新建 `/docs/components/VibeProfile/IDENTITY_PRISM.md` - 融合设计
+- [ ] 新建 `/docs/components/VibeProfile/LIFE_CONTEXT_PATHS.md` - 路径机制
+
+### B. 代码改进 Checklist
+
+- [ ] `unified_profile_repo.py` - 添加 `account` 同步
+- [ ] `unified_profile_repo.py` - 添加 `state` 管理
+- [ ] `unified_profile_repo.py` - 添加数据验证
+- [ ] 新建 `routes/profile.py` - Goals/Tasks API
+- [ ] 新建 `workers/cleanup_worker.py` - 数据清理
+- [ ] `services/proactive/trigger_detector.py` - 情绪触发器
+
+### C. 性能监控 Checklist
+
+- [ ] 添加 JSONB 操作耗时日志
+- [ ] 监控缓存命中率
+- [ ] 添加慢查询告警
+- [ ] 优化高频查询索引
+
+---
+
+**审查完成时间:** 2026-01-19
+**下次审查时间:** 2026-02-19 (P0-P1 完成后)

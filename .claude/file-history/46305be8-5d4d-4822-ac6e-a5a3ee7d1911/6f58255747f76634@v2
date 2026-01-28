@@ -1,0 +1,582 @@
+# VibeProfile 迁移指南
+
+从现有 `UnifiedProfileRepository` 迁移到 `VibeProfileRepository`。
+
+## 迁移概述
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           迁移范围                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  现有模块                           迁移后                                   │
+│  ════════                          ════════                                  │
+│                                                                              │
+│  unified_profile_repo.py   ───►   vibe_profile_repo.py                      │
+│  profile_cache.py          ───►   vibe_profile_cache.py (合并)              │
+│                                                                              │
+│  新增模块                                                                    │
+│  ════════                                                                    │
+│  vibe_profile_events.py    (事件通知)                                       │
+│  vibe_profile_insights_repo.py (Cold Layer)                                 │
+│  vibe_profile_timeline_repo.py (Cold Layer)                                 │
+│                                                                              │
+│  数据库变更                                                                  │
+│  ══════════                                                                  │
+│  unified_profiles          (扩展 JSONB Schema)                              │
+│  + vibe_profile_insights   (新建)                                           │
+│  + vibe_profile_timeline   (新建)                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 1: 数据库 Schema 扩展
+
+### 1.1 创建新表
+
+```sql
+-- migrations/XXX_create_vibe_profile_tables.sql
+
+-- 洞察表
+CREATE TABLE vibe_profile_insights (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    insight_type VARCHAR(50) NOT NULL,
+    skill_id VARCHAR(50),
+    category VARCHAR(100) NOT NULL,
+    content TEXT NOT NULL,
+    confidence FLOAT DEFAULT 0.5,
+    evidence JSONB DEFAULT '[]',
+    first_observed_at TIMESTAMPTZ DEFAULT now(),
+    last_confirmed_at TIMESTAMPTZ DEFAULT now(),
+    observation_count INT DEFAULT 1,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_insights_user_type ON vibe_profile_insights(user_id, insight_type);
+CREATE INDEX idx_insights_skill ON vibe_profile_insights(user_id, skill_id);
+CREATE INDEX idx_insights_category ON vibe_profile_insights(user_id, category);
+
+-- 时间线表
+CREATE TABLE vibe_profile_timeline (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    event_type VARCHAR(50) NOT NULL,
+    event_date DATE NOT NULL,
+    skill_id VARCHAR(50),
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    importance VARCHAR(20) DEFAULT 'normal',
+    data JSONB DEFAULT '{}',
+    source VARCHAR(50) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_timeline_user_date ON vibe_profile_timeline(user_id, event_date DESC);
+CREATE INDEX idx_timeline_type ON vibe_profile_timeline(user_id, event_type);
+CREATE INDEX idx_timeline_skill ON vibe_profile_timeline(user_id, skill_id);
+```
+
+### 1.2 扩展 unified_profiles 索引
+
+```sql
+-- migrations/XXX_add_profile_indexes.sql
+
+-- Proactive 查询索引
+CREATE INDEX IF NOT EXISTS idx_profiles_proactive_pending
+    ON unified_profiles USING GIN ((profile -> 'proactive_state' -> 'pending_triggers'));
+
+-- 状态查询索引
+CREATE INDEX IF NOT EXISTS idx_profiles_state_emotion
+    ON unified_profiles USING GIN ((profile -> 'state' -> 'emotion'));
+
+-- Skill 数据索引
+CREATE INDEX IF NOT EXISTS idx_profiles_skill_data
+    ON unified_profiles USING GIN ((profile -> 'skill_data'));
+```
+
+### 1.3 Profile JSONB 初始化
+
+对于现有用户，需要初始化新字段结构：
+
+```sql
+-- migrations/XXX_init_profile_structure.sql
+
+-- 初始化 state 字段
+UPDATE unified_profiles
+SET profile = jsonb_set(
+    profile,
+    '{state}',
+    COALESCE(profile -> 'state', '{
+        "emotion": {"current": "neutral", "baseline": "neutral", "intensity": 0},
+        "focus": {"topics": [], "primary": null, "intensity": 0},
+        "life_stage": {"stage": "unknown"},
+        "energy_level": {"level": 0.5, "trend": "stable"}
+    }'::jsonb)
+)
+WHERE NOT (profile ? 'state');
+
+-- 初始化 proactive_state 字段
+UPDATE unified_profiles
+SET profile = jsonb_set(
+    profile,
+    '{proactive_state}',
+    '{
+        "pending_triggers": [],
+        "cooldowns": {},
+        "suppressed": [],
+        "last_scanned_at": null
+    }'::jsonb
+)
+WHERE NOT (profile ? 'proactive_state');
+
+-- 重命名 birth_info 到 identity.birth_info (如果需要)
+-- 注意: 这个迁移可选，取决于是否要重组结构
+```
+
+---
+
+## Phase 2: Repository 重构
+
+### 2.1 创建 VibeProfileRepository
+
+```python
+# services/profile/vibe_profile_repo.py
+
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+class VibeProfileRepository:
+    """
+    VibeProfile 数据访问层
+
+    基于 UnifiedProfileRepository 扩展，添加:
+    - State 管理
+    - Proactive State 管理
+    - Insights/Timeline 管理
+    - 事件通知
+    """
+
+    # === 兼容层: 代理到 UnifiedProfileRepository ===
+
+    @staticmethod
+    async def get_profile(user_id: UUID) -> Optional[Dict]:
+        return await UnifiedProfileRepository.get_profile(user_id)
+
+    @staticmethod
+    async def get_birth_info(user_id: UUID) -> Dict:
+        return await UnifiedProfileRepository.get_birth_info(user_id)
+
+    @staticmethod
+    async def get_skill_data(user_id: UUID, skill: str) -> Dict:
+        return await UnifiedProfileRepository.get_skill_data(user_id, skill)
+
+    # ... 其他代理方法 ...
+
+    # === 新增方法 ===
+
+    @staticmethod
+    async def get_state(user_id: UUID) -> Dict:
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        return profile.get("state", {}) if profile else {}
+
+    @staticmethod
+    async def update_emotion(user_id: UUID, emotion: str, intensity: float) -> None:
+        """更新情绪状态，可能触发事件"""
+        from services.profile.vibe_profile_events import VibeProfileEvents
+
+        # 获取旧状态
+        old_state = await VibeProfileRepository.get_state(user_id)
+        old_emotion = old_state.get("emotion", {})
+
+        # 更新
+        new_emotion = {
+            "current": emotion,
+            "baseline": old_emotion.get("baseline", "neutral"),
+            "intensity": intensity,
+            "last_updated": datetime.utcnow().isoformat()
+        }
+
+        await execute(
+            """UPDATE unified_profiles
+               SET profile = jsonb_set(
+                   jsonb_set(profile, '{state}', COALESCE(profile->'state', '{}'::jsonb)),
+                   '{state,emotion}',
+                   $2::jsonb
+               ),
+               updated_at = NOW()
+               WHERE user_id = $1""",
+            user_id, json.dumps(new_emotion)
+        )
+
+        # 触发事件 (如果情绪显著变化)
+        if intensity > 0.7 or emotion != old_emotion.get("current"):
+            await VibeProfileEvents.emit(
+                VibeProfileEvents.EMOTION_CHANGED,
+                user_id,
+                {"emotion": emotion, "intensity": intensity, "previous": old_emotion}
+            )
+
+    # ... 其他新增方法 ...
+```
+
+### 2.2 事件系统实现
+
+```python
+# services/profile/vibe_profile_events.py
+
+import asyncio
+from typing import Dict, Callable, List
+from uuid import UUID
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class VibeProfileEvents:
+    """VibeProfile 变更事件系统"""
+
+    # 事件类型
+    BIRTH_INFO_UPDATED = "vibe_profile.birth_info_updated"
+    EMOTION_CHANGED = "vibe_profile.emotion_changed"
+    STATE_CHANGED = "vibe_profile.state_changed"
+    INSIGHT_ADDED = "vibe_profile.insight_added"
+    GOAL_UPDATED = "vibe_profile.goal_updated"
+
+    _handlers: Dict[str, List[Callable]] = {}
+
+    @classmethod
+    def on(cls, event_type: str):
+        """装饰器: 注册事件处理器"""
+        def decorator(func):
+            if event_type not in cls._handlers:
+                cls._handlers[event_type] = []
+            cls._handlers[event_type].append(func)
+            return func
+        return decorator
+
+    @classmethod
+    async def emit(cls, event_type: str, user_id: UUID, data: Dict = None):
+        """发送事件"""
+        handlers = cls._handlers.get(event_type, [])
+        if not handlers:
+            return
+
+        for handler in handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(user_id, data or {})
+                else:
+                    handler(user_id, data or {})
+            except Exception as e:
+                logger.error(f"Event handler error for {event_type}: {e}")
+```
+
+### 2.3 Insights Repository
+
+```python
+# services/profile/vibe_profile_insights_repo.py
+
+class VibeProfileInsightsRepository:
+    """洞察数据访问层"""
+
+    @staticmethod
+    async def get_insights(
+        user_id: UUID,
+        insight_type: str = None,
+        skill_id: str = None,
+        limit: int = 20
+    ) -> List[Dict]:
+        conditions = ["user_id = $1"]
+        params = [user_id]
+
+        if insight_type:
+            conditions.append(f"insight_type = ${len(params) + 1}")
+            params.append(insight_type)
+
+        if skill_id:
+            conditions.append(f"skill_id = ${len(params) + 1}")
+            params.append(skill_id)
+
+        query = f"""
+            SELECT * FROM vibe_profile_insights
+            WHERE {' AND '.join(conditions)}
+            ORDER BY last_confirmed_at DESC
+            LIMIT ${len(params) + 1}
+        """
+        params.append(limit)
+
+        return await fetch(query, *params)
+
+    @staticmethod
+    async def add_insight(
+        user_id: UUID,
+        insight_type: str,
+        category: str,
+        content: str,
+        skill_id: str = None,
+        confidence: float = 0.5,
+        evidence: List[str] = None
+    ) -> UUID:
+        from services.profile.vibe_profile_events import VibeProfileEvents
+
+        result = await fetchrow(
+            """INSERT INTO vibe_profile_insights
+               (user_id, insight_type, skill_id, category, content, confidence, evidence)
+               VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+               RETURNING id""",
+            user_id, insight_type, skill_id, category, content, confidence,
+            json.dumps(evidence or [])
+        )
+
+        insight_id = result["id"]
+
+        # 触发事件
+        await VibeProfileEvents.emit(
+            VibeProfileEvents.INSIGHT_ADDED,
+            user_id,
+            {"insight_id": insight_id, "type": insight_type, "category": category}
+        )
+
+        return insight_id
+
+    @staticmethod
+    async def confirm_insight(user_id: UUID, insight_id: UUID) -> None:
+        await execute(
+            """UPDATE vibe_profile_insights
+               SET observation_count = observation_count + 1,
+                   last_confirmed_at = NOW(),
+                   updated_at = NOW()
+               WHERE id = $1 AND user_id = $2""",
+            insight_id, user_id
+        )
+```
+
+---
+
+## Phase 3: 调用方迁移
+
+### 3.1 CoreAgent 迁移
+
+```python
+# 旧代码
+from stores.unified_profile_repo import UnifiedProfileRepository
+profile = await UnifiedProfileRepository.get_profile(user_id)
+
+# 新代码
+from services.profile.vibe_profile_repo import VibeProfileRepository
+profile = await VibeProfileRepository.get_profile(user_id)
+
+# 新增: 更新状态
+await VibeProfileRepository.update_emotion(user_id, "content", 0.3)
+await VibeProfileRepository.update_focus(user_id, ["career"], "career")
+```
+
+### 3.2 ProactiveEngine 迁移
+
+```python
+# 旧代码
+profile = await UnifiedProfileRepository.get_profile(user_id)
+# 手动检查触发条件...
+
+# 新代码
+# 查询待推送用户
+users = await VibeProfileRepository.query_users_with_pending_triggers(
+    before=datetime.now(),
+    skill_id="bazi"
+)
+
+# 处理后标记已发送
+await VibeProfileRepository.mark_trigger_sent(user_id, "bazi_daily_fortune")
+```
+
+### 3.3 Skill Services 迁移
+
+```python
+# 旧代码
+await UnifiedProfileRepository.update_skill_data(user_id, "bazi", data)
+
+# 新代码 (接口不变，内部增加事件通知)
+await VibeProfileRepository.update_skill_data(user_id, "bazi", data)
+
+# 新增: 监听出生信息变更
+@VibeProfileEvents.on(VibeProfileEvents.BIRTH_INFO_UPDATED)
+async def on_birth_info_updated(user_id: UUID, data: Dict):
+    # 重新计算命盘
+    await bazi_computer.compute_and_save(user_id, data["birth_info"])
+```
+
+---
+
+## Phase 4: 数据迁移
+
+### 4.1 迁移现有洞察 (如果有)
+
+如果现有系统在其他地方存储了洞察数据，需要迁移到 `vibe_profile_insights` 表。
+
+```python
+# scripts/migrate_insights.py
+
+async def migrate_insights():
+    # 从旧表读取
+    old_insights = await fetch("SELECT * FROM old_insights_table")
+
+    for insight in old_insights:
+        await VibeProfileInsightsRepository.add_insight(
+            user_id=insight["user_id"],
+            insight_type=map_type(insight["type"]),
+            category=insight["category"],
+            content=insight["content"],
+            confidence=insight.get("confidence", 0.5)
+        )
+```
+
+### 4.2 初始化 proactive_state
+
+```python
+# scripts/init_proactive_state.py
+
+async def init_proactive_states():
+    """为所有用户初始化 proactive_state"""
+    users = await fetch("SELECT user_id FROM unified_profiles WHERE NOT (profile ? 'proactive_state')")
+
+    for user in users:
+        await VibeProfileRepository.init_proactive_state(user["user_id"])
+```
+
+---
+
+## Phase 5: 测试验证
+
+### 5.1 单元测试
+
+```python
+# tests/test_vibe_profile.py
+
+import pytest
+from services.profile.vibe_profile_repo import VibeProfileRepository
+
+
+class TestVibeProfileRepository:
+
+    async def test_update_emotion(self, test_user):
+        await VibeProfileRepository.update_emotion(test_user.id, "anxious", 0.8)
+
+        state = await VibeProfileRepository.get_state(test_user.id)
+        assert state["emotion"]["current"] == "anxious"
+        assert state["emotion"]["intensity"] == 0.8
+
+    async def test_emotion_event_triggered(self, test_user, event_handler):
+        # 注册事件处理器
+        events = []
+        @VibeProfileEvents.on(VibeProfileEvents.EMOTION_CHANGED)
+        async def handler(user_id, data):
+            events.append((user_id, data))
+
+        # 更新情绪
+        await VibeProfileRepository.update_emotion(test_user.id, "anxious", 0.8)
+
+        # 验证事件触发
+        assert len(events) == 1
+        assert events[0][0] == test_user.id
+        assert events[0][1]["emotion"] == "anxious"
+
+    async def test_add_insight(self, test_user):
+        insight_id = await VibeProfileInsightsRepository.add_insight(
+            user_id=test_user.id,
+            insight_type="pattern",
+            category="emotion",
+            content="测试洞察"
+        )
+
+        insights = await VibeProfileInsightsRepository.get_insights(
+            test_user.id,
+            insight_type="pattern"
+        )
+        assert len(insights) == 1
+        assert insights[0]["id"] == insight_id
+```
+
+### 5.2 集成测试
+
+```python
+# tests/test_proactive_integration.py
+
+async def test_proactive_with_vibe_profile():
+    """测试 Proactive 与 VibeProfile 的集成"""
+
+    # 1. 添加待触发推送
+    await VibeProfileRepository.add_pending_trigger(user_id, {
+        "trigger_id": "test_trigger",
+        "skill_id": "bazi",
+        "ready_at": datetime.now().isoformat(),
+        "priority": "high"
+    })
+
+    # 2. 查询待推送用户
+    users = await VibeProfileRepository.query_users_with_pending_triggers(
+        before=datetime.now()
+    )
+    assert user_id in [u["user_id"] for u in users]
+
+    # 3. 标记已发送
+    await VibeProfileRepository.mark_trigger_sent(user_id, "test_trigger")
+
+    # 4. 验证 cooldown
+    state = await VibeProfileRepository.get_proactive_state(user_id)
+    assert "test_trigger" in state["cooldowns"]
+```
+
+---
+
+## 迁移 Checklist
+
+### Phase 1: Schema (Day 1)
+- [ ] 创建 vibe_profile_insights 表
+- [ ] 创建 vibe_profile_timeline 表
+- [ ] 添加 unified_profiles 索引
+- [ ] 初始化现有用户的新字段
+
+### Phase 2: Repository (Day 2-3)
+- [ ] 创建 VibeProfileRepository
+- [ ] 实现事件系统
+- [ ] 实现 Insights Repository
+- [ ] 实现 Timeline Repository
+- [ ] 单元测试通过
+
+### Phase 3: 调用方 (Day 4)
+- [ ] CoreAgent 迁移
+- [ ] ProactiveEngine 迁移
+- [ ] Skill Services 迁移
+- [ ] 集成测试通过
+
+### Phase 4: 数据迁移 (Day 5)
+- [ ] 迁移现有洞察数据 (如有)
+- [ ] 初始化所有用户的 proactive_state
+- [ ] 验证数据完整性
+
+### Phase 5: 清理
+- [ ] 移除旧代码引用
+- [ ] 更新文档
+- [ ] 监控运行状态
+
+---
+
+## 回滚方案
+
+如果迁移出现问题，可以快速回滚：
+
+1. **代码回滚**: 恢复旧的 import 路径
+2. **数据库**: 新表可以保留，不影响旧表
+3. **Profile 字段**: 新字段不影响旧字段的读取
+
+```python
+# 兼容层: 如果需要回滚
+try:
+    from services.profile.vibe_profile_repo import VibeProfileRepository
+except ImportError:
+    from stores.unified_profile_repo import UnifiedProfileRepository as VibeProfileRepository
+```

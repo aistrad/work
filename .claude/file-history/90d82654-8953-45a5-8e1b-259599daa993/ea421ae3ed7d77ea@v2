@@ -1,0 +1,663 @@
+"""
+Chat Routes - Conversation endpoints for VibeLife v3.0
+Based on: vibelife spec v3.0
+
+Features:
+- SSE streaming responses
+- Voice mode toggle (warm / sarcastic)
+- Skill-based conversations (bazi / zodiac)
+- Guest mode for demo
+- AI Interview endpoints
+- File upload + extraction
+"""
+import json
+from typing import Optional, List
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from services.vibe_engine import (
+    get_llm_service,
+    get_context_builder,
+    get_portrait_service,
+    VoiceMode,
+    Skill,
+    create_user_message,
+)
+from services.interview import get_interview_service, InterviewSession
+from services.extraction import get_extraction_service
+from stores import conversation_repo, message_repo, profile_repo
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ChatRequest(BaseModel):
+    """Chat request model"""
+    message: str = Field(..., description="User message")
+    skill: str = Field(..., description="Skill: bazi or zodiac")
+    conversation_id: Optional[UUID] = Field(None, description="Existing conversation ID")
+    voice_mode: Optional[str] = Field("warm", description="Voice mode: warm or sarcastic")
+
+
+class ChatResponse(BaseModel):
+    """Chat response model (for non-streaming)"""
+    content: str
+    conversation_id: UUID
+    skill: str
+    voice_mode: str
+    metadata: Optional[dict] = None
+
+
+class GuestChatRequest(BaseModel):
+    """Guest chat request (no auth required)"""
+    message: str
+    skill: str = "bazi"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_skill(skill_str: str) -> Skill:
+    """Parse skill string to enum"""
+    skill_lower = skill_str.lower()
+    if skill_lower in ("bazi", "八字"):
+        return Skill.BAZI
+    elif skill_lower in ("zodiac", "星座"):
+        return Skill.ZODIAC
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown skill: {skill_str}")
+
+
+def parse_voice_mode(mode_str: str) -> VoiceMode:
+    """Parse voice mode string to enum"""
+    mode_lower = mode_str.lower()
+    if mode_lower in ("warm", "温暖"):
+        return VoiceMode.WARM
+    elif mode_lower in ("sarcastic", "吐槽"):
+        return VoiceMode.SARCASTIC
+    else:
+        return VoiceMode.WARM  # Default
+
+
+async def get_user_profile(user_id: Optional[UUID]) -> dict:
+    """Get user profile from database"""
+    if user_id:
+        try:
+            profile_data = await profile_repo.get_profile_data(user_id)
+            return profile_data
+        except Exception:
+            pass
+
+    # Return default profile for guests
+    from services.vibe_engine import DEFAULT_PROFILE
+    return DEFAULT_PROFILE.copy()
+
+
+async def get_conversation_history(
+    conversation_id: Optional[UUID],
+    limit: int = 20
+) -> List[dict]:
+    """Get conversation history from database"""
+    if not conversation_id:
+        return []
+
+    try:
+        messages = await message_repo.get_messages_for_context(conversation_id, limit)
+        return messages
+    except Exception:
+        return []
+
+
+async def save_message(
+    conversation_id: UUID,
+    role: str,
+    content: str,
+    metadata: Optional[dict] = None
+) -> None:
+    """Save message to database"""
+    try:
+        await message_repo.create_message(
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            metadata=metadata
+        )
+    except Exception as e:
+        # Log but don't fail the request
+        import logging
+        logging.warning(f"Failed to save message: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    Send a message and get streaming response (SSE).
+
+    Returns Server-Sent Events with chunks of the response.
+    Final event contains [DONE] marker.
+    """
+    skill = parse_skill(request.skill)
+    voice_mode = parse_voice_mode(request.voice_mode or "warm")
+
+    # Get or create conversation
+    conversation_id = request.conversation_id or uuid4()
+
+    # Get services
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    async def generate():
+        try:
+            # Get user profile (for logged-in users)
+            profile = await get_user_profile(None)  # TODO: Get actual user
+
+            # Get conversation history
+            history = await get_conversation_history(conversation_id)
+
+            # Build context
+            system_prompt, messages = await context_builder.build(
+                skill=skill,
+                voice_mode=voice_mode,
+                current_message=request.message,
+                profile=profile,
+                history=history
+            )
+
+            # Save user message
+            await save_message(conversation_id, "user", request.message)
+
+            # Stream response
+            full_content = ""
+            async for chunk in llm.stream(messages):
+                full_content += chunk
+                # Send chunk as SSE event
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "chunk",
+                        "content": chunk
+                    })
+                }
+
+            # Save assistant message
+            await save_message(conversation_id, "assistant", full_content)
+
+            # Send completion event
+            yield {
+                "event": "message",
+                "data": json.dumps({
+                    "type": "done",
+                    "conversation_id": str(conversation_id),
+                    "skill": skill.value,
+                    "voice_mode": voice_mode.value
+                })
+            }
+
+        except Exception as e:
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                })
+            }
+
+    return EventSourceResponse(generate())
+
+
+@router.post("/", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Send a message and get non-streaming response.
+    For clients that don't support SSE.
+    """
+    skill = parse_skill(request.skill)
+    voice_mode = parse_voice_mode(request.voice_mode or "warm")
+
+    # Get or create conversation
+    conversation_id = request.conversation_id or uuid4()
+
+    # Get services
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    try:
+        # Get user profile
+        profile = await get_user_profile(None)
+
+        # Get conversation history
+        history = await get_conversation_history(conversation_id)
+
+        # Build context
+        system_prompt, messages = await context_builder.build(
+            skill=skill,
+            voice_mode=voice_mode,
+            current_message=request.message,
+            profile=profile,
+            history=history
+        )
+
+        # Save user message
+        await save_message(conversation_id, "user", request.message)
+
+        # Get response
+        response = await llm.chat(messages)
+
+        # Save assistant message
+        await save_message(conversation_id, "assistant", response.content)
+
+        return ChatResponse(
+            content=response.content,
+            conversation_id=conversation_id,
+            skill=skill.value,
+            voice_mode=voice_mode.value,
+            metadata={
+                "model": response.model,
+                "usage": response.usage
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/guest")
+async def chat_guest(request: GuestChatRequest):
+    """
+    Guest chat endpoint (no authentication required).
+    For landing page demo with limited functionality.
+    """
+    skill = parse_skill(request.skill)
+
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    try:
+        # Build simple context (no profile, no history)
+        system_prompt, messages = await context_builder.build(
+            skill=skill,
+            voice_mode=VoiceMode.WARM,
+            current_message=request.message,
+            profile=None,
+            history=None
+        )
+
+        # Get response (limited tokens for guest)
+        response = await llm.chat(messages, max_tokens=1024)
+
+        return {
+            "content": response.content,
+            "is_guest": True,
+            "skill": skill.value,
+            "suggestion": "注册后可以获得完整的个性化分析和对话历史保存"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/guest/stream")
+async def chat_guest_stream(request: GuestChatRequest):
+    """
+    Guest streaming chat endpoint.
+    For landing page demo with SSE.
+    """
+    skill = parse_skill(request.skill)
+
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    async def generate():
+        try:
+            # Build simple context
+            system_prompt, messages = await context_builder.build(
+                skill=skill,
+                voice_mode=VoiceMode.WARM,
+                current_message=request.message,
+                profile=None,
+                history=None
+            )
+
+            # Stream response
+            async for chunk in llm.stream(messages, max_tokens=1024):
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "chunk",
+                        "content": chunk
+                    })
+                }
+
+            yield {
+                "event": "message",
+                "data": json.dumps({
+                    "type": "done",
+                    "is_guest": True,
+                    "skill": skill.value
+                })
+            }
+
+        except Exception as e:
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                })
+            }
+
+    return EventSourceResponse(generate())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Voice Mode Toggle
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VoiceModeRequest(BaseModel):
+    """Voice mode toggle request"""
+    conversation_id: UUID
+    voice_mode: str  # warm | sarcastic
+
+
+@router.post("/voice-mode")
+async def toggle_voice_mode(request: VoiceModeRequest):
+    """
+    Toggle voice mode for a conversation.
+    Changes Vibe's personality between warm and sarcastic.
+    """
+    voice_mode = parse_voice_mode(request.voice_mode)
+
+    # TODO: Update conversation voice_mode in database
+
+    return {
+        "success": True,
+        "conversation_id": str(request.conversation_id),
+        "voice_mode": voice_mode.value,
+        "message": "语气已切换" if voice_mode == VoiceMode.SARCASTIC else "已切换到温暖模式"
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Conversation Management
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/conversations")
+async def list_conversations(
+    skill: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=100)
+):
+    """
+    List user's conversations.
+    TODO: Implement with authentication.
+    """
+    # TODO: Implement with actual database query
+    return {
+        "conversations": [],
+        "total": 0
+    }
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: UUID):
+    """
+    Get conversation details with messages.
+    """
+    # TODO: Implement with actual database query
+    return {
+        "id": str(conversation_id),
+        "messages": [],
+        "skill": None,
+        "voice_mode": "warm",
+        "created_at": None
+    }
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: UUID):
+    """
+    Delete a conversation.
+    """
+    try:
+        await conversation_repo.delete_conversation(conversation_id)
+        return {"success": True, "message": "Conversation deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Interview Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InterviewStartRequest(BaseModel):
+    """Start interview request"""
+    skill: str = "bazi"
+    user_id: Optional[UUID] = None
+
+
+class InterviewAnswerRequest(BaseModel):
+    """Submit answer request"""
+    session_id: UUID
+    answer: str
+
+
+@router.post("/interview/start")
+async def start_interview(request: InterviewStartRequest):
+    """
+    Start an AI interview session.
+    Required before generating reports.
+    """
+    interview_service = get_interview_service()
+
+    session = interview_service.start_session(
+        skill=request.skill,
+        user_id=request.user_id
+    )
+
+    current_question = interview_service.get_current_question(session)
+
+    return {
+        "session": session.to_dict(),
+        "intro": interview_service.get_intro(),
+        "current_question": {
+            "id": current_question.id,
+            "text": current_question.question_text,
+            "type": current_question.question_type
+        } if current_question else None,
+        "progress": interview_service.get_progress(session)
+    }
+
+
+@router.post("/interview/answer")
+async def submit_interview_answer(request: InterviewAnswerRequest):
+    """
+    Submit an answer to the current interview question.
+    """
+    interview_service = get_interview_service()
+
+    session = interview_service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    next_question, is_complete = await interview_service.submit_answer(
+        session,
+        request.answer
+    )
+
+    response = {
+        "is_complete": is_complete,
+        "next_question": None,
+        "progress": interview_service.get_progress(session),
+        "result": None
+    }
+
+    if is_complete:
+        result = interview_service.get_result(session)
+        response["result"] = {
+            "success": result.success,
+            "extracted_profile": result.extracted_profile,
+            "summary": result.summary,
+            "questions_answered": result.questions_answered,
+            "total_questions": result.total_questions
+        }
+    elif next_question:
+        response["next_question"] = {
+            "id": next_question.id,
+            "text": next_question.question_text,
+            "type": next_question.question_type
+        }
+
+    return response
+
+
+@router.post("/interview/skip")
+async def skip_interview(session_id: UUID):
+    """
+    Skip the interview (user choice).
+    """
+    interview_service = get_interview_service()
+
+    session = interview_service.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    warning = interview_service.skip_session(session)
+    result = interview_service.get_result(session)
+
+    return {
+        "warning": warning,
+        "result": {
+            "success": result.success,
+            "extracted_profile": result.extracted_profile,
+            "summary": result.summary,
+            "questions_answered": result.questions_answered,
+            "total_questions": result.total_questions
+        }
+    }
+
+
+@router.get("/interview/{session_id}")
+async def get_interview_session(session_id: UUID):
+    """
+    Get interview session status.
+    """
+    interview_service = get_interview_service()
+
+    session = interview_service.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    current_question = interview_service.get_current_question(session)
+
+    return {
+        "session": session.to_dict(),
+        "current_question": {
+            "id": current_question.id,
+            "text": current_question.question_text,
+            "type": current_question.question_type
+        } if current_question else None,
+        "progress": interview_service.get_progress(session)
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File Upload Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    context_hint: Optional[str] = None
+):
+    """
+    Upload a file for AI extraction.
+
+    Supported formats:
+    - Images (JPG, PNG): Screenshots from other apps, chat records
+    - Documents (PDF, DOCX, TXT): Resumes, diaries
+
+    Returns extracted information that can be merged into user profile.
+    """
+    # Read file data
+    file_data = await file.read()
+
+    # Check file size (10MB limit)
+    if len(file_data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大，最大支持 10MB")
+
+    # Extract information
+    extraction_service = get_extraction_service()
+
+    result = await extraction_service.extract_from_file(
+        file_data=file_data,
+        filename=file.filename or "unknown",
+        mime_type=file.content_type,
+        context_hint=context_hint
+    )
+
+    return {
+        "success": result.success,
+        "file_type": result.file_type,
+        "content_type": result.content_type,
+        "summary": result.summary,
+        "confidence": result.confidence,
+        "extracted_data": result.extracted_data,
+        "profile_updates": result.profile_updates,
+        "error": result.error
+    }
+
+
+@router.post("/upload/batch")
+async def upload_files_batch(
+    files: List[UploadFile] = File(...)
+):
+    """
+    Upload multiple files for batch extraction.
+    """
+    if len(files) > 5:
+        raise HTTPException(status_code=400, detail="最多同时上传 5 个文件")
+
+    extraction_service = get_extraction_service()
+    results = []
+
+    for file in files:
+        file_data = await file.read()
+
+        if len(file_data) > 10 * 1024 * 1024:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "error": "文件过大"
+            })
+            continue
+
+        result = await extraction_service.extract_from_file(
+            file_data=file_data,
+            filename=file.filename or "unknown",
+            mime_type=file.content_type
+        )
+
+        results.append({
+            "filename": file.filename,
+            "success": result.success,
+            "content_type": result.content_type,
+            "summary": result.summary,
+            "error": result.error
+        })
+
+    return {
+        "total": len(files),
+        "successful": sum(1 for r in results if r["success"]),
+        "results": results
+    }

@@ -1,0 +1,322 @@
+"""
+Bazi Skill Tool Handlers - 八字工具执行器
+
+v3.0 更新：
+- 移除 demo fallback，缺少信息时返回明确错误
+- 统一参数获取逻辑
+- 增强日志记录
+"""
+import logging
+from datetime import datetime
+from typing import Dict, Any, Optional
+from uuid import UUID
+
+from services.agent.tool_registry import tool_handler, ToolContext
+from skills.bazi.services import BaziComputer
+
+logger = logging.getLogger(__name__)
+
+# 单例 BaziComputer
+_bazi_computer: Optional[BaziComputer] = None
+
+
+def get_bazi_computer() -> BaziComputer:
+    global _bazi_computer
+    if _bazi_computer is None:
+        _bazi_computer = BaziComputer()
+    return _bazi_computer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 辅助函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_birth_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """统一获取出生信息
+
+    优先级：args > context.profile.birth_info
+
+    Returns:
+        Dict with keys: date, time, gender, location (optional)
+
+    Raises:
+        ValueError: 如果缺少必要的出生信息
+    """
+    profile = context.profile or {}
+    birth_info = profile.get("birth_info", {})
+
+    # 从 args 或 profile 获取
+    birth_date = (
+        args.get("birth_date") or
+        args.get("birthDate") or
+        birth_info.get("date") or
+        birth_info.get("birth_date")
+    )
+    birth_time = (
+        args.get("birth_time") or
+        args.get("birthTime") or
+        birth_info.get("time") or
+        birth_info.get("birth_time")
+    )
+    gender = (
+        args.get("gender") or
+        birth_info.get("gender")
+    )
+    location = (
+        args.get("birth_location") or
+        args.get("birthLocation") or
+        birth_info.get("location") or
+        birth_info.get("birth_location")
+    )
+
+    if not birth_date:
+        raise ValueError("缺少出生日期")
+
+    if not birth_time:
+        # 时间可以默认为午时
+        birth_time = "12:00"
+        logger.warning(f"User {context.user_id} missing birth_time, using default 12:00")
+
+    if not gender:
+        raise ValueError("缺少性别信息")
+
+    return {
+        "date": birth_date,
+        "time": birth_time,
+        "gender": gender,
+        "location": location,
+    }
+
+
+def _make_error_response(error_msg: str, need_info: Optional[str] = None) -> Dict[str, Any]:
+    """构建统一错误响应"""
+    response = {
+        "status": "error",
+        "error": error_msg,
+    }
+    if need_info:
+        response["need_info"] = need_info
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 工具处理器
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("collect_bazi_info")
+async def execute_collect_bazi_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """收集用户出生信息"""
+    include_question = args.get("include_question", True)
+
+    logger.info(f"Collecting bazi info for user {context.user_id}, include_question={include_question}")
+
+    fields = [
+        {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+        {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+        {"id": "birthPlace", "label": "出生地点", "type": "text", "required": False, "placeholder": "城市名（可选）"},
+        {"id": "gender", "label": "性别", "type": "select", "required": True, "options": [
+            {"value": "male", "label": "男"},
+            {"value": "female", "label": "女"},
+        ]},
+    ]
+
+    if include_question:
+        fields.append({
+            "id": "question",
+            "label": "你想了解什么",
+            "type": "textarea",
+            "required": False,
+            "placeholder": "描述你当前的困惑或想了解的问题..."
+        })
+
+    return {
+        "status": "collecting",
+        "cardType": "collect_form",
+        "formType": "birth_info",
+        "title": "请填写出生信息",
+        "description": "准确的出生时间有助于更精确的命盘分析",
+        "fields": fields,
+    }
+
+
+@tool_handler("calculate_bazi")
+async def execute_calculate_bazi(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """计算八字命盘"""
+    from skills.bazi.services import calculate_bazi
+
+    try:
+        birth_info = _get_birth_info(args, context)
+    except ValueError as e:
+        logger.warning(f"calculate_bazi missing info for user {context.user_id}: {e}")
+        return _make_error_response(str(e), need_info="birth")
+
+    try:
+        chart = calculate_bazi(
+            birth_info["date"],
+            birth_info["time"],
+            birth_info["gender"]
+        )
+        logger.info(f"Calculated bazi chart for user {context.user_id}")
+        return {
+            "status": "success",
+            "chart": chart,
+            "message": "八字命盘计算完成",
+        }
+    except Exception as e:
+        logger.error(f"calculate_bazi failed for user {context.user_id}: {e}")
+        return _make_error_response(f"命盘计算失败: {str(e)}")
+
+
+@tool_handler("show_bazi_chart")
+async def execute_show_bazi_chart(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示八字命盘图 - V7 委托模式"""
+    from services.agent.tool_registry import ToolRegistry
+
+    profile = context.profile or {}
+    skill_data = context.skill_data or {}
+    birth_info = profile.get("birth_info", {})
+
+    # 检查是否有出生信息
+    if not birth_info.get("date"):
+        logger.warning(f"show_bazi_chart missing birth_info for user {context.user_id}")
+        return _make_error_response(
+            "请先提供出生信息才能查看命盘",
+            need_info="birth"
+        )
+
+    # 优先从 skill_data 读取完整命盘
+    bazi_data = skill_data.get("bazi", {})
+    chart = bazi_data.get("chart", {})
+
+    if not chart:
+        # 没有缓存的命盘数据，需要实时计算
+        logger.info(f"No cached chart for user {context.user_id}, computing in real-time")
+        try:
+            from skills.bazi.services import calculate_bazi
+            chart = calculate_bazi(
+                birth_info.get("date"),
+                birth_info.get("time", "12:00"),
+                birth_info.get("gender", "unknown")
+            )
+        except Exception as e:
+            logger.error(f"show_bazi_chart compute failed for user {context.user_id}: {e}")
+            return _make_error_response(f"命盘计算失败: {str(e)}")
+
+    # 构建卡片数据
+    card_data = {
+        "userId": context.user_id,
+        "birthInfo": {
+            "date": birth_info.get("date"),
+            "time": birth_info.get("time", "12:00"),
+            "gender": birth_info.get("gender", "unknown"),
+        },
+        "fourPillars": chart.get("four_pillars", {}),
+        "dayMaster": chart.get("day_master", {}),
+        "fiveElements": chart.get("five_elements", {}),
+        "tenGods": chart.get("ten_gods", []),
+        "pattern": chart.get("pattern", {}),
+    }
+
+    logger.info(f"Showing bazi chart via show_card for user {context.user_id}")
+
+    # 委托给 show_card
+    return await ToolRegistry.execute(
+        "show_card",
+        {
+            "card_type": "custom",
+            "data_source": {"type": "inline", "data": card_data},
+            "options": {"componentId": "bazi_chart"}
+        },
+        context
+    )
+
+
+@tool_handler("show_bazi_fortune")
+async def execute_show_bazi_fortune(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示大运流年分析"""
+    computer = get_bazi_computer()
+
+    profile = context.profile or {}
+    skill_data = context.skill_data or {}
+    birth_info = profile.get("birth_info", {})
+
+    # 检查是否有出生信息
+    if not birth_info.get("date"):
+        logger.warning(f"show_bazi_fortune missing birth_info for user {context.user_id}")
+        return _make_error_response(
+            "请先提供出生信息才能分析运势",
+            need_info="birth"
+        )
+
+    year = args.get("year") or datetime.now().year
+
+    try:
+        # 构建完整 profile
+        full_profile = {
+            "birth_info": birth_info,
+            "skill_data": skill_data,
+        }
+
+        # 使用 BaziComputer 计算
+        kline_data = await computer.generate_kline_data(full_profile)
+        annual = await computer.calculate_annual_fortune(full_profile, year)
+
+        logger.info(f"Generated fortune data for user {context.user_id}, year={year}")
+        return {
+            "status": "success",
+            "cardType": "bazi_fortune",
+            "userId": context.user_id,
+            "year": year,
+            "cycles": kline_data.get("phases", []),
+            "annual": annual,
+        }
+    except Exception as e:
+        logger.error(f"show_bazi_fortune failed for user {context.user_id}: {e}")
+        return _make_error_response(f"运势分析失败: {str(e)}")
+
+
+@tool_handler("show_bazi_kline")
+async def execute_show_bazi_kline(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示运势 K 线图"""
+    computer = get_bazi_computer()
+
+    # 统一参数名（支持 camelCase 和 snake_case）
+    start_year = args.get("start_year") or args.get("startYear")
+    end_year = args.get("end_year") or args.get("endYear")
+
+    profile = context.profile or {}
+    skill_data = context.skill_data or {}
+    birth_info = profile.get("birth_info", {})
+
+    # 检查是否有出生信息
+    if not birth_info.get("date"):
+        logger.warning(f"show_bazi_kline missing birth_info for user {context.user_id}")
+        return _make_error_response(
+            "请先提供出生信息才能生成运势图",
+            need_info="birth"
+        )
+
+    try:
+        year_range = None
+        if start_year and end_year:
+            year_range = (int(start_year), int(end_year))
+
+        # 构建完整 profile
+        full_profile = {
+            "birth_info": birth_info,
+            "skill_data": skill_data,
+        }
+
+        kline_data = await computer.generate_kline_data(
+            profile=full_profile,
+            year_range=year_range,
+        )
+
+        logger.info(f"Generated kline data for user {context.user_id}")
+        kline_data["status"] = "success"
+        kline_data["cardType"] = "bazi_kline"
+        return kline_data
+
+    except Exception as e:
+        logger.error(f"show_bazi_kline failed for user {context.user_id}: {e}")
+        return _make_error_response(f"运势图生成失败: {str(e)}")

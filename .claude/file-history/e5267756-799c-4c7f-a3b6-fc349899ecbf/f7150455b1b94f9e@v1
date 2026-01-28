@@ -1,0 +1,451 @@
+# VibeProfile v13 设计文档
+
+> 简化的用户画像架构：从交互中提取，注入 Context，个性化服务
+
+## 一、设计原则
+
+```
+Vibe = 关于用户的结构化记忆
+
+输入：用户在系统中的所有交互（对话、工具调用、Skill 数据）
+输出：结构化画像 → 注入 Context → 个性化服务
+```
+
+**核心简化**：
+1. **单一数据流**：所有 Vibe 数据都从"交互"中提取，不再从多个源同步
+2. **三层存储**：Hot（实时）+ Warm（定时）+ Cold（事件）
+3. **扁平结构**：减少嵌套层级，每个字段有明确语义
+
+## 二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       VibeProfile 架构 v13                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   数据源（所有交互）              提取器                    存储            │
+│   ─────────────────              ─────                    ────            │
+│                                                                             │
+│   ┌─────────────────┐                                                       │
+│   │    对话消息      │────┐                                                  │
+│   │  role + content │    │                                                  │
+│   └─────────────────┘    │                                                  │
+│                          │    ┌──────────────┐    ┌──────────────────────┐ │
+│   ┌─────────────────┐    ├──▶│   实时提取    │──▶│   vibe.current       │ │
+│   │    工具调用      │────┤    │  (每轮对话后) │    │   (Hot, 实时覆盖)    │ │
+│   │  tool + result  │    │    └──────────────┘    └──────────────────────┘ │
+│   └─────────────────┘    │                                                  │
+│                          │    ┌──────────────┐    ┌──────────────────────┐ │
+│   ┌─────────────────┐    ├──▶│   定时提取    │──▶│   vibe.profile       │ │
+│   │   Skill 数据     │────┤    │  (每日凌晨)   │    │   (Warm, 增量合并)   │ │
+│   │  chart + 计算   │    │    └──────────────┘    └──────────────────────┘ │
+│   └─────────────────┘    │                                                  │
+│                          │    ┌──────────────┐    ┌──────────────────────┐ │
+│   ┌─────────────────┐    └──▶│   事件检测    │──▶│   vibe.timeline      │ │
+│   │    用户行为      │────────▶│  (触发式)     │    │   (Cold, 追加存储)   │ │
+│   │  click + action │         └──────────────┘    └──────────────────────┘ │
+│   └─────────────────┘                                                       │
+│                                                                             │
+│   ════════════════════════════════════════════════════════════════════════ │
+│                                                                             │
+│   消费者（读取 vibe.* 注入 Context）                                        │
+│   ──────────────────────────────────                                        │
+│   ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐          │
+│   │ CoreAgent  │  │   Skills   │  │ Proactive  │  │   推荐     │          │
+│   └────────────┘  └────────────┘  └────────────┘  └────────────┘          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 三、Vibe 层完整结构
+
+```yaml
+vibe:
+  # ═══════════════════════════════════════════════════════════════
+  # 1. current - 当前状态（Hot Layer）
+  #    更新时机：每轮对话后实时更新
+  #    写入策略：覆盖写入
+  #    用途：捕捉即时状态，下一轮对话立即可用
+  # ═══════════════════════════════════════════════════════════════
+  current:
+    emotion: "focused"           # 当前情绪 (anxious|sad|neutral|content|excited|focused)
+    energy: "high"               # 能量水平 (low|medium|high)
+    focus: ["career"]            # 当前关注领域
+    topics:                      # 进行中的话题（最多 5 个）
+      - "职业转型考虑中"
+      - "和伴侣沟通问题"
+    context: "用户在考虑是否接受新工作offer"  # 当前对话上下文摘要
+    updated_at: "2026-01-23T10:00:00Z"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. profile - 稳定画像（Warm Layer）
+  #    更新时机：每日凌晨定时提取
+  #    写入策略：增量合并，去重
+  #    用途：长期画像，供所有 Skill 读取
+  # ═══════════════════════════════════════════════════════════════
+  profile:
+    # 身份特征
+    identity:
+      archetypes: ["成长者", "开拓者"]   # 人格原型（融合多来源）
+      traits: ["创新", "进取", "直觉"]    # 核心特质（max 5）
+      style: "理性分析型"                 # 沟通风格
+      sources:                            # 来源追溯（供 Skill 参考）
+        bazi: { day_master: "甲木", element: "wood" }
+        zodiac: { sun_sign: "aries", moon_sign: "cancer" }
+
+    # 目标与愿景
+    goals:
+      - id: "g_001"
+        title: "完成副业项目第一版"
+        category: "career"               # career|health|relationship|wealth|growth
+        status: "active"                 # active|paused|completed
+        progress: 60                     # 0-100
+        deadline: "2026-03-01"
+        mentioned_at: "2026-01-20"
+      - id: "g_002"
+        title: "建立个人品牌"
+        category: "career"
+        status: "active"
+        progress: 30
+        mentioned_at: "2026-01-15"
+
+    # 关键人物
+    people:
+      - id: "p_001"
+        name: "小明"
+        relation: "romantic"             # romantic|family|friend|colleague|other
+        birth_info:                      # 可选，用于合盘
+          date: "1992-05-15"
+          time: "14:30"
+          place: "上海"
+        notes: "伴侣，沟通风格偏感性"
+        mentioned_at: "2026-01-22"
+
+    # 生活背景
+    context:
+      occupation: "产品经理"
+      industry: "互联网"
+      life_stage: "career_growth"        # student|early_career|career_growth|career_peak|transition|retirement
+      concerns: ["工作压力", "职业发展"]  # 当前困扰（max 5）
+      interests: ["命理", "心理学", "创业"]  # 兴趣领域（max 10）
+
+    # 偏好（从行为中学习）
+    preferences:
+      response_style: "简洁直接"         # 期望的回复风格
+      language: "zh-CN"
+      topics_to_avoid: []                # 不想谈的话题
+
+    updated_at: "2026-01-23T04:00:00Z"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. timeline - 重要事件（Cold Layer）
+  #    更新时机：检测到关键事件时追加
+  #    写入策略：追加存储，保留最近 100 条
+  #    用途：回溯重要节点，支持时间线展示
+  # ═══════════════════════════════════════════════════════════════
+  timeline:
+    - id: "e_001"
+      date: "2026-01-22"
+      type: "relationship"               # goal|relationship|decision|milestone|life_event
+      event: "添加伴侣信息进行合盘"
+      data:
+        person_id: "p_001"
+        action: "synastry"
+    - id: "e_002"
+      date: "2026-01-20"
+      type: "goal"
+      event: "设定新目标：完成副业项目"
+      data:
+        goal_id: "g_001"
+    - id: "e_003"
+      date: "2026-01-18"
+      type: "decision"
+      event: "开始分析 A 公司 offer"
+      data:
+        title: "要不要接 A 公司 offer"
+        status: "analyzing"
+    - id: "e_004"
+      date: "2026-01-15"
+      type: "milestone"
+      event: "首次命盘计算"
+      data:
+        skill: "bazi"
+```
+
+## 四、提取器设计
+
+### 4.1 实时提取器（Hot Extractor）
+
+```
+触发时机：每轮对话结束后
+输入：当前对话最近 10 条消息
+输出：vibe.current（覆盖写入）
+延迟要求：< 2s
+```
+
+```python
+# 实时提取 Prompt
+REALTIME_EXTRACTION_PROMPT = """
+分析对话，提取用户当前状态。只返回 JSON。
+
+{
+  "emotion": "focused",      // anxious|sad|neutral|content|excited|focused
+  "energy": "high",          // low|medium|high
+  "focus": ["career"],       // 当前关注领域
+  "topics": ["..."],         // 进行中的话题（max 5）
+  "context": "..."           // 一句话总结当前对话上下文
+}
+"""
+```
+
+### 4.2 定时提取器（Warm Extractor）
+
+```
+触发时机：每日 04:00
+输入：过去 7 天所有交互 + 现有 vibe.profile
+输出：vibe.profile（增量合并）
+处理量：每用户 ~100 条消息
+```
+
+```python
+# 定时提取 Prompt
+DAILY_EXTRACTION_PROMPT = """
+分析用户过去一周的交互记录，更新用户画像。
+
+## 当前画像
+{current_profile}
+
+## 新交互记录
+{interactions}
+
+## 输出格式
+只返回需要新增或更新的字段：
+{
+  "identity": { ... },    // 如有新发现的特质
+  "goals": [ ... ],       // 如有新目标
+  "people": [ ... ],      // 如有新提及的人物
+  "context": { ... },     // 如有新的背景信息
+  "preferences": { ... }  // 如有新的偏好
+}
+"""
+```
+
+### 4.3 事件检测器（Cold Detector）
+
+```
+触发时机：实时检测 + 定时扫描
+检测条件：
+  - 新目标设定（关键词：想要、计划、目标）
+  - 新人物提及（关键词：伴侣、父母、朋友 + 姓名）
+  - 重要决策（关键词：纠结、选择、决定）
+  - 人生事件（关键词：结婚、买房、跳槽、生病）
+输出：vibe.timeline（追加）
+```
+
+## 五、数据流设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            数据流                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   用户交互                                                                   │
+│   ────────                                                                  │
+│                                                                             │
+│   1. 对话消息 ──► messages 表                                               │
+│   2. 工具调用 ──► messages.metadata.tool_calls                              │
+│   3. Skill 计算 ──► skills.{skill_id}                                       │
+│   4. 用户行为 ──► usage_events 表                                           │
+│                                                                             │
+│   ════════════════════════════════════════════════════════════════════════ │
+│                                                                             │
+│   提取流程                                                                   │
+│   ────────                                                                  │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  对话结束                                                            │   │
+│   │      │                                                              │   │
+│   │      ▼                                                              │   │
+│   │  ┌──────────────────┐                                               │   │
+│   │  │  实时提取器       │──► vibe.current（覆盖）                       │   │
+│   │  │  extract_current │                                               │   │
+│   │  └──────────────────┘                                               │   │
+│   │      │                                                              │   │
+│   │      ▼                                                              │   │
+│   │  ┌──────────────────┐                                               │   │
+│   │  │  事件检测器       │──► vibe.timeline（追加）                      │   │
+│   │  │  detect_events   │                                               │   │
+│   │  └──────────────────┘                                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  每日 04:00                                                          │   │
+│   │      │                                                              │   │
+│   │      ▼                                                              │   │
+│   │  ┌──────────────────┐                                               │   │
+│   │  │  定时提取器       │──► vibe.profile（合并）                       │   │
+│   │  │  extract_profile │                                               │   │
+│   │  └──────────────────┘                                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ════════════════════════════════════════════════════════════════════════ │
+│                                                                             │
+│   消费流程                                                                   │
+│   ────────                                                                  │
+│                                                                             │
+│   CoreAgent / Skill / Proactive                                             │
+│       │                                                                     │
+│       ▼                                                                     │
+│   get_vibe_context(user_id)                                                 │
+│       │                                                                     │
+│       ▼                                                                     │
+│   构建个性化 System Prompt                                                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 六、API 设计
+
+```python
+class UnifiedProfileRepository:
+    # ═══════════════════════════════════════════════════════════════
+    # Vibe 读取
+    # ═══════════════════════════════════════════════════════════════
+
+    async def get_vibe(user_id: UUID) -> Dict:
+        """获取完整 Vibe 数据"""
+
+    async def get_vibe_current(user_id: UUID) -> Dict:
+        """获取当前状态（Hot Layer）"""
+
+    async def get_vibe_profile(user_id: UUID) -> Dict:
+        """获取稳定画像（Warm Layer）"""
+
+    async def get_vibe_timeline(user_id: UUID, limit: int = 20) -> List[Dict]:
+        """获取事件时间线（Cold Layer）"""
+
+    async def get_vibe_context(user_id: UUID) -> str:
+        """获取用于注入 System Prompt 的上下文字符串"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # Vibe 写入
+    # ═══════════════════════════════════════════════════════════════
+
+    async def update_vibe_current(user_id: UUID, current: Dict) -> None:
+        """更新当前状态（覆盖写入）"""
+
+    async def update_vibe_profile(user_id: UUID, updates: Dict) -> None:
+        """更新稳定画像（增量合并）"""
+
+    async def append_vibe_timeline(user_id: UUID, event: Dict) -> str:
+        """追加事件到时间线，返回 event_id"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # 便捷方法
+    # ═══════════════════════════════════════════════════════════════
+
+    async def add_goal(user_id: UUID, goal: Dict) -> str:
+        """添加目标到 vibe.profile.goals"""
+
+    async def update_goal(user_id: UUID, goal_id: str, updates: Dict) -> bool:
+        """更新目标"""
+
+    async def add_person(user_id: UUID, person: Dict) -> str:
+        """添加人物到 vibe.profile.people"""
+
+    async def get_person(user_id: UUID, person_id: str) -> Optional[Dict]:
+        """获取人物信息"""
+```
+
+## 七、Context 注入示例
+
+```python
+async def build_vibe_context(user_id: UUID) -> str:
+    """构建用于 System Prompt 的 Vibe 上下文"""
+
+    vibe = await UnifiedProfileRepository.get_vibe(user_id)
+    current = vibe.get("current", {})
+    profile = vibe.get("profile", {})
+
+    parts = []
+
+    # 当前状态
+    if current:
+        parts.append(f"【当前状态】情绪: {current.get('emotion', '未知')}, "
+                    f"关注: {', '.join(current.get('focus', []))}")
+        if current.get('context'):
+            parts.append(f"上下文: {current['context']}")
+
+    # 身份特征
+    identity = profile.get("identity", {})
+    if identity.get("archetypes"):
+        parts.append(f"【人格原型】{', '.join(identity['archetypes'])}")
+    if identity.get("traits"):
+        parts.append(f"【核心特质】{', '.join(identity['traits'])}")
+
+    # 目标
+    goals = profile.get("goals", [])
+    active_goals = [g for g in goals if g.get("status") == "active"]
+    if active_goals:
+        goal_texts = [f"{g['title']}({g.get('progress', 0)}%)" for g in active_goals[:3]]
+        parts.append(f"【当前目标】{', '.join(goal_texts)}")
+
+    # 背景
+    context = profile.get("context", {})
+    if context.get("occupation"):
+        parts.append(f"【职业】{context['occupation']}")
+    if context.get("concerns"):
+        parts.append(f"【关注问题】{', '.join(context['concerns'][:3])}")
+
+    return "\n".join(parts)
+```
+
+## 八、与 v12 的迁移映射
+
+| v12 结构 | v13 结构 | 迁移说明 |
+|----------|----------|----------|
+| insight.essence.archetype | profile.identity.archetypes | 扁平化，数组存储 |
+| insight.essence.traits | profile.identity.traits | 保持 |
+| insight.essence.shadow | 移除 | 低使用率 |
+| insight.psyche | profile.identity.style | 简化为单字段 |
+| insight.dynamic.emotion | current.emotion | 提升到 current 层 |
+| insight.dynamic.energy | current.energy | 提升到 current 层 |
+| target.north_star | profile.goals[0] | 合并到目标列表 |
+| target.goals | profile.goals | 保持 |
+| target.focus | current.focus | 分离到实时层 |
+| timing.current_window | 移除 | 按需从 Skill 实时计算 |
+| timing.windows | 移除 | 按需从 Skill 实时计算 |
+| timing.decisions | timeline[] type=decision | 作为事件存储 |
+| timing.milestones | timeline[] type=milestone | 作为事件存储 |
+| relationship.partners | profile.people | 简化结构 |
+| relationship.daily_weather | 移除 | 按需实时计算 |
+| relationship.interaction_patterns | 移除 | 低使用率 |
+
+## 九、移除的组件
+
+### 9.1 移除 vibe_sync.yaml
+
+**原因**：配置驱动的同步过于复杂，且与"从交互提取"的理念冲突。
+
+**迁移方案**：
+- Skill 数据（bazi/zodiac chart）保存在 `skills.{skill_id}`
+- 定时提取器会读取 Skill 数据，提取关键特征到 `vibe.profile.identity.sources`
+
+### 9.2 简化 ProfileExtractor
+
+**原因**：原 V8 版本同时更新 insight 和 target，结构复杂。
+
+**新设计**：
+- `extract_current()` - 实时提取当前状态
+- `extract_profile()` - 定时提取稳定画像
+- `detect_events()` - 事件检测
+
+## 十、版本历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v13 | 2026-01-23 | 简化架构：三层存储（current/profile/timeline），移除 vibe_sync.yaml |
+| v12 | 2026-01-23 | 完整设计：insight/target/timing/relationship/timeline |
+| v11 | 2026-01-15 | 新增 vibe_sync.yaml 配置驱动同步 |
+| v10 | 2026-01-10 | 新增 relationship 支持合盘 |
+| v9 | 2026-01-05 | 三层架构：identity + skills + vibe |

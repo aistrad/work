@@ -1,0 +1,458 @@
+"""
+Mentis OS v3.0 - LLM 情绪引擎
+
+混合情绪分析:
+- 规则引擎快速识别 (< 50ms)
+- LLM 深度分析 (高强度或低置信度时触发)
+- 实体抽取 (Life Connect 功能)
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any, Dict, List, Optional
+
+from services import emotion_engine, glm_service, prompts
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 数据类型定义
+# =============================================================================
+
+@dataclass
+class LLMEmotionResult:
+    """LLM 情绪分析结果"""
+    primary: str
+    intensity: int
+    secondary: List[str]
+    confidence: float
+    energy_delta: int
+    context: Dict[str, Any]
+    nuanced_feeling: Optional[str] = None
+    suggested_tags: List[str] = field(default_factory=list)
+    cognitive_patterns: List[str] = field(default_factory=list)
+    empathy_response: Optional[str] = None
+    source: str = "rule"  # "rule" | "llm" | "hybrid"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "primary": self.primary,
+            "intensity": self.intensity,
+            "secondary": self.secondary,
+            "confidence": self.confidence,
+            "energy_delta": self.energy_delta,
+            "context": self.context,
+            "nuanced_feeling": self.nuanced_feeling,
+            "suggested_tags": self.suggested_tags,
+            "cognitive_patterns": self.cognitive_patterns,
+            "empathy_response": self.empathy_response,
+            "source": self.source,
+        }
+
+
+@dataclass
+class LifeEntity:
+    """生活实体"""
+    entity_type: str  # person, event, todo, goal, place
+    name: str
+    metadata: Dict[str, Any]
+    confidence: float
+    source_text: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "entity_type": self.entity_type,
+            "name": self.name,
+            "metadata": self.metadata,
+            "confidence": self.confidence,
+            "source_text": self.source_text,
+        }
+
+
+@dataclass
+class ExtractionResult:
+    """实体抽取结果"""
+    persons: List[LifeEntity] = field(default_factory=list)
+    events: List[LifeEntity] = field(default_factory=list)
+    todos: List[LifeEntity] = field(default_factory=list)
+    goals: List[LifeEntity] = field(default_factory=list)
+    places: List[LifeEntity] = field(default_factory=list)
+
+    def all_entities(self) -> List[LifeEntity]:
+        return self.persons + self.events + self.todos + self.goals + self.places
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "persons": [e.to_dict() for e in self.persons],
+            "events": [e.to_dict() for e in self.events],
+            "todos": [e.to_dict() for e in self.todos],
+            "goals": [e.to_dict() for e in self.goals],
+            "places": [e.to_dict() for e in self.places],
+        }
+
+
+# =============================================================================
+# LLM 情绪引擎
+# =============================================================================
+
+class LLMEmotionEngine:
+    """LLM 驱动的情绪分析引擎"""
+
+    # 触发 LLM 分析的阈值
+    HIGH_INTENSITY_THRESHOLD = 7
+    LOW_CONFIDENCE_THRESHOLD = 0.7
+    MIN_TEXT_LENGTH = 50
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or "glm-4-flash"
+
+    async def analyze(
+        self,
+        text: str,
+        history_context: Optional[str] = None,
+    ) -> LLMEmotionResult:
+        """
+        使用 LLM 进行深度情绪分析
+
+        Args:
+            text: 用户输入文本
+            history_context: 历史情绪上下文 (可选)
+
+        Returns:
+            LLMEmotionResult: 分析结果
+        """
+        prompt = prompts.build_emotion_analysis_prompt(
+            text=text,
+            history_context=history_context,
+            enhanced=bool(history_context),
+        )
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.3,  # 较低温度以保证一致性
+                max_tokens=512,
+            )
+
+            result = self._parse_emotion_response(response, text)
+            result.source = "llm"
+            return result
+
+        except Exception as e:
+            logger.warning(f"LLM emotion analysis failed: {e}, falling back to rule engine")
+            # 降级到规则引擎
+            rule_result = emotion_engine.detect_emotion(text)
+            return self._convert_rule_result(rule_result, text)
+
+    async def extract_entities(
+        self,
+        text: str,
+        current_date_val: Optional[date] = None,
+    ) -> ExtractionResult:
+        """
+        从文本中抽取生活实体
+
+        Args:
+            text: 用户输入文本
+            current_date_val: 当前日期 (用于解析相对时间)
+
+        Returns:
+            ExtractionResult: 抽取结果
+        """
+        prompt = prompts.build_entity_extraction_prompt(
+            text=text,
+            current_date=current_date_val,
+        )
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.2,  # 更低温度以保证结构化输出
+                max_tokens=1024,
+            )
+
+            return self._parse_extraction_response(response, text)
+
+        except Exception as e:
+            logger.warning(f"Entity extraction failed: {e}")
+            return ExtractionResult()
+
+    def _parse_emotion_response(self, response: str, original_text: str) -> LLMEmotionResult:
+        """解析 LLM 情绪分析响应"""
+        try:
+            # 清理 markdown 代码块
+            content = response.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            data = json.loads(content.strip())
+
+            # 验证和规范化字段
+            primary = data.get("primary_emotion", "calm")
+            if primary not in emotion_engine.EMOTION_TAXONOMY["primary"]:
+                primary = "calm"
+
+            intensity = max(1, min(10, int(data.get("intensity", 5))))
+            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.7))))
+            energy_delta = max(-5, min(5, int(data.get("energy_delta", 0))))
+
+            secondary = data.get("secondary_emotions", [])
+            if not isinstance(secondary, list):
+                secondary = []
+            secondary = [s for s in secondary[:3] if s in emotion_engine.EMOTION_TAXONOMY["secondary"]]
+
+            context = data.get("context", {})
+            if not isinstance(context, dict):
+                context = {}
+
+            return LLMEmotionResult(
+                primary=primary,
+                intensity=intensity,
+                secondary=secondary,
+                confidence=confidence,
+                energy_delta=energy_delta,
+                context=context,
+                nuanced_feeling=data.get("nuanced_feeling"),
+                suggested_tags=data.get("suggested_tags", [])[:5],
+                cognitive_patterns=data.get("cognitive_patterns", []),
+                empathy_response=data.get("empathy_response"),
+            )
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to parse LLM response: {e}")
+            # 降级到规则引擎
+            rule_result = emotion_engine.detect_emotion(original_text)
+            return self._convert_rule_result(rule_result, original_text)
+
+    def _parse_extraction_response(self, response: str, original_text: str) -> ExtractionResult:
+        """解析实体抽取响应"""
+        try:
+            # 清理 markdown 代码块
+            content = response.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            data = json.loads(content.strip())
+
+            result = ExtractionResult()
+
+            # 解析人物
+            for p in data.get("persons", []):
+                if isinstance(p, dict) and p.get("name"):
+                    result.persons.append(LifeEntity(
+                        entity_type="person",
+                        name=p["name"],
+                        metadata={
+                            "relation": p.get("relation", "other"),
+                            "event": p.get("event"),
+                        },
+                        confidence=float(p.get("confidence", 0.7)),
+                        source_text=original_text[:100],
+                    ))
+
+            # 解析事件
+            for e in data.get("events", []):
+                if isinstance(e, dict) and e.get("title"):
+                    result.events.append(LifeEntity(
+                        entity_type="event",
+                        name=e["title"],
+                        metadata={
+                            "type": e.get("type", "other"),
+                            "datetime": e.get("datetime"),
+                            "participants": e.get("participants", []),
+                            "is_future": e.get("is_future", False),
+                        },
+                        confidence=float(e.get("confidence", 0.7)),
+                        source_text=original_text[:100],
+                    ))
+
+            # 解析待办
+            for t in data.get("todos", []):
+                if isinstance(t, dict) and t.get("title"):
+                    result.todos.append(LifeEntity(
+                        entity_type="todo",
+                        name=t["title"],
+                        metadata={
+                            "due_date": t.get("due_date"),
+                            "priority": t.get("priority", "medium"),
+                            "context": t.get("context"),
+                        },
+                        confidence=float(t.get("confidence", 0.7)),
+                        source_text=original_text[:100],
+                    ))
+
+            # 解析目标
+            for g in data.get("goals", []):
+                if isinstance(g, dict) and g.get("description"):
+                    result.goals.append(LifeEntity(
+                        entity_type="goal",
+                        name=g["description"],
+                        metadata={
+                            "category": g.get("category", "personal"),
+                            "timeframe": g.get("timeframe", "long_term"),
+                        },
+                        confidence=float(g.get("confidence", 0.7)),
+                        source_text=original_text[:100],
+                    ))
+
+            # 解析地点
+            for pl in data.get("places", []):
+                if isinstance(pl, dict) and pl.get("name"):
+                    result.places.append(LifeEntity(
+                        entity_type="place",
+                        name=pl["name"],
+                        metadata={
+                            "type": pl.get("type", "other"),
+                        },
+                        confidence=float(pl.get("confidence", 0.7)),
+                        source_text=original_text[:100],
+                    ))
+
+            return result
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to parse extraction response: {e}")
+            return ExtractionResult()
+
+    def _convert_rule_result(
+        self,
+        rule_result: emotion_engine.EmotionResult,
+        text: str,
+    ) -> LLMEmotionResult:
+        """将规则引擎结果转换为 LLMEmotionResult"""
+        # 使用 stream_processor 的 extract_context 逻辑
+        from services.stream_processor import extract_context
+        context = extract_context(text)
+
+        return LLMEmotionResult(
+            primary=rule_result.primary,
+            intensity=rule_result.intensity,
+            secondary=rule_result.secondary,
+            confidence=rule_result.confidence,
+            energy_delta=rule_result.energy_delta,
+            context=context,
+            source="rule",
+        )
+
+
+# =============================================================================
+# 混合分析函数
+# =============================================================================
+
+def should_use_llm(rule_result: emotion_engine.EmotionResult, text: str) -> bool:
+    """
+    判断是否需要调用 LLM 进行深度分析
+
+    触发条件:
+    - 情绪强度 >= 7 (高强度情绪需要更细腻的理解)
+    - 置信度 < 0.7 (规则引擎不确定时)
+    - 文本长度 > 50 (较长文本可能包含复杂情绪)
+    """
+    if rule_result.intensity >= LLMEmotionEngine.HIGH_INTENSITY_THRESHOLD:
+        return True
+    if rule_result.confidence < LLMEmotionEngine.LOW_CONFIDENCE_THRESHOLD:
+        return True
+    if len(text) > LLMEmotionEngine.MIN_TEXT_LENGTH:
+        return True
+    return False
+
+
+async def hybrid_emotion_analyze(
+    text: str,
+    rule_result: Optional[emotion_engine.EmotionResult] = None,
+    force_llm: bool = False,
+    history_context: Optional[str] = None,
+) -> LLMEmotionResult:
+    """
+    混合情绪分析
+
+    策略:
+    1. 首先使用规则引擎快速分析 (< 50ms)
+    2. 根据触发条件决定是否调用 LLM
+    3. 如果调用 LLM，用 LLM 结果增强规则结果
+
+    Args:
+        text: 用户输入文本
+        rule_result: 预先计算的规则分析结果 (可选)
+        force_llm: 强制使用 LLM
+        history_context: 历史情绪上下文
+
+    Returns:
+        LLMEmotionResult: 分析结果
+    """
+    # 步骤 1: 规则引擎快速分析
+    if rule_result is None:
+        rule_result = emotion_engine.detect_emotion(text)
+
+    # 步骤 2: 判断是否需要 LLM
+    if not force_llm and not should_use_llm(rule_result, text):
+        # 直接返回规则结果
+        engine = LLMEmotionEngine()
+        result = engine._convert_rule_result(rule_result, text)
+        result.source = "rule"
+        return result
+
+    # 步骤 3: 调用 LLM 进行深度分析
+    engine = LLMEmotionEngine()
+    llm_result = await engine.analyze(text, history_context)
+
+    # 步骤 4: 混合结果 (LLM 为主，规则为辅)
+    if llm_result.source == "llm":
+        llm_result.source = "hybrid"
+        # 如果 LLM 置信度低，考虑使用规则结果
+        if llm_result.confidence < 0.5 and rule_result.confidence > llm_result.confidence:
+            llm_result.primary = rule_result.primary
+            llm_result.intensity = rule_result.intensity
+            llm_result.confidence = rule_result.confidence
+
+    return llm_result
+
+
+async def extract_life_entities(
+    text: str,
+    current_date_val: Optional[date] = None,
+) -> ExtractionResult:
+    """
+    抽取生活实体
+
+    Args:
+        text: 用户输入文本
+        current_date_val: 当前日期
+
+    Returns:
+        ExtractionResult: 抽取结果
+    """
+    engine = LLMEmotionEngine()
+    return await engine.extract_entities(text, current_date_val)
+
+
+# =============================================================================
+# 同步版本 (用于非异步上下文)
+# =============================================================================
+
+def hybrid_emotion_analyze_sync(
+    text: str,
+    rule_result: Optional[emotion_engine.EmotionResult] = None,
+) -> LLMEmotionResult:
+    """
+    同步版本的混合情绪分析
+
+    注意: 同步版本只使用规则引擎
+    """
+    if rule_result is None:
+        rule_result = emotion_engine.detect_emotion(text)
+
+    engine = LLMEmotionEngine()
+    result = engine._convert_rule_result(rule_result, text)
+    result.source = "rule"
+    return result

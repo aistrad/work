@@ -1,0 +1,680 @@
+"""
+CoreAgent v10 + V9 渐进式架构（LLM-First）
+
+V9 架构特性（新增）：
+- 多 Skill 并行激活：_active_skills: List[str]
+- Core 工具始终可用
+- 工具聚合去重
+- activate_skills 支持激活多个 Skill
+
+v10 架构特性：
+- Context Engineering: 文件/JSONB 持久化状态，断点续传
+- 模块化: ContextManager, SessionManager, PromptBuilder, ToolExecutor
+- 会话恢复: 自动检测未完成会话，支持断点续传
+- 跨 Skill 共享: profile.extracted + identity
+
+LLM-First（V9.2）：
+- Phase 1 仅暴露 activate_skills、ask、show
+- 完全删除 routing.yaml 依赖
+- 路由与提示均由 SKILL.md + tools.yaml + rules/*.md 驱动
+
+v8 架构特性（保留）：
+- 分阶段上下文加载：Phase 1 (Skill 选择) / Phase 2 (Skill 执行)
+- use_skill 同轮重载：激活 skill 后同一轮内重新构建上下文
+"""
+import json
+import logging
+import time
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from dataclasses import dataclass
+from enum import Enum
+
+from services.llm import LLMClient, get_llm_client
+from services.llm.client import LLMMessage
+from .case_index import get_case_index, CaseIndex
+from .skill_loader import (
+    load_skill, get_skill_rules,
+)
+from .tool_registry import ToolRegistry, ToolContext
+# LLM-First: 不依赖 routing_config；工具描述直接由技能清单和注册表决定
+def build_skill_tool_description() -> str:
+    from .skill_loader import get_available_skills, load_skill
+    lines = ["激活专业技能来回答用户问题。\n\n## 可用技能\n"]
+    for sid in [s for s in get_available_skills() if s != "core"]:
+        skill = load_skill(sid)
+        if skill:
+            desc = skill.description
+            if len(desc) > 50:
+                desc = desc[:50] + "..."
+            triggers = skill.triggers[:3] if skill.triggers else []
+            t = "、".join(triggers)
+            lines.append(f"- **{sid}**: {desc}（{t}）")
+    lines.append("\n## 参数说明\n- `skill`: 必需，技能 ID\n- `rule`: 可选，规则 ID（如该技能有细分流程）")
+    return "\n".join(lines)
+from .context_manager import get_context_manager, ContextManager, SessionContext
+from .session_manager import get_session_manager, SessionManager, ActiveSession
+from .prompt_builder import get_prompt_builder, PromptBuilder
+from .tool_executor import get_tool_executor, ToolExecutor
+
+logger = logging.getLogger(__name__)
+
+
+class AgentState(str, Enum):
+    """Agent 执行状态"""
+    IDLE = "idle"
+    THINKING = "thinking"
+    TOOL_CALLING = "tool_calling"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+@dataclass
+class AgentEvent:
+    """Agent 执行事件"""
+    type: str  # thinking, content, tool_call, tool_result, done, error, sop_phase, session_resume
+    data: Any = None
+
+
+@dataclass
+class AgentContext:
+    """Agent 执行上下文
+
+    v10 更新：
+    - 新增 session_context 支持断点续传
+    """
+    user_id: str
+    user_tier: str = "free"
+    profile: Optional[Dict[str, Any]] = None
+    skill_data: Optional[Dict[str, Any]] = None
+    history: Optional[List[Dict[str, str]]] = None
+    skill: Optional[str] = None
+    scenario: Optional[str] = None
+    conversation_id: Optional[str] = None
+    voice_mode: Optional[str] = "warm"
+    protocol_prompt: Optional[str] = None
+    session_context: Optional[SessionContext] = None  # v10: 会话上下文
+
+
+def build_phase1_tools() -> List[Dict[str, Any]]:
+    """
+    构建 Phase 1 路由工具集 - v12: 配置驱动
+
+    从 core/tools/tools.yaml 读取带 phase1: true 标记的工具。
+    不再硬编码工具定义。
+    """
+    from .tool_registry import ToolRegistry
+
+    # 从 ToolRegistry 获取 core skill 的 Phase 1 工具
+    return ToolRegistry.get_phase1_tools("core")
+
+
+# 缓存动态生成的工具定义
+_PHASE1_TOOLS_CACHE: Optional[List[Dict[str, Any]]] = None
+
+
+def get_phase1_tools() -> List[Dict[str, Any]]:
+    """获取 Phase 1 工具定义（带缓存）"""
+    global _PHASE1_TOOLS_CACHE
+    if _PHASE1_TOOLS_CACHE is None:
+        _PHASE1_TOOLS_CACHE = build_phase1_tools()
+    return _PHASE1_TOOLS_CACHE
+
+
+class CoreAgent:
+    """
+    CoreAgent v10 - Context Engineering 驱动
+
+    Features:
+    - 会话恢复检查：自动检测未完成会话
+    - 断点续传：从 checkpoint 恢复执行
+    - 模块化设计：ContextManager, SessionManager, PromptBuilder, ToolExecutor
+    - 分阶段上下文加载
+    """
+
+    def __init__(
+        self,
+        llm: Optional[LLMClient] = None,
+        max_iterations: int = 10,
+        case_index: Optional[CaseIndex] = None
+    ):
+        self.llm = llm or get_llm_client()
+        self.max_iterations = max_iterations
+        self.case_index = case_index or get_case_index()
+        self.state = AgentState.IDLE
+
+        # v10: 新增模块
+        self.context_manager: ContextManager = get_context_manager()
+        self.session_manager: SessionManager = get_session_manager()
+        self.prompt_builder: PromptBuilder = get_prompt_builder()
+        self.tool_executor: ToolExecutor = get_tool_executor()
+
+        # 运行时状态 (V9: 支持多 Skill 激活)
+        self._active_skills: List[str] = []  # V9: 多 Skill 列表
+        self._active_skill: Optional[str] = None  # V9: 主 Skill（向后兼容）
+        self._active_scenario: Optional[str] = None
+        self._current_message: str = ""
+        self._context: Optional[AgentContext] = None
+        self._messages: Optional[List[LLMMessage]] = None
+        self._session_context: Optional[SessionContext] = None
+        self._perf_log: Dict[str, Any] = {}
+
+        # LLM-First: 技能切换节流与限制
+        self._skill_switch_count: int = 0
+        self._skill_switch_limit: int = 3
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        """获取 LLM 使用统计"""
+        return self.llm.usage
+
+    async def run(
+        self,
+        message: str,
+        context: AgentContext
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """执行 Agent 循环 - v10: Context Engineering 增强"""
+        self.state = AgentState.IDLE
+        self._current_message = message
+        self._context = context
+        self._perf_log = {
+            "iterations": 0,
+            "llm_calls": [],
+            "phase": "phase1" if not context.skill else "phase2"
+        }
+
+        # ═══════════════════════════════════════════════════════════════
+        # v10 Phase 0: 会话恢复检查
+        # ═══════════════════════════════════════════════════════════════
+        active_session = await self.session_manager.get_active_session(context.user_id)
+
+        if active_session and active_session.is_active:
+            # 检查是否应该恢复
+            if self.session_manager.should_resume(message, active_session):
+                # 恢复会话
+                yield AgentEvent(type="session_resume", data={
+                    "skill": active_session.skill_id,
+                    "rule": active_session.rule_id,
+                    "step": active_session.checkpoint_step,
+                    "total": active_session.checkpoint_total
+                })
+
+                # 自动激活 skill (V9: 同时设置 _active_skills)
+                self._active_skill = active_session.skill_id
+                self._active_skills = [active_session.skill_id] if active_session.skill_id else []
+                self._active_scenario = active_session.rule_id
+
+                # 加载会话上下文
+                self._session_context = await self.context_manager.load_session_context(
+                    context.user_id,
+                    active_session.skill_id,
+                    active_session.rule_id
+                )
+                context.session_context = self._session_context
+
+                # 动态加载 profile
+                await self._reload_profile_for_skill(active_session.skill_id)
+
+                logger.info(f"[CoreAgent] Session resumed: skill={active_session.skill_id}, step={active_session.checkpoint_step}")
+
+            elif self.session_manager.should_ask_resume(message, active_session):
+                # 提示用户是否继续
+                resume_prompt = self.session_manager.build_resume_prompt(active_session)
+                yield AgentEvent(type="session_prompt", data={
+                    "prompt": resume_prompt,
+                    "session": active_session.to_dict()
+                })
+
+        # ═══════════════════════════════════════════════════════════════
+        # Phase 1/2: 正常执行流程
+        # ═══════════════════════════════════════════════════════════════
+
+        # 使用前端指定的 skill/scenario，或从会话恢复 (V9: 同时设置 _active_skills)
+        if context.skill:
+            self._active_skill = context.skill
+            self._active_skills = [context.skill] if context.skill else []
+            self._active_scenario = context.scenario
+        elif not self._active_skill and not self._active_skills:
+            self._active_skill = None
+            self._active_skills = []
+            self._active_scenario = None
+
+        # 如果有 active skill 且没有加载 session context，现在加载
+        if self._active_skill and not self._session_context:
+            self._session_context = await self.context_manager.load_session_context(
+                context.user_id,
+                self._active_skill,
+                self._active_scenario
+            )
+            context.session_context = self._session_context
+
+        # LLM-First v10.3: 简化 SOP 阶段事件，移除硬编码状态计算
+        if self._active_skill:
+            yield AgentEvent(type="sop_phase", data={
+                "skill": self._active_skill,
+                "scenario": self._active_scenario,
+                "has_checkpoint": self._session_context.has_checkpoint if self._session_context else False,
+                "message": "LLM 驱动模式"
+            })
+
+        # 构建初始消息
+        t_prompt_start = time.time()
+        messages = await self._build_initial_messages(message, context)
+        self._messages = messages
+        self._perf_log["prompt_build_ms"] = int((time.time() - t_prompt_start) * 1000)
+        self._perf_log["system_prompt_len"] = len(messages[0].content) if messages else 0
+        logger.info(f"[PERF Agent] Prompt built: {self._perf_log['prompt_build_ms']}ms, len={self._perf_log['system_prompt_len']}")
+
+        # 主循环
+        for iteration in range(self.max_iterations):
+            self.state = AgentState.THINKING
+            # v11: Enhanced thinking events for frontend display
+            yield AgentEvent(type="thinking", data={
+                "id": f"think_{iteration}",
+                "phase": "analyzing",
+                "content": "正在分析您的问题..." if iteration == 0 else "继续思考...",
+                "iteration": iteration,
+                "is_complete": False,
+            })
+            self._perf_log["iterations"] = iteration + 1
+
+            tools = self._get_current_tools(context)
+
+            try:
+                content_buffer = ""
+                tool_calls = []
+
+                t_llm_start = time.time()
+                first_token_time = None
+
+                async for chunk in self.llm.stream(
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=None,
+                    user_tier=context.user_tier
+                ):
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        ttft = int((first_token_time - t_llm_start) * 1000)
+                        logger.info(f"[PERF Agent] LLM #{iteration+1} TTFT: {ttft}ms")
+
+                    if chunk["type"] == "content":
+                        content_buffer += chunk["content"]
+                        yield AgentEvent(type="content", data={"content": chunk["content"]})
+                    elif chunk["type"] == "tool_call":
+                        tool_calls.append(chunk)
+
+                llm_total = int((time.time() - t_llm_start) * 1000)
+                self._perf_log["llm_calls"].append({
+                    "iteration": iteration + 1,
+                    "ttft_ms": int((first_token_time - t_llm_start) * 1000) if first_token_time else 0,
+                    "total_ms": llm_total,
+                    "has_tools": len(tool_calls) > 0
+                })
+
+                if tool_calls:
+                    self.state = AgentState.TOOL_CALLING
+
+                    assistant_tool_calls = []
+                    for tc in tool_calls:
+                        assistant_tool_calls.append({
+                            "id": tc["tool_call_id"],
+                            "function": {
+                                "name": tc["tool_name"],
+                                "arguments": tc["tool_args"]
+                            }
+                        })
+                    messages.append(LLMMessage(
+                        role="assistant",
+                        content=content_buffer or "",
+                        tool_calls=assistant_tool_calls
+                    ))
+                    content_buffer = ""
+
+                    # 执行工具
+                    t_tools_start = time.time()
+                    tool_results = []
+                    for tc in tool_calls:
+                        tool_name = tc["tool_name"]
+                        tool_args = tc["tool_args"]
+                        tool_call_id = tc["tool_call_id"]
+
+                        yield AgentEvent(type="tool_call", data={
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "arguments": tool_args
+                        })
+
+                        # v11: Thinking event for tool call
+                        tool_desc = self._get_tool_description(tool_name)
+                        yield AgentEvent(type="thinking", data={
+                            "id": f"think_{iteration}",
+                            "phase": "tool_call",
+                            "content": f"正在{tool_desc}...",
+                            "iteration": iteration,
+                            "tool_name": tool_name,
+                            "is_complete": False,
+                        })
+
+                        t_tool_start = time.time()
+
+                        # 创建工具上下文
+                        tool_context = ToolContext(
+                            user_id=context.user_id,
+                            user_tier=context.user_tier,
+                            profile=context.profile or {},
+                            skill_data=context.skill_data or {},
+                            skill_id=self._active_skill,
+                            scenario_id=self._active_scenario,
+                            conversation_id=context.conversation_id
+                        )
+
+                        # 节流：限制技能频繁切换
+                        if tool_name == "activate_skills" and self._skill_switch_count >= self._skill_switch_limit:
+                            warn_msg = f"已达到技能切换上限（{self._skill_switch_limit} 次）。请先在当前技能内完成任务。"
+                            logger.info("[LLM-First] Skill switch throttled")
+                            yield AgentEvent(type="content", data={"content": warn_msg})
+                            continue
+
+                        # v10: 使用 ToolExecutor
+                        result = await self.tool_executor.execute(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            context=tool_context,
+                            current_message=self._current_message,
+                            reload_callback=lambda: self._handle_skill_activation(context)
+                        )
+
+                        # 处理需要重载上下文的工具
+                        if result.should_reload_context:
+                            # V9: 从工具结果中提取激活的 skill/rule（支持多 Skill）
+                            if isinstance(result.data, dict):
+                                # V9: 支持 skills 列表
+                                activated_skills = result.data.get("skills", [])
+                                activated_skill = result.data.get("skill")
+                                activated_rule = result.data.get("rule")
+
+                                if activated_skills:
+                                    self._active_skills = activated_skills
+                                    self._active_skill = activated_skills[0] if activated_skills else None
+                                    logger.info(f"[CoreAgent V9] Skills activated: {activated_skills}, rule: {activated_rule}")
+                                    # v11: Thinking event for skill activation
+                                    skill_names = ", ".join(activated_skills)
+                                    yield AgentEvent(type="thinking", data={
+                                        "id": f"think_{iteration}",
+                                        "phase": "skill_activate",
+                                        "content": f"正在启动 {skill_names} 分析...",
+                                        "iteration": iteration,
+                                        "skills": activated_skills,
+                                        "is_complete": False,
+                                    })
+                                elif activated_skill:
+                                    self._active_skills = [activated_skill]
+                                    self._active_skill = activated_skill
+                                    logger.info(f"[CoreAgent] Skill activated: {activated_skill}, rule: {activated_rule}")
+                                    # v11: Thinking event for skill activation
+                                    yield AgentEvent(type="thinking", data={
+                                        "id": f"think_{iteration}",
+                                        "phase": "skill_activate",
+                                        "content": f"正在启动 {activated_skill} 分析...",
+                                        "iteration": iteration,
+                                        "skills": [activated_skill],
+                                        "is_complete": False,
+                                    })
+
+                                if activated_rule:
+                                    self._active_scenario = activated_rule
+
+                            # 统计技能切换
+                            if tool_name == "activate_skills":
+                                self._skill_switch_count += 1
+                                self._perf_log["skill_switch_count"] = self._skill_switch_count
+
+                            # 重新构建 System Prompt
+                            new_system_prompt = await self._build_system_prompt(
+                                self._current_message, context
+                            )
+                            self._messages[0] = LLMMessage(role="system", content=new_system_prompt)
+                            messages[0] = self._messages[0]
+                            self._perf_log["phase"] = "phase2"
+                            self._perf_log["system_prompt_len"] = len(new_system_prompt)
+                            logger.info(f"[CoreAgent] Phase 2 prompt rebuilt, len={len(new_system_prompt)}")
+
+                        tool_exec_ms = int((time.time() - t_tool_start) * 1000)
+                        logger.info(f"[PERF Agent] Tool {tool_name}: {tool_exec_ms}ms")
+
+                        tool_results.append({
+                            "tool_call_id": tool_call_id,
+                            "result": result.data
+                        })
+
+                        yield AgentEvent(type="tool_result", data={
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "result": result.data
+                        })
+
+                    tools_total = int((time.time() - t_tools_start) * 1000)
+                    logger.info(f"[PERF Agent] All tools: {tools_total}ms")
+
+                    for tr in tool_results:
+                        result_content = tr["result"]
+                        if isinstance(result_content, dict):
+                            result_content = json.dumps(result_content, ensure_ascii=False)
+                        messages.append(LLMMessage(
+                            role="tool",
+                            content=str(result_content),
+                            tool_call_id=tr["tool_call_id"]
+                        ))
+                else:
+                    self.state = AgentState.COMPLETED
+                    logger.info(f"[PERF Agent] Done: {self._perf_log}")
+                    # v11: Thinking complete event
+                    yield AgentEvent(type="thinking", data={
+                        "id": f"think_{iteration}",
+                        "phase": "complete",
+                        "content": "分析完成",
+                        "iteration": iteration,
+                        "is_complete": True,
+                    })
+                    yield AgentEvent(type="done", data={"content": content_buffer})
+                    return
+
+            except Exception as e:
+                self.state = AgentState.ERROR
+                logger.error(f"Agent error: {e}")
+                yield AgentEvent(type="error", data={"error": str(e)})
+                return
+
+        self.state = AgentState.COMPLETED
+        yield AgentEvent(type="done", data={"max_iterations_reached": True})
+
+    async def _handle_skill_activation(self, context: AgentContext) -> None:
+        """处理 skill 激活后的上下文重载"""
+        if self._context and self._context.user_id != "guest":
+            try:
+                from stores.profile_cache import get_cached_profile_with_skill
+                from uuid import UUID
+
+                user_id = UUID(self._context.user_id)
+                skill = self._active_skill
+
+                result = await get_cached_profile_with_skill(user_id, skill)
+                self._context.profile = result.get("profile", {})
+                self._context.skill_data = result.get("skill_data", {})
+                context.profile = self._context.profile
+                context.skill_data = self._context.skill_data
+
+                # 加载 session context
+                if skill:
+                    self._session_context = await self.context_manager.load_session_context(
+                        self._context.user_id, skill, self._active_scenario
+                    )
+                    context.session_context = self._session_context
+
+                logger.info(f"[CoreAgent] Profile reloaded for skill={skill}")
+            except Exception as e:
+                logger.warning(f"[CoreAgent] Failed to reload profile: {e}")
+
+    async def _reload_profile_for_skill(self, skill_id: str) -> None:
+        """为指定 skill 重载 profile"""
+        if not self._context or self._context.user_id == "guest":
+            return
+
+        try:
+            from stores.profile_cache import get_cached_profile_with_skill
+            from uuid import UUID
+
+            user_id = UUID(self._context.user_id)
+            result = await get_cached_profile_with_skill(user_id, skill_id)
+            self._context.profile = result.get("profile", {})
+            self._context.skill_data = result.get("skill_data", {})
+
+            logger.info(f"[CoreAgent] Profile loaded for skill={skill_id}")
+        except Exception as e:
+            logger.warning(f"[CoreAgent] Failed to load profile: {e}")
+
+    def _filter_valid_history(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """过滤历史消息，确保 tool 消息配对完整"""
+        if not history:
+            return []
+
+        valid_tool_ids = set()
+        for msg in history:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        valid_tool_ids.add(tc_id)
+
+        filtered = []
+        for msg in history:
+            role = msg.get("role", "user")
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id and tool_call_id in valid_tool_ids:
+                    filtered.append(msg)
+                else:
+                    logger.warning(f"Skipping orphan tool message: {tool_call_id}")
+            else:
+                filtered.append(msg)
+
+        return filtered
+
+    async def _build_initial_messages(
+        self,
+        message: str,
+        context: AgentContext
+    ) -> List[LLMMessage]:
+        """构建初始消息列表"""
+        system_prompt = await self._build_system_prompt(message, context)
+
+        messages = [LLMMessage(role="system", content=system_prompt)]
+
+        if context.history:
+            filtered_history = self._filter_valid_history(context.history[-10:])
+            for msg in filtered_history:
+                messages.append(LLMMessage(
+                    role=msg.get("role", "user"),
+                    content=msg.get("content", ""),
+                    tool_call_id=msg.get("tool_call_id"),
+                    tool_calls=msg.get("tool_calls")
+                ))
+
+        messages.append(LLMMessage(role="user", content=message))
+        return messages
+
+    async def _build_system_prompt(self, message: str, context: AgentContext) -> str:
+        """构建 System Prompt - v10: 使用 PromptBuilder"""
+        return await self.prompt_builder.build(
+            skill_id=self._active_skill,
+            rule_id=self._active_scenario,
+            message=message,
+            profile=context.profile,
+            skill_data=context.skill_data,
+            session_context=self._session_context,
+            protocol_prompt=context.protocol_prompt
+        )
+
+    # LLM-First v10.3: 移除 _compute_sop_status
+    # SOP 状态判断由 LLM 根据 SKILL.md 规则自主完成
+
+    def _get_tool_description(self, tool_name: str) -> str:
+        """Get user-friendly description for a tool (v11)"""
+        descriptions = {
+            "activate_skills": "准备专业分析",
+            "ask": "收集信息",
+            "show": "准备展示内容",
+            "save": "保存数据",
+            "read": "读取数据",
+            "search": "检索知识库",
+            "remind": "设置提醒",
+            # Bazi tools
+            "show_bazi_chart": "计算命盘",
+            "show_bazi_fortune": "分析大运流年",
+            "show_bazi_kline": "绘制人生K线",
+            # Zodiac tools
+            "show_zodiac_chart": "计算星盘",
+            "show_transit": "计算行星推运",
+            # Tarot tools
+            "show_tarot_spread": "抽取塔罗牌",
+            # Jungastro tools
+            "show_jungastro_portrait": "分析荣格原型",
+            "show_jungastro_functions": "分析心理功能",
+            # Synastry tools
+            "show_synastry": "计算合盘",
+        }
+        return descriptions.get(tool_name, "处理数据")
+
+    def _get_current_tools(self, context: AgentContext) -> List[Dict[str, Any]]:
+        """获取当前可用工具 - V9: 支持多 Skill 工具聚合"""
+        # Phase 1: 无激活 Skill，返回路由工具
+        if not context.skill and not self._active_skill and not self._active_skills:
+            return get_phase1_tools()
+
+        tools = []
+        added_names = set()
+
+        # V9: Core 工具始终可用
+        core_tools = ToolRegistry.get_tools_for_skill("core")
+        for t in core_tools:
+            tool_name = t.get("function", {}).get("name", "")
+            if tool_name and tool_name not in added_names:
+                tools.append(t)
+                added_names.add(tool_name)
+
+        # V9: 已激活 Skill 的工具（多 Skill 支持）
+        active_skill_ids = self._active_skills if self._active_skills else []
+        if not active_skill_ids and (self._active_skill or context.skill):
+            active_skill_ids = [self._active_skill or context.skill]
+
+        for skill_id in active_skill_ids:
+            if skill_id == "core":
+                continue
+            skill_tools = ToolRegistry.get_tools_for_skill(skill_id)
+            for t in skill_tools:
+                tool_name = t.get("function", {}).get("name", "")
+                if tool_name and tool_name not in added_names:
+                    tools.append(t)
+                    added_names.add(tool_name)
+
+        # 如果没有工具，返回 Phase 1 工具
+        if not tools:
+            return get_phase1_tools()
+
+        # Phase 2: 添加 activate_skills 工具，支持动态切换 skill
+        phase1_tools = get_phase1_tools()
+        activate_tool = next((t for t in phase1_tools if t.get("function", {}).get("name") == "activate_skills"), None)
+        if activate_tool:
+            tool_name = activate_tool.get("function", {}).get("name", "")
+            if tool_name not in added_names:
+                tools.append(activate_tool)
+
+        return tools
+
+
+def create_agent(
+    llm: Optional[LLMClient] = None,
+    max_iterations: int = 10
+) -> CoreAgent:
+    """创建 CoreAgent 实例"""
+    return CoreAgent(llm=llm, max_iterations=max_iterations)

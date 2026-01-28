@@ -1,0 +1,664 @@
+"""
+八字深度报告服务
+- 支持 backend=glm
+- 同步生成报告
+- 输出 Markdown + A2UI
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from services import bazi_facts, kb_service, glm_client
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+REPORT_COMPUTE_VERSION = "bazi-report-v1.0"
+
+
+# =============================================================================
+# Enums & Data Classes
+# =============================================================================
+
+class ReportBackend(Enum):
+    GLM = "glm"
+
+
+class ReportType(Enum):
+    FULL = "full"               # 完整八字报告
+    SUMMARY = "summary"         # 摘要版
+    CAREER = "career"           # 事业方向
+    RELATIONSHIP = "relationship"  # 感情婚姻
+    HEALTH = "health"           # 健康养生
+
+
+@dataclass
+class ReportRequest:
+    user_id: int
+    report_type: ReportType
+    backend: ReportBackend = ReportBackend.GLM
+    model: Optional[str] = None
+    system_prompt: Optional[str] = None
+    extra_context: Optional[Dict] = None
+
+
+@dataclass
+class ReportResult:
+    report_id: int
+    status: str  # processing | completed | error
+    output_markdown: Optional[str] = None
+    output_a2ui: Optional[Dict] = None
+    output_summary: Optional[str] = None
+    key_findings: Optional[List[str]] = None
+    prescriptions: Optional[List[Dict]] = None
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "report_id": self.report_id,
+            "status": self.status,
+            "output_markdown": self.output_markdown,
+            "output_a2ui": self.output_a2ui,
+            "output_summary": self.output_summary,
+            "key_findings": self.key_findings,
+            "prescriptions": self.prescriptions,
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+# =============================================================================
+# System Prompts
+# =============================================================================
+
+REPORT_SYSTEM_PROMPT = """你是 Fortune AI 的八字分析师，基于积极心理学与绩效教练框架（Soul OS），为用户提供建设性、可执行的八字分析报告。
+
+【产品定位】
+人生导航 / 陪伴 / 提升。你是用户的私人命理教练，帮助用户理解自我、发挥优势、应对挑战。
+
+【六章报告框架】
+报告必须严格按照以下6章结构输出：
+
+## 第一章：命局速览
+- 一句话总结（≤50字）：用积极正向的语言概括命局特点
+- 四柱展示：年柱、月柱、日柱、时柱
+- 日主状态：日主属性、强弱、有利五行
+
+## 第二章：性格密码
+- 核心人设（1句话）：你的人格档案关键词
+- 优势能力（3-5点）：你天生擅长的领域
+- 潜在挑战（2-3点）：需要注意的成长盲区，每点必须紧跟"调整建议"
+
+## 第三章：能量地图
+- 五行分布雷达：金木水火土的强弱分析
+- 当前能量状态：基于流年流月的能量评估
+- 能量调节建议：如何补充或调和不足的五行
+
+## 第四章：流年提示
+- 近1-3年关键节点与机遇
+- 每个节点包含：时间范围、主题、建议行动
+- 标注"机遇期"或"调整期"
+
+## 第五章：行动处方
+- 必须提供≤3条具体可执行的行动建议
+- 每条必须包含：做什么、怎么做、预计时间
+- 优先级标注：高/中/低
+
+## 第六章：成长邀请
+- 一句话承诺邀请：例如"如果你愿意，我可以陪你..."
+- 后续可探索的主题（2-3个）
+- 开放性问题，邀请用户继续对话
+
+【输出要求】
+- 使用积极心理学话术，不恐吓、不定性
+- 负面信息必须紧跟"你可以做什么"（这是硬性规则）
+- 行动建议必须具体、可执行、有时间边界
+- 使用 Markdown 格式输出
+- 每章使用 `## 第X章：章节名` 格式作为标题
+
+【禁止事项】
+- 禁止输出确定性宿命论断言（如"一生注定"、"命中注定"）
+- 禁止编造经典出处或引用不存在的古籍
+- 禁止涉及医疗/法律/投资具体建议
+- 禁止仅给出负面信息而不提供解决方案"""
+
+REPORT_TYPE_INSTRUCTIONS = {
+    ReportType.FULL: "请生成完整的八字分析报告，涵盖性格、事业、感情、健康各方面。",
+    ReportType.SUMMARY: "请生成精简的八字摘要，重点突出核心特质与近期建议（约 500 字）。",
+    ReportType.CAREER: "请重点分析事业发展方向与职业建议。",
+    ReportType.RELATIONSHIP: "请重点分析感情婚姻与人际关系。",
+    ReportType.HEALTH: "请重点分析健康养生与生活方式建议。",
+}
+
+
+# =============================================================================
+# Bazi Report Service
+# =============================================================================
+
+class BaziReportService:
+    """八字深度报告服务"""
+
+    def submit_report(self, request: ReportRequest) -> ReportResult:
+        """
+        提交并生成报告（同步）
+
+        流程：
+        1. 获取用户八字事实
+        2. 检索相关知识库内容
+        3. 构建报告生成 Prompt
+        4. 调用 GLM 生成报告
+        5. 解析并存储结果
+        6. 返回 ReportResult
+        """
+        user_id = request.user_id
+        report_type = request.report_type
+        backend = request.backend
+        model = request.model
+        extra_context = request.extra_context or {}
+
+        # 1. 获取八字事实
+        try:
+            snapshot = bazi_facts.ensure_snapshot_for_user(user_id)
+        except ValueError as e:
+            return self._create_error_result(user_id, str(e))
+
+        facts = snapshot["facts"]
+        facts_hash = snapshot["facts_hash"]
+
+        # 2. 检索知识库
+        kb_refs = self._search_relevant_kb(facts)
+
+        # 3. 构建 Prompt
+        system_prompt = request.system_prompt or REPORT_SYSTEM_PROMPT
+        user_prompt = self._build_report_prompt(
+            facts=facts,
+            report_type=report_type,
+            kb_refs=kb_refs,
+            extra_context=extra_context,
+        )
+
+        # 4. 创建报告记录
+        report_id = self._create_report_record(
+            user_id=user_id,
+            report_type=report_type.value,
+            backend=backend.value,
+            model=model,
+            system_prompt=system_prompt,
+            bazi_facts_hash=facts_hash,
+            input_context=extra_context,
+        )
+
+        # 5. 调用 GLM 生成报告
+        try:
+            markdown_output = self._generate_with_glm(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+            )
+        except Exception as e:
+            logger.error(f"report generation failed: {e}")
+            self._update_report_error(report_id, str(e))
+            return ReportResult(
+                report_id=report_id,
+                status="error",
+                error_message=str(e),
+                created_at=datetime.utcnow(),
+            )
+
+        # 6. 解析报告
+        summary = self._extract_summary(markdown_output)
+        key_findings = self._extract_key_findings(markdown_output)
+        prescriptions = self._extract_prescriptions(markdown_output)
+        a2ui = self._build_report_a2ui(markdown_output, summary, prescriptions)
+
+        # 7. 更新报告记录
+        self._update_report_completed(
+            report_id=report_id,
+            output_markdown=markdown_output,
+            output_a2ui=a2ui,
+            output_summary=summary,
+            key_findings=key_findings,
+            prescriptions=prescriptions,
+        )
+
+        logger.info(
+            "report generated",
+            extra={
+                "operation": "bazi_report_generate",
+                "user_id": user_id,
+                "report_id": report_id,
+                "report_type": report_type.value,
+            },
+        )
+
+        return ReportResult(
+            report_id=report_id,
+            status="completed",
+            output_markdown=markdown_output,
+            output_a2ui=a2ui,
+            output_summary=summary,
+            key_findings=key_findings,
+            prescriptions=prescriptions,
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+
+    def get_report(self, report_id: int, user_id: int) -> Optional[ReportResult]:
+        """获取报告结果"""
+        row = fortune_db.fetch_one(
+            """
+            SELECT report_id, status, output_markdown, output_a2ui, output_summary,
+                   key_findings, prescriptions, error_message, created_at, completed_at
+            FROM fortune_bazi_report
+            WHERE report_id = %s AND user_id = %s
+            """,
+            (report_id, user_id),
+        )
+
+        if not row:
+            return None
+
+        return ReportResult(
+            report_id=row["report_id"],
+            status=row["status"],
+            output_markdown=row.get("output_markdown"),
+            output_a2ui=row.get("output_a2ui"),
+            output_summary=row.get("output_summary"),
+            key_findings=row.get("key_findings"),
+            prescriptions=row.get("prescriptions"),
+            error_message=row.get("error_message"),
+            created_at=row.get("created_at"),
+            completed_at=row.get("completed_at"),
+        )
+
+    def list_reports(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        """列出用户的报告历史"""
+        rows = fortune_db.fetch_all(
+            """
+            SELECT report_id, report_type, status, output_summary, created_at, completed_at
+            FROM fortune_bazi_report
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+
+        return [
+            {
+                "report_id": r["report_id"],
+                "report_type": r["report_type"],
+                "status": r["status"],
+                "summary": r.get("output_summary", ""),
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "completed_at": r["completed_at"].isoformat() if r.get("completed_at") else None,
+            }
+            for r in rows
+        ]
+
+    # =========================================================================
+    # Helper Methods - Prompt Building
+    # =========================================================================
+
+    def _build_report_prompt(
+        self,
+        facts: Dict[str, Any],
+        report_type: ReportType,
+        kb_refs: List[Dict],
+        extra_context: Dict,
+    ) -> str:
+        """构建报告生成 Prompt"""
+        profile = facts.get("profile", {})
+        bazi = facts.get("bazi", {})
+        pillars = bazi.get("pillars", {})
+        day_master = bazi.get("day_master", {})
+        wuxing_count = bazi.get("wuxing_count", {})
+        strength = bazi.get("strength", {})
+        shensha = bazi.get("shensha", [])
+        luck = bazi.get("luck", {})
+
+        prompt_parts = [
+            "## 用户八字信息",
+            f"- 性别：{profile.get('gender', '')}",
+            f"- 出生时间（真太阳时）：{facts.get('solar_time', {}).get('true_solar_time_local', '')}",
+            f"- 出生地：{profile.get('location', {}).get('name', '')}",
+            "",
+            "## 四柱",
+            f"- 年柱：{pillars.get('year', '')}",
+            f"- 月柱：{pillars.get('month', '')}",
+            f"- 日柱：{pillars.get('day', '')}",
+            f"- 时柱：{pillars.get('hour', '')}",
+            "",
+            "## 日主",
+            f"- 天干：{day_master.get('gan', '')}",
+            f"- 五行：{day_master.get('element', '')}",
+            "",
+            "## 五行分布",
+            f"- 金：{wuxing_count.get('金', 0)}",
+            f"- 木：{wuxing_count.get('木', 0)}",
+            f"- 水：{wuxing_count.get('水', 0)}",
+            f"- 火：{wuxing_count.get('火', 0)}",
+            f"- 土：{wuxing_count.get('土', 0)}",
+            "",
+            "## 旺衰分析",
+            f"- 状态：{strength.get('status', '')}",
+            f"- 喜用神：{', '.join(strength.get('favorable_elements', []))}",
+            "",
+            "## 神煞",
+        ]
+
+        for ss in shensha:
+            status = "命中" if ss.get("hit") else "未命中"
+            prompt_parts.append(f"- {ss.get('name', '')}：{status}")
+
+        prompt_parts.extend([
+            "",
+            "## 大运（前5步）",
+        ])
+
+        for dy in luck.get("da_yun", [])[:5]:
+            prompt_parts.append(
+                f"- {dy.get('start_age', '')}-{dy.get('end_age', '')}岁 "
+                f"({dy.get('start_year', '')}-{dy.get('end_year', '')}): {dy.get('gan_zhi', '')}"
+            )
+
+        # 添加知识库引用
+        if kb_refs:
+            prompt_parts.extend([
+                "",
+                "## 相关命理知识参考",
+            ])
+            for ref in kb_refs[:3]:
+                preview = ref.get("preview", "")[:200]
+                prompt_parts.append(f"- {preview}...")
+
+        # 添加用户额外上下文
+        if extra_context.get("question"):
+            prompt_parts.extend([
+                "",
+                "## 用户关注点",
+                str(extra_context.get("question", "")),
+            ])
+
+        # 添加报告类型指引
+        instruction = REPORT_TYPE_INSTRUCTIONS.get(report_type, REPORT_TYPE_INSTRUCTIONS[ReportType.FULL])
+        prompt_parts.extend([
+            "",
+            "## 报告要求",
+            instruction,
+            "",
+            "请按以下结构输出报告：",
+            "1. **一句话总结**（≤50字）",
+            "2. **命局概述**",
+            "3. **核心分析**（按报告类型聚焦）",
+            "4. **流年提示**（近1-3年的关键节点）",
+            "5. **行动处方**（≤3条，具体可执行）",
+            "",
+            "使用 Markdown 格式输出。",
+        ])
+
+        return "\n".join(prompt_parts)
+
+    # =========================================================================
+    # Helper Methods - LLM Generation
+    # =========================================================================
+
+    def _generate_with_glm(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+    ) -> str:
+        """使用 GLM 生成报告"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        model_name = model or "glm-4.7"
+        text, _ = glm_client.call_chat_completions(
+            messages=messages,
+            model=model_name,
+            max_tokens=4000,
+            temperature=0.7,
+            timeout_s=180.0,
+        )
+
+        return text
+
+    # =========================================================================
+    # Helper Methods - KB Search
+    # =========================================================================
+
+    def _search_relevant_kb(self, facts: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """检索相关知识库内容"""
+        try:
+            bazi = facts.get("bazi", {})
+            day_master = bazi.get("day_master", {})
+            strength = bazi.get("strength", {})
+
+            query = f"{day_master.get('gan', '')} {day_master.get('element', '')} {strength.get('status', '')} 八字分析"
+            hits = kb_service.search_bazi_kb(query, top_k=5)
+
+            return [{"kb_ref": h["kb_ref"], "preview": h["preview"]} for h in hits]
+        except Exception as e:
+            logger.warning(f"kb search failed: {e}")
+            return []
+
+    # =========================================================================
+    # Helper Methods - Parsing
+    # =========================================================================
+
+    def _extract_summary(self, markdown: str) -> str:
+        """提取一句话总结"""
+        # 尝试匹配 "一句话总结" 后的内容
+        patterns = [
+            r"一句话总结[：:]\s*(.+?)(?:\n|$)",
+            r"\*\*一句话总结\*\*[：:]\s*(.+?)(?:\n|$)",
+            r"^(.{10,50}[。！])",  # 第一句话
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, markdown, re.MULTILINE)
+            if match:
+                return match.group(1).strip()[:100]
+
+        # 默认取第一段
+        lines = [l.strip() for l in markdown.split("\n") if l.strip() and not l.startswith("#")]
+        if lines:
+            return lines[0][:100]
+
+        return ""
+
+    def _extract_key_findings(self, markdown: str) -> List[str]:
+        """提取核心发现"""
+        findings = []
+
+        # 查找命局概述或核心分析部分
+        sections = re.split(r"#{2,3}\s+", markdown)
+        for section in sections:
+            if "命局" in section or "核心" in section or "分析" in section:
+                # 提取要点（列表项或加粗文本）
+                bullets = re.findall(r"[-•]\s*(.+?)(?:\n|$)", section)
+                findings.extend([b.strip()[:100] for b in bullets[:5]])
+
+                bolds = re.findall(r"\*\*(.+?)\*\*", section)
+                for b in bolds[:3]:
+                    if len(b) > 5 and b not in findings:
+                        findings.append(b.strip()[:100])
+
+        return findings[:5]
+
+    def _extract_prescriptions(self, markdown: str) -> List[Dict[str, Any]]:
+        """提取行动处方"""
+        prescriptions = []
+
+        # 查找行动处方部分
+        match = re.search(r"(?:行动处方|行动建议|处方)[：:\s]*\n([\s\S]+?)(?:\n##|$)", markdown, re.IGNORECASE)
+        if match:
+            content = match.group(1)
+            # 提取列表项
+            items = re.findall(r"(?:\d+[.、]|\-)\s*(.+?)(?:\n|$)", content)
+            for i, item in enumerate(items[:3]):
+                prescriptions.append({
+                    "content": item.strip()[:150],
+                    "estimated_minutes": 30,
+                    "priority": "high" if i == 0 else "medium",
+                })
+
+        # 确保至少有一个处方
+        if not prescriptions:
+            prescriptions.append({
+                "content": "根据八字分析，制定个人发展计划",
+                "estimated_minutes": 60,
+                "priority": "medium",
+            })
+
+        return prescriptions
+
+    # =========================================================================
+    # Helper Methods - A2UI Building
+    # =========================================================================
+
+    def _build_report_a2ui(
+        self,
+        markdown: str,
+        summary: str,
+        prescriptions: List[Dict],
+    ) -> Dict[str, Any]:
+        """构建报告 A2UI"""
+        action_buttons = [
+            {
+                "label": "保存为资产页",
+                "action": {"type": "save_as_page"},
+            },
+            {
+                "label": "分享报告",
+                "action": {"type": "share"},
+            },
+        ]
+
+        return {
+            "meta": {
+                "summary": summary or "八字深度分析报告",
+            },
+            "ui_components": [
+                {
+                    "type": "markdown_text",
+                    "title": "报告内容",
+                    "data": markdown,
+                },
+                {
+                    "type": "action_buttons",
+                    "title": "操作",
+                    "data": action_buttons,
+                },
+            ],
+        }
+
+    # =========================================================================
+    # Helper Methods - Database Operations
+    # =========================================================================
+
+    def _create_report_record(
+        self,
+        user_id: int,
+        report_type: str,
+        backend: str,
+        model: Optional[str],
+        system_prompt: str,
+        bazi_facts_hash: str,
+        input_context: Dict,
+    ) -> int:
+        """创建报告记录"""
+        row = fortune_db.execute_returning_one(
+            """
+            INSERT INTO fortune_bazi_report (
+                user_id, report_type, backend, model, system_prompt,
+                bazi_facts_hash, input_context, status, compute_version
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s::jsonb, 'processing', %s
+            )
+            RETURNING report_id
+            """,
+            (
+                user_id, report_type, backend, model, system_prompt,
+                bazi_facts_hash, json.dumps(input_context, ensure_ascii=False),
+                REPORT_COMPUTE_VERSION,
+            ),
+        )
+
+        return row["report_id"] if row else 0
+
+    def _update_report_completed(
+        self,
+        report_id: int,
+        output_markdown: str,
+        output_a2ui: Dict,
+        output_summary: str,
+        key_findings: List[str],
+        prescriptions: List[Dict],
+    ) -> None:
+        """更新报告为完成状态"""
+        fortune_db.execute(
+            """
+            UPDATE fortune_bazi_report
+            SET status = 'completed',
+                output_markdown = %s,
+                output_a2ui = %s::jsonb,
+                output_summary = %s,
+                key_findings = %s::jsonb,
+                prescriptions = %s::jsonb,
+                completed_at = NOW()
+            WHERE report_id = %s
+            """,
+            (
+                output_markdown,
+                json.dumps(output_a2ui, ensure_ascii=False),
+                output_summary,
+                json.dumps(key_findings, ensure_ascii=False),
+                json.dumps(prescriptions, ensure_ascii=False),
+                report_id,
+            ),
+        )
+
+    def _update_report_error(self, report_id: int, error_message: str) -> None:
+        """更新报告为错误状态"""
+        fortune_db.execute(
+            """
+            UPDATE fortune_bazi_report
+            SET status = 'error',
+                error_message = %s,
+                completed_at = NOW()
+            WHERE report_id = %s
+            """,
+            (error_message[:500], report_id),
+        )
+
+    def _create_error_result(self, user_id: int, error: str) -> ReportResult:
+        """创建错误结果"""
+        return ReportResult(
+            report_id=0,
+            status="error",
+            error_message=error,
+            created_at=datetime.utcnow(),
+        )
+
+
+# =============================================================================
+# Module-level instance
+# =============================================================================
+
+bazi_report_service = BaziReportService()

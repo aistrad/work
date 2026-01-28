@@ -1,0 +1,402 @@
+"""
+VibeLife Shareable Card Generator
+可分享卡片生成器 - 生成各种尺寸的分享图片
+"""
+
+from datetime import date, datetime
+from typing import Optional, Literal
+from pydantic import BaseModel
+from pathlib import Path
+import asyncpg
+import base64
+import io
+
+from .monthly_review import MonthlyReviewData
+from .weekly_review import WeeklyReviewData
+
+
+class CardSize(BaseModel):
+    """卡片尺寸"""
+    width: int
+    height: int
+    name: str
+
+
+# 预定义卡片尺寸
+CARD_SIZES = {
+    "instagram_story": CardSize(width=1080, height=1920, name="Instagram Story"),
+    "square": CardSize(width=1080, height=1080, name="Square (微博)"),
+    "link_preview": CardSize(width=1200, height=630, name="Link Preview"),
+    "wechat_moment": CardSize(width=1080, height=1920, name="微信朋友圈"),
+}
+
+
+class ShareableCard(BaseModel):
+    """可分享卡片"""
+    card_type: str  # monthly_review, weekly_review, insight
+    size: str
+    title: str
+    content_data: dict
+    image_base64: Optional[str] = None
+    share_url: Optional[str] = None
+    generated_at: datetime
+
+
+class ShareableCardGenerator:
+    """可分享卡片生成器"""
+
+    def __init__(self, db_pool: asyncpg.Pool):
+        self.db = db_pool
+        self.assets_path = Path(__file__).parent.parent.parent / "assets" / "card_templates"
+
+    async def generate_monthly_review_card(
+        self,
+        review: MonthlyReviewData,
+        size: str = "instagram_story"
+    ) -> ShareableCard:
+        """生成月运回顾卡片"""
+        card_size = CARD_SIZES.get(size, CARD_SIZES["instagram_story"])
+
+        # 生成卡片内容
+        content_data = {
+            "month": review.month_name,
+            "summary": review.current_month_summary,
+            "highlights": review.current_month_highlights[:2],
+            "next_month": review.next_month_name,
+            "outlook": review.next_month_outlook,
+            "advice": review.key_advice,
+        }
+
+        # 生成图片
+        image_base64 = await self._render_card(
+            "monthly_review",
+            content_data,
+            card_size,
+            theme="bazi"  # 棕金色主题
+        )
+
+        return ShareableCard(
+            card_type="monthly_review",
+            size=size,
+            title=f"{review.month_name} 月运回顾",
+            content_data=content_data,
+            image_base64=image_base64,
+            generated_at=datetime.now()
+        )
+
+    async def generate_weekly_review_card(
+        self,
+        review: WeeklyReviewData,
+        size: str = "instagram_story"
+    ) -> ShareableCard:
+        """生成周运回顾卡片"""
+        card_size = CARD_SIZES.get(size, CARD_SIZES["instagram_story"])
+
+        content_data = {
+            "sun_sign": review.sun_sign,
+            "week_range": f"{review.week_start.strftime('%m/%d')} - {review.week_end.strftime('%m/%d')}",
+            "rating": review.overall_rating,
+            "summary": review.current_week_summary,
+            "theme": review.emotional_theme,
+            "next_outlook": review.next_week_outlook,
+            "lucky_day": review.lucky_day,
+            "lucky_color": review.lucky_color,
+        }
+
+        image_base64 = await self._render_card(
+            "weekly_review",
+            content_data,
+            card_size,
+            theme="zodiac"  # 星空紫色主题
+        )
+
+        return ShareableCard(
+            card_type="weekly_review",
+            size=size,
+            title=f"{review.sun_sign} 周运回顾",
+            content_data=content_data,
+            image_base64=image_base64,
+            generated_at=datetime.now()
+        )
+
+    async def generate_insight_card(
+        self,
+        insight_type: str,
+        title: str,
+        content: str,
+        size: str = "square"
+    ) -> ShareableCard:
+        """生成洞察卡片"""
+        card_size = CARD_SIZES.get(size, CARD_SIZES["square"])
+
+        # 根据洞察类型选择主题颜色
+        theme_map = {
+            "discovery": "blue",
+            "pattern": "purple",
+            "timing": "gold",
+            "growth": "green"
+        }
+        theme = theme_map.get(insight_type, "blue")
+
+        content_data = {
+            "insight_type": insight_type,
+            "title": title,
+            "content": content,
+        }
+
+        image_base64 = await self._render_card(
+            "insight",
+            content_data,
+            card_size,
+            theme=theme
+        )
+
+        return ShareableCard(
+            card_type="insight",
+            size=size,
+            title=title,
+            content_data=content_data,
+            image_base64=image_base64,
+            generated_at=datetime.now()
+        )
+
+    async def _render_card(
+        self,
+        template_type: str,
+        content_data: dict,
+        card_size: CardSize,
+        theme: str = "default"
+    ) -> str:
+        """渲染卡片为 Base64 图片"""
+        try:
+            # 尝试使用 PIL 生成图片
+            return await self._render_with_pillow(
+                template_type, content_data, card_size, theme
+            )
+        except ImportError:
+            # 如果 PIL 不可用，返回 SVG
+            return await self._render_as_svg(
+                template_type, content_data, card_size, theme
+            )
+
+    async def _render_with_pillow(
+        self,
+        template_type: str,
+        content_data: dict,
+        card_size: CardSize,
+        theme: str
+    ) -> str:
+        """使用 Pillow 渲染卡片"""
+        from PIL import Image, ImageDraw, ImageFont
+
+        # 主题颜色定义
+        themes = {
+            "bazi": {
+                "bg_start": (139, 90, 43),      # 深棕色
+                "bg_end": (218, 165, 32),        # 金色
+                "text": (255, 255, 255),
+                "accent": (255, 215, 0),
+            },
+            "zodiac": {
+                "bg_start": (25, 25, 112),       # 深蓝色
+                "bg_end": (75, 0, 130),          # 紫色
+                "text": (255, 255, 255),
+                "accent": (255, 255, 255),
+            },
+            "blue": {
+                "bg_start": (30, 60, 114),
+                "bg_end": (42, 82, 152),
+                "text": (255, 255, 255),
+                "accent": (100, 200, 255),
+            },
+            "purple": {
+                "bg_start": (76, 0, 153),
+                "bg_end": (128, 0, 128),
+                "text": (255, 255, 255),
+                "accent": (200, 150, 255),
+            },
+            "gold": {
+                "bg_start": (184, 134, 11),
+                "bg_end": (218, 165, 32),
+                "text": (255, 255, 255),
+                "accent": (255, 255, 200),
+            },
+            "green": {
+                "bg_start": (0, 100, 0),
+                "bg_end": (34, 139, 34),
+                "text": (255, 255, 255),
+                "accent": (144, 238, 144),
+            },
+            "default": {
+                "bg_start": (50, 50, 50),
+                "bg_end": (80, 80, 80),
+                "text": (255, 255, 255),
+                "accent": (200, 200, 200),
+            }
+        }
+
+        colors = themes.get(theme, themes["default"])
+
+        # 创建图片
+        img = Image.new("RGB", (card_size.width, card_size.height), colors["bg_start"])
+        draw = ImageDraw.Draw(img)
+
+        # 绘制渐变背景
+        for y in range(card_size.height):
+            ratio = y / card_size.height
+            r = int(colors["bg_start"][0] * (1 - ratio) + colors["bg_end"][0] * ratio)
+            g = int(colors["bg_start"][1] * (1 - ratio) + colors["bg_end"][1] * ratio)
+            b = int(colors["bg_start"][2] * (1 - ratio) + colors["bg_end"][2] * ratio)
+            draw.line([(0, y), (card_size.width, y)], fill=(r, g, b))
+
+        # 尝试加载字体，如果失败则使用默认字体
+        try:
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        except (OSError, IOError):
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        # 绘制内容
+        padding = 60
+        y_offset = padding * 2
+
+        if template_type == "monthly_review":
+            # 月运回顾卡片布局
+            title = content_data.get("month", "月运回顾")
+            draw.text((padding, y_offset), title, fill=colors["accent"], font=font_large)
+            y_offset += 80
+
+            summary = content_data.get("summary", "")
+            draw.text((padding, y_offset), summary[:50], fill=colors["text"], font=font_medium)
+            y_offset += 100
+
+            # 建议
+            advice = content_data.get("advice", "")
+            draw.text((padding, y_offset), f"建议: {advice[:40]}", fill=colors["accent"], font=font_small)
+
+        elif template_type == "weekly_review":
+            # 周运回顾卡片布局
+            sign = content_data.get("sun_sign", "")
+            week_range = content_data.get("week_range", "")
+            draw.text((padding, y_offset), f"{sign} 周运", fill=colors["accent"], font=font_large)
+            y_offset += 60
+            draw.text((padding, y_offset), week_range, fill=colors["text"], font=font_small)
+            y_offset += 80
+
+            # 评分
+            rating = content_data.get("rating", 3)
+            stars = "★" * rating + "☆" * (5 - rating)
+            draw.text((padding, y_offset), stars, fill=colors["accent"], font=font_medium)
+            y_offset += 80
+
+            summary = content_data.get("summary", "")
+            draw.text((padding, y_offset), summary[:40], fill=colors["text"], font=font_medium)
+
+        elif template_type == "insight":
+            # 洞察卡片布局
+            title = content_data.get("title", "")
+            draw.text((padding, y_offset), title[:30], fill=colors["accent"], font=font_large)
+            y_offset += 100
+
+            content = content_data.get("content", "")
+            # 简单换行处理
+            words = content[:100]
+            draw.text((padding, y_offset), words, fill=colors["text"], font=font_medium)
+
+        # 品牌标识
+        brand = "VibeLife"
+        draw.text(
+            (card_size.width - padding - 100, card_size.height - padding),
+            brand,
+            fill=colors["accent"],
+            font=font_small
+        )
+
+        # 转换为 base64
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode("utf-8")
+
+    async def _render_as_svg(
+        self,
+        template_type: str,
+        content_data: dict,
+        card_size: CardSize,
+        theme: str
+    ) -> str:
+        """渲染为 SVG（作为后备方案）"""
+        themes = {
+            "bazi": ("#8B5A2B", "#DAA520"),
+            "zodiac": ("#191970", "#4B0082"),
+            "blue": ("#1E3C72", "#2A5298"),
+            "purple": ("#4C0099", "#800080"),
+            "gold": ("#B8860B", "#DAA520"),
+            "green": ("#006400", "#228B22"),
+            "default": ("#323232", "#505050"),
+        }
+
+        color1, color2 = themes.get(theme, themes["default"])
+
+        if template_type == "monthly_review":
+            title = content_data.get("month", "月运回顾")
+            summary = content_data.get("summary", "")[:50]
+        elif template_type == "weekly_review":
+            title = f"{content_data.get('sun_sign', '')} 周运"
+            summary = content_data.get("summary", "")[:50]
+        else:
+            title = content_data.get("title", "洞察")[:30]
+            summary = content_data.get("content", "")[:50]
+
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{card_size.width}" height="{card_size.height}">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:{color1}"/>
+      <stop offset="100%" style="stop-color:{color2}"/>
+    </linearGradient>
+  </defs>
+  <rect width="100%" height="100%" fill="url(#bg)"/>
+  <text x="60" y="120" font-family="Arial" font-size="48" fill="white" font-weight="bold">{title}</text>
+  <text x="60" y="200" font-family="Arial" font-size="28" fill="white">{summary}</text>
+  <text x="{card_size.width - 160}" y="{card_size.height - 40}" font-family="Arial" font-size="24" fill="rgba(255,255,255,0.7)">VibeLife</text>
+</svg>'''
+
+        return base64.b64encode(svg.encode("utf-8")).decode("utf-8")
+
+    async def save_card(self, card: ShareableCard, user_id: str) -> str:
+        """保存卡片记录并返回分享URL"""
+        import json
+
+        # 生成唯一的分享 ID
+        result = await self.db.fetchrow("""
+            INSERT INTO skill_insights (
+                id, user_id, skill_id, insight_type, title, content, created_at
+            ) VALUES (
+                uuid_generate_v4(), $1::uuid, 'mirror', $2, $3, $4, NOW()
+            )
+            RETURNING id
+        """,
+            user_id,
+            f"card_{card.card_type}",
+            card.title,
+            json.dumps(card.content_data, ensure_ascii=False)
+        )
+
+        card_id = str(result["id"])
+        share_url = f"https://vibelife.app/share/{card_id}"
+
+        return share_url
+
+    def get_available_sizes(self) -> dict:
+        """获取可用的卡片尺寸"""
+        return {
+            key: {
+                "width": size.width,
+                "height": size.height,
+                "name": size.name
+            }
+            for key, size in CARD_SIZES.items()
+        }

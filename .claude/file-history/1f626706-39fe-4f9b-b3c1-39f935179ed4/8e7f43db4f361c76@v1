@@ -1,0 +1,411 @@
+"""
+Report Service - Core report generation logic
+Based on: vibelife spec v3.0, section 4.6
+
+Report Types:
+1. 简版报告 (lite): Free, limited content
+2. 完整报告 (full): Paid, complete analysis
+
+Report Sections (八字):
+- 命盘结构: 天干地支、五行分布、十神关系
+- 性格解读: 日主特质、内外矛盾、核心驱动
+- 运势分析: 当前大运、流年影响、关键节点
+- 行动建议: 适合方向、注意事项、发展策略
+
+Report Sections (星座):
+- 星盘结构: 太阳/月亮/上升、行星分布、宫位
+- 性格解读: 核心特质、情绪模式、关系倾向
+- 周期分析: 当前天象、重要过境、关键时间
+- 行动建议: 成长方向、关系策略、时机把握
+"""
+
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any
+from uuid import UUID, uuid4
+from datetime import datetime
+from enum import Enum
+
+from ..vibe_engine import get_llm_service, create_system_message, create_user_message
+from ...stores import report_repo
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Enums and Constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ReportType(str, Enum):
+    LITE = "lite"      # 简版 (免费)
+    FULL = "full"      # 完整版 (付费)
+
+
+class ReportStatus(str, Enum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ReportSkill(str, Enum):
+    BAZI = "bazi"
+    ZODIAC = "zodiac"
+
+
+# Section definitions by skill
+BAZI_SECTIONS = [
+    ("chart_structure", "命盘结构", "天干地支、五行分布、十神关系"),
+    ("personality", "性格解读", "日主特质、内外矛盾、核心驱动"),
+    ("fortune", "运势分析", "当前大运、流年影响、关键节点"),
+    ("action", "行动建议", "适合方向、注意事项、发展策略"),
+]
+
+ZODIAC_SECTIONS = [
+    ("chart_structure", "星盘结构", "太阳/月亮/上升、行星分布、宫位"),
+    ("personality", "性格解读", "核心特质、情绪模式、关系倾向"),
+    ("cycle", "周期分析", "当前天象、重要过境、关键时间"),
+    ("action", "行动建议", "成长方向、关系策略、时机把握"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ReportSection:
+    """Single section of a report"""
+    id: str
+    title: str
+    subtitle: str
+    content: str
+    score: Optional[int] = None  # 0-100 for some sections
+    highlights: List[str] = field(default_factory=list)
+    is_premium: bool = False  # Whether this section is behind paywall
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Report:
+    """Complete report"""
+    id: UUID
+    user_id: UUID
+    skill: ReportSkill
+    report_type: ReportType
+    status: ReportStatus
+
+    # Content
+    prologue: str  # 综合判断卷首语 (always visible)
+    sections: List[ReportSection] = field(default_factory=list)
+
+    # Metadata
+    profile_snapshot: Dict[str, Any] = field(default_factory=dict)
+    interview_summary: Optional[str] = None
+
+    # AI Generated Image
+    poster_url: Optional[str] = None
+    poster_thumbnail_url: Optional[str] = None
+
+    # Timestamps
+    created_at: datetime = field(default_factory=datetime.now)
+    completed_at: Optional[datetime] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "skill": self.skill.value,
+            "report_type": self.report_type.value,
+            "status": self.status.value,
+            "prologue": self.prologue,
+            "sections": [s.to_dict() for s in self.sections],
+            "profile_snapshot": self.profile_snapshot,
+            "interview_summary": self.interview_summary,
+            "poster_url": self.poster_url,
+            "poster_thumbnail_url": self.poster_thumbnail_url,
+            "created_at": self.created_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+    def to_lite_dict(self) -> dict:
+        """Return lite version (hide premium sections)"""
+        visible_sections = []
+        for section in self.sections:
+            if section.is_premium:
+                # Show placeholder for premium content
+                visible_sections.append({
+                    "id": section.id,
+                    "title": section.title,
+                    "subtitle": section.subtitle,
+                    "content": "...",  # Hidden
+                    "is_premium": True,
+                    "locked": True,
+                })
+            else:
+                visible_sections.append(section.to_dict())
+
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "skill": self.skill.value,
+            "report_type": "lite",
+            "status": self.status.value,
+            "prologue": self.prologue,  # Always visible - this is the hook
+            "sections": visible_sections,
+            "poster_url": None,  # Watermarked or hidden for lite
+            "poster_thumbnail_url": self.poster_thumbnail_url,  # Show thumbnail with watermark
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+REPORT_SYSTEM_PROMPT = """你是 VibeLife 的报告生成专家。你需要基于用户的命理信息和访谈内容，生成深度、专业、有洞察力的分析报告。
+
+风格要求:
+- 专业但不晦涩，用通俗易懂的语言解释命理概念
+- 有洞察力，能看到表象背后的本质
+- 有温度，让用户感到被理解
+- 有行动力，给出具体可执行的建议
+
+输出格式:
+你的输出必须是有效的 JSON 格式。"""
+
+SECTION_PROMPT_TEMPLATE = """请为用户生成报告的「{section_title}」部分。
+
+用户信息:
+{user_profile}
+
+访谈摘要:
+{interview_summary}
+
+章节要求:
+- 标题: {section_title}
+- 副标题: {section_subtitle}
+- 内容长度: 300-500字
+- 需要包含 2-3 个核心洞察点 (highlights)
+- 如果适用，给出一个 0-100 的评分
+
+请以 JSON 格式输出:
+{{
+    "content": "章节正文内容...",
+    "highlights": ["核心洞察1", "核心洞察2", "核心洞察3"],
+    "score": 75
+}}"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Report Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ReportService:
+    """Main service for report generation"""
+
+    def __init__(self):
+        self._llm = None
+        self._prologue_generator = None
+        self._image_generator = None
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = get_llm_service()
+        return self._llm
+
+    async def generate_report(
+        self,
+        user_id: UUID,
+        skill: str,
+        report_type: str,
+        profile: Dict[str, Any],
+        interview_result: Optional[Dict[str, Any]] = None,
+    ) -> Report:
+        """
+        Generate a complete report.
+
+        Args:
+            user_id: User ID
+            skill: "bazi" or "zodiac"
+            report_type: "lite" or "full"
+            profile: User profile data
+            interview_result: Optional interview summary
+
+        Returns:
+            Generated Report
+        """
+        report_id = uuid4()
+        skill_enum = ReportSkill(skill)
+        type_enum = ReportType(report_type)
+
+        # Create initial report
+        report = Report(
+            id=report_id,
+            user_id=user_id,
+            skill=skill_enum,
+            report_type=type_enum,
+            status=ReportStatus.GENERATING,
+            prologue="",
+            sections=[],
+            profile_snapshot=profile,
+            interview_summary=interview_result.get("summary") if interview_result else None,
+        )
+
+        try:
+            # Step 1: Generate prologue (always included)
+            from .prologue_generator import PrologueGenerator
+            prologue_gen = PrologueGenerator()
+            report.prologue = await prologue_gen.generate(
+                profile=profile,
+                skill=skill,
+                interview_summary=report.interview_summary,
+            )
+
+            # Step 2: Generate sections
+            sections = BAZI_SECTIONS if skill == "bazi" else ZODIAC_SECTIONS
+
+            for i, (section_id, title, subtitle) in enumerate(sections):
+                # For lite reports, only generate first 2 sections fully
+                is_premium = type_enum == ReportType.LITE and i >= 2
+
+                if is_premium and type_enum == ReportType.LITE:
+                    # Placeholder for premium content
+                    section = ReportSection(
+                        id=section_id,
+                        title=title,
+                        subtitle=subtitle,
+                        content="解锁完整报告查看更多内容...",
+                        is_premium=True,
+                    )
+                else:
+                    # Generate actual content
+                    section = await self._generate_section(
+                        section_id=section_id,
+                        title=title,
+                        subtitle=subtitle,
+                        profile=profile,
+                        interview_summary=report.interview_summary,
+                        skill=skill,
+                    )
+                    section.is_premium = is_premium
+
+                report.sections.append(section)
+
+            # Step 3: Generate AI poster (for full reports)
+            if type_enum == ReportType.FULL:
+                from .image_generator import ImageGenerator
+                img_gen = ImageGenerator()
+                image_result = await img_gen.generate_poster(
+                    profile=profile,
+                    skill=skill,
+                    prologue=report.prologue,
+                )
+                if image_result:
+                    report.poster_url = image_result.url
+                    report.poster_thumbnail_url = image_result.thumbnail_url
+
+            report.status = ReportStatus.COMPLETED
+            report.completed_at = datetime.now()
+
+        except Exception as e:
+            logger.error(f"Report generation failed: {e}")
+            report.status = ReportStatus.FAILED
+            raise
+
+        return report
+
+    async def _generate_section(
+        self,
+        section_id: str,
+        title: str,
+        subtitle: str,
+        profile: Dict[str, Any],
+        interview_summary: Optional[str],
+        skill: str,
+    ) -> ReportSection:
+        """Generate a single report section"""
+
+        prompt = SECTION_PROMPT_TEMPLATE.format(
+            section_title=title,
+            section_subtitle=subtitle,
+            user_profile=json.dumps(profile, ensure_ascii=False, indent=2),
+            interview_summary=interview_summary or "无访谈内容",
+        )
+
+        messages = [
+            create_system_message(REPORT_SYSTEM_PROMPT),
+            create_user_message(prompt),
+        ]
+
+        try:
+            response = await self.llm.chat(messages)
+
+            # Parse JSON response
+            content_json = response.content.strip()
+            if content_json.startswith("```"):
+                # Remove markdown code blocks
+                content_json = content_json.split("```")[1]
+                if content_json.startswith("json"):
+                    content_json = content_json[4:]
+
+            data = json.loads(content_json)
+
+            return ReportSection(
+                id=section_id,
+                title=title,
+                subtitle=subtitle,
+                content=data.get("content", ""),
+                score=data.get("score"),
+                highlights=data.get("highlights", []),
+            )
+
+        except Exception as e:
+            logger.error(f"Section generation failed: {e}")
+            # Return fallback section
+            return ReportSection(
+                id=section_id,
+                title=title,
+                subtitle=subtitle,
+                content=f"正在生成{title}内容...",
+                highlights=[],
+            )
+
+    async def upgrade_report(
+        self,
+        report_id: UUID,
+        user_id: UUID,
+    ) -> Report:
+        """
+        Upgrade a lite report to full.
+        Called after payment is confirmed.
+        """
+        # TODO: Load existing report from database
+        # For now, regenerate full report
+        # In production, you'd unlock the existing content
+        raise NotImplementedError("Report upgrade requires database integration")
+
+    def get_sections_for_skill(self, skill: str) -> List[tuple]:
+        """Get section definitions for a skill"""
+        if skill == "bazi":
+            return BAZI_SECTIONS
+        return ZODIAC_SECTIONS
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_report_service: Optional[ReportService] = None
+
+
+def get_report_service() -> ReportService:
+    """Get singleton report service instance"""
+    global _report_service
+    if _report_service is None:
+        _report_service = ReportService()
+    return _report_service

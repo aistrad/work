@@ -1,0 +1,785 @@
+"""
+LLM Service - Multi-model LLM support with Zhipu GLM-4 as primary
+Based on: vibelife spec v3.0
+
+Supported providers:
+- Zhipu GLM-4-Plus (primary) - Chinese optimized
+- Claude (backup) - Complex reasoning
+- Gemini (chat & image generation default) - Multimodal & Image Generation
+"""
+import os
+import json
+import base64
+from typing import Optional, List, Dict, Any, AsyncGenerator, Union
+from dataclasses import dataclass, field
+from enum import Enum
+import httpx
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class LLMProvider(str, Enum):
+    """Supported LLM providers"""
+    ZHIPU = "zhipu"
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+
+
+@dataclass
+class LLMMessage:
+    """Standard message format for all LLM providers"""
+    role: str  # 'system', 'user', 'assistant'
+    content: Union[str, List[Dict[str, Any]]]  # str or multimodal content
+
+
+@dataclass
+class ToolCall:
+    """Tool call information"""
+    id: str
+    type: str  # 'function'
+    function: Dict[str, Any]  # {name: str, arguments: str}
+
+
+@dataclass
+class LLMResponse:
+    """Standard response format"""
+    content: str
+    model: str
+    provider: LLMProvider
+    usage: Optional[Dict[str, int]] = None
+    finish_reason: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    raw_response: Optional[Dict] = None
+
+
+@dataclass
+class LLMConfig:
+    """LLM configuration"""
+    # Zhipu (Primary) - supports both ZHIPU_* and GLM_* env vars
+    zhipu_api_key: str = field(default_factory=lambda: os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY", ""))
+    zhipu_base_url: str = field(default_factory=lambda: os.getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"))
+    zhipu_chat_model: str = field(default_factory=lambda: os.getenv("ZHIPU_CHAT_MODEL") or os.getenv("GLM_CHAT_MODEL", "glm-4-plus"))
+    zhipu_vision_model: str = field(default_factory=lambda: os.getenv("GLM_VISION_MODEL", "glm-4v-plus"))
+
+    # Claude (Backup)
+    claude_api_key: str = field(default_factory=lambda: os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY", ""))
+    claude_model: str = "claude-3-5-sonnet-20241022"
+
+    # Gemini (Chat & Image Generation Default)
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    gemini_base_url: str = field(default_factory=lambda: os.getenv("GEMINI_BASE_URL", "https://api2.qiandao.mom/v1"))
+    gemini_chat_model: str = field(default_factory=lambda: os.getenv("GEMINI_CHAT_MODEL", "gemini-3-pro-preview"))
+    gemini_image_model: str = field(default_factory=lambda: os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"))
+
+    # Default settings - supports both 'zhipu' and 'glm' as provider name
+    default_provider: LLMProvider = field(default_factory=lambda: LLMProvider(
+        "zhipu" if os.getenv("DEFAULT_LLM_PROVIDER", "zhipu").lower() in ("zhipu", "glm") else os.getenv("DEFAULT_LLM_PROVIDER", "zhipu")
+    ))
+    default_temperature: float = 0.7
+    default_max_tokens: int = 4096
+    timeout: float = 120.0
+
+
+class LLMService:
+    """
+    Unified LLM service with multi-provider support.
+
+    Features:
+    - Zhipu GLM-4-Plus as primary (Chinese optimized)
+    - Automatic fallback on errors
+    - Streaming support
+    - Vision/multimodal support
+    """
+
+    def __init__(self, config: Optional[LLMConfig] = None):
+        self.config = config or LLMConfig()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Zhipu GLM-4 Methods
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def chat_zhipu(
+        self,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """Chat with Zhipu GLM-4 (non-streaming)"""
+        model = model or self.config.zhipu_chat_model
+
+        formatted_messages = self._format_messages_for_zhipu(messages)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs
+        }
+
+        # Add tools if provided
+        if tools:
+            payload["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {self.config.zhipu_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.post(
+                f"{self.config.zhipu_base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        message = data["choices"][0]["message"]
+        content = message.get("content", "")
+
+        # Parse tool calls if present
+        tool_calls = None
+        if "tool_calls" in message and message["tool_calls"]:
+            tool_calls = [
+                ToolCall(
+                    id=tc["id"],
+                    type=tc["type"],
+                    function=tc["function"]
+                )
+                for tc in message["tool_calls"]
+            ]
+
+        return LLMResponse(
+            content=content,
+            model=model,
+            provider=LLMProvider.ZHIPU,
+            usage=data.get("usage"),
+            finish_reason=data["choices"][0].get("finish_reason"),
+            tool_calls=tool_calls,
+            raw_response=data
+        )
+
+    async def stream_zhipu(
+        self,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream chat with Zhipu GLM-4
+
+        Yields dict with:
+        - type: "content" | "tool_call"
+        - content: str (for content chunks)
+        - tool_call_id: str (for tool calls)
+        - tool_name: str (for tool calls)
+        - tool_args: str (for tool calls, JSON string)
+        """
+        model = model or self.config.zhipu_chat_model
+
+        formatted_messages = self._format_messages_for_zhipu(messages)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            **kwargs
+        }
+
+        # Add tools if provided
+        if tools:
+            payload["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {self.config.zhipu_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # Track tool call accumulation for streaming
+        tool_call_chunks = {}
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{self.config.zhipu_base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data["choices"][0].get("delta", {})
+
+                            # Handle content chunks
+                            content = delta.get("content", "")
+                            if content:
+                                yield {"type": "content", "content": content}
+
+                            # Handle tool calls
+                            if "tool_calls" in delta:
+                                for tc_delta in delta["tool_calls"]:
+                                    index = tc_delta.get("index", 0)
+
+                                    # Initialize tool call if not exists
+                                    if index not in tool_call_chunks:
+                                        tool_call_chunks[index] = {
+                                            "id": tc_delta.get("id", ""),
+                                            "type": tc_delta.get("type", "function"),
+                                            "function": {
+                                                "name": "",
+                                                "arguments": ""
+                                            }
+                                        }
+
+                                    # Accumulate tool call data
+                                    if "id" in tc_delta:
+                                        tool_call_chunks[index]["id"] = tc_delta["id"]
+                                    if "type" in tc_delta:
+                                        tool_call_chunks[index]["type"] = tc_delta["type"]
+                                    if "function" in tc_delta:
+                                        if "name" in tc_delta["function"]:
+                                            tool_call_chunks[index]["function"]["name"] += tc_delta["function"]["name"]
+                                        if "arguments" in tc_delta["function"]:
+                                            tool_call_chunks[index]["function"]["arguments"] += tc_delta["function"]["arguments"]
+                        except json.JSONDecodeError:
+                            continue
+
+                # Emit complete tool calls at the end
+                for tc in tool_call_chunks.values():
+                    if tc["function"]["name"]:  # Only emit if we have a complete tool call
+                        yield {
+                            "type": "tool_call",
+                            "tool_call_id": tc["id"],
+                            "tool_name": tc["function"]["name"],
+                            "tool_args": tc["function"]["arguments"]
+                        }
+
+    async def vision_zhipu(
+        self,
+        image_base64: str,
+        prompt: str,
+        model: Optional[str] = None
+    ) -> LLMResponse:
+        """Analyze image with Zhipu vision model"""
+        model = model or self.config.zhipu_vision_model
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                }
+            ]
+        }]
+
+        payload = {"model": model, "messages": messages}
+
+        headers = {
+            "Authorization": f"Bearer {self.config.zhipu_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.post(
+                f"{self.config.zhipu_base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=model,
+            provider=LLMProvider.ZHIPU,
+            usage=data.get("usage"),
+            raw_response=data
+        )
+
+    def _format_messages_for_zhipu(self, messages: List[LLMMessage]) -> List[Dict]:
+        """Format messages for Zhipu API"""
+        return [
+            {"role": m.role, "content": m.content}
+            for m in messages
+        ]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Claude Methods (Backup)
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def chat_claude(
+        self,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        **kwargs
+    ) -> LLMResponse:
+        """Chat with Claude (non-streaming)"""
+        if not self.config.claude_api_key:
+            raise ValueError("CLAUDE_API_KEY / ANTHROPIC_API_KEY not configured")
+
+        model = model or self.config.claude_model
+
+        # Extract system message
+        system_content = None
+        formatted_messages = []
+        for m in messages:
+            if m.role == "system":
+                system_content = m.content if isinstance(m.content, str) else str(m.content)
+            else:
+                formatted_messages.append({
+                    "role": m.role,
+                    "content": m.content
+                })
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "max_tokens": max_tokens,
+            **kwargs
+        }
+        if system_content:
+            payload["system"] = system_content
+
+        headers = {
+            "x-api-key": self.config.claude_api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return LLMResponse(
+            content=data["content"][0]["text"],
+            model=model,
+            provider=LLMProvider.CLAUDE,
+            usage={
+                "input_tokens": data["usage"]["input_tokens"],
+                "output_tokens": data["usage"]["output_tokens"]
+            },
+            finish_reason=data.get("stop_reason"),
+            raw_response=data
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Gemini Methods (Chat & Image Generation)
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def chat_gemini(
+        self,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        **kwargs
+    ) -> LLMResponse:
+        """Chat with Gemini (OpenAI-compatible API)"""
+        if not self.config.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not configured")
+
+        model = model or self.config.gemini_chat_model
+
+        formatted_messages = self._format_messages_for_gemini(messages)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.config.gemini_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.post(
+                f"{self.config.gemini_base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        message = data["choices"][0]["message"]
+        content = message.get("content", "")
+
+        return LLMResponse(
+            content=content,
+            model=model,
+            provider=LLMProvider.GEMINI,
+            usage=data.get("usage"),
+            finish_reason=data["choices"][0].get("finish_reason"),
+            raw_response=data
+        )
+
+    async def stream_gemini(
+        self,
+        messages: List[LLMMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream chat with Gemini (OpenAI-compatible API)"""
+        if not self.config.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not configured")
+
+        model = model or self.config.gemini_chat_model
+
+        formatted_messages = self._format_messages_for_gemini(messages)
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            **kwargs
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.config.gemini_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{self.config.gemini_base_url}/chat/completions",
+                json=payload,
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield {"type": "content", "content": content}
+                        except json.JSONDecodeError:
+                            continue
+
+    async def generate_image_gemini(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        size: str = "1024x1024",
+        n: int = 1,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Generate image using Gemini image generation model.
+
+        Args:
+            prompt: Image generation prompt
+            model: Model to use (defaults to gemini_image_model)
+            size: Image size (default: 1024x1024)
+            n: Number of images to generate
+
+        Returns:
+            Dict containing:
+            - images: List of base64-encoded images or URLs
+            - model: Model used
+            - provider: "gemini"
+        """
+        if not self.config.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not configured")
+
+        model = model or self.config.gemini_image_model
+
+        # Use OpenAI-compatible image generation endpoint
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "n": n,
+            "size": size,
+            **kwargs
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.config.gemini_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{self.config.gemini_base_url}/images/generations",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Extract images from response
+        images = []
+        for img_data in data.get("data", []):
+            if "b64_json" in img_data:
+                images.append({
+                    "type": "base64",
+                    "data": img_data["b64_json"]
+                })
+            elif "url" in img_data:
+                images.append({
+                    "type": "url",
+                    "data": img_data["url"]
+                })
+
+        return {
+            "images": images,
+            "model": model,
+            "provider": "gemini",
+            "raw_response": data
+        }
+
+    def _format_messages_for_gemini(self, messages: List[LLMMessage]) -> List[Dict]:
+        """Format messages for Gemini API (OpenAI-compatible format)"""
+        return [
+            {"role": m.role, "content": m.content}
+            for m in messages
+        ]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Unified Interface
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def chat(
+        self,
+        messages: List[LLMMessage],
+        provider: Optional[LLMProvider] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        fallback: bool = True,
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Unified chat interface with automatic fallback.
+
+        Args:
+            messages: List of messages
+            provider: LLM provider (default: config.default_provider)
+            model: Model name (default: provider's default)
+            temperature: Sampling temperature
+            max_tokens: Max tokens to generate
+            fallback: Whether to fallback on errors
+            **kwargs: Additional provider-specific args
+
+        Returns:
+            LLMResponse with generated content
+        """
+        provider = provider or self.config.default_provider
+        temperature = temperature or self.config.default_temperature
+        max_tokens = max_tokens or self.config.default_max_tokens
+
+        try:
+            if provider == LLMProvider.ZHIPU:
+                return await self.chat_zhipu(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            elif provider == LLMProvider.CLAUDE:
+                return await self.chat_claude(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            elif provider == LLMProvider.GEMINI:
+                return await self.chat_gemini(
+                    messages, model, temperature, max_tokens, **kwargs
+                )
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+
+        except Exception as e:
+            logger.warning(f"{provider} failed: {e}")
+
+            if fallback:
+                # Try fallback providers
+                fallback_order = [
+                    p for p in [LLMProvider.ZHIPU, LLMProvider.GEMINI, LLMProvider.CLAUDE]
+                    if p != provider
+                ]
+
+                for fallback_provider in fallback_order:
+                    try:
+                        logger.info(f"Falling back to {fallback_provider}")
+                        if fallback_provider == LLMProvider.ZHIPU:
+                            return await self.chat_zhipu(
+                                messages, None, temperature, max_tokens, **kwargs
+                            )
+                        elif fallback_provider == LLMProvider.CLAUDE:
+                            return await self.chat_claude(
+                                messages, None, temperature, max_tokens, **kwargs
+                            )
+                        elif fallback_provider == LLMProvider.GEMINI:
+                            return await self.chat_gemini(
+                                messages, None, temperature, max_tokens, **kwargs
+                            )
+                    except Exception as fallback_error:
+                        logger.warning(f"Fallback to {fallback_provider} failed: {fallback_error}")
+                        continue
+
+            raise
+
+    async def stream(
+        self,
+        messages: List[LLMMessage],
+        provider: Optional[LLMProvider] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Unified streaming interface.
+
+        Currently only Zhipu supports streaming.
+        For other providers, yields entire response at once.
+
+        Yields dict with:
+        - type: "content" | "tool_call"
+        - content: str (for content chunks)
+        - tool_call_id: str (for tool calls)
+        - tool_name: str (for tool calls)
+        - tool_args: str (for tool calls, JSON string)
+        """
+        provider = provider or self.config.default_provider
+        temperature = temperature or self.config.default_temperature
+        max_tokens = max_tokens or self.config.default_max_tokens
+
+        if provider == LLMProvider.ZHIPU:
+            async for chunk in self.stream_zhipu(
+                messages, model, temperature, max_tokens, tools, **kwargs
+            ):
+                yield chunk
+        elif provider == LLMProvider.GEMINI:
+            async for chunk in self.stream_gemini(
+                messages, model, temperature, max_tokens, **kwargs
+            ):
+                yield chunk
+        else:
+            # Fallback to non-streaming
+            response = await self.chat(
+                messages, provider, model, temperature, max_tokens, **kwargs
+            )
+            yield {"type": "content", "content": response.content}
+
+    async def vision(
+        self,
+        image_base64: str,
+        prompt: str,
+        provider: Optional[LLMProvider] = None,
+        model: Optional[str] = None
+    ) -> LLMResponse:
+        """
+        Unified vision/multimodal interface.
+        """
+        provider = provider or LLMProvider.ZHIPU
+
+        if provider == LLMProvider.ZHIPU:
+            return await self.vision_zhipu(image_base64, prompt, model)
+        else:
+            raise ValueError(f"Vision not supported for provider: {provider}")
+
+    async def generate_image(
+        self,
+        prompt: str,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        size: str = "1024x1024",
+        n: int = 1,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Unified image generation interface.
+
+        Args:
+            prompt: Image generation prompt
+            provider: Provider to use (default: from DEFAULT_IMAGE_PROVIDER env var or "gemini")
+            model: Model to use (default: provider's default)
+            size: Image size (default: 1024x1024)
+            n: Number of images to generate
+
+        Returns:
+            Dict containing:
+            - images: List of image data (base64 or URL)
+            - model: Model used
+            - provider: Provider used
+        """
+        # Get default provider from env var
+        provider = provider or os.getenv("DEFAULT_IMAGE_PROVIDER", "gemini")
+
+        if provider.lower() == "gemini":
+            return await self.generate_image_gemini(prompt, model, size, n, **kwargs)
+        else:
+            raise ValueError(f"Image generation not supported for provider: {provider}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Global Instance
+# ═══════════════════════════════════════════════════════════════════════════
+
+_llm_service: Optional[LLMService] = None
+
+
+def get_llm_service() -> LLMService:
+    """Get or create global LLM service instance"""
+    global _llm_service
+    if _llm_service is None:
+        _llm_service = LLMService()
+    return _llm_service
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def create_message(role: str, content: str) -> LLMMessage:
+    """Create a simple text message"""
+    return LLMMessage(role=role, content=content)
+
+
+def create_system_message(content: str) -> LLMMessage:
+    """Create a system message"""
+    return LLMMessage(role="system", content=content)
+
+
+def create_user_message(content: str) -> LLMMessage:
+    """Create a user message"""
+    return LLMMessage(role="user", content=content)
+
+
+def create_assistant_message(content: str) -> LLMMessage:
+    """Create an assistant message"""
+    return LLMMessage(role="assistant", content=content)

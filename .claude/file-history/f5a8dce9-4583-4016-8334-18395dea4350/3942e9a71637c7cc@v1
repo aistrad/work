@@ -1,0 +1,592 @@
+"""
+Lifecoach Skill - Tool Handlers V2
+
+使用 @tool_handler 装饰器注册工具执行器。
+支持数据持久化和展示卡片生成。
+
+数据结构 (与 DATA-STRUCTURE.md 对齐):
+- system: 系统配置（方法论、角色设定）
+- north_star: 北极星愿景、反愿景、使命、原则
+- goals: 核心目标（最多3个），包含年度目标
+- roadmap: 路线图（年度、季度）
+- current: 当前焦点（月度项目 current.month、周大石头 current.week、每日杠杆 current.daily）
+- identity: 身份设计（当前身份、目标身份、锚定行为）
+- progress: 进度追踪（签到、连续天数）
+- journal: 复盘日志（数组）
+"""
+
+import uuid
+from typing import Any, Dict, List, Optional
+from datetime import datetime, date
+
+from services.agent.tool_registry import tool_handler, ToolContext
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+
+# 有效的 section 列表（与 DATA-STRUCTURE.md 对齐）
+VALID_SECTIONS = ["system", "north_star", "goals", "roadmap", "current", "identity", "progress", "journal"]
+
+
+def deep_merge(base: Dict, update: Dict) -> Dict:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif value is not None:
+            result[key] = value
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 数据工具 (V2 - 与 DATA-STRUCTURE.md 对齐)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("read_lifecoach_state")
+async def read_lifecoach_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    读取用户的人生地图状态
+
+    从 unified_profile 的 life_context.lifecoach 路径读取数据
+    支持的 sections: system, north_star, goals, roadmap, current, identity, progress, journal
+    """
+    sections = args.get("sections", ["north_star", "goals", "current", "progress"])
+
+    try:
+        # 从 unified_profile 读取 lifecoach 数据
+        data = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        if not data or not data.content:
+            return {
+                "status": "empty",
+                "message": "尚未建立人生地图，让我们开始吧！",
+                "data": {}
+            }
+
+        # 按请求的 sections 过滤返回
+        result = {}
+        content = data.content
+        for section in sections:
+            if section in content:
+                result[section] = content[section]
+
+        return {
+            "status": "success",
+            "data": result,
+            "version": data.version,
+            "updated_at": data.updated_at.isoformat() if data.updated_at else None
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"读取状态失败: {str(e)}",
+            "data": {}
+        }
+
+
+@tool_handler("write_lifecoach_state")
+async def write_lifecoach_state(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    写入用户的人生地图状态
+
+    使用 jsonb_set 进行局部更新，避免覆盖其他 section
+    """
+    section = args.get("section")
+    data = args.get("data")
+
+    if not section or not data:
+        return {
+            "status": "error",
+            "message": "缺少必要参数: section 和 data"
+        }
+
+    try:
+        # 先读取现有数据
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        # 合并数据
+        content = existing.content if existing else {}
+        content[section] = data
+        content["_last_updated"] = datetime.utcnow().isoformat()
+        content["_last_section"] = section
+
+        # 写入
+        result = await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            content
+        )
+
+        return {
+            "status": "success",
+            "message": f"已保存 {section}",
+            "version": result.version
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"保存失败: {str(e)}"
+        }
+
+
+@tool_handler("add_journal_entry")
+async def add_journal_entry(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    添加复盘日志条目
+    """
+    entry_type = args.get("entry_type")
+    content = args.get("content")
+
+    if not entry_type or not content:
+        return {
+            "status": "error",
+            "message": "缺少必要参数: entry_type 和 content"
+        }
+
+    try:
+        # 读取现有数据
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        lifecoach_data = existing.content if existing else {}
+        journal = lifecoach_data.get("journal", {"entries": []})
+
+        # 创建新条目
+        entry = {
+            "id": str(uuid.uuid4())[:8],
+            "type": entry_type,
+            "content": content,
+            "created_at": datetime.utcnow().isoformat(),
+            "mood": args.get("mood"),
+            "energy": args.get("energy"),
+            "wins": args.get("wins", []),
+            "learnings": args.get("learnings", []),
+            "blockers": args.get("blockers", [])
+        }
+
+        # 添加到日志列表（最新在前）
+        journal["entries"] = [entry] + journal.get("entries", [])[:99]  # 保留最近100条
+        journal["last_entry_at"] = entry["created_at"]
+        journal["total_entries"] = len(journal["entries"])
+
+        # 保存
+        lifecoach_data["journal"] = journal
+        await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            lifecoach_data
+        )
+
+        return {
+            "status": "success",
+            "message": "日志已记录",
+            "entry_id": entry["id"]
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"记录失败: {str(e)}"
+        }
+
+
+@tool_handler("update_progress")
+async def update_progress(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    更新进度/签到
+    """
+    action_type = args.get("action_type")
+
+    if not action_type:
+        return {
+            "status": "error",
+            "message": "缺少必要参数: action_type"
+        }
+
+    try:
+        # 读取现有数据
+        existing = await UnifiedProfileRepository.read_life_context_path(
+            context.user_id,
+            "lifecoach"
+        )
+
+        lifecoach_data = existing.content if existing else {}
+        progress = lifecoach_data.get("progress", {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "total_checkins": 0,
+            "last_checkin_date": None,
+            "checkin_history": [],
+            "completed_levers": [],
+            "completed_rocks": [],
+            "milestones": []
+        })
+
+        today = date.today().isoformat()
+        now = datetime.utcnow().isoformat()
+
+        if action_type == "daily_checkin":
+            # 检查是否今天已签到
+            if progress.get("last_checkin_date") == today:
+                return {
+                    "status": "already_checked_in",
+                    "message": "今天已经签到过了！",
+                    "current_streak": progress["current_streak"]
+                }
+
+            # 更新连续签到
+            last_date = progress.get("last_checkin_date")
+            if last_date:
+                last = date.fromisoformat(last_date)
+                today_date = date.today()
+                diff = (today_date - last).days
+                if diff == 1:
+                    progress["current_streak"] += 1
+                elif diff > 1:
+                    progress["current_streak"] = 1
+            else:
+                progress["current_streak"] = 1
+
+            # 更新最长连续
+            if progress["current_streak"] > progress.get("longest_streak", 0):
+                progress["longest_streak"] = progress["current_streak"]
+
+            progress["total_checkins"] = progress.get("total_checkins", 0) + 1
+            progress["last_checkin_date"] = today
+
+            # 记录签到历史
+            history = progress.get("checkin_history", [])
+            history.append({
+                "date": today,
+                "time": now,
+                "notes": args.get("notes")
+            })
+            progress["checkin_history"] = history[-30:]  # 保留最近30天
+
+        elif action_type == "lever_complete":
+            lever_id = args.get("lever_id")
+            if lever_id:
+                completed = progress.get("completed_levers", [])
+                completed.append({
+                    "id": lever_id,
+                    "completed_at": now,
+                    "notes": args.get("notes")
+                })
+                progress["completed_levers"] = completed[-100:]
+
+        elif action_type == "rock_complete":
+            rock_id = args.get("rock_id")
+            if rock_id:
+                completed = progress.get("completed_rocks", [])
+                completed.append({
+                    "id": rock_id,
+                    "completed_at": now,
+                    "notes": args.get("notes")
+                })
+                progress["completed_rocks"] = completed[-50:]
+
+        elif action_type == "milestone_reached":
+            milestones = progress.get("milestones", [])
+            milestones.append({
+                "reached_at": now,
+                "notes": args.get("notes")
+            })
+            progress["milestones"] = milestones
+
+        # 保存
+        lifecoach_data["progress"] = progress
+        await UnifiedProfileRepository.write_life_context_path(
+            context.user_id,
+            "lifecoach",
+            lifecoach_data
+        )
+
+        return {
+            "status": "success",
+            "message": "进度已更新",
+            "current_streak": progress.get("current_streak", 0),
+            "total_checkins": progress.get("total_checkins", 0)
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"更新失败: {str(e)}"
+        }
+
+
+# ══════════════════��════════════════════════════════════════════════════════
+# 展示工具 - V2 新增
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_life_roadmap")
+async def show_life_roadmap(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示人生路线图卡片
+    """
+    north_star = args.get("north_star", {})
+
+    return {
+        "card_type": "life_roadmap",
+        "data": {
+            "north_star": north_star,
+            "yearly_theme": args.get("yearly_theme"),
+            "quarterly_milestones": args.get("quarterly_milestones", []),
+            "current_focus": args.get("current_focus"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_role_balance")
+async def show_role_balance(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示目标平衡轮卡片
+    """
+    roles = args.get("roles", [])
+
+    # 计算平衡分数
+    if roles:
+        scores = [r.get("current_score", 0) for r in roles if r.get("current_score") is not None]
+        if scores:
+            avg = sum(scores) / len(scores)
+            variance = sum((s - avg) ** 2 for s in scores) / len(scores)
+            # 平衡分数：平均分越高、方差越小，分数越高
+            balance_score = min(100, max(0, avg * 10 - variance * 2))
+        else:
+            balance_score = 0
+    else:
+        balance_score = args.get("balance_score", 0)
+
+    return {
+        "card_type": "role_balance",
+        "data": {
+            "roles": roles,
+            "balance_score": round(balance_score, 1),
+            "insight": args.get("insight"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_weekly_rocks")
+async def show_weekly_rocks(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示周大石头卡片
+    """
+    rocks = args.get("rocks", [])
+
+    # 计算完成进度
+    total = len(rocks)
+    completed = sum(1 for r in rocks if r.get("status") == "completed")
+    in_progress = sum(1 for r in rocks if r.get("status") == "in_progress")
+
+    return {
+        "card_type": "weekly_rocks",
+        "data": {
+            "week_start": args.get("week_start", date.today().isoformat()),
+            "rocks": rocks,
+            "theme": args.get("theme"),
+            "energy_budget": args.get("energy_budget"),
+            "stats": {
+                "total": total,
+                "completed": completed,
+                "in_progress": in_progress,
+                "completion_rate": round(completed / total * 100, 1) if total > 0 else 0
+            },
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_daily_levers")
+async def show_daily_levers(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示每日杠杆行动卡片
+    """
+    levers = args.get("levers", [])
+
+    # 计算完成进度
+    total = len(levers)
+    completed = sum(1 for l in levers if l.get("status") == "completed")
+
+    return {
+        "card_type": "daily_levers",
+        "data": {
+            "date": args.get("date", date.today().isoformat()),
+            "levers": levers,
+            "energy_level": args.get("energy_level"),
+            "intention": args.get("intention"),
+            "stats": {
+                "total": total,
+                "completed": completed,
+                "completion_rate": round(completed / total * 100, 1) if total > 0 else 0
+            },
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_progress_streak")
+async def show_progress_streak(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示连续签到和进度统计卡片
+    """
+    current_streak = args.get("current_streak", 0)
+    longest_streak = args.get("longest_streak", current_streak)
+
+    # 计算激励消息
+    if current_streak >= 30:
+        motivation = "太棒了！一个月的坚持，你正在重塑自己！"
+    elif current_streak >= 14:
+        motivation = "两周了！习惯正在形成，继续保持！"
+    elif current_streak >= 7:
+        motivation = "一周连续签到！你已经超越了大多数人！"
+    elif current_streak >= 3:
+        motivation = "连续三天，好的开始！"
+    elif current_streak >= 1:
+        motivation = "今天是新的开始！"
+    else:
+        motivation = "准备好开始你的旅程了吗？"
+
+    return {
+        "card_type": "progress_streak",
+        "data": {
+            "current_streak": current_streak,
+            "longest_streak": longest_streak,
+            "total_checkins": args.get("total_checkins", 0),
+            "weekly_completion_rate": args.get("weekly_completion_rate", 0),
+            "monthly_stats": args.get("monthly_stats", {}),
+            "achievements": args.get("achievements", []),
+            "motivation": motivation,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 展示工具 - V1 保留 (使用 @tool_handler 重写)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_pattern_insight")
+async def show_pattern_insight(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示行为模式洞察卡片
+    """
+    pattern_type = args.get("pattern_type", "behavior")
+
+    type_labels = {
+        "behavior": "行为模式",
+        "stuck": "卡点分析",
+        "conflict": "目标冲突",
+        "protection": "自我保护"
+    }
+
+    return {
+        "card_type": "pattern_insight",
+        "data": {
+            "type": pattern_type,
+            "type_label": type_labels.get(pattern_type, "模式分析"),
+            "surface_pattern": args.get("surface_pattern", ""),
+            "hidden_goal": args.get("hidden_goal"),
+            "cost": args.get("cost"),
+            "insight": args.get("insight"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_identity_design")
+async def show_identity_design(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示身份设计卡片
+    """
+    return {
+        "card_type": "identity_design",
+        "data": {
+            "old_identity": args.get("old_identity"),
+            "new_identity": args.get("new_identity", ""),
+            "bridge_belief": args.get("bridge_belief"),
+            "anchor_behaviors": args.get("anchor_behaviors", []),
+            "transformation_arrow": "→" if args.get("old_identity") else None,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_vision_map")
+async def show_vision_map(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示愿景/反愿景地图
+    """
+    map_type = args.get("map_type", "vision")
+
+    return {
+        "card_type": "vision_map",
+        "data": {
+            "map_type": map_type,
+            "vision": {
+                "statement": args.get("vision_statement"),
+                "three_year_picture": args.get("three_year_picture"),
+                "identity_belief": args.get("identity_belief"),
+                "one_year_milestone": args.get("one_year_milestone")
+            } if map_type in ["vision", "both"] else None,
+            "anti_vision": {
+                "statement": args.get("anti_vision_statement"),
+                "five_year_picture": args.get("five_year_picture")
+            } if map_type in ["anti_vision", "both"] else None,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_action_plan")
+async def show_action_plan(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示行动计划卡片
+    """
+    return {
+        "card_type": "action_plan",
+        "data": {
+            "context": args.get("context"),
+            "hierarchy": {
+                "one_year_goal": args.get("one_year_goal"),
+                "one_month_project": args.get("one_month_project"),
+                "daily_actions": args.get("daily_actions", [])
+            },
+            "first_step": args.get("first_step"),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+
+@tool_handler("show_life_game")
+async def show_life_game(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """
+    展示人生游戏设计卡片
+    """
+    return {
+        "card_type": "life_game",
+        "data": {
+            "win_condition": args.get("win_condition", ""),
+            "lose_condition": args.get("lose_condition", ""),
+            "main_mission": args.get("main_mission", ""),
+            "current_boss": {
+                "name": args.get("current_boss"),
+                "reward": args.get("boss_reward")
+            } if args.get("current_boss") else None,
+            "daily_quests": args.get("daily_quests", []),
+            "game_rules": args.get("game_rules", []),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }

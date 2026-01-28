@@ -1,0 +1,307 @@
+"""
+Profile Extractor Worker - 从用户交互中抽取信息更新 Profile
+
+极简设计：
+- 单一抽取入口，替代 daily_extraction + portrait_service + insight_generator
+- 定时运行（每日），增量处理新消息
+- 输出结构化 JSON，写入 unified_profiles.profile.extracted
+"""
+import asyncio
+import json
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from uuid import UUID
+
+from stores.db import fetch, fetchrow
+from stores.unified_profile_repo import UnifiedProfileRepository, ColdLayerRepository
+from services.model_router.client import chat
+
+logger = logging.getLogger(__name__)
+
+# 抽取 Prompt
+EXTRACTION_PROMPT = """你是一个用户画像分析专家。分析用户的对话记录，提取关键信息。
+
+## 抽取规则
+
+1. **事实信息 (facts)**: 用户明确陈述的客观事实
+   - 姓名、职业、居住地
+   - 宠物、家人、朋友
+   - 重要经历
+
+2. **关注领域 (concerns)**: 用户反复提及或询问的话题
+   - 最多保留 5 个
+   - 按重要性排序
+
+3. **目标愿望 (goals)**: 用户表达的期望或计划
+   - 只记录明确表达的
+   - 不要推测
+
+4. **困难痛点 (pain_points)**: 用户抱怨或求助的问题
+   - 只记录当前有效的
+   - 过期的不要记录
+
+5. **生活事件 (life_events)**: 重要的人生节点
+   - 记录日期（如果提及）和事件
+   - 最多保留 5 个最近的
+
+6. **行为模式 (patterns)**: 从交互中观察到的规律
+   - 偏好的话题
+   - 对话风格
+
+## 输出格式
+
+返回 JSON，只包含从对话中明确提取到的信息：
+```json
+{
+  "facts": {"name": "...", "occupation": "...", "location": "...", "pets": [...], "relationships": [...]},
+  "concerns": ["..."],
+  "goals": ["..."],
+  "pain_points": ["..."],
+  "life_events": [{"date": "2024-01", "event": "..."}],
+  "patterns": {"preferred_topics": [...], "conversation_style": "..."}
+}
+```
+
+如果某个字段没有提取到信息，不要包含该字段。
+如果完全没有新信息，返回空对象 {}"""
+
+
+async def get_active_users(days: int = 7) -> List[UUID]:
+    """获取最近活跃的用户"""
+    query = """
+        SELECT DISTINCT c.user_id FROM conversations c
+        WHERE c.user_id IS NOT NULL
+        AND c.updated_at > NOW() - INTERVAL '%s days'
+    """
+    rows = await fetch(query, days)
+    return [row["user_id"] for row in rows]
+
+
+async def get_user_messages_since(
+    user_id: UUID,
+    since: Optional[datetime] = None,
+    limit: int = 100
+) -> List[Dict[str, Any]]:
+    """获取用户自指定时间以来的消息"""
+    if since is None:
+        since = datetime.now() - timedelta(days=30)
+
+    query = """
+        SELECT m.role, m.content, m.created_at
+        FROM messages m
+        JOIN conversations c ON m.conversation_id = c.id
+        WHERE c.user_id = $1 AND m.created_at > $2
+        ORDER BY m.created_at ASC
+        LIMIT $3
+    """
+    rows = await fetch(query, user_id, since, limit)
+    return [dict(row) for row in rows]
+
+
+def merge_extracted(current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """合并抽取结果"""
+    if not new:
+        return current
+
+    result = current.copy() if current else {}
+
+    # facts: 深度合并
+    if "facts" in new:
+        current_facts = result.get("facts", {})
+        for key, value in new["facts"].items():
+            if value:  # 只更新非空值
+                if isinstance(value, list) and isinstance(current_facts.get(key), list):
+                    # 列表合并去重
+                    combined = current_facts.get(key, []) + value
+                    current_facts[key] = list(dict.fromkeys(combined))[:10]
+                else:
+                    current_facts[key] = value
+        result["facts"] = current_facts
+
+    # 列表字段: 合并去重，保留最新 N 个
+    for field, limit in [("concerns", 5), ("goals", 5), ("pain_points", 5)]:
+        if field in new and new[field]:
+            current_list = result.get(field, [])
+            combined = new[field] + current_list  # 新的在前
+            result[field] = list(dict.fromkeys(combined))[:limit]
+
+    # life_events: 追加，按时间排序
+    if "life_events" in new and new["life_events"]:
+        current_events = result.get("life_events", [])
+        all_events = new["life_events"] + current_events
+
+        # 去重 by event
+        seen = set()
+        unique = []
+        for e in all_events:
+            event_key = e.get("event", "")
+            if event_key and event_key not in seen:
+                seen.add(event_key)
+                unique.append(e)
+
+        # 按日期排序，保留最新 10 个
+        result["life_events"] = sorted(
+            unique,
+            key=lambda x: x.get("date", ""),
+            reverse=True
+        )[:10]
+
+    # patterns: 合并
+    if "patterns" in new and new["patterns"]:
+        current_patterns = result.get("patterns", {})
+        for key, value in new["patterns"].items():
+            if value:
+                if isinstance(value, list) and isinstance(current_patterns.get(key), list):
+                    combined = value + current_patterns.get(key, [])
+                    current_patterns[key] = list(dict.fromkeys(combined))[:10]
+                else:
+                    current_patterns[key] = value
+        result["patterns"] = current_patterns
+
+    return result
+
+
+async def extract_user_profile(user_id: UUID) -> Dict[str, Any]:
+    """为单个用户抽取 Profile"""
+    logger.info(f"Extracting profile for user {user_id}")
+
+    # 1. 获取现有 extracted 数据
+    current_extracted = await UnifiedProfileRepository.get_extracted(user_id)
+    last_extracted_at = current_extracted.get("last_extracted_at") if current_extracted else None
+
+    # 2. 确定抽取起始时间
+    if last_extracted_at:
+        try:
+            since = datetime.fromisoformat(last_extracted_at.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            since = datetime.now() - timedelta(days=7)
+    else:
+        since = datetime.now() - timedelta(days=30)  # 首次抽取，取最近 30 天
+
+    # 3. 获取新消息
+    messages = await get_user_messages_since(user_id, since, limit=100)
+
+    if not messages:
+        logger.info(f"No new messages for user {user_id}")
+        return current_extracted or {}
+
+    # 4. 格式化消息
+    messages_text = "\n".join([
+        f"[{m['role']}] {m['content'][:300]}"
+        for m in messages
+        if m.get('content')
+    ])
+
+    if len(messages_text) < 50:
+        logger.info(f"Messages too short for user {user_id}")
+        return current_extracted or {}
+
+    # 5. 构建 prompt
+    prompt = f"""## 当前已有信息
+{json.dumps(current_extracted, ensure_ascii=False, indent=2) if current_extracted else "无"}
+
+## 新对话记录 (共 {len(messages)} 条)
+{messages_text[:6000]}
+
+请分析新对话，提取需要更新或新增的用户信息。只返回有变化的字段。"""
+
+    # 6. 调用 LLM 抽取
+    try:
+        response = await chat(
+            messages=[{"role": "user", "content": prompt}],
+            system=EXTRACTION_PROMPT,
+            capability="analysis",
+            user_id=str(user_id),
+            temperature=0.3,
+        )
+
+        # 7. 解析响应
+        content = response.content if hasattr(response, 'content') else str(response)
+
+        # 提取 JSON
+        json_match = re.search(r'\{[\s\S]*\}', content)
+        if not json_match:
+            logger.warning(f"No JSON found in response for user {user_id}")
+            return current_extracted or {}
+
+        new_extracted = json.loads(json_match.group())
+
+        # 8. 合并结果
+        merged = merge_extracted(current_extracted, new_extracted)
+        merged["last_extracted_at"] = datetime.now().isoformat()
+        merged["extraction_version"] = (current_extracted or {}).get("extraction_version", 0) + 1
+
+        # 9. 写入数据库
+        await UnifiedProfileRepository.update_extracted(user_id, merged)
+        logger.info(f"Updated extracted profile for user {user_id}")
+
+        return merged
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error for user {user_id}: {e}")
+        return current_extracted or {}
+    except Exception as e:
+        logger.error(f"Extraction failed for user {user_id}: {e}")
+        return current_extracted or {}
+
+
+async def run_profile_extraction(days: int = 7, batch_size: int = 10):
+    """
+    运行 Profile 抽取任务
+
+    Args:
+        days: 处理最近 N 天活跃的用户
+        batch_size: 每批处理的用户数
+    """
+    logger.info(f"Starting profile extraction task (days={days})")
+
+    # 获取活跃用户
+    active_users = await get_active_users(days=days)
+    logger.info(f"Found {len(active_users)} active users")
+
+    success_count = 0
+    error_count = 0
+
+    for i, user_id in enumerate(active_users):
+        try:
+            await extract_user_profile(user_id)
+            success_count += 1
+
+            # 限流：每处理 batch_size 个用户后暂停
+            if (i + 1) % batch_size == 0:
+                logger.info(f"Processed {i + 1}/{len(active_users)} users, pausing...")
+                await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Failed to extract for user {user_id}: {e}")
+            error_count += 1
+            continue
+
+    logger.info(f"Profile extraction completed: {success_count} success, {error_count} errors")
+
+
+async def main():
+    """命令行入口"""
+    import sys
+
+    # 简单参数解析
+    days = 7
+    if len(sys.argv) > 1:
+        try:
+            days = int(sys.argv[1])
+        except ValueError:
+            pass
+
+    await run_profile_extraction(days=days)
+
+
+if __name__ == "__main__":
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    asyncio.run(main())

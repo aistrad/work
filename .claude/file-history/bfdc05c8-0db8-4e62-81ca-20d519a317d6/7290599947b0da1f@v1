@@ -1,0 +1,157 @@
+/**
+ * Next.js API Route for Chat - AI SDK 6 Compatible
+ *
+ * Implements Data Stream Protocol with x-vercel-ai-ui-message-stream header
+ * Proxies to Python backend and converts SSE format
+ */
+
+import { NextRequest, NextResponse } from 'next/server';
+
+// 服务端使用内部地址直接访问后端 API
+// VIBELIFE_API_INTERNAL 是服务端环境变量（非 NEXT_PUBLIC_）
+const API_BASE = process.env.VIBELIFE_API_INTERNAL
+  ? `${process.env.VIBELIFE_API_INTERNAL}/api/v1`
+  : "http://127.0.0.1:8000/api/v1";
+
+export const runtime = 'edge';
+
+/**
+ * AI SDK 6 Data Stream Protocol format:
+ * - text-start: {"type":"text-start","id":"[id]"}
+ * - text-delta: {"type":"text-delta","id":"[id]","delta":"[content]"}
+ * - text-end: {"type":"text-end","id":"[id]"}
+ * - [DONE] to terminate
+ */
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const { messages, skill, voice_mode, conversation_id } = body;
+
+  // Extract the latest user message
+  const lastMessage = messages?.[messages.length - 1];
+  const userMessage = typeof lastMessage === 'string'
+    ? lastMessage
+    : lastMessage?.content || lastMessage?.parts?.[0]?.text || body.message || '';
+
+  // Get auth token from header
+  const authHeader = req.headers.get('authorization');
+
+  // Prepare request to Python backend
+  const chatRequest = {
+    message: userMessage,
+    skill: skill || 'bazi',
+    voice_mode: voice_mode || 'warm',
+    conversation_id: conversation_id,
+  };
+
+  try {
+    // Call Python backend SSE endpoint
+    const response = await fetch(`${API_BASE}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authHeader && { Authorization: authHeader }),
+      },
+      body: JSON.stringify(chatRequest),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: 'Chat failed' }));
+      return NextResponse.json({ error: error.detail || 'Chat failed' }, { status: response.status });
+    }
+
+    // Create ReadableStream for AI SDK 6 Data Stream Protocol
+    const encoder = new TextEncoder();
+    const messageId = `msg-${Date.now()}`;
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (!reader) {
+          controller.close();
+          return;
+        }
+
+        let buffer = '';
+        let hasStarted = false;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6).trim();
+                if (!dataStr) continue;
+
+                try {
+                  const data = JSON.parse(dataStr);
+
+                  if (data.type === 'chunk') {
+                    // AI SDK 6 format: just send the text directly with 0: prefix
+                    // Format: 0:"text content"\n
+                    const textContent = JSON.stringify(data.content);
+                    controller.enqueue(encoder.encode(`0:${textContent}\n`));
+                    hasStarted = true;
+                  } else if (data.type === 'done') {
+                    // Send finish message with metadata
+                    // Format: d:{"finishReason":"stop","metadata":{...}}\n
+                    const finishData = {
+                      finishReason: 'stop',
+                      usage: { promptTokens: 0, completionTokens: 0 },
+                      ...(data.conversation_id && {
+                        metadata: {
+                          conversation_id: data.conversation_id,
+                          skill: data.skill,
+                          voice_mode: data.voice_mode,
+                        }
+                      })
+                    };
+                    controller.enqueue(encoder.encode(`d:${JSON.stringify(finishData)}\n`));
+                  } else if (data.type === 'error') {
+                    // Send error in AI SDK format
+                    // Format: 3:"error message"\n
+                    controller.enqueue(encoder.encode(`3:${JSON.stringify(data.message)}\n`));
+                  }
+                } catch {
+                  // Skip malformed JSON
+                }
+              }
+            }
+          }
+
+          // If we never started (no chunks received), send empty finish
+          if (!hasStarted) {
+            controller.enqueue(encoder.encode(`d:${JSON.stringify({ finishReason: 'stop' })}\n`));
+          }
+        } catch (error) {
+          // Send error in AI SDK format
+          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+          controller.enqueue(encoder.encode(`3:${JSON.stringify(errorMsg)}\n`));
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'x-vercel-ai-ui-message-stream': 'v1',
+      },
+    });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Unknown error' },
+      { status: 500 }
+    );
+  }
+}

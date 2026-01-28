@@ -1,0 +1,332 @@
+# Fortune AI Backend Refactoring Plan
+
+## User Decisions
+
+- **Approach**: All at once (complete cutover)
+- **Legacy API**: Replace directly (no parallel period)
+- **Model Provider**: GLM-4.7 (current)
+
+## Overview
+
+Refactor the Fortune AI backend from Python-centric FastAPI to a **Vercel AI SDK Driven** architecture with three runtime units:
+
+1. **Next.js Agent Runtime** - AI inference with `streamText()` + `tool()` + `toDataStreamResponse()`
+2. **FastAPI Data Service** - Auth, SSOT writes, deterministic computation, Internal APIs
+3. **Python Cold Path Worker** - Insight Agent, async processing (future phase)
+
+## Current State
+
+| Component | Location | Lines | Status |
+|-----------|----------|-------|--------|
+| FastAPI Backend | `/api/` | 20 routers | Core refactoring target |
+| chat_routes.py | `/api/chat_routes.py` | 1,106 | Move to Next.js |
+| glm_client.py | `/services/glm_client.py` | 292 | Remove |
+| soul_os.py | `/services/soul_os.py` | 1,237 | Split (data stays) |
+| Next.js Web-App | `/web-app/` | No API routes | Add Agent Runtime |
+
+## Routing Strategy
+
+```
+/api/chat        → Next.js (Agent Runtime)
+/api/landing/*   → Next.js (Landing Page API)
+/internal/*      → FastAPI (Internal only)
+/api/*           → FastAPI (Data Service)
+```
+
+---
+
+## Phase 1: Infrastructure Foundation
+
+### 1.1 Add Vercel AI SDK Dependencies
+
+**File:** `/web-app/package.json`
+```json
+{
+  "dependencies": {
+    "ai": "^4.0.0",
+    "@ai-sdk/openai": "^1.0.0",
+    "zod": "^3.22.0"
+  }
+}
+```
+
+### 1.2 Create Next.js API Structure
+
+**New files:**
+```
+web-app/src/app/api/
+  chat/route.ts              # Main Agent Runtime
+
+web-app/src/lib/
+  skills/
+    index.ts                 # Skills Registry
+    divine-skills.ts         # Bazi tools
+    heal-skills.ts           # PERMA tools
+    grow-skills.ts           # Goal tools
+  models/
+    model-provider.ts        # GLM/Claude provider
+  context/
+    context-builder.ts       # System prompt
+  types/
+    a2ui-card.ts             # ToolResultCard types
+```
+
+### 1.3 FastAPI Internal Routes
+
+**New file:** `/api/internal_routes.py`
+
+Endpoints:
+- `GET /internal/context` - Aggregate user context (L0+L1+history)
+- `POST /internal/chat/run/start` - Record run_id + user message
+- `POST /internal/chat/run/finalize` - Transaction commit all side effects
+
+### 1.4 Update Nginx Routing
+
+**File:** `/etc/nginx/sites-available/fortune-ai`
+- Route `/api/chat` → Next.js (:8231)
+- Route `/internal/*` → FastAPI (:8230, internal only)
+- Route `/api/*` → FastAPI (:8230)
+
+### 1.5 Deliverables
+- [ ] Install Vercel AI SDK in web-app
+- [ ] Create `/api/chat/route.ts` skeleton
+- [ ] Create `/api/internal_routes.py` with 3 endpoints
+- [ ] Register internal_routes in `/api/main.py`
+- [ ] Configure Nginx dual-backend routing
+
+---
+
+## Phase 2: Agent Runtime Core
+
+### 2.1 Implement `/api/chat/route.ts`
+
+**Key pattern:**
+```typescript
+export async function POST(req: Request) {
+  // 1. Auth from Cookie
+  const sessionCookie = cookies().get('fortune_session')?.value;
+
+  // 2. Parse request (NO userId - from session)
+  const { session_id, message, command } = await req.json();
+
+  // 3. Fetch context from FastAPI
+  const context = await fetch(`${FASTAPI_URL}/internal/context`, {
+    headers: { 'Cookie': `fortune_session=${sessionCookie}` }
+  });
+
+  // 4. Start run
+  const { run_id } = await fetch(`${FASTAPI_URL}/internal/chat/run/start`, ...);
+
+  // 5. Stream with Vercel AI SDK
+  const result = streamText({
+    model: selectModel(),
+    system: buildSystemPrompt(context),
+    tools: getToolsForCommand(command),
+    maxSteps: 5,
+    onFinish: async ({ text }) => {
+      // 6. Finalize run
+      await fetch(`${FASTAPI_URL}/internal/chat/run/finalize`, ...);
+    }
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+### 2.2 Model Provider
+
+**File:** `/web-app/src/lib/models/model-provider.ts`
+
+Use OpenAI-compatible provider for GLM:
+```typescript
+export const glmProvider = createOpenAI({
+  baseURL: 'https://api.z.ai/api/paas/v4',
+  apiKey: process.env.GLM_API_KEY,
+  compatibility: 'compatible',
+});
+```
+
+### 2.3 Context Builder
+
+**File:** `/web-app/src/lib/context/context-builder.ts`
+
+Migrate system prompt from `chat_routes.py` lines 48-94.
+
+### 2.4 Deliverables
+- [ ] Implement `/api/chat/route.ts` with full lifecycle
+- [ ] Implement model-provider.ts
+- [ ] Implement context-builder.ts
+- [ ] Test streaming response
+
+---
+
+## Phase 3: Skills Implementation
+
+### 3.1 Divine Skills (`/web-app/src/lib/skills/divine-skills.ts`)
+
+```typescript
+export const divineSkills = {
+  calculate_bazi: tool({
+    description: '计算八字命盘',
+    parameters: z.object({ birth_datetime: z.string() }),
+    execute: async ({ birth_datetime }) => {
+      return fetch(`${FASTAPI_URL}/api/bazi/calculate`, ...);
+    },
+  }),
+};
+```
+
+### 3.2 Heal Skills (`/web-app/src/lib/skills/heal-skills.ts`)
+
+- `mood_checkin` - Emotion logging
+- `log_perma` - PERMA dimension update
+
+### 3.3 Grow Skills (`/web-app/src/lib/skills/grow-skills.ts`)
+
+- `create_commitment` - Task creation
+- `complete_task` - Task completion
+
+### 3.4 Skills Registry (`/web-app/src/lib/skills/index.ts`)
+
+```typescript
+export function getToolsForCommand(command: string) {
+  switch (command) {
+    case '/divine': return divineSkills;
+    case '/heal': return healSkills;
+    case '/grow': return growSkills;
+    default: return allSkills;
+  }
+}
+```
+
+### 3.5 Deliverables
+- [ ] Implement divine-skills.ts
+- [ ] Implement heal-skills.ts
+- [ ] Implement grow-skills.ts
+- [ ] Implement skills registry
+
+---
+
+## Phase 4: Frontend Adaptation
+
+### 4.1 Update API Client
+
+**File:** `/web-app/src/lib/api.ts`
+
+Add support for new endpoint while keeping legacy:
+```typescript
+const USE_NEW_RUNTIME = process.env.NEXT_PUBLIC_USE_NEW_RUNTIME === 'true';
+
+export function streamChatMessage(...) {
+  if (USE_NEW_RUNTIME) {
+    return streamNewChat(...);  // Use /api/chat
+  }
+  return streamLegacyChat(...);  // Use /api/chat/stream
+}
+```
+
+### 4.2 Add useChat Support
+
+**File:** `/web-app/src/components/chat/chat-zone.tsx`
+
+Option to use `useChat` hook:
+```typescript
+import { useChat } from 'ai/react';
+
+const { messages, input, handleSubmit } = useChat({
+  api: '/api/chat',
+});
+```
+
+### 4.3 ToolResultCard Component
+
+**New file:** `/web-app/src/components/chat/tool-result-card.tsx`
+
+Render toolInvocations as A2UI cards.
+
+### 4.4 Deliverables
+- [ ] Add feature flag for new runtime
+- [ ] Update streamChatMessage in api.ts
+- [ ] Add useChat integration option
+- [ ] Create ToolResultCard component
+
+---
+
+## Phase 5: Testing & Cleanup
+
+### 5.1 End-to-End Testing
+
+- [ ] Test new `/api/chat` endpoint streaming
+- [ ] Verify all Skills execute correctly
+- [ ] Test ToolResultCard rendering
+- [ ] Validate session/auth flow
+
+### 5.2 Files to Delete
+
+```bash
+rm services/glm_client.py           # LLM moved to TypeScript
+rm services/agent_service_client.py # No longer needed
+rm -rf agent_service/               # Merged into Next.js
+```
+
+### 5.3 Files to Modify
+
+- `/api/main.py` - Remove chat_routes router
+- `/api/chat_routes.py` - Archive or delete
+
+### 5.4 Deliverables
+- [ ] Remove deprecated files
+- [ ] Update documentation
+
+---
+
+## Critical Files Reference
+
+| File | Purpose | Action |
+|------|---------|--------|
+| `/api/chat_routes.py` | Current chat logic | Reference, then delete |
+| `/api/deps.py` | Auth/CSRF patterns | Keep for internal routes |
+| `/api/main.py` | Router registration | Update routing |
+| `/services/soul_os.py` | Context assembly | Keep, call via internal API |
+| `/services/glm_client.py` | LLM calls | Delete |
+| `/services/agent_service_client.py` | HTTP shim | Delete |
+| `/web-app/src/lib/api.ts` | Frontend API client | Update for new endpoint |
+| `/web-app/src/stores/app-store.ts` | Zustand store | Update sendMessage |
+| `/agent_service/src/agents/coach.ts` | Existing AI SDK pattern | Reference for Next.js |
+
+---
+
+## Risk Mitigation
+
+| Risk | Strategy |
+|------|----------|
+| Breaking changes | Comprehensive testing before cutover |
+| CSRF issues | Same-origin Next.js doesn't need CSRF |
+| Session forwarding | Forward cookie in fetch headers |
+| Tool idempotency | `idempotency_key` with Redis dedup |
+| Rollback | Git revert + restore old endpoints |
+
+---
+
+## Implementation Order
+
+Since we're doing **all at once** with **direct replacement**:
+
+1. Create all new files first (no breaking changes yet)
+2. Test new endpoint in isolation (`/api/chat-new` temporarily)
+3. Swap endpoints atomically
+4. Delete old files
+
+---
+
+## Estimated Timeline
+
+All phases executed together: **3-5 days**
+
+| Day | Focus |
+|-----|-------|
+| Day 1 | Infrastructure + Internal Routes |
+| Day 2 | Agent Runtime Core |
+| Day 3 | Skills + Frontend |
+| Day 4 | Integration Testing |
+| Day 5 | Cutover + Cleanup |

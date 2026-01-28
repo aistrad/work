@@ -1,0 +1,276 @@
+# VibeLife 订阅系统迁移计划 v2
+> 精简高效版 | 2026-01-15
+
+---
+
+## 一、当前依赖分析
+
+### 1. EntitlementService 调用点
+
+| 文件 | 调用方法 | 用途 |
+|------|----------|------|
+| `routes/chat.py:25,216,396,444,511` | `check_can_chat()`, `consume_conversation()` | 对话限额检查 |
+| `routes/chat.py:1092` | `get_entitlements()` | 获取 tier |
+| `routes/chat_v5.py:156-158` | `get_entitlements()` | 获取 tier |
+| `routes/context.py:145-149,249-254` | `get_entitlements()` | 获取 tier |
+| `routes/entitlement.py` | 全部 | 独立 API 路由 |
+
+### 2. SubscriptionService (已存在但未使用)
+
+| 位置 | 状态 |
+|------|------|
+| `services/billing/subscription.py` | ✅ 480行完整实现 |
+| `routes/payment.py:769-779` | ❌ TODO 注释，从未调用 |
+
+### 3. 核心问题
+
+```
+Webhook 支付成功 → TODO 注释 → 订阅状态未持久化
+                            ↓
+                用户付了钱，系统不知道
+```
+
+---
+
+## 二、迁移策略：最小改动
+
+### 原则
+1. **复用现有** - SubscriptionService 已有完整逻辑，直接用
+2. **合并删除** - EntitlementService 功能合入 SubscriptionService
+3. **接口兼容** - 保持 API 不变，只改内部实现
+
+---
+
+## 三、具体变更清单
+
+### Step 1: 修复 Webhook (关键)
+
+```python
+# routes/payment.py:763-779
+# 删除 TODO，改为:
+
+from services.billing.subscription import SubscriptionService
+from stores.db import get_db_pool
+
+async def _handle_checkout_completed(session):
+    # ... 现有代码 ...
+
+    pool = await get_db_pool()
+    sub_service = SubscriptionService(pool)
+
+    if region == "CN":
+        service_days = int(metadata.get("service_days", 30))
+        await sub_service.create_prepaid_subscription(
+            user_id=user_id,
+            plan_code="paid",
+            service_days=service_days,
+            payment_session_id=session_id,
+            region=region
+        )
+    else:
+        subscription_id = session.get("subscription")
+        customer_id = session.get("customer")
+        # 获取 Stripe 订阅详情
+        stripe_sub = await stripe.Subscription.retrieve(subscription_id)
+        await sub_service.create_stripe_subscription(
+            user_id=user_id,
+            plan_code="paid",
+            stripe_subscription_id=subscription_id,
+            stripe_customer_id=customer_id,
+            current_period_end=datetime.fromtimestamp(stripe_sub.current_period_end)
+        )
+```
+
+### Step 2: 合并 EntitlementService → SubscriptionService
+
+在 `services/billing/subscription.py` 末尾添加:
+
+```python
+# ═══════════════════════════════════════════════════════════════
+# Entitlement 方法 (从 EntitlementService 合并)
+# ═══════════════════════════════════════════════════════════════
+
+TIER_CONFIG = {
+    "free": {"daily_limit": 3},
+    "paid": {"daily_limit": 200},
+}
+
+async def check_can_chat(self, user_id: str) -> dict:
+    """检查用户是否可以对话"""
+    sub = await self.get_user_subscription(user_id)
+    tier = "paid" if sub and sub.status == SubscriptionStatus.ACTIVE else "free"
+
+    usage = await self.get_user_usage(user_id)
+    limit = TIER_CONFIG[tier]["daily_limit"]
+    remaining = max(0, limit - usage["today_messages"])
+
+    return {
+        "can_chat": remaining > 0,
+        "remaining": remaining,
+        "tier": tier
+    }
+
+async def consume_conversation(self, user_id: str) -> bool:
+    """消耗一次对话额度 (记录到 messages 表即可)"""
+    return True  # usage 通过 message_repo 自动记录
+
+async def get_entitlements(self, user_id: str) -> dict:
+    """获取用户权益"""
+    sub = await self.get_user_subscription(user_id)
+    tier = "paid" if sub and sub.status == SubscriptionStatus.ACTIVE else "free"
+    usage = await self.get_user_usage(user_id)
+    limit = TIER_CONFIG[tier]["daily_limit"]
+
+    return {
+        "tier": tier,
+        "daily_limit": limit,
+        "daily_used": usage["today_messages"],
+        "daily_remaining": max(0, limit - usage["today_messages"]),
+        "subscription_expires_at": sub.current_period_end if sub else None
+    }
+```
+
+### Step 3: 创建兼容层 (过渡期)
+
+```python
+# services/entitlement/__init__.py (修改)
+
+from services.billing.subscription import SubscriptionService
+from stores.db import get_db_pool
+
+class EntitlementService:
+    """兼容层 - 委托给 SubscriptionService"""
+
+    @staticmethod
+    async def _get_service():
+        pool = await get_db_pool()
+        return SubscriptionService(pool)
+
+    @staticmethod
+    async def check_can_chat(user_id):
+        svc = await EntitlementService._get_service()
+        return await svc.check_can_chat(str(user_id))
+
+    @staticmethod
+    async def consume_conversation(user_id):
+        return True  # 消费记录在 message_repo
+
+    @staticmethod
+    async def get_entitlements(user_id):
+        svc = await EntitlementService._get_service()
+        return await svc.get_entitlements(str(user_id))
+
+    @staticmethod
+    async def upgrade_to_paid(user_id, expires_at):
+        svc = await EntitlementService._get_service()
+        await svc.create_prepaid_subscription(
+            str(user_id), "paid",
+            (expires_at - datetime.now()).days,
+            "manual_upgrade"
+        )
+        return True
+
+    @staticmethod
+    async def downgrade_to_free(user_id):
+        # 标记现有订阅为 expired
+        svc = await EntitlementService._get_service()
+        await svc.cancel_subscription(str(user_id))
+        return True
+```
+
+### Step 4: 删除冗余文件
+
+```bash
+# 删除
+rm -rf apps/api/services/entitlement/service.py
+rm -rf apps/api/services/identity/usage_limits.py
+
+# 保留兼容层
+# services/entitlement/__init__.py (委托到 SubscriptionService)
+```
+
+---
+
+## 四、文件变更汇总
+
+| 操作 | 文件 | 变更 |
+|------|------|------|
+| **修改** | `routes/payment.py` | 删除 TODO，调用 SubscriptionService |
+| **修改** | `services/billing/subscription.py` | 添加 entitlement 方法 (~50行) |
+| **修改** | `services/entitlement/__init__.py` | 改为兼容层，委托调用 |
+| **删除** | `services/entitlement/service.py` | 合并到 subscription.py |
+| **删除** | `services/identity/usage_limits.py` | 重复功能 |
+| 不变 | `routes/chat.py` 等 | 无需修改，兼容层保持接口 |
+
+---
+
+## 五、数据库
+
+### 现有表结构 (无需迁移)
+
+```sql
+-- subscriptions 表已存在以下字段:
+-- id, user_id, plan_code, status, vip_type, region
+-- started_at, expires_at, stripe_subscription_id, stripe_customer_id
+-- payment_failed_count, source, created_at, updated_at
+
+-- user_entitlements 表可废弃，用 subscriptions 替代
+```
+
+### 可选: 废弃 user_entitlements
+
+```sql
+-- 确认 subscriptions 表数据完整后执行
+-- ALTER TABLE user_entitlements RENAME TO user_entitlements_deprecated;
+```
+
+---
+
+## 六、实施顺序
+
+```
+1. [5分钟] 修复 payment.py webhook → 支付立即生效
+     ↓
+2. [10分钟] subscription.py 添加 entitlement 方法
+     ↓
+3. [5分钟] entitlement/__init__.py 改为兼容层
+     ↓
+4. [1分钟] 删除冗余文件
+     ↓
+5. [测试] 验证支付流程 + 对话限额
+```
+
+---
+
+## 七、验证检查点
+
+```bash
+# 1. Webhook 测试
+curl -X POST localhost:8000/payment/webhook-test \
+  -H "Content-Type: application/json" \
+  -d '{"type": "checkout.session.completed", ...}'
+
+# 2. 订阅状态检查
+SELECT * FROM subscriptions WHERE user_id = 'xxx';
+
+# 3. 对话限额测试
+curl localhost:8000/entitlement/can-chat \
+  -H "Authorization: Bearer xxx"
+```
+
+---
+
+## 八、回滚方案
+
+```bash
+# 如果出问题，恢复 entitlement/service.py
+git checkout HEAD -- apps/api/services/entitlement/service.py
+git checkout HEAD -- apps/api/services/identity/usage_limits.py
+```
+
+---
+
+**净效果**:
+- 修复支付 → 订阅断联问题 (P0)
+- 删除 ~200 行重复代码
+- 保持 API 完全兼容

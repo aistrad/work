@@ -1,0 +1,568 @@
+/**
+ * Next.js API Route for Chat - AI SDK 6 UI Message Stream
+ *
+ * Proxies to Python backend and converts SSE events into AI SDK v6 UIMessageChunk format.
+ *
+ * Supported backend event types:
+ * - chunk: Text content chunks (streaming)
+ * - done: Conversation complete with metadata
+ * - error: Error messages
+ * - tool_call: Tool invocation requests (for Generative UI)
+ * - tool_result: Tool execution results (for Generative UI)
+ */
+
+import { NextRequest, NextResponse } from 'next/server';
+import { createUIMessageStreamResponse, type UIMessageChunk } from 'ai';
+
+// 服务端使用内部地址直接访问后端 API
+// VIBELIFE_API_INTERNAL 是服务端环境变量（非 NEXT_PUBLIC_）
+const API_BASE = process.env.VIBELIFE_API_INTERNAL
+  ? `${process.env.VIBELIFE_API_INTERNAL}/api/v1`
+  : "http://127.0.0.1:8000/api/v1";
+
+export const runtime = 'edge';
+
+type JsonObject = Record<string, unknown>;
+
+function isRecord(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function getNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function buildDefaultProfile(skill: string): JsonObject {
+  const nowYear = new Date().getFullYear();
+  return {
+    basic: {
+      birth_year: 1990,
+      day_master_element: "wood",
+      gender: "unknown",
+      zodiac: skill === 'zodiac' ? 'Leo' : undefined,
+      current_year: nowYear,
+    },
+    life_context: {},
+  };
+}
+
+async function fetchJson(url: string, init?: RequestInit) {
+  const res = await fetch(url, init);
+  const text = await res.text();
+  if (!text) return { ok: res.ok, status: res.status, json: null as unknown };
+  try {
+    return { ok: res.ok, status: res.status, json: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: res.ok, status: res.status, json: { raw: text } as unknown };
+  }
+}
+
+async function executeToolCall(options: {
+  toolName: string;
+  args: JsonObject;
+  skill: string;
+  voiceMode: string;
+  authHeader: string | null;
+  fallbackUserId: string;
+}) {
+  const { toolName, args, skill, voiceMode, authHeader, fallbackUserId } = options;
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(authHeader ? { Authorization: authHeader } : {}),
+  };
+
+  const rawUserId =
+    getString(args.userId) ||
+    getString(args.user_id) ||
+    getString(args.userID) ||
+    fallbackUserId;
+
+  const userId = isUuid(rawUserId) ? rawUserId : fallbackUserId;
+
+  const profile = (isRecord(args.profile) ? args.profile : buildDefaultProfile(skill)) as JsonObject;
+
+  switch (toolName) {
+    case 'show_bazi_kline': {
+      const startYear = getNumber(args.startYear) ?? getNumber(args.start_year);
+      const endYear = getNumber(args.endYear) ?? getNumber(args.end_year);
+
+      const { ok, json } = await fetchJson(`${API_BASE}/fortune/kline`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          user_id: userId,
+          profile,
+          ...(startYear ? { start_year: startYear } : {}),
+          ...(endYear ? { end_year: endYear } : {}),
+        }),
+      });
+
+      if (!ok || !isRecord(json) || json.success !== true || !isRecord(json.data)) {
+        const errorText = isRecord(json) ? getString(json.error) : undefined;
+        throw new Error(errorText || 'K线数据获取失败');
+      }
+
+      return json.data;
+    }
+
+    case 'show_bazi_fortune': {
+      const basic = isRecord(profile.basic) ? profile.basic : {};
+      const birthYear = getNumber(basic.birth_year) ?? 1990;
+      const dayMasterElement = getString(basic.day_master_element) ?? 'wood';
+      const gender = getString(basic.gender) ?? 'unknown';
+      const year = getNumber(args.year) ?? new Date().getFullYear();
+
+      const cyclesUrl = new URL(`${API_BASE}/fortune/cycles`);
+      cyclesUrl.searchParams.set('birth_year', String(birthYear));
+      cyclesUrl.searchParams.set('day_master_element', dayMasterElement);
+      cyclesUrl.searchParams.set('gender', gender);
+
+      const cyclesRes = await fetchJson(cyclesUrl.toString(), { headers });
+      const annualRes = await fetchJson(
+        `${API_BASE}/fortune/annual/${year}?day_master_element=${encodeURIComponent(dayMasterElement)}`,
+        { headers }
+      );
+
+      const cycles =
+        isRecord(cyclesRes.json) && cyclesRes.json.success === true && Array.isArray(cyclesRes.json.cycles)
+          ? cyclesRes.json.cycles
+          : [];
+
+      const annual =
+        isRecord(annualRes.json) && annualRes.json.success === true && isRecord(annualRes.json.fortune)
+          ? annualRes.json.fortune
+          : null;
+
+      return {
+        user_id: userId,
+        profile,
+        year,
+        cycles,
+        annual,
+        voice_mode: voiceMode,
+      };
+    }
+
+    case 'show_report': {
+      const normalizeReport = (report: JsonObject) => ({
+        ...report,
+        ...(report.created_at && !report.createdAt ? { createdAt: report.created_at } : {}),
+        ...(report.is_paid !== undefined && report.isPaid === undefined ? { isPaid: report.is_paid } : {}),
+        ...(report.report_type && !report.reportType ? { reportType: report.report_type } : {}),
+      });
+
+      const reportId = getString(args.reportId) || getString(args.report_id);
+
+      if (reportId) {
+        const { ok, json } = await fetchJson(`${API_BASE}/report/${reportId}`, { headers });
+        if (ok && isRecord(json) && json.success === true) {
+          const report = isRecord(json.report) ? json.report : isRecord(json) ? json : null;
+          if (report) return normalizeReport(report);
+        }
+      }
+
+      // If we have auth, try to list reports using /users/me/profile -> /report/list
+      if (authHeader) {
+        const me = await fetchJson(`${API_BASE}/users/me/profile`, { headers });
+        const meId = isRecord(me.json) ? getString(me.json.user_id) : undefined;
+        if (meId) {
+          const listUrl = new URL(`${API_BASE}/report/list`);
+          listUrl.searchParams.set('user_id', meId);
+          listUrl.searchParams.set('skill', skill);
+          const list = await fetchJson(listUrl.toString(), { headers });
+          const reports =
+            isRecord(list.json) && list.json.success === true && Array.isArray(list.json.reports)
+              ? list.json.reports
+              : [];
+          const first = reports[0];
+          const firstId = isRecord(first) ? getString(first.id) : undefined;
+          if (firstId) {
+            const detail = await fetchJson(`${API_BASE}/report/${encodeURIComponent(firstId)}`, { headers });
+            if (detail.ok && isRecord(detail.json) && detail.json.success === true) {
+              const report = isRecord(detail.json.report) ? detail.json.report : isRecord(detail.json) ? detail.json : null;
+              if (report) return normalizeReport(report);
+            }
+          }
+        }
+      }
+
+      // Fallback demo report
+      return {
+        id: 'demo',
+        title: `${skill === 'zodiac' ? '星盘' : '八字'}报告（演示）`,
+        createdAt: new Date().toISOString().slice(0, 10),
+        prologue: '这是一个演示版报告卡片。完善个人信息后可生成真实报告。',
+        isPaid: false,
+      };
+    }
+
+    case 'show_relationship': {
+      const partnerInfo = isRecord(args.partnerInfo) ? args.partnerInfo : isRecord(args.partner_info) ? args.partner_info : null;
+      const relationshipType =
+        getString(args.relationshipType) || getString(args.relationship_type) || 'general';
+
+      const partnerProfile = partnerInfo
+        ? { basic: partnerInfo, life_context: {} }
+        : { basic: { zodiac: 'taurus' }, life_context: {} };
+
+      const { ok, json } = await fetchJson(`${API_BASE}/relationship/analyze`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          user_id: userId,
+          user_profile: profile,
+          partner_info: partnerProfile,
+          relationship_type: relationshipType,
+        }),
+      });
+
+      if (!ok || !isRecord(json) || json.success !== true || !isRecord(json.analysis)) {
+        const errorText = isRecord(json) ? getString(json.error) : undefined;
+        throw new Error(errorText || '关系分析失败');
+      }
+
+      const analysis = json.analysis;
+      const score = getNumber(analysis.overall_score) ?? 85;
+      return { score, ...analysis };
+    }
+
+    case 'request_info': {
+      const infoType = getString(args.infoType) || 'birth';
+      const fields =
+        infoType === 'birth'
+          ? [
+              { id: 'birthDate', label: '出生日期', type: 'date', placeholder: '' },
+              { id: 'birthTime', label: '出生时间', type: 'time', placeholder: '' },
+              { id: 'birthPlace', label: '出生地点', type: 'text', placeholder: '城市名' },
+            ]
+          : infoType === 'context'
+            ? [{ id: 'situation', label: '当前情况', type: 'text', placeholder: '描述你目前面临的情况' }]
+            : infoType === 'goals'
+              ? [{ id: 'goals', label: '你的目标', type: 'text', placeholder: '你想达成什么' }]
+              : [{ id: 'concerns', label: '你的困惑', type: 'text', placeholder: '最困扰你的是什么' }];
+
+      return {
+        infoType,
+        question: getString(args.question),
+        fields,
+      };
+    }
+
+    case 'show_insight': {
+      return {
+        insights: [
+          {
+            id: `ins-${Date.now()}`,
+            title: '关键洞察（演示）',
+            content: '你做决定时更看重长期收益；本周适合把目标拆成更小的行动。',
+          },
+          {
+            id: `ins-${Date.now()}-2`,
+            title: '行动建议（演示）',
+            content: '把「下一步」写成一句话，并在 25 分钟内启动第一小步。',
+          },
+        ],
+      };
+    }
+
+    case 'show_bazi_chart': {
+      return {
+        userId,
+        birthInfo: { date: '1990-05-15', time: '08:00', gender: 'unknown' },
+        fourPillars: {
+          year: { stem: '庚', branch: '午' },
+          month: { stem: '戊', branch: '子' },
+          day: { stem: '甲', branch: '辰' },
+          hour: { stem: '甲', branch: '寅' },
+        },
+        dayMaster: { element: 'wood', stem: '甲', description: '甲木日主，重视成长与原则。' },
+        fiveElements: { wood: 3, fire: 2, earth: 2, metal: 1, water: 2 },
+        tenGods: [],
+        pattern: { name: '正印格', description: '偏向学习与积累。' },
+      };
+    }
+
+    case 'show_zodiac_chart': {
+      return {
+        userId,
+        birthInfo: { date: '1990-05-15', time: '08:00', place: 'Shanghai' },
+        sunSign: '金牛座',
+        moonSign: '巨蟹座',
+        risingSign: '处女座',
+        planets: [
+          { planet: 'Sun', sign: '金牛座', degree: 12, house: 9 },
+          { planet: 'Moon', sign: '巨蟹座', degree: 3, house: 11 },
+          { planet: 'Mercury', sign: '金牛座', degree: 25, house: 9 },
+          { planet: 'Venus', sign: '双子座', degree: 5, house: 10 },
+          { planet: 'Mars', sign: '狮子座', degree: 18, house: 12, retrograde: false },
+        ],
+        aspects: [],
+        dominantElement: '土',
+        dominantModality: '固定',
+      };
+    }
+
+    case 'show_zodiac_transit': {
+      const date = getString(args.date) || new Date().toISOString().slice(0, 10);
+      return {
+        date,
+        transits: [
+          {
+            planet: 'Mercury',
+            sign: '摩羯座',
+            aspect: '合相',
+            natalPlanet: 'Sun',
+            influence: 'neutral',
+            description: '适合复盘与校对细节，沟通更重逻辑。',
+            startDate: date,
+            endDate: date,
+            isActive: true,
+          },
+        ],
+        majorEvents: [],
+        overallEnergy: '稳中求进，适合做计划与结构化整理。',
+        advice: '把复杂问题拆成 3 个可执行步骤，先完成最容易的一步。',
+      };
+    }
+
+    case 'show_zodiac_synastry': {
+      return {
+        person1: { name: '你', sunSign: '金牛座' },
+        person2: { name: 'TA', sunSign: '狮子座' },
+        overallScore: 82,
+        categories: [
+          { name: '沟通', score: 78, description: '表达方式不同但可互补。' },
+          { name: '价值观', score: 84, description: '目标一致，节奏需协调。' },
+          { name: '情绪', score: 80, description: '需要更多安全感的表达。' },
+        ],
+        strengths: ['踏实可靠', '愿意长期投入'],
+        challenges: ['固执时容易僵持', '情绪表达风格不同'],
+        advice: '明确边界与期待，用具体行动替代猜测。',
+      };
+    }
+
+    default: {
+      return { ok: true, tool: toolName, args };
+    }
+  }
+}
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const { messages, skill, voice_mode, conversation_id } = body;
+
+  // Extract the latest user message
+  const lastMessage = messages?.[messages.length - 1];
+  const userMessage = typeof lastMessage === 'string'
+    ? lastMessage
+    : lastMessage?.content || lastMessage?.parts?.[0]?.text || body.message || '';
+
+  // Get auth token from header
+  const authHeader = req.headers.get('authorization');
+  const fallbackUserId = crypto.randomUUID();
+
+  // Prepare request to Python backend
+  const chatRequest = {
+    message: userMessage,
+    skill: skill || 'bazi',
+    voice_mode: voice_mode || 'warm',
+    conversation_id: conversation_id,
+  };
+
+  try {
+    // Call Python backend SSE endpoint
+    const response = await fetch(`${API_BASE}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authHeader && { Authorization: authHeader }),
+      },
+      body: JSON.stringify(chatRequest),
+      signal: req.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      const errorText = await response.text().catch(() => 'Chat failed');
+      const errorStream = new ReadableStream<UIMessageChunk>({
+        start(controller) {
+          controller.enqueue({ type: 'error', errorText: errorText || 'Chat failed' });
+          controller.close();
+        },
+      });
+      return createUIMessageStreamResponse({ stream: errorStream, status: response.status });
+    }
+
+    const textPartId = `text-${Date.now()}`;
+    const assistantMessageId = `msg-${Date.now()}`;
+
+    const stream = new ReadableStream<UIMessageChunk>({
+      async start(controller) {
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (!reader) {
+          controller.close();
+          return;
+        }
+
+        let buffer = '';
+        let textStarted = false;
+        let finished = false;
+        let shouldStop = false;
+        let currentTextPartId = textPartId;
+
+        // Initialize message + text part early so UI can stream instantly.
+        controller.enqueue({ type: 'start', messageId: assistantMessageId });
+        controller.enqueue({ type: 'text-start', id: currentTextPartId });
+        textStarted = true;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6).trim();
+                if (!dataStr) continue;
+
+                try {
+                  const data = JSON.parse(dataStr);
+
+                  if (data.type === 'chunk') {
+                    controller.enqueue({
+                      type: 'text-delta',
+                      id: currentTextPartId,
+                      delta: String(data.content ?? ''),
+                    });
+                  } else if (data.type === 'tool_call') {
+                    // AI SDK 6: Tool call event from backend
+                    // Format: { type: 'tool_call', tool_name: string, tool_call_id: string, args: object }
+                    if (textStarted) {
+                      controller.enqueue({ type: 'text-end', id: currentTextPartId });
+                      textStarted = false;
+                    }
+                    // Use tool-input-available for tool calls in AI SDK 6
+                    const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
+                    const toolName = String(data.tool_name || '');
+                    const args = isRecord(data.args) ? (data.args as JsonObject) : {};
+                    controller.enqueue({
+                      type: 'tool-input-available',
+                      toolCallId,
+                      toolName,
+                      input: args,
+                    });
+
+                    // Execute tool on the server (Next route) and stream tool output for Generative UI.
+                    try {
+                      const output = await executeToolCall({
+                        toolName,
+                        args,
+                        skill: chatRequest.skill,
+                        voiceMode: chatRequest.voice_mode,
+                        authHeader,
+                        fallbackUserId,
+                      });
+                      controller.enqueue({
+                        type: 'tool-output-available',
+                        toolCallId,
+                        output,
+                      });
+                    } catch (toolError) {
+                      const errorText =
+                        toolError instanceof Error ? toolError.message : 'Tool execution failed';
+                      controller.enqueue({
+                        type: 'tool-output-error',
+                        toolCallId,
+                        errorText,
+                      });
+                    }
+                  } else if (data.type === 'tool_result') {
+                    // AI SDK 6: Tool result event from backend
+                    // Format: { type: 'tool_result', tool_call_id: string, result: any }
+                    // Use tool-output-available for tool results in AI SDK 6
+                    controller.enqueue({
+                      type: 'tool-output-available',
+                      toolCallId: data.tool_call_id,
+                      output: data.result,
+                    });
+                  } else if (data.type === 'done') {
+                    if (textStarted) {
+                      controller.enqueue({ type: 'text-end', id: currentTextPartId });
+                    }
+                    controller.enqueue({
+                      type: 'finish',
+                      finishReason: 'stop',
+                      messageMetadata: {
+                        ...(data.conversation_id ? { conversation_id: data.conversation_id } : {}),
+                        ...(data.skill ? { skill: data.skill } : {}),
+                        ...(data.voice_mode ? { voice_mode: data.voice_mode } : {}),
+                      },
+                    });
+                    finished = true;
+                    shouldStop = true;
+                    break;
+                  } else if (data.type === 'error') {
+                    controller.enqueue({
+                      type: 'error',
+                      errorText: String(data.message ?? 'Chat error'),
+                    });
+                    finished = true;
+                    shouldStop = true;
+                    break;
+                  }
+                } catch {
+                  // Skip malformed JSON
+                }
+              }
+            }
+
+            if (shouldStop) break;
+          }
+
+          // If backend ended without a done marker, close gracefully.
+          if (!finished) {
+            if (textStarted) controller.enqueue({ type: 'text-end', id: currentTextPartId });
+            controller.enqueue({ type: 'finish', finishReason: 'stop' });
+          }
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+          controller.enqueue({ type: 'error', errorText: errorMsg });
+          finished = true;
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return createUIMessageStreamResponse({ stream });
+  } catch (error) {
+    const errorStream = new ReadableStream<UIMessageChunk>({
+      start(controller) {
+        controller.enqueue({
+          type: 'error',
+          errorText: error instanceof Error ? error.message : 'Unknown error',
+        });
+        controller.close();
+      },
+    });
+    return createUIMessageStreamResponse({ stream: errorStream, status: 500 });
+  }
+}

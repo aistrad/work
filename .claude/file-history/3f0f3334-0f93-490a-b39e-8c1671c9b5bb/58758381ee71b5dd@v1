@@ -1,0 +1,619 @@
+# VibeLife 用户数据体系 v2
+
+> **设计原则**: 4 表核心架构，职责清晰，避免冗余
+
+---
+
+## 1. 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           用户数据体系 v2                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────┐
+  │     vibe_users       │  ← 身份层 (Identity)
+  │  账号 + 认证 + 计费   │
+  └──────────┬───────────┘
+             │ 1:1
+             ▼
+  ┌──────────────────────┐
+  │   unified_profiles   │  ← 画像层 (Profile)
+  │  出生信息 + 命理计算  │
+  │  + 偏好 + 生活上下文  │
+  └──────────┬───────────┘
+             │ 1:N
+             ▼
+  ┌──────────────────────┐
+  │   user_data_store    │  ← 内容层 (Content)
+  │  目标/计划/打卡/文档  │
+  │  虚拟文件系统路径     │
+  └──────────────────────┘
+
+  ┌──────────────────────┐
+  │    user_triggers     │  ← 主动服务层 (Proactive)
+  │  提醒 + 条件触发      │
+  └──────────────────────┘
+```
+
+---
+
+## 2. 数据分层职责
+
+| 层级 | 表名 | 职责 | 数据特性 |
+|------|------|------|----------|
+| **身份层** | vibe_users | 账号、认证、订阅、配额、计费汇总 | 高频读取，低频写入 |
+| **画像层** | unified_profiles | 出生信息、命理计算、偏好、生活上下文 | 用户画像，Skill 共享 |
+| **内容层** | user_data_store | 目标、计划、打卡、文档、照片 | 用户创建的内容数据 |
+| **主动层** | user_triggers | 提醒、条件触发、定时任务 | 主动服务调度 |
+
+---
+
+## 3. 表结构设计
+
+### 3.1 vibe_users (身份层 + 计费)
+
+```sql
+CREATE TABLE vibe_users (
+    -- 身份标识
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    vibe_id         VARCHAR(20) UNIQUE NOT NULL,  -- VB-A1B2C3D4
+    display_name    VARCHAR(100),
+    avatar_url      VARCHAR(500),
+
+    -- 订阅状态 (缓存，权威数据在 user_subscriptions)
+    tier            VARCHAR(20) DEFAULT 'free',   -- free | paid | premium
+    tier_expires_at TIMESTAMPTZ,
+
+    -- 用量配额 (每日/每月限制)
+    daily_quota     JSONB DEFAULT '{
+        "conversations": 10,
+        "llm_calls": 50
+    }',
+
+    -- 计费汇总 (由 Worker 从 usage_events 定期聚合)
+    billing_summary JSONB DEFAULT '{
+        "current_month": {
+            "llm_calls": 0,
+            "tokens": 0,
+            "cost_usd": 0.0
+        },
+        "lifetime": {
+            "total_conversations": 0,
+            "total_tokens": 0,
+            "total_cost_usd": 0.0
+        }
+    }',
+
+    -- 时间戳
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 认证表
+CREATE TABLE vibe_user_auth (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID REFERENCES vibe_users(id) ON DELETE CASCADE,
+    auth_type       VARCHAR(20) NOT NULL,  -- email | phone | wechat | apple
+    auth_identifier VARCHAR(255) NOT NULL,
+    auth_credential VARCHAR(255),          -- hashed password or token
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (auth_type, auth_identifier)
+);
+
+-- 索引
+CREATE INDEX idx_users_tier ON vibe_users (tier);
+CREATE INDEX idx_users_vibe_id ON vibe_users (vibe_id);
+```
+
+**billing_summary 结构**:
+
+```json
+{
+  "current_month": {
+    "period": "2026-01",
+    "llm_calls": 150,
+    "tokens": 125000,
+    "cost_usd": 0.45,
+    "by_skill": {
+      "bazi": {"calls": 80, "tokens": 60000},
+      "zodiac": {"calls": 70, "tokens": 65000}
+    }
+  },
+  "lifetime": {
+    "total_conversations": 500,
+    "total_tokens": 2500000,
+    "total_cost_usd": 12.50,
+    "first_use": "2025-06-01"
+  }
+}
+```
+
+---
+
+### 3.2 unified_profiles (画像层)
+
+```sql
+CREATE TABLE unified_profiles (
+    user_id     UUID PRIMARY KEY REFERENCES vibe_users(id) ON DELETE CASCADE,
+    profile     JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 历史归档表
+CREATE TABLE unified_profiles_history (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL,
+    profile     JSONB NOT NULL,
+    archived_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_profiles_birth ON unified_profiles USING GIN ((profile -> 'birth_info'));
+CREATE INDEX idx_profiles_history ON unified_profiles_history (user_id, archived_at DESC);
+```
+
+**profile JSONB 结构**:
+
+```json
+{
+  "birth_info": {
+    "date": "1990-05-15",
+    "time": "10:30",
+    "place": "北京",
+    "gender": "male",
+    "timezone": "Asia/Shanghai",
+    "solar_date": "1990-05-15",
+    "lunar_date": "庚午年四月廿一"
+  },
+
+  "skill_data": {
+    "bazi": {
+      "pillars": {
+        "year": {"stem": "庚", "branch": "午"},
+        "month": {"stem": "辛", "branch": "巳"},
+        "day": {"stem": "甲", "branch": "子"},
+        "hour": {"stem": "己", "branch": "巳"}
+      },
+      "day_master": "甲木",
+      "day_master_strength": "身弱",
+      "useful_god": "水",
+      "dayun": [...],
+      "calculated_at": "2026-01-18T10:00:00Z"
+    },
+    "zodiac": {
+      "sun_sign": "金牛座",
+      "moon_sign": "双子座",
+      "rising_sign": "狮子座",
+      "chart": {...},
+      "calculated_at": "2026-01-18T10:00:00Z"
+    }
+  },
+
+  "preferences": {
+    "voice_mode": "warm",
+    "language": "zh-CN",
+    "timezone": "Asia/Shanghai",
+    "notification_time": "08:00",
+    "enable_proactive": true,
+    "enable_fortune_insights": true
+  },
+
+  "life_context": {
+    "current_focus": "职业发展",
+    "career": {
+      "industry": "互联网",
+      "role": "产品经理",
+      "concerns": ["晋升", "转型"]
+    },
+    "relationships": {
+      "status": "已婚",
+      "partner_birth": "1992-03-20"
+    },
+    "health": {},
+    "updated_at": "2026-01-18T10:00:00Z"
+  },
+
+  "extracted": {
+    "facts": ["在北京工作", "有两个孩子"],
+    "concerns": ["职业发展", "子女教育"],
+    "goals": ["今年晋升", "改善睡眠"],
+    "patterns": ["早起型", "决策谨慎"],
+    "extracted_at": "2026-01-18T10:00:00Z"
+  }
+}
+```
+
+---
+
+### 3.3 user_data_store (内容层)
+
+```sql
+CREATE TABLE user_data_store (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    data_type   VARCHAR(50) NOT NULL,   -- goals | plans | checkins | docs | photos
+    data_path   VARCHAR(255) NOT NULL,  -- goals/2026/year, plans/daily/2026-01-18
+    content     JSONB NOT NULL,
+    version     INTEGER DEFAULT 1,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE (user_id, data_path)
+);
+
+-- 索引
+CREATE INDEX idx_data_user_type ON user_data_store (user_id, data_type);
+CREATE INDEX idx_data_user_path ON user_data_store (user_id, data_path);
+CREATE INDEX idx_data_content ON user_data_store USING GIN (content);
+CREATE INDEX idx_data_updated ON user_data_store (user_id, updated_at DESC);
+```
+
+**虚拟文件系统路径规范**:
+
+```
+/users/{user_id}/
+│
+├── goals/                          # 目标数据
+│   ├── 2026/
+│   │   ├── year                    # data_path: "goals/2026/year"
+│   │   ├── q1                      # data_path: "goals/2026/q1"
+│   │   ├── q2
+│   │   └── months/
+│   │       ├── 01                  # data_path: "goals/2026/months/01"
+│   │       └── 02
+│   └── 2025/
+│
+├── plans/                          # 计划数据
+│   └── daily/
+│       ├── 2026-01-18              # data_path: "plans/daily/2026-01-18"
+│       └── 2026-01-19
+│
+├── checkins/                       # 打卡数据
+│   ├── 2026-01-18                  # data_path: "checkins/2026-01-18"
+│   └── 2026-01-19
+│
+├── reflections/                    # 复盘数据
+│   ├── week_01                     # data_path: "reflections/week_01"
+│   └── week_02
+│
+└── docs/                           # 用户文档
+    ├── career_notes                # data_path: "docs/career_notes"
+    └── reading_list
+```
+
+**content 示例**:
+
+```json
+// goals/2026/year
+{
+  "title": "2026年度目标",
+  "level": "year",
+  "status": "active",
+  "progress": 25,
+  "items": [
+    {"id": "g1", "title": "完成 PMP 认证", "status": "in_progress", "deadline": "2026-06-30"},
+    {"id": "g2", "title": "晋升高级产品经理", "status": "pending", "deadline": "2026-12-31"}
+  ],
+  "created_at": "2026-01-01T00:00:00Z"
+}
+
+// checkins/2026-01-18
+{
+  "date": "2026-01-18",
+  "completed_tasks": ["task1", "task2"],
+  "energy": 4,
+  "mood": 4,
+  "reflection": "今天效率很高，完成了主要任务",
+  "highlights": ["完成了季度报告"],
+  "created_at": "2026-01-18T21:30:00Z"
+}
+```
+
+---
+
+### 3.4 user_triggers (主动服务层)
+
+```sql
+CREATE TABLE user_triggers (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+
+    -- 触发类型
+    trigger_type    VARCHAR(50) NOT NULL,  -- reminder | condition | schedule
+
+    -- 触发内容
+    title           VARCHAR(255) NOT NULL,
+    description     TEXT,
+    action          JSONB NOT NULL DEFAULT '{}',
+
+    -- 调度配置 (for reminder/schedule)
+    schedule        VARCHAR(100),           -- cron 表达式 或 HH:MM
+    schedule_type   VARCHAR(20),            -- once | daily | weekly | cron
+    next_trigger_at TIMESTAMPTZ,
+    last_triggered  TIMESTAMPTZ,
+
+    -- 条件配置 (for condition trigger)
+    condition       JSONB,
+
+    -- 关联
+    source_skill    VARCHAR(50),            -- 来源 skill
+    source_path     VARCHAR(255),           -- 关联的 user_data_store path
+
+    -- 状态
+    status          VARCHAR(20) DEFAULT 'active',  -- active | paused | completed | cancelled
+    trigger_count   INTEGER DEFAULT 0,
+    metadata        JSONB DEFAULT '{}',
+
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_trigger_user_status ON user_triggers (user_id, status);
+CREATE INDEX idx_trigger_next ON user_triggers (next_trigger_at) WHERE status = 'active';
+CREATE INDEX idx_trigger_type ON user_triggers (trigger_type, status);
+```
+
+**trigger_type 说明**:
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| reminder | 定时提醒 | 每天早8点提醒查看目标 |
+| condition | 条件触发 | 连续打卡7天触发庆祝 |
+| schedule | 定时任务 | 每周日生成周报 |
+
+**action JSONB 示例**:
+
+```json
+// 提醒类
+{
+  "type": "proactive_message",
+  "template": "daily_plan_reminder",
+  "params": {
+    "greeting": "新的一天开始了！来看看今天的计划吧",
+    "include_fortune": true
+  }
+}
+
+// 数据操作类
+{
+  "type": "generate_content",
+  "template": "weekly_reflection",
+  "params": {
+    "output_path": "reflections/week_{week_number}"
+  }
+}
+
+// 庆祝类
+{
+  "type": "celebration",
+  "template": "streak_milestone",
+  "params": {
+    "milestone": 7,
+    "badge": "一周坚持"
+  }
+}
+```
+
+**condition JSONB 示例**:
+
+```json
+// 连续打卡触发
+{
+  "type": "streak",
+  "check_path": "checkins/*",
+  "rule": {"streak_days": {"$gte": 7}}
+}
+
+// 目标即将到期触发
+{
+  "type": "deadline",
+  "check_path": "goals/2026/*",
+  "rule": {"days_until_deadline": {"$lte": 7}}
+}
+
+// 数据变化触发
+{
+  "type": "data_change",
+  "watch_path": "goals/2026/year",
+  "rule": {"progress": {"$gte": 100}}
+}
+```
+
+---
+
+## 4. 辅助表 (保持不变)
+
+### 4.1 usage_events (用量事件流)
+
+```sql
+CREATE TABLE usage_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL,
+    event_type      VARCHAR(50) NOT NULL,  -- llm_call | skill_use | tool_call | conversation
+    model           VARCHAR(100),
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    estimated_cost  DECIMAL(10, 6) DEFAULT 0,
+    skill_id        VARCHAR(50),
+    tool_name       VARCHAR(100),
+    conversation_id UUID,
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 分区表 (按月)
+-- 索引
+CREATE INDEX idx_usage_user_date ON usage_events (user_id, created_at);
+CREATE INDEX idx_usage_skill ON usage_events (skill_id, created_at);
+```
+
+### 4.2 user_subscriptions (订阅管理)
+
+```sql
+CREATE TABLE user_subscriptions (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id                 UUID NOT NULL REFERENCES vibe_users(id),
+    plan_id                 VARCHAR(50) NOT NULL,
+    status                  VARCHAR(20) DEFAULT 'active',
+    source_skill            VARCHAR(50),
+    source_campaign         VARCHAR(100),
+    payment_provider        VARCHAR(50),
+    payment_subscription_id VARCHAR(255),
+    started_at              TIMESTAMPTZ DEFAULT NOW(),
+    current_period_end      TIMESTAMPTZ,
+    cancelled_at            TIMESTAMPTZ
+);
+```
+
+---
+
+## 5. 数据流向图
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                              数据流向                                       │
+└────────────────────────────────────────────────────────────────────────────┘
+
+  用户请求
+     │
+     ▼
+┌────────────┐    配额检查     ┌────────────────┐
+│  API 层    │───────────────►│   vibe_users   │
+└────────────┘                 │ tier + quota   │
+     │                         └────────────────┘
+     │ 获取 Profile                    │
+     ▼                                 │ 用量累计
+┌────────────────┐            ┌────────┴───────┐
+│ Profile Cache  │◄───────────│unified_profiles│
+│  (Redis/内存)   │            │  (画像数据)     │
+└────────────────┘            └────────────────┘
+     │
+     │ Agent 执行
+     ▼
+┌────────────┐   读写用户数据   ┌────────────────┐
+│ CoreAgent  │◄──────────────►│ user_data_store│
+│            │                 │  (内容数据)     │
+└────────────┘                 └────────────────┘
+     │
+     │ 创建触发器
+     ▼
+┌────────────────┐
+│ user_triggers  │◄───────────  ProactiveEngine 扫描
+│  (主动服务)     │
+└────────────────┘
+     │
+     │ 触发时
+     ▼
+┌────────────────┐
+│ Notification   │───────────►  推送到用户
+│   Service      │
+└────────────────┘
+     │
+     ▼
+┌────────────────┐
+│ usage_events   │◄───────────  记录所有用量
+│  (计费事件流)   │
+└────────────────┘
+     │
+     ▼ (每日聚合 Worker)
+┌────────────────┐
+│ vibe_users     │
+│.billing_summary│
+└────────────────┘
+```
+
+---
+
+## 6. 主动服务流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         主动服务架构 (Proactive Service)                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│   ┌─────────────┐     ┌─────────────────┐     ┌─────────────────────────┐   │
+│   │   Cron Job  │────►│ ProactiveEngine │────►│    TriggerDetector      │   │
+│   │ (每分钟跑)  │     │   (engine.py)   │     │  (trigger_detector.py)  │   │
+│   └─────────────┘     └────────┬────────┘     └──────────────┬──────────┘   │
+│                                │                              │              │
+│                                │                              │ 检查触发条件 │
+│                                │                              ▼              │
+│                    ┌───────────┴───────────┐  ┌─────────────────────────┐   │
+│                    │                       │  │     user_triggers       │   │
+│                    │                       │  │ • reminder (定时提醒)   │   │
+│                    │                       │  │ • condition (条件触发)  │   │
+│                    │                       │  │ • schedule (定时任务)   │   │
+│                    │                       │  └─────────────────────────┘   │
+│                    │                       │              │                  │
+│                    ▼                       ▼              ▼                  │
+│        ┌─────────────────────┐ ┌─────────────────────────────────────────┐  │
+│        │  ContentGenerator   │ │           ActionExecutor                 │  │
+│        │ (生成个性化内容)     │ │  • proactive_message → 推送消息          │  │
+│        └──────────┬──────────┘ │  • generate_content → 生成内容           │  │
+│                   │            │  • celebration → 庆祝动画                 │  │
+│                   │            │  • data_update → 更新数据                 │  │
+│                   │            └─────────────────────────────────────────┘  │
+│                   │                              │                           │
+│                   ▼                              ▼                           │
+│        ┌─────────────────────────────────────────────────────────────────┐  │
+│        │                    NotificationService                           │  │
+│        │                    (notification.py)                             │  │
+│        ├─────────────────────────────────────────────────────────────────┤  │
+│        │  • 保存到 notifications 表                                       │  │
+│        │  • 推送到 APNs / FCM (移动端)                                    │  │
+│        │  • WebSocket 实时推送 (Web端)                                    │  │
+│        └─────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. 系统提醒 vs 用户触发器
+
+| 类型 | 来源 | 存储 | 示例 |
+|------|------|------|------|
+| **系统提醒** | reminders.yaml 配置 | 代码定义 | 每日早报、每日打卡提醒 |
+| **用户触发器** | 用户通过对话创建 | user_triggers 表 | "每天8点提醒我看目标" |
+| **条件触发器** | 系统根据规则创建 | user_triggers 表 | 连续打卡7天庆祝 |
+
+---
+
+## 8. 删除的表
+
+| 表名 | 状态 | 原因 |
+|------|------|------|
+| `skill_profiles` | **删除** | 合并到 unified_profiles.skill_data |
+| `user_reminders` | **升级** | 升级为 user_triggers，增加条件触发能力 |
+
+---
+
+## 9. 关键设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 计费数据位置 | vibe_users.billing_summary | 配额检查高频读取，汇总缓存避免聚合 |
+| skill_data 位置 | unified_profiles | 是用户画像的一部分，Skill 间共享 |
+| goal_tracking | 移到 user_data_store | 它是内容数据，不是画像元数据 |
+| reminders 升级 | user_triggers | 支持条件触发，更强大的主动服务能力 |
+| Profile 存储 | JSONB 单字段 | 灵活扩展，无需频繁 DDL |
+| 用户数据存储 | 虚拟文件路径 | 支持层级结构，易于理解和查询 |
+| 版本控制 | 乐观锁 (version) | 防止并发写入冲突 |
+
+---
+
+## 10. 迁移检查清单
+
+- [ ] 添加 vibe_users.tier, daily_quota, billing_summary 字段
+- [ ] 创建 user_triggers 表
+- [ ] 迁移 user_reminders 数据到 user_triggers
+- [ ] 将 skill_profiles.profile_data 合并到 unified_profiles.skill_data
+- [ ] 删除 skill_profiles 表
+- [ ] 更新 UnifiedProfileRepository
+- [ ] 创建 TriggerService 替代 ReminderService
+- [ ] 创建计费汇总 Worker

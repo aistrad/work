@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Comprehensive verification for Migration 023 fixes
+Tests all critical issues identified by Vibe Review
+"""
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from datetime import datetime
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stores.db import get_connection
+from stores.user_repo import UserRepository
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+async def test_forward_trigger():
+    """Test: Forward trigger (vibe_users → unified_profiles)"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Test 1: Forward Trigger Sync")
+    logger.info("=" * 60)
+
+    try:
+        async with get_connection() as conn:
+            # Get a test user
+            user = await conn.fetchrow("SELECT id, vibe_id, status, tier FROM vibe_users LIMIT 1")
+            if not user:
+                logger.warning("No users found, skipping test")
+                return False
+
+            user_id = user['id']
+            original_status = user['status']
+
+            # Update vibe_users
+            new_status = 'pending_deletion' if original_status == 'active' else 'active'
+            logger.info(f"Updating vibe_users.status: {original_status} → {new_status}")
+
+            await conn.execute(
+                "UPDATE vibe_users SET status = $1 WHERE id = $2",
+                new_status, user_id
+            )
+
+            # Check if synced to unified_profiles
+            profile_status = await conn.fetchval(
+                "SELECT profile->'account'->>'status' FROM unified_profiles WHERE user_id = $1",
+                user_id
+            )
+
+            # Restore original status
+            await conn.execute(
+                "UPDATE vibe_users SET status = $1 WHERE id = $2",
+                original_status, user_id
+            )
+
+            if profile_status == new_status:
+                logger.info(f"✅ Forward trigger working! Status synced: {new_status}")
+                return True
+            else:
+                logger.error(f"❌ Forward trigger failed! Expected: {new_status}, Got: {profile_status}")
+                return False
+
+    except Exception as e:
+        logger.exception(f"Forward trigger test failed: {e}")
+        return False
+
+
+async def test_reverse_trigger():
+    """Test: Reverse trigger (unified_profiles → vibe_users)"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Test 2: Reverse Trigger Sync")
+    logger.info("=" * 60)
+
+    try:
+        async with get_connection() as conn:
+            # Get a test user
+            user = await conn.fetchrow("SELECT id, status FROM vibe_users LIMIT 1")
+            if not user:
+                logger.warning("No users found, skipping test")
+                return False
+
+            user_id = user['id']
+            original_status = user['status']
+
+            # Update unified_profiles
+            new_status = 'pending_deletion' if original_status == 'active' else 'active'
+            logger.info(f"Updating unified_profiles.account.status: {original_status} → {new_status}")
+
+            await conn.execute(
+                """
+                UPDATE unified_profiles
+                SET profile = jsonb_set(profile, '{account, status}', to_jsonb($1::text))
+                WHERE user_id = $2
+                """,
+                new_status, user_id
+            )
+
+            # Check if synced to vibe_users
+            vu_status = await conn.fetchval(
+                "SELECT status FROM vibe_users WHERE id = $1",
+                user_id
+            )
+
+            # Restore original status
+            await conn.execute(
+                """
+                UPDATE unified_profiles
+                SET profile = jsonb_set(profile, '{account, status}', to_jsonb($1::text))
+                WHERE user_id = $2
+                """,
+                original_status, user_id
+            )
+
+            if vu_status == new_status:
+                logger.info(f"✅ Reverse trigger working! Status synced: {new_status}")
+                return True
+            else:
+                logger.error(f"❌ Reverse trigger failed! Expected: {new_status}, Got: {vu_status}")
+                return False
+
+    except Exception as e:
+        logger.exception(f"Reverse trigger test failed: {e}")
+        return False
+
+
+async def test_user_creation():
+    """Test: New user creation flow"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Test 3: User Creation Flow")
+    logger.info("=" * 60)
+
+    try:
+        # Create user
+        logger.info("Creating new user...")
+        user = await UserRepository.create(
+            display_name="Test User",
+            timezone="Asia/Shanghai",
+            language="zh-CN"
+        )
+
+        user_id = user['id']
+        logger.info(f"✓ User created: {user['vibe_id']}")
+
+        # Verify vibe_users
+        logger.info("Verifying vibe_users record...")
+        async with get_connection() as conn:
+            vu_row = await conn.fetchrow("SELECT * FROM vibe_users WHERE id = $1", user_id)
+            assert vu_row['vibe_id'] == user['vibe_id']
+            assert vu_row['status'] == 'active'
+            assert vu_row['tier'] == 'free'
+            logger.info("✓ vibe_users record correct")
+
+            # Verify unified_profiles
+            logger.info("Verifying unified_profiles record...")
+            up_row = await conn.fetchrow("SELECT profile FROM unified_profiles WHERE user_id = $1", user_id)
+            assert up_row is not None
+            import json
+            profile = json.loads(up_row['profile']) if isinstance(up_row['profile'], str) else up_row['profile']
+            assert profile['account']['vibe_id'] == user['vibe_id']
+            assert profile['account']['display_name'] == "Test User"
+            assert profile['preferences']['timezone'] == "Asia/Shanghai"
+            logger.info("✓ unified_profiles record correct")
+
+            # Cleanup
+            logger.info("Cleaning up test user...")
+            await conn.execute("DELETE FROM unified_profiles WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM vibe_users WHERE id = $1", user_id)
+
+        logger.info("✅ User creation flow working!")
+        return True
+
+    except Exception as e:
+        logger.exception(f"User creation test failed: {e}")
+        return False
+
+
+async def test_trigger_existence():
+    """Test: Verify all required triggers exist"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Test 4: Trigger Existence")
+    logger.info("=" * 60)
+
+    try:
+        async with get_connection() as conn:
+            triggers = await conn.fetch("""
+                SELECT
+                    t.tgname,
+                    p.proname AS function_name,
+                    c.relname AS table_name
+                FROM pg_trigger t
+                JOIN pg_proc p ON t.tgfoid = p.oid
+                JOIN pg_class c ON t.tgrelid = c.oid
+                WHERE NOT t.tgisinternal
+                AND c.relname IN ('vibe_users', 'unified_profiles')
+                ORDER BY c.relname, t.tgname
+            """)
+
+            logger.info(f"Found {len(triggers)} triggers:")
+            for t in triggers:
+                logger.info(f"  - {t['table_name']}.{t['tgname']} → {t['function_name']}")
+
+            # Check required triggers
+            trigger_names = {t['tgname'] for t in triggers}
+            required = {
+                'trigger_sync_core_to_profile',  # Forward sync
+                'trigger_sync_status_from_profile',  # Reverse sync
+                'trg_init_skill_subscriptions'  # Skill init
+            }
+
+            missing = required - trigger_names
+            if missing:
+                logger.error(f"❌ Missing triggers: {missing}")
+                return False
+
+            logger.info("✅ All required triggers exist!")
+            return True
+
+    except Exception as e:
+        logger.exception(f"Trigger check failed: {e}")
+        return False
+
+
+async def test_schema_validation():
+    """Test: Verify schema structure"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Test 5: Schema Validation")
+    logger.info("=" * 60)
+
+    try:
+        async with get_connection() as conn:
+            # Check vibe_users columns
+            vu_cols = await conn.fetch("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'vibe_users'
+                ORDER BY ordinal_position
+            """)
+
+            col_names = [c['column_name'] for c in vu_cols]
+            expected_cols = ['id', 'vibe_id', 'status', 'tier', 'daily_quota', 'billing_summary', 'created_at', 'updated_at']
+
+            logger.info(f"vibe_users columns ({len(col_names)}): {col_names}")
+
+            if len(col_names) == 8 and set(col_names) == set(expected_cols):
+                logger.info("✅ vibe_users schema correct (8 columns)")
+                return True
+            else:
+                logger.error(f"❌ Schema mismatch! Expected: {expected_cols}")
+                return False
+
+    except Exception as e:
+        logger.exception(f"Schema validation failed: {e}")
+        return False
+
+
+async def main():
+    """Run all tests"""
+    logger.info("=" * 60)
+    logger.info("Comprehensive Verification for Migration 023")
+    logger.info("=" * 60)
+
+    tests = [
+        ("Schema Validation", test_schema_validation()),
+        ("Trigger Existence", test_trigger_existence()),
+        ("Forward Trigger Sync", test_forward_trigger()),
+        ("Reverse Trigger Sync", test_reverse_trigger()),
+        ("User Creation Flow", test_user_creation())
+    ]
+
+    results = []
+    for name, test in tests:
+        try:
+            result = await test
+            results.append((name, result))
+        except Exception as e:
+            logger.exception(f"{name} failed with exception")
+            results.append((name, False))
+
+    # Summary
+    logger.info("\n" + "=" * 60)
+    logger.info("Test Summary")
+    logger.info("=" * 60)
+
+    passed = 0
+    failed = 0
+    for name, result in results:
+        status = "✅ PASS" if result else "❌ FAIL"
+        logger.info(f"{status}: {name}")
+        if result:
+            passed += 1
+        else:
+            failed += 1
+
+    logger.info("\n" + "=" * 60)
+    if failed == 0:
+        logger.info(f"✅ All tests passed! ({passed}/{len(results)})")
+        logger.info("=" * 60)
+        logger.info("\nMigration 023 fixes verified successfully!")
+        logger.info("All critical issues have been resolved.")
+        return 0
+    else:
+        logger.error(f"❌ Some tests failed! ({passed} passed, {failed} failed)")
+        logger.error("=" * 60)
+        return 1
+
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    exit(exit_code)

@@ -1,0 +1,518 @@
+     1→"""
+     2→CoreAgent v6 - 支持 Scenario 路由和 PostgreSQL 知识检索的智能体
+     3→
+     4→v6 架构特性：
+     5→- Scenario 路由：根据用户消息匹配最佳场景
+     6→- PostgreSQL 知识检索：RAG + 案例匹配
+     7→- 7 阶段 SOP：P1-P2 强制，P3-P7 LLM 自由发挥
+     8→- 工具-卡片映射：标准化工具元数据
+     9→"""
+    10→import json
+    11→import logging
+    12→from typing import Optional, List, Dict, Any, AsyncGenerator
+    13→from dataclasses import dataclass
+    14→from enum import Enum
+    15→
+    16→from services.llm import LLMClient, get_llm_client
+    17→from services.llm.client import LLMMessage
+    18→from services.knowledge.repository import get_knowledge_repository, KnowledgeRepository
+    19→from .skill_loader import (
+    20→    load_skill, load_scenario, get_skill_triggers,
+    21→    build_system_prompt, SkillConfig, ScenarioConfig,
+    22→    route_scenario as memory_route_scenario
+    23→)
+    24→from .sop_engine import SOPEngine, SOPAction, SOPPhase, check_sop_requirements
+    25→from .tools import get_tools_for_scenario, ToolRegistry
+    26→
+    27→logger = logging.getLogger(__name__)
+    28→
+    29→
+    30→class AgentState(str, Enum):
+    31→    """Agent 执行状态"""
+    32→    IDLE = "idle"
+    33→    THINKING = "thinking"
+    34→    TOOL_CALLING = "tool_calling"
+    35→    COMPLETED = "completed"
+    36→    ERROR = "error"
+    37→
+    38→
+    39→@dataclass
+    40→class AgentEvent:
+    41→    """Agent 执行事件"""
+    42→    type: str  # thinking, content, tool_call, tool_result, done, error, sop_phase
+    43→    data: Any = None
+    44→
+    45→
+    46→@dataclass
+    47→class AgentContext:
+    48→    """Agent 执行上下文"""
+    49→    user_id: str
+    50→    user_tier: str = "free"
+    51→    profile: Optional[Dict[str, Any]] = None
+    52→    skill_data: Optional[Dict[str, Any]] = None
+    53→    history: Optional[List[Dict[str, str]]] = None
+    54→    skill: Optional[str] = None
+    55→    scenario: Optional[str] = None
+    56→    portrait: Optional[str] = None
+    57→    conversation_id: Optional[str] = None
+    58→
+    59→
+    60→# Skill 选择工具 - V6 架构：一次决定 skill + scenario + confidence
+    61→USE_SKILL_TOOL = {
+    62→    "type": "function",
+    63→    "function": {
+    64→        "name": "use_skill",
+    65→        "description": """激活专业技能来回答用户问题。一次决定 skill、scenario 和 confidence。
+    66→
+    67→## Skill 路由
+    68→- 八字、命理、生辰、测算、算命、命盘 → skill: "bazi"
+    69→- 星座、星盘、占星、行星、上升 → skill: "zodiac"
+    70→- 职业、工作、跳槽、升职、创业 → skill: "career"
+    71→- 塔罗、牌阵、抽牌、占卜 → skill: "tarot"
+    72→
+    73→## Bazi Scenario 目录
+    74→- basic_reading: 基础命盘解读（默认）
+    75→- career: 事业财运分析
+    76→- relationship: 感情婚姻分析
+    77→- compatibility: 八字合婚配对
+    78→- yearly_fortune: 流年运势预测
+    79→- timing: 择日择时
+    80→- wealth: 财运投资分析
+    81→- personality: 性格特质分析
+    82→- life_blueprint: 人生蓝图规划
+    83→- dayun: 大运分析
+    84→- quick_query: 快速问答
+    85→
+    86→## Confidence 说明
+    87→- high: 用户意图明确，直接执行
+    88→- medium: 基本确定，可能需要追问细节
+    89→- low: 不确定，需要向用户确认
+    90→
+    91→重要：如果用户消息中已经包含了出生信息，设置 birth_info_provided=true。""",
+    92→        "parameters": {
+    93→            "type": "object",
+    94→            "properties": {
+    95→                "skill": {
+    96→                    "type": "string",
+    97→                    "enum": ["bazi", "zodiac", "career", "tarot"],
+    98→                    "description": "要使用的技能"
+    99→                },
+   100→                "scenario": {
+   101→                    "type": "string",
+   102→                    "description": "场景 ID，参考上方场景目录"
+   103→                },
+   104→                "confidence": {
+   105→                    "type": "string",
+   106→                    "enum": ["high", "medium", "low"],
+   107→                    "description": "路由置信度"
+   108→                },
+   109→                "topic": {
+   110→                    "type": "string",
+   111→                    "enum": ["career", "relationship", "fortune", "health", "self", "general"],
+   112→                    "description": "用户关注的话题类型"
+   113→                },
+   114→                "birth_info_provided": {
+   115→                    "type": "boolean",
+   116→                    "description": "用户消息中是否已包含出生信息"
+   117→                }
+   118→            },
+   119→            "required": ["skill", "scenario", "confidence"]
+   120→        }
+   121→    }
+   122→}
+   123→
+   124→
+   125→class CoreAgent:
+   126→    """
+   127→    CoreAgent v6 - 支持 Scenario 路由和 PostgreSQL 知识检索
+   128→
+   129→    Features:
+   130→    - Scenario routing via PostgreSQL
+   131→    - Knowledge retrieval (RAG + cases)
+   132→    - 7-phase SOP execution
+   133→    - Tool-card mapping
+   134→    """
+   135→
+   136→    def __init__(
+   137→        self,
+   138→        llm: Optional[LLMClient] = None,
+   139→        max_iterations: int = 10,
+   140→        knowledge_repo: Optional[KnowledgeRepository] = None
+   141→    ):
+   142→        self.llm = llm or get_llm_client()
+   143→        self.max_iterations = max_iterations
+   144→        self.knowledge_repo = knowledge_repo or get_knowledge_repository()
+   145→        self.state = AgentState.IDLE
+   146→        self._active_skill: Optional[str] = None
+   147→        self._active_scenario: Optional[str] = None
+   148→        self._topic: Optional[str] = None
+   149→        self._current_message: str = ""
+   150→
+   151→    @property
+   152→    def usage(self) -> Dict[str, int]:
+   153→        """获取 LLM 使用统计"""
+   154→        return self.llm.usage
+   155→
+   156→    async def run(
+   157→        self,
+   158→        message: str,
+   159→        context: AgentContext
+   160→    ) -> AsyncGenerator[AgentEvent, None]:
+   161→        """执行 Agent 循环"""
+   162→        self.state = AgentState.IDLE
+   163→        self._current_message = message
+   164→
+   165→        # 使用前端指定的 skill/scenario，或让 LLM 决定
+   166→        if context.skill:
+   167→            self._active_skill = context.skill
+   168→            self._active_scenario = context.scenario or await self._route_scenario(context.skill, message)
+   169→        else:
+   170→            self._active_skill = None
+   171→            self._active_scenario = None
+   172→
+   173→        # 检查 SOP 要求
+   174→        if self._active_skill:
+   175→            action, sop_context = check_sop_requirements(
+   176→                skill_id=self._active_skill,
+   177→                scenario_id=self._active_scenario,
+   178→                profile=context.profile,
+   179→                skill_data=context.skill_data,
+   180→                message=message
+   181→            )
+   182→
+   183→            yield AgentEvent(type="sop_phase", data={
+   184→                "skill": self._active_skill,
+   185→                "scenario": self._active_scenario,
+   186→                "action": action.value,
+   187→                "phase": sop_context.get("phase", SOPPhase.ANALYZE).value,
+   188→                "context": sop_context
+   189→            })
+   190→
+   191→        # 构建初始消息
+   192→        messages = await self._build_initial_messages(message, context)
+   193→
+   194→        for iteration in range(self.max_iterations):
+   195→            self.state = AgentState.THINKING
+   196→            yield AgentEvent(type="thinking", data={"iteration": iteration})
+   197→
+   198→            tools = self._get_current_tools(context)
+   199→
+   200→            try:
+   201→                content_buffer = ""
+   202→                tool_calls = []
+   203→
+   204→                async for chunk in self.llm.stream(
+   205→                    messages=messages,
+   206→                    tools=tools,
+   207→                    tool_choice=None,
+   208→                    user_tier=context.user_tier
+   209→                ):
+   210→                    if chunk["type"] == "content":
+   211→                        content_buffer += chunk["content"]
+   212→                        yield AgentEvent(type="content", data={"content": chunk["content"]})
+   213→                    elif chunk["type"] == "tool_call":
+   214→                        tool_calls.append(chunk)
+   215→
+   216→                if tool_calls:
+   217→                    self.state = AgentState.TOOL_CALLING
+   218→
+   219→                    assistant_tool_calls = []
+   220→                    for tc in tool_calls:
+   221→                        assistant_tool_calls.append({
+   222→                            "id": tc["tool_call_id"],
+   223→                            "function": {
+   224→                                "name": tc["tool_name"],
+   225→                                "arguments": tc["tool_args"]
+   226→                            }
+   227→                        })
+   228→                    messages.append(LLMMessage(
+   229→                        role="assistant",
+   230→                        content=content_buffer or "",
+   231→                        tool_calls=assistant_tool_calls
+   232→                    ))
+   233→                    content_buffer = ""
+   234→
+   235→                    tool_results = []
+   236→                    for tc in tool_calls:
+   237→                        tool_name = tc["tool_name"]
+   238→                        tool_args = tc["tool_args"]
+   239→                        tool_call_id = tc["tool_call_id"]
+   240→
+   241→                        yield AgentEvent(type="tool_call", data={
+   242→                            "id": tool_call_id,
+   243→                            "name": tool_name,
+   244→                            "arguments": tool_args
+   245→                        })
+   246→
+   247→                        result = await self._execute_tool(tool_name, tool_args, context)
+   248→                        tool_results.append({
+   249→                            "tool_call_id": tool_call_id,
+   250→                            "result": result
+   251→                        })
+   252→
+   253→                        yield AgentEvent(type="tool_result", data={
+   254→                            "id": tool_call_id,
+   255→                            "name": tool_name,
+   256→                            "result": result
+   257→                        })
+   258→
+   259→                    for tr in tool_results:
+   260→                        result_content = tr["result"]
+   261→                        if isinstance(result_content, dict):
+   262→                            result_content = json.dumps(result_content, ensure_ascii=False)
+   263→                        messages.append(LLMMessage(
+   264→                            role="tool",
+   265→                            content=str(result_content),
+   266→                            tool_call_id=tr["tool_call_id"]
+   267→                        ))
+   268→                else:
+   269→                    self.state = AgentState.COMPLETED
+   270→                    yield AgentEvent(type="done", data={"content": content_buffer})
+   271→                    return
+   272→
+   273→            except Exception as e:
+   274→                self.state = AgentState.ERROR
+   275→                logger.error(f"Agent error: {e}")
+   276→                yield AgentEvent(type="error", data={"error": str(e)})
+   277→                return
+   278→
+   279→        self.state = AgentState.COMPLETED
+   280→        yield AgentEvent(type="done", data={"max_iterations_reached": True})
+   281→
+   282→    async def _route_scenario(self, skill_id: str, message: str) -> Optional[str]:
+   283→        """场景路由 - 根据消息匹配最佳场景"""
+   284→        try:
+   285→            matches = await self.knowledge_repo.route_scenario(skill_id, message)
+   286→            if matches:
+   287→                return matches[0].scenario_id
+   288→        except Exception as e:
+   289→            logger.warning(f"Scenario routing failed: {e}")
+   290→
+   291→        # 回退到默认场景
+   292→        skill = load_skill(skill_id)
+   293→        return skill.default_scenario if skill else "basic_reading"
+   294→
+   295→    async def _build_initial_messages(
+   296→        self,
+   297→        message: str,
+   298→        context: AgentContext
+   299→    ) -> List[LLMMessage]:
+   300→        """构建初始消息列表"""
+   301→        system_prompt = await self._build_system_prompt(message, context)
+   302→
+   303→        messages = [LLMMessage(role="system", content=system_prompt)]
+   304→
+   305→        if context.history:
+   306→            for msg in context.history[-10:]:
+   307→                messages.append(LLMMessage(
+   308→                    role=msg.get("role", "user"),
+   309→                    content=msg.get("content", "")
+   310→                ))
+   311→
+   312→        messages.append(LLMMessage(role="user", content=message))
+   313→        return messages
+   314→
+   315→    async def _build_system_prompt(self, message: str, context: AgentContext) -> str:
+   316→        """构建 System Prompt"""
+   317→        parts = []
+   318→
+   319→        # 基础 prompt
+   320→        if self._active_skill:
+   321→            user_ctx = {
+   322→                "birth_info": context.profile.get("birth_info") if context.profile else None,
+   323→                "portrait": context.portrait
+   324→            }
+   325→            base_prompt = build_system_prompt(
+   326→                self._active_skill,
+   327→                self._active_scenario,
+   328→                user_ctx
+   329→            )
+   330→            parts.append(base_prompt)
+   331→
+   332→            # 知识检索
+   333→            try:
+   334→                knowledge = await self.knowledge_repo.search_knowledge(
+   335→                    self._active_skill, message, top_k=5
+   336→                )
+   337→                if knowledge:
+   338→                    knowledge_text = "\n## 相关知识\n\n"
+   339→                    for chunk in knowledge:
+   340→                        knowledge_text += f"**{chunk.book_name}** ({chunk.chapter or ''})\n{chunk.chunk_text[:500]}...\n\n"
+   341→                    parts.append(knowledge_text)
+   342→            except Exception as e:
+   343→                logger.warning(f"Knowledge retrieval failed: {e}")
+   344→
+   345→            # 案例匹配
+   346→            try:
+   347→                cases = await self.knowledge_repo.match_cases(
+   348→                    self._active_skill,
+   349→                    scenario_id=self._active_scenario,
+   350→                    top_k=2
+   351→                )
+   352→                if cases:
+   353→                    cases_text = "\n## 相关案例\n\n"
+   354→                    for case in cases:
+   355→                        cases_text += f"**{case.name}**\n{json.dumps(case.conclusion, ensure_ascii=False)}\n\n"
+   356→                    parts.append(cases_text)
+   357→            except Exception as e:
+   358→                logger.warning(f"Case matching failed: {e}")
+   359→        else:
+   360→            # 无 skill 时，添加触发规则
+   361→            triggers = get_skill_triggers()
+   362→            if triggers:
+   363→                trigger_rules = "## 技能触发规则\n\n当用户消息包含以下关键词时，调用 `use_skill` 工具：\n"
+   364→                for skill_name, keywords in triggers.items():
+   365→                    trigger_rules += f"- **{skill_name}**: {', '.join(keywords)}\n"
+   366→                parts.append(trigger_rules)
+   367→
+   368→        # 用户命盘数据
+   369→        if context.skill_data and self._active_skill:
+   370→            skill_data = context.skill_data.get(self._active_skill, {})
+   371→            if skill_data:
+   372→                parts.append(f"\n## 用户命盘数据\n{json.dumps(skill_data, ensure_ascii=False, indent=2)}")
+   373→
+   374→        return "\n".join(parts)
+   375→
+   376→    def _get_current_tools(self, context: AgentContext) -> List[Dict[str, Any]]:
+   377→        """获取当前可用工具"""
+   378→        if not context.skill and not self._active_skill:
+   379→            return [USE_SKILL_TOOL]
+   380→
+   381→        skill_id = self._active_skill or context.skill
+   382→        scenario_id = self._active_scenario or context.scenario
+   383→
+   384→        tools = get_tools_for_scenario(skill_id, scenario_id)
+   385→        return tools if tools else [USE_SKILL_TOOL]
+   386→
+   387→    async def _execute_tool(
+   388→        self,
+   389→        tool_name: str,
+   390→        tool_args: str,
+   391→        context: AgentContext
+   392→    ) -> Dict[str, Any]:
+   393→        """执行工具调用"""
+   394→        try:
+   395→            args = json.loads(tool_args) if tool_args else {}
+   396→        except json.JSONDecodeError:
+   397→            args = {}
+   398→
+   399→        if tool_name == "use_skill":
+   400→            return await self._handle_use_skill(args, context)
+   401→
+   402→        if tool_name == "search_db":
+   403→            return await self._handle_search_db(args, context)
+   404→
+   405→        if tool_name == "ask_user_question":
+   406→            return {"status": "question", "question": args.get("question"), "options": args.get("options", [])}
+   407→
+   408→        # UI 工具
+   409→        from services.vibe_engine.tool_executor import execute_ui_tool, is_ui_tool
+   410→        if is_ui_tool(tool_name):
+   411→            return await execute_ui_tool(
+   412→                tool_name=tool_name,
+   413→                args=args,
+   414→                user_id=context.user_id,
+   415→                profile=context.profile,
+   416→                skill=self._active_skill or "bazi",
+   417→                skill_data=context.skill_data
+   418→            )
+   419→
+   420→        return {"status": "unknown_tool", "tool": tool_name}
+   421→
+   422→    async def _handle_search_db(
+   423→        self,
+   424→        args: Dict[str, Any],
+   425→        context: AgentContext
+   426→    ) -> Dict[str, Any]:
+   427→        """处理 search_db 工具调用"""
+   428→        table = args.get("table", "knowledge_chunks")
+   429→        query = args.get("query", "")
+   430→        filters = args.get("filters", {})
+   431→        top_k = args.get("top_k", 5)
+   432→
+   433→        # 自动添加当前 skill_id 到 filters
+   434→        if self._active_skill and "skill_id" not in filters:
+   435→            filters["skill_id"] = self._active_skill
+   436→        if self._active_scenario and "scenario_id" not in filters:
+   437→            filters["scenario_id"] = self._active_scenario
+   438→
+   439→        results = await self.knowledge_repo.search_db(
+   440→            table=table,
+   441→            query=query,
+   442→            filters=filters,
+   443→            top_k=top_k
+   444→        )
+   445→
+   446→        return {
+   447→            "status": "success",
+   448→            "table": table,
+   449→            "query": query,
+   450→            "count": len(results),
+   451→            "results": results
+   452→        }
+   453→
+   454→    async def _handle_use_skill(
+   455→        self,
+   456→        args: Dict[str, Any],
+   457→        context: AgentContext
+   458→    ) -> Dict[str, Any]:
+   459→        """处理 skill 选择 - V6: 一次决定 skill + scenario + confidence"""
+   460→        skill = args.get("skill")
+   461→        scenario = args.get("scenario", "basic_reading")
+   462→        confidence = args.get("confidence", "high")
+   463→        topic = args.get("topic", "general")
+   464→
+   465→        if not skill:
+   466→            return {"status": "error", "message": "No skill specified"}
+   467→
+   468→        self._active_skill = skill
+   469→        self._active_scenario = scenario
+   470→        self._topic = topic
+   471→
+   472→        # 低置信度时，返回确认请求
+   473→        if confidence == "low":
+   474→            return {
+   475→                "status": "need_confirm",
+   476→                "skill": skill,
+   477→                "scenario": scenario,
+   478→                "confidence": confidence,
+   479→                "message": f"我理解您可能想使用 {skill} 的 {scenario} 服务，请确认是否正确？"
+   480→            }
+   481→
+   482→        # 检查是否需要出生信息
+   483→        needs_birth = skill in ["bazi", "zodiac"]
+   484→        has_birth = context.profile and context.profile.get("birth_info")
+   485→        birth_provided = args.get("birth_info_provided", False)
+   486→
+   487→        if needs_birth and not has_birth and not birth_provided:
+   488→            return {
+   489→                "status": "need_info",
+   490→                "skill": skill,
+   491→                "scenario": scenario,
+   492→                "confidence": confidence,
+   493→                "topic": topic,
+   494→                "info_type": "birth",
+   495→                "message": "技能已激活。请调用 request_info 工具收集出生信息。"
+   496→            }
+   497→
+   498→        return {
+   499→            "status": "activated",
+   500→            "skill": skill,
+   501→            "scenario": scenario,
+   502→            "confidence": confidence,
+   503→            "topic": topic,
+   504→            "message": f"已激活 {skill} 技能，场景: {scenario}"
+   505→        }
+   506→
+   507→
+   508→def create_agent(
+   509→    llm: Optional[LLMClient] = None,
+   510→    max_iterations: int = 10
+   511→) -> CoreAgent:
+   512→    """创建 CoreAgent 实例"""
+   513→    return CoreAgent(llm=llm, max_iterations=max_iterations)
+   514→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

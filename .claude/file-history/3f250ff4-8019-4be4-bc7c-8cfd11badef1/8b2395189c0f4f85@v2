@@ -1,0 +1,624 @@
+# VibeLife 数据管理机制详细分析
+
+## 用户问题
+详细解释 VibeLife 的用户数据管理机制、context 管理机制，以及为什么"用户数据分析沉淀机制"在当前版本中尚未完全实现。
+
+---
+
+## 1. VibeLife 用户数据管理机制
+
+### 1.1 数据存储架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PostgreSQL (pgvector enabled)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐     ┌──────────────────┐     ┌───────────────────┐    │
+│  │   vibe_users    │────►│  skill_profiles  │────►│skill_conversations│    │
+│  │  (核心用户表)    │     │ (每用户每技能档案) │     │   (对话记录)       │    │
+│  └─────────────────┘     └──────────────────┘     └─────────┬─────────┘    │
+│          │                                                   │              │
+│          ▼                                                   ▼              │
+│  ┌─────────────────┐                              ┌───────────────────┐    │
+│  │ vibe_user_auth  │                              │  skill_messages   │    │
+│  │   (认证方式)     │                              │   (消息存储)       │    │
+│  └─────────────────┘                              └─────────┬─────────┘    │
+│          │                                                   │              │
+│          ▼                                                   ▼              │
+│  ┌─────────────────┐                              ┌───────────────────┐    │
+│  │vibe_data_consents│                             │  skill_insights   │    │
+│  │ (数据共享授权)   │                              │   (洞察记录) ✅    │    │
+│  └─────────────────┘                              └───────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 核心用户表 (`vibe_users`)
+
+**文件**: [migrations/001_init.sql](migrations/001_init.sql#L16-L31)
+
+```sql
+CREATE TABLE vibe_users (
+    id UUID PRIMARY KEY,
+    vibe_id VARCHAR(20) UNIQUE NOT NULL,       -- 唯一标识 (VB-XXXXXXXX)
+    display_name VARCHAR(100),
+    avatar_url VARCHAR(500),
+    birth_datetime TIMESTAMPTZ,                -- 出生日期时间 (八字/星座计算用)
+    birth_location VARCHAR(255),               -- 出生地点
+    birth_location_coords POINT,               -- 地理坐标
+    timezone VARCHAR(50) DEFAULT 'Asia/Shanghai',
+    language VARCHAR(10) DEFAULT 'zh-CN',
+    status VARCHAR(20) DEFAULT 'active',
+    email_verified BOOLEAN DEFAULT false,
+    phone_verified BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()       -- 自动更新触发器
+);
+```
+
+**存储内容**:
+| 数据类型 | 字段 | 说明 |
+|---------|------|------|
+| 用户身份 | `vibe_id`, `display_name`, `avatar_url` | 展示用 |
+| 出生信息 | `birth_datetime`, `birth_location`, `birth_location_coords` | 八字/星座计算的核心输入 |
+| 偏好设置 | `timezone`, `language` | 本地化 |
+| 账户状态 | `status`, `*_verified` | 认证状态 |
+
+### 1.3 技能档案表 (`skill_profiles`)
+
+**文件**: [migrations/001_init.sql](migrations/001_init.sql#L62-L71)
+
+```sql
+CREATE TABLE skill_profiles (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50) NOT NULL,             -- 'bazi', 'zodiac', 'mbti'
+    profile_data JSONB NOT NULL DEFAULT '{}',  -- 灵活的技能特定数据
+    first_use_at TIMESTAMPTZ,
+    last_use_at TIMESTAMPTZ,
+    total_sessions INTEGER DEFAULT 0,
+    UNIQUE(user_id, skill_id)
+);
+```
+
+**存储逻辑**:
+- 每个用户在每个技能中有独立的 profile
+- `profile_data` JSONB 字段存储技能特定数据（如八字命盘缓存、MBTI 类型结果等）
+
+### 1.4 洞察记录表 (`skill_insights`) - 已实现
+
+**文件**: [migrations/001_init.sql](migrations/001_init.sql#L101-L113)
+
+```sql
+CREATE TABLE skill_insights (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50) NOT NULL,
+    conversation_id UUID REFERENCES skill_conversations(id),
+    insight_type VARCHAR(50) NOT NULL,         -- 'discovery', 'pattern', 'timing', 'growth'
+    title VARCHAR(255),
+    content TEXT NOT NULL,
+    evidence JSONB,                            -- 触发证据
+    confidence FLOAT,                          -- 置信度
+    user_reaction VARCHAR(20),                 -- 'helpful', 'not_helpful', 'saved'
+    created_at TIMESTAMPTZ
+);
+```
+
+---
+
+## 2. Context 管理机制
+
+### 2.1 多层上下文架构
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                      Context Assembly Pipeline                     │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  Layer 1: User Profile Context (用户档案)                          │
+│  ├─ birth_datetime, birth_location                                │
+│  ├─ skill_profiles.profile_data                                   │
+│  └─ 来源: UserRepository, SkillRepository                         │
+│                                                                    │
+│  Layer 2: Conversation History (对话历史)                          │
+│  ├─ 最近 N 条消息 (default: 10)                                   │
+│  ├─ 消息 role, content, intent, tools_used                        │
+│  └─ 来源: SkillRepository.get_messages()                          │
+│                                                                    │
+│  Layer 3: User Insights (用户洞察)                                 │
+│  ├─ 最近 3 个洞察                                                 │
+│  ├─ insight_type, content, confidence                             │
+│  └─ 来源: SkillRepository.get_user_insights()                     │
+│                                                                    │
+│  Layer 4: Knowledge Retrieval (知识检索)                           │
+│  ├─ 混合搜索 (向量 + 全文)                                        │
+│  ├─ RRF 融合排序                                                  │
+│  └─ 来源: RetrievalService.get_context_for_query()                │
+│                                                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 核心文件
+
+| 文件 | 功能 |
+|------|------|
+| [services/vibe_engine/memory_system.py](apps/api/services/vibe_engine/memory_system.py) | 记忆管理，构建上下文字符串 |
+| [services/vibe_engine/llm_orchestrator.py](apps/api/services/vibe_engine/llm_orchestrator.py) | LLM 调用编排，构建 system prompt |
+| [services/agent/runtime.py](apps/api/services/agent/runtime.py) | Agent 处理管道，整合所有上下文 |
+| [services/knowledge/retrieval.py](apps/api/services/knowledge/retrieval.py) | RAG 知识检索 |
+
+### 2.3 Context 构建流程
+
+```
+AgentRuntime.process_message(user_message)
+    │
+    ├─ 1. 加载用户档案
+    │      └─ UserRepository.get_by_id() → user_context
+    │
+    ├─ 2. 获取对话历史
+    │      └─ SkillRepository.get_messages(limit=10) → history
+    │
+    ├─ 3. 检索相关洞察
+    │      └─ SkillRepository.get_user_insights(limit=3) → insights
+    │
+    ├─ 4. 知识检索 (RAG)
+    │      └─ RetrievalService.get_context_for_query() → knowledge
+    │
+    ├─ 5. 情感分析
+    │      └─ EmotionEngine.analyze() → emotion_result
+    │
+    ├─ 6. 构建 System Prompt
+    │      └─ LLMOrchestrator.build_system_prompt(
+    │             persona,           # 技能角色定义
+    │             skill_context,     # 知识上下文
+    │             user_context,      # 用户信息
+    │             guidelines         # 响应指南
+    │         )
+    │
+    └─ 7. LLM 推理
+           └─ LLMOrchestrator.chat(messages)
+```
+
+---
+
+## 3. 为什么"用户数据分析沉淀机制"尚未完全实现
+
+### 3.1 您提到的三层架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    VibeLife 完整数据架构                     │
+├──────────────────┬──────────────────┬───────────────────────┤
+│  Knowledge Layer │   User Layer     │   Insight Layer       │
+│  (本次优化)      │   (已实现)       │   (需要补充)          │
+├──────────────────┼──────────────────┼───────────────────────┤
+│ 通用专业知识     │ 用户基本信息     │ 用户洞察沉淀          │
+│ - 八字理论       │ - 生日/性别      │ - 性格模式识别        │
+│ - 星座知识       │ - 八字命盘       │ - 行为偏好学习        │
+│ - MBTI 解读      │ - 星座信息       │ - 个性化建议积累      │
+├──────────────────┼──────────────────┼───────────────────────┤
+│ 所有用户共享     │ 每用户独立       │ 每用户独立            │
+│ 管理员维护       │ 用户输入         │ AI 分析生成           │
+└──────────────────┴──────────────────┴───────────────────────┘
+```
+
+### 3.2 当前实现状态
+
+| 层 | 状态 | 实现程度 | 说明 |
+|----|------|---------|------|
+| **Knowledge Layer** | ✅ 已实现 | 100% | `knowledge_chunks` + `knowledge_qa_pairs` 表，RAG 检索 |
+| **User Layer** | ✅ 已实现 | 100% | `vibe_users` + `skill_profiles` 表 |
+| **Insight Layer** | ⚠️ 部分实现 | 50% | `skill_insights` 表已创建，InsightGenerator 基础版已实现 |
+
+### 3.3 Insight Layer 的差距分析
+
+#### 已实现 ✅
+
+1. **数据库表结构** ([001_init.sql:101-113](migrations/001_init.sql#L101-L113))
+   - `skill_insights` 表已创建
+   - 支持 4 种洞察类型 (discovery, pattern, timing, growth)
+   - 支持 evidence (证据), confidence (置信度), user_reaction (反馈)
+
+2. **基础生成器** ([insight_generator.py](apps/api/services/vibe_engine/insight_generator.py))
+   - `InsightGenerator` 类
+   - 触发规则配置 (DISCOVERY_TRIGGERS, PATTERN_TRIGGERS, 等)
+   - 冷却期机制 (24h ~ 168h)
+   - LLM 内容生成
+
+3. **存储和检索** ([skill_repo.py](apps/api/stores/skill_repo.py))
+   - `create_insight()` - 创建洞察
+   - `get_user_insights()` - 获取洞察
+   - `update_insight_reaction()` - 更新用户反馈
+
+#### 未实现 ❌
+
+| 功能 | 描述 | 当前状态 |
+|------|------|---------|
+| **性格模式识别** | 从多次对话中识别用户性格特征 | ❌ 仅有简单关键词触发 |
+| **行为偏好学习** | 学习用户的交互偏好、时间偏好 | ❌ 未实现 |
+| **跨 Skill 洞察** | 综合八字、星座、MBTI 的洞察 | ❌ 每个 skill 独立 |
+| **长期趋势分析** | 追踪用户情绪、话题的长期变化 | ❌ 仅简单里程碑检测 |
+| **主动推荐** | 基于洞察主动推送内容 | ❌ 仅被动响应 |
+
+### 3.4 为什么没有完全实现
+
+#### 原因 1: 开发优先级
+
+当前 Phase 14 聚焦于:
+1. 基础功能完整性 (认证、对话、支付)
+2. 知识系统优化 (RAG 检索质量)
+3. 部署稳定性
+
+用户洞察沉淀是"增值功能"，需要在基础稳定后才能迭代。
+
+#### 原因 2: 数据积累不足
+
+有效的模式识别需要:
+- 足够多的用户对话数据
+- 长时间跨度的数据 (30-90天)
+- 用户反馈闭环
+
+当前项目处于初期，数据量不足以训练有效的模式识别。
+
+#### 原因 3: 技术复杂度
+
+完整的 Insight Layer 需要:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 完整 Insight 架构 (待实现)                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────────┐     ┌─────────────────┐                │
+│  │  Message Stream  │────►│ Topic Extractor  │               │
+│  │  (实时对话流)    │     │  (话题提取器)    │               │
+│  └─────────────────┘     └────────┬────────┘                │
+│                                    │                         │
+│                                    ▼                         │
+│  ┌─────────────────┐     ┌─────────────────┐                │
+│  │ Emotion Tracker  │────►│ Pattern Detector │               │
+│  │  (情绪追踪器)    │     │   (模式检测器)   │               │
+│  └─────────────────┘     └────────┬────────┘                │
+│                                    │                         │
+│                                    ▼                         │
+│                          ┌─────────────────┐                │
+│                          │ Insight Ranker   │                │
+│                          │ (洞察排序/去重)  │                │
+│                          └────────┬────────┘                │
+│                                    │                         │
+│                                    ▼                         │
+│  ┌─────────────────┐     ┌─────────────────┐                │
+│  │  LLM Generator   │────►│  Insight Store   │               │
+│  │  (内容生成)      │     │   (持久化)       │               │
+│  └─────────────────┘     └─────────────────┘                │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+这需要额外的:
+- 话题提取模型/规则
+- 情绪追踪持久化
+- 跨会话模式检测
+- 洞察去重和排序
+
+---
+
+## 4. 当前 InsightGenerator 的局限性
+
+### 4.1 触发机制过于简单
+
+**文件**: [insight_generator.py:107-147](apps/api/services/vibe_engine/insight_generator.py#L107-L147)
+
+当前 `check_discovery_trigger()`:
+```python
+# 仅检查:
+# 1. 情绪强度 > 0.7 → +0.4 分
+# 2. 关键词匹配 (人生/未来/感情/事业/健康/家庭) → +0.3 分
+# 3. 基础分 → +0.1 分
+# 需要总分 >= 0.7 才触发
+
+# 问题:
+# - 没有"首次提及"检测 (需要话题追踪)
+# - 没有用户历史对比 (需要长期数据)
+# - 没有语义理解 (仅关键词)
+```
+
+### 4.2 Pattern 检测不完整
+
+```python
+# check_pattern_trigger() 仅检查:
+# - 最近消息中情绪重复次数 >= 3
+
+# 缺失:
+# - 话题重复检测
+# - 时间段模式 (如每周末焦虑)
+# - 跨技能模式
+```
+
+### 4.3 Growth 检测仅有里程碑
+
+```python
+# check_growth_trigger() 仅检查:
+# - 洞察数量达到 10/25/50/100
+
+# 缺失:
+# - 情绪变化趋势对比
+# - 行为变化检测
+# - 目标达成追踪
+```
+
+---
+
+## 5. 补充 User Insight 沉淀的建议方案
+
+### 5.1 短期优化 (Low-hanging fruit)
+
+| 优化项 | 工作量 | 效果 |
+|--------|-------|------|
+| 添加话题追踪表 | 2h | 支持"首次提及"检测 |
+| 情绪历史持久化 | 1h | 支持长期情绪趋势 |
+| 增强 Pattern 检测 | 4h | 话题重复 + 时间模式 |
+
+### 5.2 中期优化 (需要更多设计)
+
+| 优化项 | 工作量 | 效果 |
+|--------|-------|------|
+| 跨 Skill 洞察 | 1-2d | 综合分析 |
+| 用户偏好学习 | 2-3d | 个性化推荐 |
+| 主动推送 | 1-2d | 基于洞察的通知 |
+
+### 5.3 新表建议
+
+```sql
+-- 话题追踪表 (支持"首次提及"检测)
+CREATE TABLE user_topic_mentions (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50),
+    topic VARCHAR(100),             -- 话题标识
+    first_mentioned_at TIMESTAMPTZ,
+    last_mentioned_at TIMESTAMPTZ,
+    mention_count INTEGER DEFAULT 1,
+    related_conversations UUID[],   -- 相关对话 ID
+    UNIQUE(user_id, skill_id, topic)
+);
+
+-- 情绪追踪表 (支持长期趋势)
+CREATE TABLE user_emotion_history (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50),
+    conversation_id UUID,
+    primary_emotion VARCHAR(50),
+    intensity FLOAT,
+    energy_delta INT,
+    recorded_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_emotion_history_user_time
+    ON user_emotion_history(user_id, skill_id, recorded_at DESC);
+```
+
+---
+
+## 6. 总结
+
+### 当前状态
+
+| 机制 | 状态 | 文件位置 |
+|------|------|---------|
+| 用户基础数据 | ✅ 完整 | `vibe_users`, `skill_profiles` |
+| 对话上下文 | ✅ 完整 | `skill_conversations`, `skill_messages` |
+| 知识检索 | ✅ 完整 | `knowledge_chunks`, RAG pipeline |
+| 洞察存储 | ✅ 基础 | `skill_insights` |
+| 洞察生成 | ⚠️ 基础 | `InsightGenerator` (触发规则简单) |
+| 模式识别 | ❌ 缺失 | 需要话题/情绪追踪 |
+| 偏好学习 | ❌ 缺失 | 需要行为分析模块 |
+| 跨技能分析 | ❌ 缺失 | 需要 Skill Mirror 增强 |
+
+### 建议下一步
+
+根据用户确认，本计划已包含完整的 User Insight 沉淀机制实现方案（见第 7 节）。
+
+---
+
+## 7. User Insight 沉淀机制实现计划
+
+### 7.1 实现概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         增强后的 Insight 架构                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  用户消息                                                                    │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ┌──────────────────┐     ┌──────────────────┐                              │
+│  │ TopicExtractor   │────►│user_topic_mentions│ (新表)                      │
+│  │  (话题提取)       │     │  (话题追踪)       │                              │
+│  └──────────────────┘     └──────────────────┘                              │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ┌──────────────────┐     ┌──────────────────┐                              │
+│  │ EmotionTracker   │────►│user_emotion_history│ (新表)                     │
+│  │  (情绪追踪)       │     │  (情绪历史)        │                             │
+│  └──────────────────┘     └──────────────────┘                              │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ┌──────────────────┐                                                       │
+│  │ PatternDetector  │ (新模块)                                              │
+│  │  - 首次提及检测                                                          │
+│  │  - 话题重复模式                                                          │
+│  │  - 情绪变化趋势                                                          │
+│  │  - 时间段模式                                                            │
+│  └──────────────────┘                                                       │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ┌──────────────────┐     ┌──────────────────┐                              │
+│  │InsightGenerator  │────►│  skill_insights   │ (现有表)                    │
+│  │   (增强版)        │     │   (洞察存储)      │                              │
+│  └──────────────────┘     └──────────────────┘                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 新数据库表
+
+#### user_topic_mentions (话题提及表)
+
+```sql
+CREATE TABLE user_topic_mentions (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50),
+    conversation_id UUID,
+    message_id UUID,
+    topic VARCHAR(100),              -- 归一化话题名
+    topic_category VARCHAR(50),      -- 话题分类
+    raw_mention TEXT,                -- 原始提及文本
+    sentiment VARCHAR(20),           -- positive/negative/neutral
+    emotion VARCHAR(50),             -- 关联情绪
+    intensity FLOAT,                 -- 提及强度
+    mentioned_at TIMESTAMPTZ,
+    day_of_week INTEGER,
+    hour_of_day INTEGER,
+    is_first_mention BOOLEAN,        -- 是否首次提及
+    mention_count INTEGER            -- 累计提及次数
+);
+```
+
+#### user_emotion_history (情绪历史表)
+
+```sql
+CREATE TABLE user_emotion_history (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50),
+    conversation_id UUID,
+    message_id UUID,
+    primary_emotion VARCHAR(50),
+    secondary_emotion VARCHAR(50),
+    intensity FLOAT,
+    confidence FLOAT,
+    energy_delta INTEGER,
+    triggers TEXT[],
+    related_topic VARCHAR(100),
+    context_snippet TEXT,
+    recorded_at TIMESTAMPTZ,
+    day_of_week INTEGER,
+    hour_of_day INTEGER
+);
+```
+
+### 7.3 新模块文件
+
+| 文件路径 | 功能 |
+|---------|------|
+| `migrations/002_insight_tracking.sql` | 新表迁移脚本 |
+| `apps/api/services/vibe_engine/topic_extractor.py` | 话题提取器 |
+| `apps/api/services/vibe_engine/emotion_tracker.py` | 情绪追踪持久化 |
+| `apps/api/services/vibe_engine/pattern_detector.py` | 模式检测器 |
+| `apps/api/stores/insight_repo.py` | 数据访问层 |
+
+### 7.4 InsightGenerator 增强
+
+**增强方法:**
+
+| 方法 | 当前实现 | 增强后 |
+|------|---------|-------|
+| `check_discovery_trigger` | 关键词匹配 | + 首次话题提及检测 |
+| `check_pattern_trigger` | 情绪重复计数 | + 话题重复 + 时间模式 + 话题-情绪关联 |
+| `check_growth_trigger` | 里程碑检测 | + 情绪趋势对比 + 能量变化分析 |
+
+### 7.5 AgentRuntime 集成
+
+```python
+# runtime.py 处理流程增强
+
+async def process_message(...):
+    # 1-4. 保留现有流程
+
+    # 5. 情绪分析
+    emotion_result = await EmotionEngine.analyze(message)
+
+    # 5.1 新增: 话题提取
+    extracted_topics = TopicExtractor.extract_topics(message, emotion_result)
+
+    # 6-7. 响应生成和消息保存
+
+    # 7.1 新增: 异步持久化追踪数据 (不阻塞响应)
+    asyncio.create_task(
+        _persist_tracking_data(user_id, skill_id, emotion_result, extracted_topics)
+    )
+
+    # 8. 增强版洞察生成
+    insight = await InsightGenerator.maybe_generate_insight_enhanced(
+        ..., extracted_topics=extracted_topics
+    )
+```
+
+### 7.6 实现优先级
+
+#### Phase 1: 数据基础 (1-2 天)
+- [ ] 创建 `002_insight_tracking.sql` 迁移脚本
+- [ ] 创建 `insight_repo.py` 数据访问层
+
+#### Phase 2: 核心模块 (2-3 天)
+- [ ] 实现 `topic_extractor.py`
+- [ ] 实现 `emotion_tracker.py`
+- [ ] 实现 `pattern_detector.py`
+
+#### Phase 3: InsightGenerator 增强 (1 天)
+- [ ] 增强 `check_discovery_trigger` - 首次提及
+- [ ] 增强 `check_pattern_trigger` - 多维模式
+- [ ] 增强 `check_growth_trigger` - 趋势对比
+
+#### Phase 4: 集成与测试 (1 天)
+- [ ] 更新 `runtime.py` 集成
+- [ ] 添加异步后台处理
+- [ ] 单元测试
+
+**总工作量: 5-7 天**
+
+### 7.7 关键修改文件
+
+| 文件 | 修改类型 | 说明 |
+|------|---------|------|
+| `migrations/002_insight_tracking.sql` | 新增 | 新表定义 |
+| `apps/api/stores/insight_repo.py` | 新增 | 数据访问层 |
+| `apps/api/services/vibe_engine/topic_extractor.py` | 新增 | 话题提取 |
+| `apps/api/services/vibe_engine/emotion_tracker.py` | 新增 | 情绪持久化 |
+| `apps/api/services/vibe_engine/pattern_detector.py` | 新增 | 模式检测 |
+| `apps/api/services/vibe_engine/insight_generator.py` | 修改 | 增强触发逻辑 |
+| `apps/api/services/agent/runtime.py` | 修改 | 集成新模块 |
+| `apps/api/services/vibe_engine/__init__.py` | 修改 | 导出新模块 |
+| `apps/api/stores/__init__.py` | 修改 | 导出新 repo |
+
+---
+
+## 8. 总结
+
+### 当前状态对照
+
+| 层 | 组件 | 状态 | 说明 |
+|----|------|------|------|
+| **Knowledge Layer** | `knowledge_chunks` | ✅ 已实现 | RAG 检索 |
+| **User Layer** | `vibe_users` + `skill_profiles` | ✅ 已实现 | 用户基础数据 |
+| **Insight Layer** | `skill_insights` 表 | ✅ 基础 | 存储结构已有 |
+| **Insight Layer** | `InsightGenerator` | ⚠️ 基础 | 触发规则简单 |
+| **Insight Layer** | 话题追踪 | ❌ 缺失 | 需新增 `user_topic_mentions` |
+| **Insight Layer** | 情绪历史 | ❌ 缺失 | 需新增 `user_emotion_history` |
+| **Insight Layer** | 模式检测 | ❌ 缺失 | 需新增 `PatternDetector` |
+
+### 本次实现目标
+
+1. **完善数据基础** - 新增话题追踪和情绪历史表
+2. **增强洞察生成** - 多维度触发检测
+3. **性能优化** - 异步持久化不阻塞响应
+4. **可扩展设计** - 模块化便于后续迭代
+
+---
+
+*本文档为 VibeLife User Insight 沉淀机制的完整分析和实现计划。*

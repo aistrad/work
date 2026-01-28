@@ -1,0 +1,1050 @@
+"""
+Social Network Service.
+
+REQ: REQ-SOCIAL-001 ~ REQ-SOCIAL-005
+Design: §3.4.1 ~ §3.4.2
+HOS-REF: §7.2
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from common.logging import get_logger
+from models.social import (
+    BuffType,
+    ChainParticipant,
+    ChainStatus,
+    EnergyBuff,
+    LuckChain,
+    RelationshipStatus,
+    RelationshipType,
+    RitualType,
+    ShareCard,
+    SocialEdge,
+)
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+class SocialServiceError(Exception):
+    """Base exception for social service errors."""
+    pass
+
+
+class NotFriendsError(SocialServiceError):
+    """Users are not friends."""
+    pass
+
+
+class InsufficientBalanceError(SocialServiceError):
+    """Insufficient balance for operation."""
+    pass
+
+
+class AlreadyJoinedError(SocialServiceError):
+    """User already joined the chain."""
+    pass
+
+
+class ChainNotActiveError(SocialServiceError):
+    """Chain is not active."""
+    pass
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# =============================================================================
+# Friend Management (REQ-SOCIAL-001)
+# =============================================================================
+
+def send_friend_request(
+    user_id: int,
+    peer_user_id: int,
+    relationship_type: RelationshipType = RelationshipType.FRIEND,
+) -> SocialEdge:
+    """
+    Send a friend request.
+
+    REQ: REQ-SOCIAL-001
+    """
+    if user_id == peer_user_id:
+        raise SocialServiceError("Cannot send friend request to yourself")
+
+    # Check if relationship already exists
+    existing = fortune_db.fetch_one(
+        """
+        SELECT * FROM fortune_social_edge
+        WHERE user_id = %s AND peer_user_id = %s
+        """,
+        [user_id, peer_user_id],
+    )
+
+    if existing:
+        if existing["status"] == "accepted":
+            raise SocialServiceError("Already friends")
+        elif existing["status"] == "pending":
+            raise SocialServiceError("Friend request already pending")
+        elif existing["status"] == "blocked":
+            raise SocialServiceError("Cannot send request to blocked user")
+
+    now = _now_utc()
+
+    # Create the edge (one direction)
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_social_edge (
+            user_id, peer_user_id, relationship_type, status, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, peer_user_id) DO UPDATE SET
+            status = 'pending', updated_at = %s
+        """,
+        [user_id, peer_user_id, relationship_type.value, "pending", now, now, now],
+    )
+
+    logger.info("friend_request_sent from=%s to=%s", user_id, peer_user_id)
+
+    return SocialEdge(
+        user_id=user_id,
+        peer_user_id=peer_user_id,
+        relationship_type=relationship_type,
+        status=RelationshipStatus.PENDING,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def accept_friend_request(user_id: int, peer_user_id: int) -> SocialEdge:
+    """
+    Accept a friend request.
+
+    REQ: REQ-SOCIAL-001
+    """
+    # Check if there's a pending request from peer to user
+    request = fortune_db.fetch_one(
+        """
+        SELECT * FROM fortune_social_edge
+        WHERE user_id = %s AND peer_user_id = %s AND status = 'pending'
+        """,
+        [peer_user_id, user_id],
+    )
+
+    if not request:
+        raise SocialServiceError("No pending friend request found")
+
+    now = _now_utc()
+
+    # Update the original request to accepted
+    fortune_db.execute(
+        """
+        UPDATE fortune_social_edge
+        SET status = 'accepted', updated_at = %s
+        WHERE user_id = %s AND peer_user_id = %s
+        """,
+        [now, peer_user_id, user_id],
+    )
+
+    # Create the reverse edge (bidirectional friendship)
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_social_edge (
+            user_id, peer_user_id, relationship_type, status, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, peer_user_id) DO UPDATE SET
+            status = 'accepted', updated_at = %s
+        """,
+        [user_id, peer_user_id, request["relationship_type"], "accepted", now, now, now],
+    )
+
+    logger.info("friend_request_accepted user=%s peer=%s", user_id, peer_user_id)
+
+    return SocialEdge(
+        user_id=user_id,
+        peer_user_id=peer_user_id,
+        relationship_type=RelationshipType(request["relationship_type"]),
+        status=RelationshipStatus.ACCEPTED,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def get_friends(user_id: int, status: Optional[RelationshipStatus] = None) -> List[SocialEdge]:
+    """
+    Get user's friends.
+
+    REQ: REQ-SOCIAL-001
+    """
+    if status:
+        rows = fortune_db.fetch_all(
+            """
+            SELECT * FROM fortune_social_edge
+            WHERE user_id = %s AND status = %s
+            ORDER BY updated_at DESC
+            """,
+            [user_id, status.value],
+        )
+    else:
+        rows = fortune_db.fetch_all(
+            """
+            SELECT * FROM fortune_social_edge
+            WHERE user_id = %s
+            ORDER BY updated_at DESC
+            """,
+            [user_id],
+        )
+
+    return [
+        SocialEdge(
+            user_id=row["user_id"],
+            peer_user_id=row["peer_user_id"],
+            relationship_type=RelationshipType(row["relationship_type"]),
+            status=RelationshipStatus(row["status"]),
+            compatibility_score=float(row["compatibility_score"]) if row.get("compatibility_score") else None,
+            compatibility_data=row.get("compatibility_data"),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+        )
+        for row in rows
+    ]
+
+
+def are_friends(user_id: int, peer_user_id: int) -> bool:
+    """Check if two users are friends."""
+    row = fortune_db.fetch_one(
+        """
+        SELECT 1 FROM fortune_social_edge
+        WHERE user_id = %s AND peer_user_id = %s AND status = 'accepted'
+        """,
+        [user_id, peer_user_id],
+    )
+    return row is not None
+
+
+# =============================================================================
+# Energy Buff (REQ-SOCIAL-002)
+# =============================================================================
+
+def send_energy_buff(
+    from_user_id: int,
+    to_user_id: int,
+    buff_type: BuffType,
+    amount: int,
+    message: Optional[str] = None,
+) -> EnergyBuff:
+    """
+    Send energy buff to a friend.
+
+    REQ: REQ-SOCIAL-002
+    Design: §3.4.1
+
+    Steps:
+    1. Verify friendship
+    2. Verify sender balance
+    3. Execute transfer in transaction
+    4. Update receiver's twin
+    5. Send push notification
+    """
+    # 1. Verify friendship
+    if not are_friends(from_user_id, to_user_id):
+        raise NotFriendsError("Users are not friends")
+
+    # 2. Verify sender balance
+    balance_row = fortune_db.fetch_one(
+        "SELECT coins FROM fortune_user_balance WHERE user_id = %s",
+        [from_user_id],
+    )
+
+    if not balance_row:
+        # Create balance record if not exists
+        fortune_db.execute(
+            "INSERT INTO fortune_user_balance (user_id, coins, aura) VALUES (%s, 0, 0)",
+            [from_user_id],
+        )
+        raise InsufficientBalanceError("Insufficient balance")
+
+    if balance_row["coins"] < amount:
+        raise InsufficientBalanceError(f"Insufficient balance: have {balance_row['coins']}, need {amount}")
+
+    now = _now_utc()
+
+    # 3. Execute transfer in transaction
+    # Deduct from sender
+    fortune_db.execute(
+        """
+        UPDATE fortune_user_balance
+        SET coins = coins - %s, updated_at = %s
+        WHERE user_id = %s
+        """,
+        [amount, now, from_user_id],
+    )
+
+    # Record sender ledger entry
+    sender_balance = fortune_db.fetch_one(
+        "SELECT coins FROM fortune_user_balance WHERE user_id = %s",
+        [from_user_id],
+    )
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_currency_ledger (
+            user_id, currency_type, amount, balance_after, category, reason, ref_type, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [from_user_id, "coins", -amount, sender_balance["coins"], "transfer_out", "send_buff", "buff", now],
+    )
+
+    # Add to receiver (create balance if not exists)
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+        VALUES (%s, %s, 0, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            coins = fortune_user_balance.coins + %s,
+            updated_at = %s
+        """,
+        [to_user_id, amount, now, amount, now],
+    )
+
+    # Record receiver ledger entry
+    receiver_balance = fortune_db.fetch_one(
+        "SELECT coins FROM fortune_user_balance WHERE user_id = %s",
+        [to_user_id],
+    )
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_currency_ledger (
+            user_id, currency_type, amount, balance_after, category, reason, ref_type, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [to_user_id, "coins", amount, receiver_balance["coins"], "transfer_in", "receive_buff", "buff", now],
+    )
+
+    # Record buff
+    buff_row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_energy_buff (
+            from_user_id, to_user_id, buff_type, amount, message, source, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING buff_id
+        """,
+        [from_user_id, to_user_id, buff_type.value, amount, message, "app", now],
+    )
+
+    buff_id = buff_row["buff_id"] if buff_row else 0
+
+    # 4. Update receiver's twin (increment buffs received)
+    try:
+        from services import twin_service
+        from models.twin import TwinLayer, TwinUpdateEvent
+
+        # First get current value to properly increment
+        twin_data = twin_service.get_twin(to_user_id)
+        current_buffs = 0
+        if twin_data.dynamic_social:
+            current_buffs = twin_data.dynamic_social.get("recent_buffs_received", 0)
+
+        twin_service.update_twin(TwinUpdateEvent(
+            user_id=to_user_id,
+            layer=TwinLayer.L2,
+            path="dynamic_social.recent_buffs_received",
+            new_value=current_buffs + 1,  # Properly increment
+            confidence=1.0,
+            source="system",
+            trigger="social_event",
+        ))
+    except Exception as e:
+        logger.warning("Failed to update twin for buff: %s", str(e))
+
+    logger.info(
+        "energy_buff_sent from=%s to=%s type=%s amount=%s",
+        from_user_id, to_user_id, buff_type.value, amount
+    )
+
+    return EnergyBuff(
+        buff_id=buff_id,
+        from_user_id=from_user_id,
+        to_user_id=to_user_id,
+        buff_type=buff_type,
+        amount=amount,
+        message=message,
+        source="app",
+        created_at=now,
+    )
+
+
+def get_received_buffs(user_id: int, limit: int = 20) -> List[EnergyBuff]:
+    """Get buffs received by user."""
+    rows = fortune_db.fetch_all(
+        """
+        SELECT * FROM fortune_energy_buff
+        WHERE to_user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        [user_id, limit],
+    )
+
+    return [
+        EnergyBuff(
+            buff_id=row["buff_id"],
+            from_user_id=row["from_user_id"],
+            to_user_id=row["to_user_id"],
+            buff_type=BuffType(row["buff_type"]),
+            amount=row["amount"],
+            message=row.get("message"),
+            source=row.get("source", "app"),
+            created_at=row.get("created_at"),
+        )
+        for row in rows
+    ]
+
+
+# =============================================================================
+# Luck Chain (REQ-SOCIAL-004)
+# =============================================================================
+
+def create_luck_chain(
+    creator_user_id: int,
+    title: str,
+    ritual_type: RitualType,
+    description: Optional[str] = None,
+    base_reward: int = 10,
+    expires_hours: int = 24,
+) -> LuckChain:
+    """
+    Create a new luck chain.
+
+    REQ: REQ-SOCIAL-004
+    """
+    now = _now_utc()
+    expires_at = now + timedelta(hours=expires_hours)
+
+    row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_luck_chain (
+            creator_user_id, title, description, ritual_type,
+            base_reward, participant_count, status, expires_at, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING chain_id
+        """,
+        [creator_user_id, title, description, ritual_type.value,
+         base_reward, 0, "active", expires_at, now],
+    )
+
+    chain_id = row["chain_id"] if row else 0
+
+    logger.info("luck_chain_created chain_id=%s creator=%s", chain_id, creator_user_id)
+
+    return LuckChain(
+        chain_id=chain_id,
+        creator_user_id=creator_user_id,
+        title=title,
+        description=description,
+        ritual_type=ritual_type,
+        base_reward=base_reward,
+        participant_count=0,
+        status=ChainStatus.ACTIVE,
+        expires_at=expires_at,
+        created_at=now,
+    )
+
+
+def join_luck_chain(
+    chain_id: int,
+    user_id: int,
+    contribution: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Join a luck chain.
+
+    REQ: REQ-SOCIAL-004
+    Design: §3.4.2
+
+    Reward formula: floor(base_reward * log2(count + 2))
+
+    Uses transaction to ensure atomicity:
+    - FOR UPDATE lock held until commit
+    - Prevents position conflicts and participant_count race conditions
+    """
+    now = _now_utc()
+
+    # Use transaction to ensure atomicity
+    with fortune_db.transaction() as tx:
+        # 1. Get chain info with lock
+        chain_row = tx.fetch_one(
+            "SELECT * FROM fortune_luck_chain WHERE chain_id = %s FOR UPDATE",
+            [chain_id],
+        )
+
+        if not chain_row:
+            raise SocialServiceError("Chain not found")
+
+        if chain_row["status"] != "active":
+            raise ChainNotActiveError("Chain is not active")
+
+        if chain_row["expires_at"] and chain_row["expires_at"] < now:
+            # Mark as expired
+            tx.execute(
+                "UPDATE fortune_luck_chain SET status = 'expired' WHERE chain_id = %s",
+                [chain_id],
+            )
+            raise ChainNotActiveError("Chain has expired")
+
+        # 2. Check if already joined
+        existing = tx.fetch_one(
+            """
+            SELECT 1 FROM fortune_luck_chain_participant
+            WHERE chain_id = %s AND user_id = %s
+            """,
+            [chain_id, user_id],
+        )
+
+        if existing:
+            raise AlreadyJoinedError("Already joined this chain")
+
+        current_count = chain_row["participant_count"]
+        new_position = current_count + 1
+
+        # 3. Calculate reward
+        base_reward = chain_row["base_reward"]
+        reward = int(base_reward * math.log2(new_position + 2))
+
+        # 4. Add participant
+        tx.execute(
+            """
+            INSERT INTO fortune_luck_chain_participant (
+                chain_id, user_id, position, contribution, reward_earned, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [chain_id, user_id, new_position, contribution, reward, now],
+        )
+
+        # 5. Update chain participant count
+        tx.execute(
+            """
+            UPDATE fortune_luck_chain
+            SET participant_count = participant_count + 1
+            WHERE chain_id = %s
+            """,
+            [chain_id],
+        )
+
+        # 6. Award Aura to all participants (within same transaction)
+        participants = tx.fetch_all(
+            "SELECT user_id FROM fortune_luck_chain_participant WHERE chain_id = %s",
+            [chain_id],
+        )
+
+        for p in participants:
+            # Add aura reward and get new balance in one operation
+            balance_row = tx.execute_returning_one(
+                """
+                INSERT INTO fortune_user_balance (user_id, coins, aura, updated_at)
+                VALUES (%s, 0, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    aura = fortune_user_balance.aura + %s,
+                    updated_at = %s
+                RETURNING aura
+                """,
+                [p["user_id"], reward, now, reward, now],
+            )
+            new_aura = balance_row["aura"] if balance_row else reward
+
+            # Record ledger
+            tx.execute(
+                """
+                INSERT INTO fortune_currency_ledger (
+                    user_id, currency_type, amount, balance_after, category, reason, ref_type, ref_id, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [p["user_id"], "aura", reward, new_aura,
+                 "earn", "luck_chain", "chain", str(chain_id), now],
+            )
+    # Transaction commits here
+
+    chain_strength = math.log2(new_position + 2)
+
+    logger.info(
+        "chain_join chain_id=%s user=%s position=%s reward=%s",
+        chain_id, user_id, new_position, reward
+    )
+
+    return {
+        "position": new_position,
+        "reward": reward,
+        "total_participants": new_position,
+        "chain_strength": round(chain_strength, 2),
+        "message": f"成功加入接龙！获得 {reward} 能量值",
+    }
+
+
+def get_chain_detail(chain_id: int, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Get chain details with participants."""
+    chain_row = fortune_db.fetch_one(
+        "SELECT * FROM fortune_luck_chain WHERE chain_id = %s",
+        [chain_id],
+    )
+
+    if not chain_row:
+        raise SocialServiceError("Chain not found")
+
+    participants = fortune_db.fetch_all(
+        """
+        SELECT * FROM fortune_luck_chain_participant
+        WHERE chain_id = %s
+        ORDER BY position
+        """,
+        [chain_id],
+    )
+
+    my_participation = None
+    if user_id:
+        for p in participants:
+            if p["user_id"] == user_id:
+                my_participation = ChainParticipant(
+                    chain_id=p["chain_id"],
+                    user_id=p["user_id"],
+                    position=p["position"],
+                    contribution=p.get("contribution"),
+                    reward_earned=p.get("reward_earned"),
+                    created_at=p.get("created_at"),
+                )
+                break
+
+    return {
+        "chain": LuckChain(
+            chain_id=chain_row["chain_id"],
+            creator_user_id=chain_row["creator_user_id"],
+            title=chain_row["title"],
+            description=chain_row.get("description"),
+            ritual_type=RitualType(chain_row["ritual_type"]),
+            base_reward=chain_row["base_reward"],
+            participant_count=chain_row["participant_count"],
+            status=ChainStatus(chain_row["status"]),
+            expires_at=chain_row.get("expires_at"),
+            created_at=chain_row.get("created_at"),
+        ),
+        "participants": [
+            ChainParticipant(
+                chain_id=p["chain_id"],
+                user_id=p["user_id"],
+                position=p["position"],
+                contribution=p.get("contribution"),
+                reward_earned=p.get("reward_earned"),
+                created_at=p.get("created_at"),
+            )
+            for p in participants
+        ],
+        "my_participation": my_participation,
+    }
+
+
+# =============================================================================
+# Share Card (REQ-SOCIAL-005)
+# =============================================================================
+
+def create_share_card(
+    user_id: int,
+    card_type: str,
+    content: Dict[str, Any],
+    expires_hours: int = 168,
+) -> ShareCard:
+    """
+    Create a shareable card.
+
+    REQ: REQ-SOCIAL-005
+    """
+    import os
+
+    card_id = uuid4()
+    now = _now_utc()
+    expires_at = now + timedelta(hours=expires_hours)
+
+    base_url = os.getenv("H5_BASE", "http://localhost:8230")
+    share_url = f"{base_url}/share/{card_id}"
+
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_share_card (
+            card_id, user_id, card_type, content, share_url, view_count, expires_at, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [str(card_id), user_id, card_type, json.dumps(content), share_url, 0, expires_at, now],
+    )
+
+    logger.info("share_card_created card_id=%s user=%s type=%s", card_id, user_id, card_type)
+
+    return ShareCard(
+        card_id=card_id,
+        user_id=user_id,
+        card_type=card_type,
+        content=content,
+        share_url=share_url,
+        view_count=0,
+        expires_at=expires_at,
+        created_at=now,
+    )
+
+
+def get_share_card(card_id: str) -> Optional[ShareCard]:
+    """Get a share card by ID."""
+    row = fortune_db.fetch_one(
+        "SELECT * FROM fortune_share_card WHERE card_id = %s",
+        [card_id],
+    )
+
+    if not row:
+        return None
+
+    # Increment view count
+    fortune_db.execute(
+        "UPDATE fortune_share_card SET view_count = view_count + 1 WHERE card_id = %s",
+        [card_id],
+    )
+
+    content = row.get("content") or {}
+    if isinstance(content, str):
+        content = json.loads(content)
+
+    return ShareCard(
+        card_id=row["card_id"],
+        user_id=row["user_id"],
+        card_type=row["card_type"],
+        content=content,
+        share_url=row.get("share_url"),
+        view_count=row.get("view_count", 0) + 1,
+        expires_at=row.get("expires_at"),
+        created_at=row.get("created_at"),
+    )
+
+
+# =============================================================================
+# Compatibility Analysis (REQ-SOCIAL-003)
+# =============================================================================
+
+def calculate_compatibility(
+    user_id: int,
+    peer_user_id: int,
+    analysis_type: str = "basic",
+) -> Dict[str, Any]:
+    """
+    Calculate compatibility between two users based on their bazi data.
+
+    REQ: REQ-SOCIAL-003
+    Design: §3.4.1 合盘分析
+
+    Dimensions analyzed:
+    - wuxing_harmony: 五行相生相克
+    - shishen_synergy: 十神互补
+    - daymaster_relation: 日主关系
+    - overall: 综合评分
+
+    Args:
+        user_id: First user ID
+        peer_user_id: Second user ID
+        analysis_type: "basic" or "detailed"
+
+    Returns:
+        Compatibility result with scores and insights
+    """
+    from services import bazi_facts
+
+    # Get bazi snapshots for both users
+    user_snap = fortune_db.fetch_one(
+        """
+        SELECT facts, facts_hash FROM fortune_bazi_snapshot
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT 1
+        """,
+        [user_id],
+    )
+    peer_snap = fortune_db.fetch_one(
+        """
+        SELECT facts, facts_hash FROM fortune_bazi_snapshot
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT 1
+        """,
+        [peer_user_id],
+    )
+
+    if not user_snap or not peer_snap:
+        raise SocialServiceError("Both users must have bazi data for compatibility analysis")
+
+    user_facts = user_snap.get("facts") or {}
+    peer_facts = peer_snap.get("facts") or {}
+    if isinstance(user_facts, str):
+        user_facts = json.loads(user_facts)
+    if isinstance(peer_facts, str):
+        peer_facts = json.loads(peer_facts)
+
+    user_bazi = user_facts.get("bazi", {})
+    peer_bazi = peer_facts.get("bazi", {})
+
+    # Extract key elements
+    user_daymaster = user_bazi.get("day_master", {})
+    peer_daymaster = peer_bazi.get("day_master", {})
+    user_wuxing = user_bazi.get("wuxing_count", {})
+    peer_wuxing = peer_bazi.get("wuxing_count", {})
+
+    # Calculate dimension scores
+    dimensions = {}
+    insights = []
+    recommendations = []
+
+    # 1. 五行和谐度 (Wuxing Harmony)
+    wuxing_score = _calculate_wuxing_harmony(user_wuxing, peer_wuxing)
+    dimensions["wuxing_harmony"] = wuxing_score
+    if wuxing_score >= 70:
+        insights.append("五行互补性强，能量流动顺畅")
+    elif wuxing_score >= 50:
+        insights.append("五行基本平衡，需要相互理解")
+    else:
+        insights.append("五行存在冲突，需要更多包容")
+        recommendations.append("在沟通中多关注对方的需求")
+
+    # 2. 日主关系 (Daymaster Relation)
+    daymaster_score = _calculate_daymaster_relation(
+        user_daymaster.get("element", ""),
+        peer_daymaster.get("element", ""),
+    )
+    dimensions["daymaster_relation"] = daymaster_score
+    if daymaster_score >= 70:
+        insights.append("日主相生，天然亲和力强")
+    elif daymaster_score >= 50:
+        insights.append("日主关系中性，需要培养默契")
+    else:
+        insights.append("日主相克，需要更多耐心")
+        recommendations.append("避免在压力下做重要决定")
+
+    # 3. 十神互补 (Shishen Synergy)
+    user_shishen = user_bazi.get("shishen", {})
+    peer_shishen = peer_bazi.get("shishen", {})
+    shishen_score = _calculate_shishen_synergy(user_shishen, peer_shishen)
+    dimensions["shishen_synergy"] = shishen_score
+    if shishen_score >= 70:
+        insights.append("性格特质互补，合作潜力大")
+    elif shishen_score >= 50:
+        insights.append("性格有相似之处，容易产生共鸣")
+    else:
+        recommendations.append("尝试从对方角度思考问题")
+
+    # 4. Calculate overall score
+    overall_score = (
+        wuxing_score * 0.35 +
+        daymaster_score * 0.35 +
+        shishen_score * 0.30
+    )
+    dimensions["overall"] = round(overall_score, 1)
+
+    # Generate summary insight
+    if overall_score >= 80:
+        insights.insert(0, "整体兼容度很高，是理想的合作/关系伙伴")
+    elif overall_score >= 60:
+        insights.insert(0, "整体兼容度良好，有发展潜力")
+    elif overall_score >= 40:
+        insights.insert(0, "整体兼容度一般，需要双方努力")
+    else:
+        insights.insert(0, "整体兼容度较低，建议保持适当距离")
+
+    # Cache result in social edge
+    _cache_compatibility_result(user_id, peer_user_id, overall_score, dimensions)
+
+    logger.info(
+        "compatibility_calculated user=%s peer=%s score=%s",
+        user_id, peer_user_id, overall_score
+    )
+
+    return {
+        "overall_score": round(overall_score, 1),
+        "dimensions": {k: round(v, 1) for k, v in dimensions.items()},
+        "insights": insights,
+        "recommendations": recommendations,
+        "cached": False,
+    }
+
+
+def _calculate_wuxing_harmony(user_wuxing: Dict[str, int], peer_wuxing: Dict[str, int]) -> float:
+    """
+    Calculate wuxing harmony score based on five elements distribution.
+
+    相生关系: 木生火, 火生土, 土生金, 金生水, 水生木
+    相克关系: 木克土, 土克水, 水克火, 火克金, 金克木
+    """
+    elements = ["木", "火", "土", "金", "水"]
+    sheng_pairs = [("木", "火"), ("火", "土"), ("土", "金"), ("金", "水"), ("水", "木")]
+    ke_pairs = [("木", "土"), ("土", "水"), ("水", "火"), ("火", "金"), ("金", "木")]
+
+    score = 50.0  # Base score
+
+    # Check for complementary elements (one has what other lacks)
+    for elem in elements:
+        user_count = user_wuxing.get(elem, 0)
+        peer_count = peer_wuxing.get(elem, 0)
+
+        # Complementary: one has excess, other has deficiency
+        if (user_count >= 3 and peer_count <= 1) or (peer_count >= 3 and user_count <= 1):
+            score += 5
+
+        # Both have balanced amounts
+        if 1 <= user_count <= 2 and 1 <= peer_count <= 2:
+            score += 3
+
+    # Check sheng (generating) relationships
+    for elem1, elem2 in sheng_pairs:
+        if user_wuxing.get(elem1, 0) >= 2 and peer_wuxing.get(elem2, 0) >= 2:
+            score += 4
+
+    # Check ke (controlling) relationships - negative impact
+    for elem1, elem2 in ke_pairs:
+        if user_wuxing.get(elem1, 0) >= 3 and peer_wuxing.get(elem2, 0) >= 3:
+            score -= 5
+
+    return max(0, min(100, score))
+
+
+def _calculate_daymaster_relation(user_element: str, peer_element: str) -> float:
+    """
+    Calculate daymaster relation score.
+
+    Based on five elements relationship:
+    - Same element: 70 (similar but may compete)
+    - Generating: 85 (supportive)
+    - Generated by: 80 (receiving support)
+    - Controlling: 40 (tension)
+    - Controlled by: 45 (pressure)
+    """
+    if not user_element or not peer_element:
+        return 50.0
+
+    # Normalize element names
+    element_map = {
+        "甲": "木", "乙": "木",
+        "丙": "火", "丁": "火",
+        "戊": "土", "己": "土",
+        "庚": "金", "辛": "金",
+        "壬": "水", "癸": "水",
+    }
+    user_elem = element_map.get(user_element, user_element)
+    peer_elem = element_map.get(peer_element, peer_element)
+
+    # Same element
+    if user_elem == peer_elem:
+        return 70.0
+
+    # Generating relationships
+    sheng = {"木": "火", "火": "土", "土": "金", "金": "水", "水": "木"}
+    if sheng.get(user_elem) == peer_elem:
+        return 85.0  # User generates peer
+    if sheng.get(peer_elem) == user_elem:
+        return 80.0  # Peer generates user
+
+    # Controlling relationships
+    ke = {"木": "土", "土": "水", "水": "火", "火": "金", "金": "木"}
+    if ke.get(user_elem) == peer_elem:
+        return 40.0  # User controls peer
+    if ke.get(peer_elem) == user_elem:
+        return 45.0  # Peer controls user
+
+    return 50.0
+
+
+def _calculate_shishen_synergy(user_shishen: Dict[str, Any], peer_shishen: Dict[str, Any]) -> float:
+    """
+    Calculate shishen synergy score.
+
+    Complementary pairs:
+    - 比肩/劫财 + 正官/七杀: Leadership balance
+    - 食神/伤官 + 正印/偏印: Creativity + wisdom
+    - 正财/偏财 + 比肩/劫财: Resource management
+    """
+    score = 50.0
+
+    # Extract dominant shishen for each user
+    user_dominant = _get_dominant_shishen(user_shishen)
+    peer_dominant = _get_dominant_shishen(peer_shishen)
+
+    # Complementary pairs
+    complementary = [
+        ({"比肩", "劫财"}, {"正官", "七杀"}),
+        ({"食神", "伤官"}, {"正印", "偏印"}),
+        ({"正财", "偏财"}, {"比肩", "劫财"}),
+    ]
+
+    for set1, set2 in complementary:
+        if (user_dominant in set1 and peer_dominant in set2) or \
+           (user_dominant in set2 and peer_dominant in set1):
+            score += 20
+
+    # Same dominant shishen - similar personalities
+    if user_dominant == peer_dominant:
+        score += 10
+
+    return max(0, min(100, score))
+
+
+def _get_dominant_shishen(shishen: Dict[str, Any]) -> str:
+    """Get the dominant shishen from a shishen dict."""
+    if not shishen:
+        return ""
+
+    # Try to find the most prominent shishen
+    shishen_list = ["比肩", "劫财", "食神", "伤官", "正财", "偏财", "正官", "七杀", "正印", "偏印"]
+    for ss in shishen_list:
+        if shishen.get(ss):
+            return ss
+    return ""
+
+
+def _cache_compatibility_result(
+    user_id: int,
+    peer_user_id: int,
+    score: float,
+    dimensions: Dict[str, float],
+) -> None:
+    """Cache compatibility result in social edge."""
+    try:
+        fortune_db.execute(
+            """
+            UPDATE fortune_social_edge
+            SET compatibility_score = %s,
+                compatibility_data = %s::jsonb,
+                updated_at = now()
+            WHERE user_id = %s AND peer_user_id = %s
+            """,
+            [score, json.dumps(dimensions, ensure_ascii=False), user_id, peer_user_id],
+        )
+    except Exception as e:
+        logger.warning("Failed to cache compatibility result: %s", str(e))
+
+
+def get_cached_compatibility(user_id: int, peer_user_id: int) -> Optional[Dict[str, Any]]:
+    """Get cached compatibility result if available."""
+    row = fortune_db.fetch_one(
+        """
+        SELECT compatibility_score, compatibility_data, updated_at
+        FROM fortune_social_edge
+        WHERE user_id = %s AND peer_user_id = %s
+        AND compatibility_score IS NOT NULL
+        """,
+        [user_id, peer_user_id],
+    )
+
+    if not row:
+        return None
+
+    data = row.get("compatibility_data") or {}
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    return {
+        "overall_score": row["compatibility_score"],
+        "dimensions": data,
+        "insights": [],  # Cached version doesn't include insights
+        "recommendations": [],
+        "cached": True,
+        "cached_at": row.get("updated_at"),
+    }

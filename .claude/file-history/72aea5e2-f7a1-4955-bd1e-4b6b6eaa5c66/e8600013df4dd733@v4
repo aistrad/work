@@ -1,0 +1,379 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Migration: 003_model_router
+-- Description: 模型路由系统 - 支持动态模型选择、配额管理、A/B测试
+-- Created: 2026-01-09
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 1. 模型提供商配置（定义可用的 LLM 提供商）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS model_providers (
+    id VARCHAR(20) PRIMARY KEY,           -- glm, gemini, claude
+    name VARCHAR(50) NOT NULL,            -- 显示名称
+    base_url VARCHAR(255),                -- API 基础 URL
+    api_key_env VARCHAR(50),              -- 环境变量名（不存实际 key）
+    enabled BOOLEAN DEFAULT TRUE,
+    config JSONB DEFAULT '{}',            -- 额外配置
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE model_providers IS '模型提供商配置表';
+COMMENT ON COLUMN model_providers.api_key_env IS 'API Key 的环境变量名，实际 key 不存数据库';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 2. 模型定义（每个提供商的具体模型）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS models (
+    id VARCHAR(50) PRIMARY KEY,           -- provider:model 格式，如 glm:glm-4-plus
+    provider_id VARCHAR(20) NOT NULL REFERENCES model_providers(id) ON DELETE CASCADE,
+    model_name VARCHAR(100) NOT NULL,     -- 实际 API 使用的模型名
+    display_name VARCHAR(100),            -- 显示名称
+    capabilities JSONB DEFAULT '[]',      -- 能力: ["chat", "vision", "image_gen", "embedding"]
+    cost_per_1k_input DECIMAL(10,6),      -- 每 1K 输入 token 成本 (USD)
+    cost_per_1k_output DECIMAL(10,6),     -- 每 1K 输出 token 成本 (USD)
+    cost_per_image DECIMAL(10,6),         -- 每张图片成本 (USD)
+    max_tokens INT DEFAULT 4096,          -- 最大输出 token
+    context_window INT DEFAULT 8192,      -- 上下文窗口大小
+    enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE models IS '模型定义表';
+COMMENT ON COLUMN models.id IS '格式: provider:model，如 glm:glm-4-plus';
+COMMENT ON COLUMN models.capabilities IS '模型能力列表: chat, vision, image_gen, embedding, analysis';
+
+CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id);
+CREATE INDEX IF NOT EXISTS idx_models_capabilities ON models USING GIN(capabilities);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 3. 路由规则（核心：决定什么情况用什么模型）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS model_routes (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,           -- 规则名称，便于管理
+    description TEXT,                     -- 规则描述
+    priority INT DEFAULT 100,             -- 优先级，数字越小越优先
+
+    -- 匹配条件（NULL 表示不限制该条件）
+    match_user_id UUID,                   -- 特定用户 ID
+    match_user_tier VARCHAR(20),          -- 用户等级: free, pro, vip
+    match_skill VARCHAR(50),              -- skill: bazi, zodiac, mbti
+    match_task VARCHAR(50),               -- 任务类型: chat, image_gen, analysis, interview, report
+
+    -- 目标模型
+    model_id VARCHAR(50) NOT NULL REFERENCES models(id),
+
+    -- Fallback 配置
+    fallback_chain TEXT[],                -- 有序降级列表: ['glm:glm-4-flash', 'gemini:gemini-3-pro']
+
+    -- A/B 测试配置
+    ab_test_group VARCHAR(50),            -- A/B 测试分组标识
+    ab_test_percentage INT CHECK (ab_test_percentage >= 0 AND ab_test_percentage <= 100),
+
+    -- 元数据
+    enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE model_routes IS '模型路由规则表';
+COMMENT ON COLUMN model_routes.priority IS '优先级，数字越小越优先匹配';
+COMMENT ON COLUMN model_routes.fallback_chain IS '降级链，当主模型不可用或配额超限时按顺序尝试';
+
+CREATE INDEX IF NOT EXISTS idx_model_routes_priority ON model_routes(priority) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_model_routes_match ON model_routes(match_user_id, match_user_tier, match_skill, match_task) WHERE enabled = TRUE;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 4. 配额规则
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS quota_rules (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,           -- 规则名称
+    description TEXT,
+
+    -- 配额范围维度
+    scope VARCHAR(20) NOT NULL,           -- global, provider, model, user, tier, task
+    scope_provider_id VARCHAR(20),        -- 当涉及特定提供商时
+    scope_model_id VARCHAR(50),           -- 当涉及特定模型时
+    scope_user_tier VARCHAR(20),          -- 当涉及特定用户等级时
+    scope_task VARCHAR(50),               -- 当涉及特定任务时
+
+    -- 限制配置
+    period VARCHAR(20) DEFAULT 'daily',   -- hourly, daily, weekly, monthly
+    max_calls INT,                        -- 最大调用次数
+    max_input_tokens INT,                 -- 最大输入 token 数
+    max_output_tokens INT,                -- 最大输出 token 数
+    max_cost DECIMAL(10,4),               -- 最大成本 (USD)
+
+    -- 超额处理策略
+    on_exceed VARCHAR(20) DEFAULT 'downgrade', -- downgrade, reject, queue
+    downgrade_to_model VARCHAR(50),       -- 降级到哪个模型
+    exceed_message TEXT,                  -- 超额时的提示消息
+
+    -- 元数据
+    enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE quota_rules IS '配额规则表';
+COMMENT ON COLUMN quota_rules.scope IS '配额范围: global=全局, provider=按提供商, model=按模型, user=按用户, tier=按等级, task=按任务';
+COMMENT ON COLUMN quota_rules.on_exceed IS '超额策略: downgrade=降级, reject=拒绝, queue=排队';
+
+CREATE INDEX IF NOT EXISTS idx_quota_rules_scope ON quota_rules(scope, scope_provider_id, scope_model_id, scope_user_tier, scope_task) WHERE enabled = TRUE;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 5. 配额使用计数（实时统计）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS quota_usage (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id INT NOT NULL REFERENCES quota_rules(id) ON DELETE CASCADE,
+
+    -- 使用者标识（根据 scope 可能为 NULL）
+    user_id UUID,
+
+    -- 时间周期
+    period_start TIMESTAMP NOT NULL,
+    period_end TIMESTAMP NOT NULL,
+
+    -- 计数
+    call_count INT DEFAULT 0,
+    input_tokens INT DEFAULT 0,
+    output_tokens INT DEFAULT 0,
+    estimated_cost DECIMAL(10,6) DEFAULT 0,
+
+    -- 元数据
+    last_updated TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(rule_id, user_id, period_start)
+);
+
+COMMENT ON TABLE quota_usage IS '配额使用统计表';
+
+CREATE INDEX IF NOT EXISTS idx_quota_usage_lookup ON quota_usage(rule_id, user_id, period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_quota_usage_period ON quota_usage(period_end);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 6. 模型调用日志（用于统计、审计和成本分析）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS model_call_logs (
+    id BIGSERIAL PRIMARY KEY,
+
+    -- 请求上下文
+    user_id UUID,
+    session_id UUID,                      -- 对话 session
+    skill VARCHAR(50),
+    task VARCHAR(50),
+
+    -- 路由信息
+    route_id INT,                         -- 匹配的路由规则
+    requested_model VARCHAR(50),          -- 原始请求的模型
+    actual_model VARCHAR(50) NOT NULL,    -- 实际使用的模型
+    was_downgraded BOOLEAN DEFAULT FALSE,
+    downgrade_reason VARCHAR(100),
+
+    -- 使用量
+    input_tokens INT,
+    output_tokens INT,
+    total_tokens INT GENERATED ALWAYS AS (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) STORED,
+    estimated_cost DECIMAL(10,6),
+
+    -- 结果
+    status VARCHAR(20) NOT NULL,          -- success, error, timeout, rate_limited
+    latency_ms INT,
+    error_code VARCHAR(50),
+    error_message TEXT,
+
+    -- 元数据
+    request_id VARCHAR(100),              -- 外部请求 ID
+    metadata JSONB DEFAULT '{}',          -- 额外元数据
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE model_call_logs IS '模型调用日志表，用于统计和审计';
+
+CREATE INDEX IF NOT EXISTS idx_call_logs_user ON model_call_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_model ON model_call_logs(actual_model, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_status ON model_call_logs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_time ON model_call_logs(created_at DESC);
+
+-- 分区表（可选，用于大数据量场景）
+-- CREATE INDEX IF NOT EXISTS idx_call_logs_partition ON model_call_logs(created_at);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 7. A/B 测试用户分组（记录用户被分配到哪个测试组）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS ab_test_assignments (
+    id SERIAL PRIMARY KEY,
+    user_id UUID NOT NULL,
+    test_name VARCHAR(100) NOT NULL,      -- 测试名称
+    group_name VARCHAR(50) NOT NULL,      -- 分组: control, variant_a, variant_b
+    assigned_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(user_id, test_name)
+);
+
+COMMENT ON TABLE ab_test_assignments IS 'A/B 测试用户分组表';
+
+CREATE INDEX IF NOT EXISTS idx_ab_test_user ON ab_test_assignments(user_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 8. 插入初始数据
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- 模型提供商
+INSERT INTO model_providers (id, name, base_url, api_key_env, enabled) VALUES
+('glm', '智谱 GLM', 'https://open.bigmodel.cn/api/paas/v4', 'GLM_API_KEY', TRUE),
+('gemini', 'Google Gemini', NULL, 'GEMINI_API_KEY', TRUE),  -- base_url 从环境变量读取
+('claude', 'Anthropic Claude', 'https://api.anthropic.com/v1', 'CLAUDE_API_KEY', TRUE)
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    base_url = EXCLUDED.base_url,
+    api_key_env = EXCLUDED.api_key_env,
+    updated_at = NOW();
+
+-- 模型定义
+INSERT INTO models (id, provider_id, model_name, display_name, capabilities, cost_per_1k_input, cost_per_1k_output, max_tokens, context_window) VALUES
+-- GLM 模型
+('glm:glm-4-plus', 'glm', 'glm-4-plus', 'GLM-4 Plus', '["chat", "analysis"]', 0.050, 0.050, 4096, 128000),
+('glm:glm-4-flash', 'glm', 'glm-4-flash', 'GLM-4 Flash', '["chat"]', 0.001, 0.001, 4096, 128000),
+('glm:glm-4.7-flash', 'glm', 'glm-4.7-flash', 'GLM-4.7 Flash', '["chat", "analysis"]', 0.001, 0.001, 4096, 128000),
+('glm:glm-4-long', 'glm', 'glm-4-long', 'GLM-4 Long', '["chat", "analysis"]', 0.001, 0.001, 4096, 1000000),
+('glm:glm-4v-plus', 'glm', 'glm-4v-plus', 'GLM-4V Plus', '["chat", "vision"]', 0.050, 0.050, 4096, 8192),
+-- Gemini 模型
+('gemini:gemini-3-pro', 'gemini', 'gemini-3-pro-preview', 'Gemini 3 Pro', '["chat", "analysis"]', 0.025, 0.075, 8192, 1000000),
+('gemini:gemini-3-image', 'gemini', 'gemini-3-pro-image-preview', 'Gemini 3 Image', '["image_gen"]', NULL, NULL, NULL, NULL),
+-- Claude 模型
+('claude:claude-3-5-sonnet', 'claude', 'claude-3-5-sonnet-20241022', 'Claude 3.5 Sonnet', '["chat", "analysis", "vision"]', 0.003, 0.015, 8192, 200000),
+('claude:claude-3-haiku', 'claude', 'claude-3-haiku-20240307', 'Claude 3 Haiku', '["chat"]', 0.00025, 0.00125, 4096, 200000)
+ON CONFLICT (id) DO UPDATE SET
+    model_name = EXCLUDED.model_name,
+    display_name = EXCLUDED.display_name,
+    capabilities = EXCLUDED.capabilities,
+    cost_per_1k_input = EXCLUDED.cost_per_1k_input,
+    cost_per_1k_output = EXCLUDED.cost_per_1k_output,
+    max_tokens = EXCLUDED.max_tokens,
+    context_window = EXCLUDED.context_window,
+    updated_at = NOW();
+
+-- 更新 Gemini 图片成本
+UPDATE models SET cost_per_image = 0.02 WHERE id = 'gemini:gemini-3-image';
+
+-- 默认路由规则
+INSERT INTO model_routes (name, description, priority, match_task, model_id, fallback_chain, enabled) VALUES
+-- 任务级别路由（优先级 20）
+('图像生成默认', '所有图像生成任务使用 Gemini', 20, 'image_gen', 'gemini:gemini-3-image', '{}', TRUE)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO model_routes (name, description, priority, match_user_tier, model_id, fallback_chain, enabled) VALUES
+-- 用户等级路由（优先级 30）
+('VIP用户用Gemini Pro', 'VIP 用户使用 Gemini 3 Pro', 30, 'vip', 'gemini:gemini-3-pro', '{"glm:glm-4.7-flash", "glm:glm-4-flash"}', TRUE),
+('Pro用户用Gemini Pro', 'Pro 用户使用 Gemini 3 Pro', 35, 'pro', 'gemini:gemini-3-pro', '{"glm:glm-4.7-flash", "glm:glm-4-flash"}', TRUE)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO model_routes (name, description, priority, model_id, fallback_chain, enabled) VALUES
+-- 全局默认（优先级 100）
+('全局默认', '默认使用 GLM-4.7 Flash', 100, 'glm:glm-4.7-flash', '{"glm:glm-4-flash", "gemini:gemini-3-pro"}', TRUE)
+ON CONFLICT DO NOTHING;
+
+-- 配额规则
+INSERT INTO quota_rules (name, description, scope, scope_provider_id, period, max_calls, on_exceed, downgrade_to_model, enabled) VALUES
+-- 全局 Gemini 限制（新增）
+('Gemini 全局日限', '每天最多调用 Gemini 5000 次', 'provider', 'gemini', 'daily', 5000, 'downgrade', 'glm:glm-4.7-flash', TRUE),
+-- 全局 Claude 限制
+('Claude 全局日限', '每天最多调用 Claude 1000 次', 'provider', 'claude', 'daily', 1000, 'downgrade', 'gemini:gemini-3-pro', TRUE)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO quota_rules (name, description, scope, scope_user_tier, period, max_calls, on_exceed, downgrade_to_model, exceed_message, enabled) VALUES
+-- 免费用户限制
+('免费用户日限', '免费用户每天最多 50 次调用', 'tier', 'free', 'daily', 50, 'reject', NULL, '今日免费额度已用完，升级 Pro 获取更多', TRUE)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO quota_rules (name, description, scope, scope_task, period, max_calls, on_exceed, exceed_message, enabled) VALUES
+-- 图像生成限制
+('图像生成全局日限', '每天最多生成 500 张图片', 'task', 'image_gen', 'daily', 500, 'reject', '今日图片生成额度已用完', TRUE)
+ON CONFLICT DO NOTHING;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 9. 辅助函数
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- 获取周期起止时间的函数
+CREATE OR REPLACE FUNCTION get_period_bounds(p_period VARCHAR, p_time TIMESTAMP DEFAULT NOW())
+RETURNS TABLE(period_start TIMESTAMP, period_end TIMESTAMP) AS $$
+BEGIN
+    CASE p_period
+        WHEN 'hourly' THEN
+            RETURN QUERY SELECT
+                date_trunc('hour', p_time),
+                date_trunc('hour', p_time) + INTERVAL '1 hour';
+        WHEN 'daily' THEN
+            RETURN QUERY SELECT
+                date_trunc('day', p_time),
+                date_trunc('day', p_time) + INTERVAL '1 day';
+        WHEN 'weekly' THEN
+            RETURN QUERY SELECT
+                date_trunc('week', p_time),
+                date_trunc('week', p_time) + INTERVAL '1 week';
+        WHEN 'monthly' THEN
+            RETURN QUERY SELECT
+                date_trunc('month', p_time),
+                date_trunc('month', p_time) + INTERVAL '1 month';
+        ELSE
+            RETURN QUERY SELECT
+                date_trunc('day', p_time),
+                date_trunc('day', p_time) + INTERVAL '1 day';
+    END CASE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 增加配额使用量的函数
+CREATE OR REPLACE FUNCTION increment_quota_usage(
+    p_rule_id INT,
+    p_user_id UUID,
+    p_calls INT DEFAULT 1,
+    p_input_tokens INT DEFAULT 0,
+    p_output_tokens INT DEFAULT 0,
+    p_cost DECIMAL DEFAULT 0
+) RETURNS VOID AS $$
+DECLARE
+    v_period VARCHAR;
+    v_period_start TIMESTAMP;
+    v_period_end TIMESTAMP;
+BEGIN
+    -- 获取规则的周期设置
+    SELECT period INTO v_period FROM quota_rules WHERE id = p_rule_id;
+
+    -- 获取周期边界
+    SELECT * INTO v_period_start, v_period_end FROM get_period_bounds(v_period);
+
+    -- 更新或插入使用记录
+    INSERT INTO quota_usage (rule_id, user_id, period_start, period_end, call_count, input_tokens, output_tokens, estimated_cost)
+    VALUES (p_rule_id, p_user_id, v_period_start, v_period_end, p_calls, p_input_tokens, p_output_tokens, p_cost)
+    ON CONFLICT (rule_id, user_id, period_start)
+    DO UPDATE SET
+        call_count = quota_usage.call_count + p_calls,
+        input_tokens = quota_usage.input_tokens + p_input_tokens,
+        output_tokens = quota_usage.output_tokens + p_output_tokens,
+        estimated_cost = quota_usage.estimated_cost + p_cost,
+        last_updated = NOW();
+END;
+$$ LANGUAGE plpgsql;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 10. 清理过期数据的函数（可定期调用）
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION cleanup_old_data(p_days INT DEFAULT 90) RETURNS VOID AS $$
+BEGIN
+    -- 删除过期的配额使用记录
+    DELETE FROM quota_usage WHERE period_end < NOW() - (p_days || ' days')::INTERVAL;
+
+    -- 删除过期的调用日志（保留更长时间用于分析）
+    DELETE FROM model_call_logs WHERE created_at < NOW() - (p_days * 2 || ' days')::INTERVAL;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION cleanup_old_data IS '清理过期数据，建议每周执行一次';

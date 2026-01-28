@@ -1,0 +1,877 @@
+"""
+Account Routes - 用户账户统一入口
+
+合并自:
+- routes/auth.py (认证)
+- routes/users.py (用户资料)
+- routes/identity.py (身份棱镜)
+- routes/guest.py (访客会话)
+
+端点:
+- /account/auth/* - 认证相关
+- /account/profile/* - 用户资料
+- /account/guest/* - 访客会话
+- /account/identity/* - 身份棱镜
+"""
+import os
+from typing import Optional, List
+from datetime import datetime, timezone
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, status, Depends, Cookie, Response, Query
+from pydantic import BaseModel, EmailStr
+
+from services.identity import (
+    AuthService, SSOService, OAuthService, GuestSessionService,
+    AccountDeletionService, EmailAuthService,
+    get_current_user, get_optional_user, CurrentUser
+)
+from stores import UserRepository, SkillRepository, SubscriptionRepository, UnifiedProfileRepository
+
+router = APIRouter(prefix="/account", tags=["Account"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- Auth Models ---
+
+class OnboardingData(BaseModel):
+    """Onboarding data to associate with registration"""
+    birth_datetime: Optional[datetime] = None
+    birth_location: Optional[str] = None
+    gender: Optional[str] = None
+    voice_mode: Optional[str] = "warm"
+    skill: Optional[str] = "bazi"
+    interview_responses: Optional[dict] = None
+    focus_areas: Optional[List[str]] = None
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: dict
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+    onboarding: Optional[OnboardingData] = None
+
+
+class AppleAuthRequest(BaseModel):
+    id_token: str
+    user_name: Optional[str] = None
+    onboarding: Optional[OnboardingData] = None
+
+
+# --- WeChat OAuth Models ---
+
+class WechatQRCodeRequest(BaseModel):
+    redirect_uri: str
+
+
+class WechatQRCodeResponse(BaseModel):
+    scene_id: str
+    qrcode_url: str
+    expires_at: str
+
+
+class WechatCallbackRequest(BaseModel):
+    code: str
+    state: str
+    onboarding: Optional[OnboardingData] = None
+
+
+class WechatStatusResponse(BaseModel):
+    status: str  # pending | scanned | confirmed | expired
+    message: Optional[str] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[str] = None
+    expires_in: Optional[int] = None
+    user: Optional[dict] = None
+
+
+# --- Account Deletion Models ---
+
+class DeletionStatusResponse(BaseModel):
+    status: str  # active | pending_deletion | deleted
+    deletion_requested_at: Optional[str] = None
+    deletion_scheduled_at: Optional[str] = None
+    grace_period_days: Optional[int] = None
+    can_cancel: bool = False
+    message: Optional[str] = None
+
+
+# --- Profile Models ---
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    birth_datetime: Optional[datetime] = None
+    birth_location: Optional[str] = None
+    timezone: Optional[str] = None
+    language: Optional[str] = None
+
+
+class ProfileResponse(BaseModel):
+    user_id: str
+    vibe_id: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    birth_datetime: Optional[datetime] = None
+    birth_location: Optional[str] = None
+    timezone: str
+    language: str
+    created_at: datetime
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    vibe_id: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    email: Optional[str] = None
+
+
+# --- Preferences Models ---
+
+class PreferencesResponse(BaseModel):
+    voice_mode: str = "warm"
+    language: str = "zh-CN"
+
+
+class PreferencesUpdateRequest(BaseModel):
+    voice_mode: Optional[str] = None
+    language: Optional[str] = None
+
+
+# --- Guest Models ---
+
+class GuestSessionResponse(BaseModel):
+    session_id: str
+    birth_datetime: Optional[datetime] = None
+    birth_location: Optional[str] = None
+    gender: Optional[str] = None
+    voice_mode: Optional[str] = None
+    skill: Optional[str] = None
+    interview_responses: Optional[dict] = None
+    focus_areas: Optional[list] = None
+    expires_at: datetime
+
+
+class GuestOnboardingRequest(BaseModel):
+    birth_datetime: Optional[datetime] = None
+    birth_location: Optional[str] = None
+    gender: Optional[str] = None
+    voice_mode: Optional[str] = None
+    skill: Optional[str] = None
+    interview_responses: Optional[dict] = None
+    focus_areas: Optional[List[str]] = None
+
+
+# --- Identity Prism Models ---
+
+class PrismLayer(BaseModel):
+    title: str
+    content: str
+    evidence: Optional[str] = None
+
+
+class DimensionScore(BaseModel):
+    name: str
+    score: int
+    source: str
+
+
+class Memory(BaseModel):
+    content: str
+    date: str
+
+
+class PrismResponse(BaseModel):
+    core: PrismLayer
+    inner: PrismLayer
+    outer: PrismLayer
+    progress: int
+    dimensions: list[DimensionScore]
+    memories: list[Memory]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_onboarding_dict(onboarding: Optional[OnboardingData]) -> Optional[dict]:
+    """Convert OnboardingData to dict for service calls."""
+    if not onboarding:
+        return None
+    return {
+        "birth_datetime": onboarding.birth_datetime,
+        "birth_location": onboarding.birth_location,
+        "gender": onboarding.gender,
+        "voice_mode": onboarding.voice_mode,
+        "skill": onboarding.skill,
+        "interview_responses": onboarding.interview_responses,
+        "focus_areas": onboarding.focus_areas
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auth Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token(request: RefreshRequest):
+    """Refresh access token"""
+    try:
+        result = await AuthService.refresh_token(request.refresh_token)
+        return TokenResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+
+
+@router.post("/auth/logout")
+async def logout(current_user: CurrentUser = Depends(get_current_user)):
+    """Logout user"""
+    return {"message": "Logged out successfully"}
+
+
+@router.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: CurrentUser = Depends(get_current_user)):
+    """Get current authenticated user"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    # Get account info from unified_profiles (Week 3: migrate to unified_profiles)
+    account = await UnifiedProfileRepository.get_account_full(current_user.user_id)
+
+    # Get email from vibe_user_auth table
+    email = None
+    auth_record = await UserRepository.get_auth_by_user_id(current_user.user_id, "email")
+    if auth_record:
+        email = auth_record.get("auth_identifier")
+
+    return UserResponse(
+        user_id=str(current_user.user_id),
+        vibe_id=account.get("vibe_id") or current_user.vibe_id,
+        display_name=account.get("display_name") or current_user.display_name,
+        avatar_url=account.get("avatar_url"),
+        email=email
+    )
+
+
+# --- OAuth ---
+
+@router.post("/auth/oauth/google", response_model=TokenResponse)
+async def google_auth(request: GoogleAuthRequest):
+    """Login or register with Google OAuth"""
+    try:
+        result = await OAuthService.google_login(
+            id_token=request.id_token,
+            onboarding_data=_build_onboarding_dict(request.onboarding)
+        )
+        return TokenResponse(**result)
+    except ValueError as e:
+        error_msg = str(e)
+        if "already registered" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=error_msg
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=error_msg or "Google authentication failed"
+        )
+
+
+@router.post("/auth/oauth/apple", response_model=TokenResponse)
+async def apple_auth(request: AppleAuthRequest):
+    """Login or register with Apple OAuth"""
+    try:
+        result = await OAuthService.apple_login(
+            id_token=request.id_token,
+            user_name=request.user_name,
+            onboarding_data=_build_onboarding_dict(request.onboarding)
+        )
+        return TokenResponse(**result)
+    except ValueError as e:
+        error_msg = str(e)
+        if "already registered" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=error_msg
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=error_msg or "Apple authentication failed"
+        )
+
+
+# --- WeChat OAuth ---
+
+@router.post("/auth/oauth/wechat/qrcode", response_model=WechatQRCodeResponse)
+async def get_wechat_qrcode(request: WechatQRCodeRequest):
+    """Generate a WeChat QR code for login"""
+    try:
+        result = await WechatService.generate_qrcode(redirect_uri=request.redirect_uri)
+        return WechatQRCodeResponse(**result)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/auth/oauth/wechat/status/{scene_id}", response_model=WechatStatusResponse)
+async def poll_wechat_status(scene_id: str):
+    """Poll the status of a WeChat QR code login session"""
+    result = await WechatService.poll_status(scene_id)
+
+    response = WechatStatusResponse(
+        status=result["status"],
+        message=result.get("message")
+    )
+
+    # If confirmed, include tokens and user info
+    if result["status"] == "confirmed" and result.get("tokens"):
+        response.access_token = result["tokens"].get("access_token")
+        response.refresh_token = result["tokens"].get("refresh_token")
+        response.token_type = result["tokens"].get("token_type")
+        response.expires_in = result["tokens"].get("expires_in")
+        response.user = result.get("user")
+
+    return response
+
+
+@router.post("/auth/oauth/wechat/callback", response_model=TokenResponse)
+async def wechat_callback(request: WechatCallbackRequest):
+    """Handle WeChat OAuth callback after user authorizes"""
+    result = await WechatService.handle_callback(
+        code=request.code,
+        state=request.state,
+        onboarding_data=_build_onboarding_dict(request.onboarding)
+    )
+
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="WeChat authentication failed"
+        )
+
+    return TokenResponse(**result)
+
+
+# --- Dev Login (Development Only) ---
+
+class DevLoginRequest(BaseModel):
+    """Dev login request - only works in development mode"""
+    email: Optional[str] = None
+    vibe_id: Optional[str] = None
+
+
+@router.post("/auth/dev-login", response_model=TokenResponse)
+async def dev_login(request: DevLoginRequest):
+    """
+    Development-only login endpoint.
+    Allows login by email or vibe_id without OAuth.
+    Only available when VIBELIFE_ENV != 'production'.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Dev login request: email={request.email}, vibe_id={request.vibe_id}")
+
+    # Security check: only allow in development
+    env = os.getenv("VIBELIFE_ENV", "development")
+    if env == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dev login is not available in production"
+        )
+
+    # Find user by email or vibe_id
+    user = None
+    if request.email:
+        # Use auth table to find user by email (returns joined user data)
+        logger.info(f"Looking up user by email: {request.email}")
+        auth = await UserRepository.get_auth_by_identifier("email", request.email)
+        logger.info(f"Auth result: {auth}")
+        if auth:
+            # auth already contains user data from JOIN query
+            user = {
+                "id": auth["user_id"],
+                "vibe_id": auth["vibe_id"],
+                "display_name": auth.get("display_name"),
+                "avatar_url": auth.get("avatar_url"),
+            }
+    elif request.vibe_id:
+        user = await UserRepository.get_by_vibe_id(request.vibe_id)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either email or vibe_id is required"
+        )
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    # Generate tokens
+    from services.identity import JWTService
+
+    access_token = JWTService.create_access_token(
+        user_id=str(user["id"]),
+        vibe_id=user["vibe_id"]
+    )
+    refresh_token = JWTService.create_refresh_token(
+        user_id=str(user["id"]),
+        vibe_id=user["vibe_id"]
+    )
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=JWTService.get_token_expiry(),
+        user={
+            "user_id": str(user["id"]),
+            "vibe_id": user["vibe_id"],
+            "display_name": user.get("display_name"),
+            "avatar_url": user.get("avatar_url")
+        }
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Profile Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/profile", response_model=ProfileResponse)
+async def get_profile(current_user: CurrentUser = Depends(get_current_user)):
+    """Get current user's full profile"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    # Week 3: Read from unified_profiles instead of vibe_users
+    account = await UnifiedProfileRepository.get_account_full(current_user.user_id)
+    birth_info = await UnifiedProfileRepository.get_birth_info(current_user.user_id)
+
+    # Construct birth_datetime from birth_info
+    birth_datetime = None
+    if birth_info and birth_info.get("date"):
+        time_str = birth_info.get("time", "12:00:00")
+        birth_datetime_str = f"{birth_info['date']} {time_str}"
+        try:
+            from datetime import datetime
+            birth_datetime = datetime.fromisoformat(birth_datetime_str)
+        except:
+            pass
+
+    # created_at still from vibe_users (account-level immutable field)
+    user = await UserRepository.get_by_id(current_user.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return ProfileResponse(
+        user_id=str(current_user.user_id),
+        vibe_id=account.get("vibe_id") or current_user.vibe_id,
+        display_name=account.get("display_name"),
+        avatar_url=account.get("avatar_url"),
+        birth_datetime=birth_datetime,
+        birth_location=birth_info.get("place") if birth_info else None,
+        timezone=account.get("timezone", "Asia/Shanghai"),
+        language=account.get("language", "zh-CN"),
+        created_at=user["created_at"]
+    )
+
+
+@router.put("/profile", response_model=ProfileResponse)
+async def update_profile(
+    request: ProfileUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Update current user's profile"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    update_data = request.model_dump(exclude_unset=True)
+
+    # Week 3: Split updates by data type
+    # 1. Account info (display_name, avatar_url)
+    if "display_name" in update_data or "avatar_url" in update_data:
+        await UnifiedProfileRepository.update_account_info(
+            current_user.user_id,
+            display_name=update_data.get("display_name"),
+            avatar_url=update_data.get("avatar_url")
+        )
+
+    # 2. Birth info (birth_datetime, birth_location + gender if provided)
+    if "birth_datetime" in update_data or "birth_location" in update_data:
+        birth_info = {}
+        if "birth_datetime" in update_data:
+            dt = update_data["birth_datetime"]
+            if dt:
+                birth_info["date"] = dt.date().isoformat()
+                birth_info["time"] = dt.time().isoformat()
+            else:
+                birth_info["date"] = None
+                birth_info["time"] = None
+
+        if "birth_location" in update_data:
+            birth_info["place"] = update_data["birth_location"]
+
+        if birth_info:
+            await UnifiedProfileRepository.update_birth_info(
+                current_user.user_id,
+                birth_info
+            )
+
+    # 3. Preferences (timezone, language)
+    if "timezone" in update_data or "language" in update_data:
+        prefs_update = {}
+        if "timezone" in update_data:
+            prefs_update["timezone"] = update_data["timezone"]
+        if "language" in update_data:
+            prefs_update["language"] = update_data["language"]
+
+        await UnifiedProfileRepository.update_preferences(
+            current_user.user_id,
+            prefs_update
+        )
+
+    # Return updated profile
+    return await get_profile(current_user)
+
+
+# --- Preferences Endpoints ---
+
+@router.get("/preferences", response_model=PreferencesResponse)
+async def get_preferences(current_user: CurrentUser = Depends(get_current_user)):
+    """Get current user's preferences (voice_mode, language, etc.)"""
+    preferences = await UnifiedProfileRepository.get_preferences(current_user.user_id)
+    return PreferencesResponse(
+        voice_mode=preferences.get("voice_mode", "warm"),
+        language=preferences.get("language", "zh-CN")
+    )
+
+
+@router.put("/preferences", response_model=PreferencesResponse)
+async def update_preferences(
+    request: PreferencesUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Update current user's preferences"""
+    update_data = request.model_dump(exclude_unset=True)
+
+    if update_data:
+        await UnifiedProfileRepository.update_preferences(current_user.user_id, update_data)
+
+    # Return updated preferences
+    preferences = await UnifiedProfileRepository.get_preferences(current_user.user_id)
+    return PreferencesResponse(
+        voice_mode=preferences.get("voice_mode", "warm"),
+        language=preferences.get("language", "zh-CN")
+    )
+
+
+@router.get("/profile/export")
+async def export_data(current_user: CurrentUser = Depends(get_current_user)):
+    """Export all user data (GDPR compliance)"""
+    user = await UserRepository.get_by_id(current_user.user_id)
+    profiles = await SkillRepository.get_user_profiles(current_user.user_id)
+    consents = await UserRepository.get_consents(current_user.user_id)
+    subscription = await SubscriptionRepository.get_user_subscription(current_user.user_id)
+
+    return {
+        "user": {
+            "vibe_id": user["vibe_id"],
+            "display_name": user.get("display_name"),
+            "birth_datetime": str(user.get("birth_datetime")) if user.get("birth_datetime") else None,
+            "birth_location": user.get("birth_location"),
+            "timezone": user.get("timezone"),
+            "language": user.get("language"),
+            "created_at": str(user["created_at"])
+        },
+        "skill_profiles": [
+            {
+                "skill_id": p["skill_id"],
+                "profile_data": p["profile_data"],
+                "total_sessions": p["total_sessions"]
+            }
+            for p in profiles
+        ],
+        "consents": [
+            {
+                "source_skill": c["source_skill"],
+                "target_skill": c["target_skill"],
+                "data_type": c["data_type"],
+                "consent_granted": c["consent_granted"]
+            }
+            for c in consents
+        ],
+        "subscription": {
+            "plan_id": subscription["plan_id"] if subscription else "free",
+            "status": subscription["status"] if subscription else "none"
+        } if subscription else None,
+        "export_date": str(datetime.now(timezone.utc))
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Account Deletion Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/auth/delete-account", response_model=DeletionStatusResponse)
+async def request_account_deletion(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Request account deletion.
+
+    Initiates a 30-day grace period before permanent deletion.
+    User can cancel during this period.
+    """
+    try:
+        result = await AccountDeletionService.request_deletion(current_user.user_id)
+        return DeletionStatusResponse(**result)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.post("/auth/cancel-deletion", response_model=DeletionStatusResponse)
+async def cancel_account_deletion(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Cancel a pending account deletion request.
+
+    Only works during the 30-day grace period.
+    """
+    try:
+        result = await AccountDeletionService.cancel_deletion(current_user.user_id)
+        return DeletionStatusResponse(**result)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/auth/deletion-status", response_model=DeletionStatusResponse)
+async def get_deletion_status(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Get current account deletion status.
+
+    Returns whether deletion is pending and when it's scheduled.
+    """
+    try:
+        result = await AccountDeletionService.get_deletion_status(current_user.user_id)
+        return DeletionStatusResponse(**result)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Guest Session Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/guest/session", response_model=GuestSessionResponse)
+async def create_guest_session(response: Response):
+    """Create a new guest session"""
+    session = await GuestSessionService.create_session()
+
+    response.set_cookie(
+        key="guest_session_id",
+        value=session["session_id"],
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        samesite="lax",
+        secure=True
+    )
+
+    return GuestSessionResponse(
+        session_id=session["session_id"],
+        expires_at=session["expires_at"]
+    )
+
+
+@router.get("/guest/session", response_model=GuestSessionResponse)
+async def get_guest_session(guest_session_id: Optional[str] = Cookie(None)):
+    """Get current guest session"""
+    if not guest_session_id:
+        raise HTTPException(status_code=404, detail="No guest session found")
+
+    session = await GuestSessionService.get_session(guest_session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Guest session not found or expired")
+
+    return GuestSessionResponse(
+        session_id=session["session_id"],
+        birth_datetime=session.get("birth_datetime"),
+        birth_location=session.get("birth_location"),
+        gender=session.get("gender"),
+        voice_mode=session.get("voice_mode"),
+        skill=session.get("skill"),
+        interview_responses=session.get("interview_responses"),
+        focus_areas=session.get("focus_areas"),
+        expires_at=session["expires_at"]
+    )
+
+
+@router.put("/guest/session/onboarding", response_model=GuestSessionResponse)
+async def save_guest_onboarding(
+    data: GuestOnboardingRequest,
+    guest_session_id: Optional[str] = Cookie(None)
+):
+    """Save onboarding data to guest session"""
+    if not guest_session_id:
+        raise HTTPException(status_code=404, detail="No guest session found")
+
+    session = await GuestSessionService.save_onboarding_data(
+        session_id=guest_session_id,
+        birth_datetime=data.birth_datetime,
+        birth_location=data.birth_location,
+        gender=data.gender,
+        voice_mode=data.voice_mode,
+        skill=data.skill,
+        interview_responses=data.interview_responses,
+        focus_areas=data.focus_areas
+    )
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Guest session not found or expired")
+
+    return GuestSessionResponse(
+        session_id=session["session_id"],
+        birth_datetime=session.get("birth_datetime"),
+        birth_location=session.get("birth_location"),
+        gender=session.get("gender"),
+        voice_mode=session.get("voice_mode"),
+        skill=session.get("skill"),
+        interview_responses=session.get("interview_responses"),
+        focus_areas=session.get("focus_areas"),
+        expires_at=session["expires_at"]
+    )
+
+
+@router.delete("/guest/session")
+async def delete_guest_session(
+    response: Response,
+    guest_session_id: Optional[str] = Cookie(None)
+):
+    """Delete guest session"""
+    response.delete_cookie(key="guest_session_id")
+    return {"message": "Guest session cleared"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Identity Prism Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/identity/prism", response_model=PrismResponse)
+async def get_prism(
+    user_id: Optional[UUID] = Query(None),
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """Get user's Identity Prism data"""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    target_user_id = user_id or (current_user.user_id if current_user else None)
+
+    # Default prism for guests
+    default_prism = PrismResponse(
+        core=PrismLayer(
+            title="核心驱动力",
+            content="追求稳定与安全感，同时渴望被理解和认可",
+            evidence="八字·星座"
+        ),
+        inner=PrismLayer(
+            title="内在渴望",
+            content="希望在事业上有所成就，同时保持内心的平静",
+            evidence="对话记录"
+        ),
+        outer=PrismLayer(
+            title="外在表现",
+            content="给人稳重可靠的印象，善于倾听和沟通",
+            evidence="八字·星座"
+        ),
+        progress=35,
+        dimensions=[
+            DimensionScore(name="八字命理", score=50, source="bazi"),
+            DimensionScore(name="星座能量", score=40, source="zodiac"),
+            DimensionScore(name="对话洞察", score=20, source="chat"),
+            DimensionScore(name="行为模式", score=10, source="behavior"),
+        ],
+        memories=[Memory(content="欢迎来到 VibeLife", date="刚刚")]
+    )
+
+    if not target_user_id:
+        return default_prism
+
+    try:
+        profiles = await SkillRepository.get_user_profiles(target_user_id)
+
+        bazi_score = 0
+        zodiac_score = 0
+        chat_score = 0
+
+        for profile in profiles:
+            skill = profile.get("skill_id", "")
+            sessions = profile.get("total_sessions", 0)
+            if skill == "bazi":
+                bazi_score = min(100, sessions * 20 + 50)
+            elif skill == "zodiac":
+                zodiac_score = min(100, sessions * 20 + 40)
+            elif skill == "chat":
+                chat_score = min(100, sessions * 5 + 10)
+
+        progress = int((bazi_score + zodiac_score + chat_score) / 4)
+
+        insights = await SkillRepository.get_user_insights(user_id=target_user_id, limit=5)
+
+        memories = [
+            Memory(
+                content=i.get("content", "")[:50] if i.get("content") else "新的洞察",
+                date=str(i.get("created_at", ""))[:10] if i.get("created_at") else "最近"
+            )
+            for i in insights
+        ] if insights else [Memory(content="继续探索，让我更了解你", date="刚刚")]
+
+        return PrismResponse(
+            core=PrismLayer(
+                title="核心驱动力",
+                content="追求稳定与安全感，同时渴望被理解和认可",
+                evidence="八字·星座"
+            ),
+            inner=PrismLayer(
+                title="内在渴望",
+                content="希望在事业上有所成就，同时保持内心的平静",
+                evidence="对话记录"
+            ),
+            outer=PrismLayer(
+                title="外在表现",
+                content="给人稳重可靠的印象，善于倾听和沟通",
+                evidence="八字·星座"
+            ),
+            progress=max(35, progress),
+            dimensions=[
+                DimensionScore(name="八字命理", score=max(50, bazi_score), source="bazi"),
+                DimensionScore(name="星座能量", score=max(40, zodiac_score), source="zodiac"),
+                DimensionScore(name="对话洞察", score=max(20, chat_score), source="chat"),
+                DimensionScore(name="行为模式", score=10, source="behavior"),
+            ],
+            memories=memories
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to get prism data: {e}")
+        return default_prism

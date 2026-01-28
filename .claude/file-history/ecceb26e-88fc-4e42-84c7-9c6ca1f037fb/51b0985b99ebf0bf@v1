@@ -1,0 +1,310 @@
+"use client";
+
+/**
+ * useDashboard Hook - Dashboard v2.0 数据管理
+ *
+ * 使用 SWR 进行数据获取，支持乐观更新
+ * 遵循 React Best Practices: client-swr-dedup
+ */
+
+import useSWR from "swr";
+import { useCallback, useEffect } from "react";
+import { apiClient } from "@/lib/api";
+import type {
+  DashboardDTO,
+  DashboardResponse,
+  CheckinResponse,
+  LeverToggleResponse,
+  SkillSubscribeResponse,
+  SkillCardData,
+} from "@/types/dashboard";
+
+const DASHBOARD_KEY = "/dashboard";
+const CACHE_KEY = "vibelife-dashboard-cache";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Local Storage Cache for Offline Support
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getCachedData(): DashboardDTO | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const cached = localStorage.getItem(CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      // Check if cache is from today (for daily data freshness)
+      const cachedDate = new Date(parsed.generatedAt).toDateString();
+      const today = new Date().toDateString();
+      if (cachedDate === today) {
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore parse errors
+  }
+  return undefined;
+}
+
+function setCachedData(data: DashboardDTO): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+  } catch {
+    // Ignore storage errors (quota exceeded, etc.)
+  }
+}
+
+// Fetcher function
+async function fetcher(url: string): Promise<DashboardDTO> {
+  const { data } = await apiClient.get<DashboardResponse>(url);
+  return data.data;
+}
+
+export function useDashboard() {
+  const { data, error, isLoading, mutate } = useSWR<DashboardDTO>(
+    DASHBOARD_KEY,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: true,
+      dedupingInterval: 60000, // 1 minute dedup
+      errorRetryCount: 3,
+      fallbackData: getCachedData(), // Offline support
+      onSuccess: (data) => {
+        // Cache successful responses for offline use
+        setCachedData(data);
+      },
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Actions with optimistic updates
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 签到
+   */
+  const checkIn = useCallback(async () => {
+    if (!data) return;
+
+    const currentStreak = data.status.streak;
+
+    // 1. Optimistic update
+    await mutate(
+      {
+        ...data,
+        status: {
+          ...data.status,
+          checkedIn: true,
+          streak: currentStreak + 1,
+        },
+      },
+      false
+    );
+
+    try {
+      // 2. API call
+      const { data: result } = await apiClient.post<CheckinResponse>(
+        "/dashboard/checkin"
+      );
+
+      // 3. Update with server data
+      await mutate(
+        {
+          ...data,
+          status: {
+            ...data.status,
+            checkedIn: true,
+            streak: result.data.streak,
+          },
+        },
+        false
+      );
+
+      return result.data;
+    } catch (err) {
+      // 4. Rollback on error
+      await mutate(data, false);
+      throw err;
+    }
+  }, [data, mutate]);
+
+  /**
+   * 切换杠杆完成状态
+   */
+  const toggleLever = useCallback(
+    async (leverId: string) => {
+      if (!data) return;
+
+      const lever = data.lifecoach.todayLevers.find((l) => l.id === leverId);
+      if (!lever) return;
+
+      const newCompleted = !lever.completed;
+
+      // 1. Optimistic update
+      const optimisticData = {
+        ...data,
+        lifecoach: {
+          ...data.lifecoach,
+          todayLevers: data.lifecoach.todayLevers.map((l) =>
+            l.id === leverId ? { ...l, completed: newCompleted } : l
+          ),
+        },
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.patch<LeverToggleResponse>(
+          `/dashboard/lever/${leverId}`,
+          { completed: newCompleted }
+        );
+
+        // Keep optimistic data (server will confirm)
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 切换大石头完成状态
+   */
+  const toggleRock = useCallback(
+    async (rockId: string) => {
+      if (!data) return;
+
+      const rock = data.lifecoach.weekRocks.find((r) => r.id === rockId);
+      if (!rock) return;
+
+      const newCompleted = !rock.completed;
+
+      // 1. Optimistic update
+      const optimisticData = {
+        ...data,
+        lifecoach: {
+          ...data.lifecoach,
+          weekRocks: data.lifecoach.weekRocks.map((r) =>
+            r.id === rockId ? { ...r, completed: newCompleted } : r
+          ),
+        },
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.patch(`/dashboard/rock/${rockId}`, {
+          completed: newCompleted,
+        });
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 订阅 Skill
+   */
+  const subscribeSkill = useCallback(
+    async (skillId: string) => {
+      if (!data) return;
+
+      // Find the skill in discover
+      const targetSkill = data.discover.find((s) => s.skillId === skillId);
+      if (!targetSkill) return;
+
+      // 1. Optimistic update: move from discover to mySkills (with placeholder)
+      const placeholderCard: SkillCardData = {
+        skillId,
+        cardId: "loading",
+        title: targetSkill.title,
+        icon: targetSkill.icon,
+        content: {
+          headline: "加载中…",
+          insights: [],
+        },
+        computedAt: new Date().toISOString(),
+        actionLabel: "加载中…",
+        actionRoute: "",
+      };
+
+      const optimisticData = {
+        ...data,
+        mySkills: [...data.mySkills, placeholderCard],
+        discover: data.discover.filter((s) => s.skillId !== skillId),
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.post(`/skills/${skillId}/subscribe`);
+
+        // 3. Update with placeholder card (backend doesn't return card data yet)
+        // Create a proper placeholder card from the discover item
+        const subscribedCard: SkillCardData = {
+          skillId,
+          cardId: `${skillId}-subscribed`,
+          title: targetSkill.title,
+          icon: targetSkill.icon,
+          content: {
+            headline: "已订阅",
+            insights: [targetSkill.description],
+          },
+          computedAt: new Date().toISOString(),
+          actionLabel: "开始使用",
+          actionRoute: `/chat?skill=${skillId}`,
+        };
+
+        await mutate(
+          {
+            ...optimisticData,
+            mySkills: optimisticData.mySkills.map((s) =>
+              s.skillId === skillId ? subscribedCard : s
+            ),
+          },
+          false
+        );
+
+        return { subscription: { skillId, subscribedAt: new Date().toISOString() }, card: subscribedCard };
+      } catch (err) {
+        // 4. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 刷新数据
+   */
+  const refresh = useCallback(() => {
+    return mutate();
+  }, [mutate]);
+
+  return {
+    // Data
+    dashboard: data,
+    isLoading,
+    error,
+
+    // Computed
+    isCheckedIn: data?.status.checkedIn ?? false,
+    streak: data?.status.streak ?? 0,
+
+    // Actions
+    checkIn,
+    toggleLever,
+    toggleRock,
+    subscribeSkill,
+    refresh,
+  };
+}
+
+export default useDashboard;

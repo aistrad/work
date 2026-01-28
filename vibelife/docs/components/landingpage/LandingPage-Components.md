@@ -1,0 +1,1446 @@
+# VibeLife Landing Page 组件实现规范
+
+> **版本**: 7.2
+> **配套文档**: LandingPage-Design-v1.md
+> **设计理念**: Mentis OS — 道林纸质感 + 高级灰棕强调 + 衬线优雅
+> **配色体系**: 高级灰棕 + Morandi 中饱和色系
+
+---
+
+## 一、全局样式系统
+
+### 1.1 CSS Variables 完整定义 (v7.2)
+
+```css
+/* globals.css */
+
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Inter:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@400;700&display=swap');
+
+:root {
+  /* ====================================================================== */
+  /* 背景层级 - 道林纸质感 (增强层次)                                          */
+  /* ====================================================================== */
+  --bg-primary: #F8F7F4;      /* 主背景 - 柔和暖灰 */
+  --bg-secondary: #F2F1EE;    /* 次级背景 - Section 交替 */
+  --bg-tertiary: #ECEAE6;     /* 三级背景 - 对比区域 */
+  --bg-elevated: #FFFFFF;     /* 悬浮元素 - 卡片/浮层 */
+  --bg-hover: #F5F4F1;        /* hover 状态背景 */
+  --bg-active: #EEEDEA;       /* active 状态背景 */
+  --bg-overlay: rgba(0, 0, 0, 0.4);  /* 遮罩层 */
+
+  /* ====================================================================== */
+  /* 墨色系列 - 柔和对比                                                      */
+  /* ====================================================================== */
+  --ink-50: #FAFAFA;
+  --ink-100: #F4F4F4;
+  --ink-200: #E4E4E4;
+  --ink-300: #D1D1D1;
+  --ink-400: #A1A1A1;
+  --ink-500: #717171;
+  --ink-600: #525252;
+  --ink-700: #3D3D3D;
+  --ink-800: #262626;         /* 主文字色 - 深灰而非纯黑 */
+  --ink-900: #171717;
+
+  /* 文字层级别名 (兼容旧版) */
+  --text-primary: var(--ink-800);
+  --text-secondary: var(--ink-500);
+  --text-tertiary: var(--ink-400);
+  --text-disabled: var(--ink-300);
+
+  /* ====================================================================== */
+  /* 边框与分割                                                               */
+  /* ====================================================================== */
+  --border-default: #E9E9E7;  /* 卡片描边、分割线 */
+  --border-hover: #D3D1CB;    /* Hover 态边框 */
+  --border-subtle: #F0F0EE;   /* 极淡分割线 */
+
+  /* ====================================================================== */
+  /* 强调色系 - 高级灰棕 (v7.2 核心升级)                                       */
+  /* ====================================================================== */
+  --accent-primary: #7A6B5A;  /* 主强调色 - 高级灰棕 */
+  --accent-secondary: #8F8070; /* 次强调色 */
+  --accent-hover: #6B5C4B;    /* hover 状态 */
+  --accent-active: #5C4D3C;   /* active 状态 */
+  --accent-muted: rgba(122, 107, 90, 0.08);  /* 淡化背景 */
+  --accent-subtle: rgba(122, 107, 90, 0.12); /* 微妙强调 */
+  --focus-ring: rgba(122, 107, 90, 0.3); /* 焦点环 */
+
+  /* ====================================================================== */
+  /* 羊皮纸色系 (Vellum)                                                      */
+  /* ====================================================================== */
+  --vellum-50: #FDFCFA;
+  --vellum-100: #FAF8F5;
+  --vellum-200: #F5F2ED;
+  --vellum-300: #EDE9E2;
+  --vellum-400: #E2DDD4;
+  --vellum-500: #D4CEC3;
+  --vellum-600: #B8B1A4;
+  --vellum-700: #9A9285;
+  --vellum-800: #7C7568;
+  --vellum-900: #5E584D;
+
+  /* ====================================================================== */
+  /* 古金色系 (Gold) - 东方智慧                                               */
+  /* ====================================================================== */
+  --gold-50: #FDFCF8;
+  --gold-100: #FAF7EE;
+  --gold-200: #F2ECDA;
+  --gold-300: #E6DCC0;
+  --gold-400: #D4C9A0;
+  --gold-500: #BBA978;        /* 主要金色 - 沉稳 */
+  --gold-600: #A08F5C;
+  --gold-700: #857648;
+  --gold-800: #6A5D38;
+  --gold-900: #4F4528;
+
+  /* ====================================================================== */
+  /* 神秘紫色系 (Mystic) - 灵性洞察                                           */
+  /* ====================================================================== */
+  --mystic-50: #FAF9FB;
+  --mystic-100: #F3F1F5;
+  --mystic-200: #E5E1EB;
+  --mystic-300: #D2CBDC;
+  --mystic-400: #B5AAC5;
+  --mystic-500: #8E7FA0;      /* 主要神秘紫 - 灰调优雅 */
+  --mystic-600: #716480;
+  --mystic-700: #564B61;
+  --mystic-800: #3B3342;
+  --mystic-900: #201C24;
+
+  /* ====================================================================== */
+  /* PERMA 数据可视化色系                                                     */
+  /* ====================================================================== */
+  --perma-positive: #84A59D;      /* Sage Green - 积极/治愈/平静 */
+  --perma-engagement: #F28482;    /* Soft Red - 投入/热情/活力 */
+  --perma-relationship: #F6BD60;  /* Mustard - 关系/温暖/连接 */
+  --perma-meaning: #7B8E6F;       /* Forest Green - 意义/深沉/生长 */
+  --perma-accomplishment: var(--mystic-500); /* 神秘紫 - 成就/智慧/升华 */
+
+  /* ====================================================================== */
+  /* 五行色系 (降低饱和度，更和谐)                                             */
+  /* ====================================================================== */
+  --element-wood: #4A7C59;    /* 木 - 生长、创造力 */
+  --element-fire: #B85450;    /* 火 - 激情、转化 */
+  --element-earth: #B8A060;   /* 土 - 稳定、滋养 */
+  --element-metal: #A8A8A8;   /* 金 - 精准、价值 */
+  --element-water: #5B7B9A;   /* 水 - 智慧、流动 */
+
+  /* ====================================================================== */
+  /* 12原型配色 (Morandi 中饱和版 - 饱和度提升 12%)                            */
+  /* ====================================================================== */
+  --archetype-innocent: #F2B8B8;   /* 柔粉 - 提升可见度 */
+  --archetype-sage: #9480A8;       /* 灰紫 - 更清晰 */
+  --archetype-explorer: #7DB8C5;   /* 雾蓝 - 更鲜明 */
+  --archetype-outlaw: #A8524F;     /* 暗红 - 更有力 */
+  --archetype-magician: #8570AB;   /* 薰紫 - 更神秘 */
+  --archetype-hero: #D46560;       /* 砖红 - 更热烈 */
+  --archetype-lover: #D47D90;      /* 玫红 - 更温暖 */
+  --archetype-jester: #E5AD58;     /* 暖金 - 更活跃 */
+  --archetype-regular: #6F9A6F;    /* 草绿 - 更生机 */
+  --archetype-caregiver: #80C494;  /* 薄荷 - 更清新 */
+  --archetype-ruler: #C99D58;      /* 赭金 - 更尊贵 */
+  --archetype-creator: #5C94C3;    /* 灰蓝 - 更深邃 */
+
+  /* ====================================================================== */
+  /* 语义色彩 (降低饱和度，更柔和)                                             */
+  /* ====================================================================== */
+  --color-success: #5A9A6A;
+  --color-warning: #C4956A;
+  --color-error: #C46A6A;
+  --color-info: #6A8AC4;
+
+  /* ====================================================================== */
+  /* 阴影系统 (Linear 风格多层阴影)                                           */
+  /* ====================================================================== */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.02);
+  --shadow-sm:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 2px 4px rgba(0, 0, 0, 0.02);
+  --shadow-md:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 2px 4px rgba(0, 0, 0, 0.02),
+    0 4px 8px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.02);
+  --shadow-lg:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 4px 8px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.03),
+    0 16px 32px rgba(0, 0, 0, 0.04);
+  --shadow-xl:
+    0 0 0 1px rgba(0, 0, 0, 0.02),
+    0 8px 16px rgba(0, 0, 0, 0.03),
+    0 16px 32px rgba(0, 0, 0, 0.04),
+    0 24px 48px rgba(0, 0, 0, 0.05);
+  --shadow-capsule:
+    0 0 0 1px rgba(0, 0, 0, 0.03),
+    0 8px 30px rgba(0, 0, 0, 0.04);
+  --shadow-card:
+    0 0 0 1px rgba(122, 107, 90, 0.04),
+    0 2px 4px rgba(122, 107, 90, 0.02),
+    0 4px 12px rgba(122, 107, 90, 0.04);
+  --shadow-card-hover:
+    0 0 0 1px rgba(122, 107, 90, 0.06),
+    0 4px 8px rgba(122, 107, 90, 0.03),
+    0 8px 24px rgba(122, 107, 90, 0.06);
+  --shadow-focus:
+    0 0 0 2px var(--bg-primary),
+    0 0 0 4px rgba(122, 107, 90, 0.3);
+  --shadow-glow:
+    0 0 20px rgba(142, 127, 160, 0.15),
+    0 0 40px rgba(142, 127, 160, 0.08);
+
+  /* ====================================================================== */
+  /* 圆角与间距 (4px 网格)                                                    */
+  /* ====================================================================== */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-full: 9999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ====================================================================== */
+  /* 字体栈                                                                   */
+  /* ====================================================================== */
+  --font-serif: 'Playfair Display', 'Noto Serif SC', Georgia, serif;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* ====================================================================== */
+  /* 动画                                                                     */
+  /* ====================================================================== */
+  --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-smooth: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --duration-fast: 150ms;
+  --duration-normal: 300ms;
+  --duration-slow: 500ms;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6, .serif-heading {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-primary);
+}
+
+/* 字体大小 */
+.text-hero { font-size: 48px; font-family: var(--font-serif); font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
+.text-subtitle { font-size: 24px; font-weight: 400; line-height: 1.4; }
+.text-section { font-size: 18px; font-family: var(--font-serif); font-weight: 600; line-height: 1.3; }
+.text-card-title { font-size: 16px; font-weight: 500; line-height: 1.4; }
+.text-body { font-size: 14px; font-weight: 400; line-height: 1.6; }
+.text-caption { font-size: 12px; font-weight: 400; line-height: 1.5; color: var(--text-tertiary); }
+.text-label { font-size: 10px; font-weight: 500; line-height: 1.2; text-transform: uppercase; letter-spacing: 0.05em; }
+
+/* 命令前缀 "/" - 斜体衬线 */
+.command-prefix {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
+/* 引言块 */
+.quote {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 767px) {
+  .text-hero { font-size: 32px; }
+  .text-subtitle { font-size: 18px; }
+  .text-section { font-size: 16px; }
+}
+```
+
+---
+
+## 二、核心组件
+
+### 2.1 Orb 符号组件 (品牌标识)
+
+```tsx
+// components/landing/OrbSymbol.tsx
+'use client'
+import { motion } from 'framer-motion'
+
+const ARCHETYPE_COLORS = [
+  'var(--archetype-innocent)',
+  'var(--archetype-sage)',
+  'var(--archetype-explorer)',
+  'var(--archetype-outlaw)',
+  'var(--archetype-magician)',
+  'var(--archetype-hero)',
+  'var(--archetype-lover)',
+  'var(--archetype-jester)',
+  'var(--archetype-regular)',
+  'var(--archetype-caregiver)',
+  'var(--archetype-ruler)',
+  'var(--archetype-creator)',
+]
+
+export function OrbSymbol({ size = 160, className = '' }) {
+  return (
+    <div className={`relative ${className}`} style={{ width: size, height: size }}>
+      {/* 外层光晕 */}
+      <motion.div
+        className="absolute inset-0 rounded-full"
+        style={{
+          background: `conic-gradient(from 0deg, ${ARCHETYPE_COLORS.join(', ')})`,
+          filter: 'blur(30px)',
+          opacity: 0.3,
+        }}
+        animate={{ rotate: 360, scale: [1, 1.05, 1] }}
+        transition={{
+          rotate: { duration: 30, ease: 'linear', repeat: Infinity },
+          scale: { duration: 4, ease: 'easeInOut', repeat: Infinity },
+        }}
+      />
+
+      {/* 外环 - 12原型色渐变 */}
+      <motion.div
+        className="absolute inset-2 rounded-full"
+        style={{
+          background: `conic-gradient(from 0deg, ${ARCHETYPE_COLORS.join(', ')})`,
+          padding: 2,
+        }}
+        animate={{ rotate: 360 }}
+        transition={{ duration: 30, ease: 'linear', repeat: Infinity }}
+      >
+        <div
+          className="w-full h-full rounded-full"
+          style={{ background: 'var(--bg-primary)' }}
+        />
+      </motion.div>
+
+      {/* 内核 - 陶土红渐变 */}
+      <div className="absolute inset-6 flex items-center justify-center">
+        <motion.div
+          className="w-full h-full rounded-full flex items-center justify-center"
+          style={{
+            background: 'linear-gradient(135deg, #E16259 0%, #C94D44 100%)',
+          }}
+          animate={{ scale: [1, 1.02, 1] }}
+          transition={{ duration: 4, ease: 'easeInOut', repeat: Infinity }}
+        >
+          {/* V 字母 - 白色衬线斜体 */}
+          <span
+            className="text-white"
+            style={{
+              fontFamily: 'var(--font-serif)',
+              fontStyle: 'italic',
+              fontWeight: 600,
+              fontSize: size * 0.25,
+            }}
+          >
+            V
+          </span>
+        </motion.div>
+      </div>
+    </div>
+  )
+}
+```
+
+### 2.2 Section 容器与标题组件
+
+```tsx
+// components/landing/Section.tsx
+export function Section({
+  id,
+  className = '',
+  children,
+  background = 'default'
+}) {
+  const bgClass = {
+    default: 'bg-[var(--bg-primary)]',
+    secondary: 'bg-[var(--bg-secondary)]',
+    elevated: 'bg-[var(--bg-elevated)]',
+  }[background]
+
+  return (
+    <section id={id} className={`py-16 md:py-20 lg:py-24 ${bgClass} ${className}`}>
+      <div className="max-w-6xl mx-auto px-4 md:px-6 lg:px-8">
+        {children}
+      </div>
+    </section>
+  )
+}
+
+// components/landing/SectionHeader.tsx
+export function SectionHeader({
+  title,
+  subtitle,
+  align = 'center'
+}) {
+  return (
+    <div className={`mb-10 md:mb-12 ${align === 'center' ? 'text-center' : 'text-left'}`}>
+      <h2
+        className="serif-heading mb-3"
+        style={{
+          fontFamily: 'var(--font-serif)',
+          fontSize: '28px',
+          fontWeight: 600,
+          color: 'var(--text-primary)',
+          letterSpacing: '0.02em',
+        }}
+      >
+        {title.split('').map((c, i) => (
+          <span key={i} className={c === ' ' ? 'mx-1' : 'mx-0.5'}>{c}</span>
+        ))}
+      </h2>
+      {subtitle && (
+        <p
+          className="max-w-2xl mx-auto"
+          style={{
+            fontSize: '16px',
+            color: 'var(--text-secondary)',
+            lineHeight: 1.6,
+          }}
+        >
+          {subtitle}
+        </p>
+      )}
+    </div>
+  )
+}
+```
+
+### 2.3 Prompt Card 组件 (功能卡片)
+
+```tsx
+// components/landing/PromptCard.tsx
+'use client'
+import { motion } from 'framer-motion'
+
+interface PromptCardProps {
+  emoji: string
+  title: string
+  subtitle: string
+  onClick?: () => void
+}
+
+export function PromptCard({ emoji, title, subtitle, onClick }: PromptCardProps) {
+  return (
+    <motion.div
+      className="cursor-pointer"
+      style={{
+        background: 'var(--bg-elevated)',
+        border: '1px solid var(--border-default)',
+        borderRadius: 'var(--radius)',
+        padding: 'var(--space-5)',
+        boxShadow: 'var(--shadow-sm)',
+      }}
+      whileHover={{
+        y: -4,
+        boxShadow: 'var(--shadow-lg)',
+        borderColor: 'var(--border-hover)',
+      }}
+      transition={{ duration: 0.3 }}
+      onClick={onClick}
+    >
+      {/* Emoji */}
+      <motion.div
+        className="mb-3"
+        style={{ fontSize: '32px', filter: 'grayscale(20%)' }}
+        whileHover={{ filter: 'grayscale(0%)' }}
+      >
+        {emoji}
+      </motion.div>
+
+      {/* Title */}
+      <h3
+        style={{
+          fontSize: '16px',
+          fontWeight: 500,
+          color: 'var(--text-primary)',
+          marginBottom: 'var(--space-1)',
+        }}
+      >
+        {title}
+      </h3>
+
+      {/* Subtitle */}
+      <p style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+        {subtitle}
+      </p>
+    </motion.div>
+  )
+}
+```
+
+### 2.4 体系卡片组件
+
+```tsx
+// components/landing/SystemCard.tsx
+'use client'
+import { motion } from 'framer-motion'
+
+interface SystemCardProps {
+  icon: string
+  title: string
+  subtitle: string
+  tags: string[]
+  heritage: string
+  insight: string
+  action_hint: string
+  color: string
+}
+
+export function SystemCard({
+  icon, title, subtitle, tags, heritage, insight, action_hint, color
+}: SystemCardProps) {
+  return (
+    <motion.div
+      style={{
+        background: 'var(--bg-elevated)',
+        border: '1px solid var(--border-default)',
+        borderRadius: 'var(--radius)',
+        padding: 'var(--space-6)',
+        boxShadow: 'var(--shadow-sm)',
+      }}
+      whileHover={{ y: -4, boxShadow: 'var(--shadow-card-hover)' }}
+      transition={{ duration: 0.2 }}
+    >
+      {/* Icon */}
+      <div
+        className="w-12 h-12 rounded-full flex items-center justify-center text-xl mb-4"
+        style={{ backgroundColor: `${color}15`, color }}
+      >
+        {icon}
+      </div>
+
+      {/* Title & Subtitle */}
+      <h3
+        className="serif-heading mb-1"
+        style={{
+          fontFamily: 'var(--font-serif)',
+          fontSize: '18px',
+          fontWeight: 600,
+          color: 'var(--text-primary)',
+        }}
+      >
+        {title}
+      </h3>
+      <p className="text-sm mb-4" style={{ color: 'var(--text-tertiary)' }}>
+        {subtitle}
+      </p>
+
+      {/* Tags */}
+      <div className="flex flex-wrap gap-2 mb-4">
+        {tags.map(tag => (
+          <span
+            key={tag}
+            className="text-xs px-2 py-1 rounded-md"
+            style={{
+              background: 'var(--bg-secondary)',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            {tag}
+          </span>
+        ))}
+      </div>
+
+      {/* Heritage & Insight */}
+      <div
+        className="pt-4"
+        style={{ borderTop: '1px solid var(--border-subtle)' }}
+      >
+        <p
+          className="serif-heading text-sm mb-2"
+          style={{
+            fontFamily: 'var(--font-serif)',
+            color: 'var(--text-secondary)',
+          }}
+        >
+          {heritage}
+        </p>
+        <p
+          className="text-xs italic"
+          style={{ color: 'var(--perma-accomplishment)' }}
+        >
+          {insight}
+        </p>
+        <p
+          className="text-xs mt-2"
+          style={{ color: 'var(--text-tertiary)' }}
+        >
+          ✦ {action_hint}
+        </p>
+      </div>
+    </motion.div>
+  )
+}
+
+// 体系卡片数据
+export const SYSTEM_CARDS_DATA = [
+  {
+    icon: '◎',
+    title: '东方命理',
+    subtitle: 'Eastern Wisdom',
+    tags: ['八字', '五行', '十神', '行运'],
+    heritage: '3000年 · 理解你的能量倾向',
+    insight: '帮助回答"我倾向于用什么方式面对世界"',
+    action_hint: '了解倾向，不是为了顺从它，而是为了更有意识地选择',
+    color: 'var(--element-fire)'
+  },
+  {
+    icon: '☆',
+    title: '西方占星',
+    subtitle: 'Western Astrology',
+    tags: ['太阳', '月亮', '上升', '行星'],
+    heritage: '2000年 · 理解你的多面策略',
+    insight: '帮助回答"我在不同情境中为何有不同的表现"',
+    action_hint: '多面不是分裂，是你应对不同生活任务的灵活性',
+    color: 'var(--element-water)'
+  },
+  {
+    icon: '◈',
+    title: '深度心理',
+    subtitle: 'Depth Psychology',
+    tags: ['荣格原型', '阿德勒勇气', '个体化'],
+    heritage: '100年 · 理解你的成长方向',
+    insight: '帮助回答"我想成为什么样的人，需要什么样的勇气"',
+    action_hint: '成长不是变成别人，是更完整地成为自己',
+    color: 'var(--perma-accomplishment)'
+  }
+]
+```
+
+### 2.5 四维节点组件
+
+```tsx
+// components/landing/DimensionNode.tsx
+'use client'
+import { motion } from 'framer-motion'
+
+interface DimensionNodeProps {
+  name_cn: string
+  name_en: string
+  icon: string
+  headline: string
+  description: string
+  question: string
+  action_hint: string
+  insight?: string
+  color: string
+  isActive?: boolean
+}
+
+export function DimensionNode({
+  name_cn, name_en, icon, headline, description, question, action_hint, insight, color, isActive = false
+}: DimensionNodeProps) {
+  return (
+    <motion.div
+      className="relative p-4 rounded-lg"
+      style={{
+        background: 'var(--bg-elevated)',
+        boxShadow: isActive ? 'var(--shadow-card-hover)' : 'var(--shadow-sm)',
+        borderLeft: `3px solid ${color}`,
+      }}
+      whileHover={{ scale: 1.02 }}
+    >
+      {/* Header */}
+      <div className="flex items-center gap-3 mb-2">
+        <span className="text-xl" style={{ color }}>{icon}</span>
+        <div>
+          <h4
+            className="serif-heading"
+            style={{
+              fontFamily: 'var(--font-serif)',
+              fontSize: '16px',
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+            }}
+          >
+            {name_cn}
+          </h4>
+          <span
+            className="text-xs uppercase tracking-wider"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
+            {name_en}
+          </span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <p
+        className="font-medium mb-1"
+        style={{ fontSize: '14px', color: 'var(--text-primary)' }}
+      >
+        {headline}
+      </p>
+      <p
+        className="text-sm mb-2"
+        style={{ color: 'var(--text-secondary)' }}
+      >
+        {description}
+      </p>
+      <p
+        className="text-xs italic"
+        style={{ color: 'var(--perma-accomplishment)' }}
+      >
+        {question}
+      </p>
+
+      {/* Insight & Action Hint */}
+      {insight && (
+        <p
+          className="text-xs mt-2 pt-2"
+          style={{
+            color: 'var(--perma-relationship)',
+            borderTop: '1px solid var(--border-subtle)',
+          }}
+        >
+          ✦ {insight}
+        </p>
+      )}
+      <p
+        className="text-xs mt-2"
+        style={{ color: 'var(--text-tertiary)' }}
+      >
+        → {action_hint}
+      </p>
+    </motion.div>
+  )
+}
+
+// 四维节点数据
+export const DIMENSIONS_DATA = [
+  {
+    key: 'core',
+    name_cn: '核心',
+    name_en: 'Core',
+    icon: '☀',
+    headline: '你的主要策略',
+    description: '你面对生活任务时，最常用的方式',
+    question: '我倾向于如何行动？',
+    action_hint: '这是你的主策略——可以依赖它，也可以在需要时尝试新方式',
+    color: 'var(--perma-relationship)'
+  },
+  {
+    key: 'inner',
+    name_cn: '内心',
+    name_en: 'Inner',
+    icon: '☽',
+    headline: '你的自我认知',
+    description: '你内心如何理解自己的策略',
+    question: '我如何看待自己？',
+    action_hint: '自我认知可能准确，也可能是童年时形成的旧地图——值得重新审视',
+    color: 'var(--perma-accomplishment)'
+  },
+  {
+    key: 'outer',
+    name_cn: '外在',
+    name_en: 'Outer',
+    icon: '⊕',
+    headline: '你的社会表达',
+    description: '他人眼中的你，你与世界连接的方式',
+    question: '我如何与他人连接？',
+    action_hint: '社会兴趣是心理健康的标志——你如何让他人因你而更好？',
+    color: 'var(--perma-positive)'
+  },
+  {
+    key: 'shadow',
+    name_cn: '阴影',
+    name_en: 'Shadow',
+    icon: '◐',
+    headline: '你尚未开发的潜能',
+    description: '被你回避的能力，也是成长的机会',
+    question: '什么能力等待我去发展？',
+    insight: '阴影不是敌人，是你尚未拥有的勇气',
+    action_hint: '整合阴影需要勇气——但每一步都让你变得更完整',
+    color: 'var(--text-tertiary)'
+  }
+]
+```
+
+### 2.6 原型卡片组件
+
+```tsx
+// components/landing/ArchetypeCard.tsx
+'use client'
+import { motion } from 'framer-motion'
+import { useState } from 'react'
+
+interface ArchetypeCardProps {
+  number: string
+  name_cn: string
+  name_en: string
+  tagline: string
+  shadow_hint?: string
+  color: string
+  gradient: string
+  onClick?: () => void
+}
+
+export function ArchetypeCard({
+  number, name_cn, name_en, tagline, shadow_hint, color, gradient, onClick
+}: ArchetypeCardProps) {
+  const [isHovered, setIsHovered] = useState(false)
+
+  return (
+    <motion.div
+      className="relative w-[180px] h-[280px] cursor-pointer flex-shrink-0"
+      onHoverStart={() => setIsHovered(true)}
+      onHoverEnd={() => setIsHovered(false)}
+      whileHover={{ y: -8, scale: 1.02 }}
+      onClick={onClick}
+    >
+      <div
+        className="absolute inset-0 rounded-xl transition-all duration-200"
+        style={{
+          border: `2px solid ${isHovered ? color : 'var(--border-default)'}`,
+          backgroundColor: 'var(--bg-elevated)',
+          boxShadow: isHovered ? 'var(--shadow-card-hover)' : 'var(--shadow-sm)',
+        }}
+      >
+        {/* Inner Border */}
+        <div
+          className="absolute inset-2 border rounded-lg opacity-50"
+          style={{ borderColor: 'var(--border-default)' }}
+        />
+
+        {/* Content */}
+        <div className="relative h-full flex flex-col items-center justify-center p-4">
+          {/* Number */}
+          <span
+            className="serif-heading mb-2"
+            style={{
+              fontFamily: 'var(--font-serif)',
+              fontSize: '12px',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            {number}
+          </span>
+
+          {/* Color Circle */}
+          <div
+            className="w-16 h-16 rounded-full flex items-center justify-center mb-4"
+            style={{ background: `${color}15` }}
+          >
+            <div
+              className="w-8 h-8 rounded-full"
+              style={{ background: gradient }}
+            />
+          </div>
+
+          {/* Divider */}
+          <div
+            className="w-12 h-px mb-4"
+            style={{ background: 'var(--border-default)' }}
+          />
+
+          {/* Name */}
+          <span
+            className="text-xs uppercase tracking-wider mb-1"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
+            {name_en}
+          </span>
+          <h4
+            className="serif-heading mb-2"
+            style={{
+              fontFamily: 'var(--font-serif)',
+              fontSize: '16px',
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+            }}
+          >
+            {name_cn}
+          </h4>
+
+          {/* Tagline */}
+          <p
+            className="text-xs text-center italic leading-relaxed"
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            "{tagline}"
+          </p>
+
+          {/* Shadow Hint (on hover) */}
+          {shadow_hint && isHovered && (
+            <p
+              className="text-xs mt-2 opacity-70"
+              style={{ color: 'var(--perma-accomplishment)' }}
+            >
+              {shadow_hint}
+            </p>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  )
+}
+
+// 12原型数据 (Morandi 中饱和版 v7.2 - 饱和度提升 12%)
+export const ARCHETYPE_CARDS_DATA = [
+  {
+    number: 'I', key: 'Innocent', name_cn: '天真者', name_en: 'Innocent',
+    tagline: '相信美好，是一种选择', shadow_hint: '可探索：Hero',
+    color: 'var(--archetype-innocent)', gradient: 'linear-gradient(135deg, #F2B8B8 0%, #FDF0F0 100%)'
+  },
+  {
+    number: 'II', key: 'Sage', name_cn: '智者', name_en: 'Sage',
+    tagline: '理解，是我与世界连接的方式', shadow_hint: '可探索：Jester',
+    color: 'var(--archetype-sage)', gradient: 'linear-gradient(135deg, #9480A8 0%, #E8E0EB 100%)'
+  },
+  {
+    number: 'III', key: 'Explorer', name_cn: '探险家', name_en: 'Explorer',
+    tagline: '自由是选择的能力，不是逃避的借口', shadow_hint: '可探索：Caregiver',
+    color: 'var(--archetype-explorer)', gradient: 'linear-gradient(135deg, #7DB8C5 0%, #E4F2F5 100%)'
+  },
+  {
+    number: 'IV', key: 'Outlaw', name_cn: '叛逆者', name_en: 'Outlaw',
+    tagline: '打破旧规则，是为了建立更好的规则', shadow_hint: '可探索：Ruler',
+    color: 'var(--archetype-outlaw)', gradient: 'linear-gradient(135deg, #A8524F 0%, #E8D5D5 100%)'
+  },
+  {
+    number: 'V', key: 'Magician', name_cn: '魔术师', name_en: 'Magician',
+    tagline: '转化现实，从转化自己的视角开始', shadow_hint: '可探索：Lover',
+    color: 'var(--archetype-magician)', gradient: 'linear-gradient(135deg, #8570AB 0%, #E0DAE8 100%)'
+  },
+  {
+    number: 'VI', key: 'Hero', name_cn: '英雄', name_en: 'Hero',
+    tagline: '真正的强大，是知道何时柔软', shadow_hint: '可探索：Innocent',
+    color: 'var(--archetype-hero)', gradient: 'linear-gradient(135deg, #D46560 0%, #F5E0DE 100%)'
+  },
+  {
+    number: 'VII', key: 'Lover', name_cn: '爱人', name_en: 'Lover',
+    tagline: '全情投入，是我存在的方式', shadow_hint: '可探索：Magician',
+    color: 'var(--archetype-lover)', gradient: 'linear-gradient(135deg, #D47D90 0%, #F5E6EA 100%)'
+  },
+  {
+    number: 'VIII', key: 'Jester', name_cn: '愚者', name_en: 'Jester',
+    tagline: '快乐是智慧，不是逃避', shadow_hint: '可探索：Sage',
+    color: 'var(--archetype-jester)', gradient: 'linear-gradient(135deg, #E5AD58 0%, #FAF0DD 100%)'
+  },
+  {
+    number: 'IX', key: 'Regular', name_cn: '凡人', name_en: 'Regular',
+    tagline: '归属感，是人类最深的需要之一', shadow_hint: '可探索：Creator',
+    color: 'var(--archetype-regular)', gradient: 'linear-gradient(135deg, #6F9A6F 0%, #E2EFE2 100%)'
+  },
+  {
+    number: 'X', key: 'Caregiver', name_cn: '照顾者', name_en: 'Caregiver',
+    tagline: '照顾他人，也要记得照顾自己', shadow_hint: '可探索：Explorer',
+    color: 'var(--archetype-caregiver)', gradient: 'linear-gradient(135deg, #80C494 0%, #E5F5EA 100%)'
+  },
+  {
+    number: 'XI', key: 'Ruler', name_cn: '统治者', name_en: 'Ruler',
+    tagline: '建立秩序，是为了让更多人受益', shadow_hint: '可探索：Outlaw',
+    color: 'var(--archetype-ruler)', gradient: 'linear-gradient(135deg, #C99D58 0%, #F7F0E0 100%)'
+  },
+  {
+    number: 'XII', key: 'Creator', name_cn: '创造者', name_en: 'Creator',
+    tagline: '创造，是为了让世界多一种可能', shadow_hint: '可探索：Regular',
+    color: 'var(--archetype-creator)', gradient: 'linear-gradient(135deg, #5C94C3 0%, #E0ECF5 100%)'
+  }
+]
+```
+
+### 2.7 CTA 按钮组件
+
+```tsx
+// components/landing/CTAButton.tsx
+'use client'
+import { motion } from 'framer-motion'
+import Link from 'next/link'
+
+interface CTAButtonProps {
+  href: string
+  children: React.ReactNode
+  variant?: 'primary' | 'secondary'
+  size?: 'default' | 'large'
+}
+
+export function CTAButton({
+  href, children, variant = 'primary', size = 'default'
+}: CTAButtonProps) {
+  const isPrimary = variant === 'primary'
+
+  return (
+    <motion.div whileHover={{ y: -2 }} whileTap={{ scale: 0.98 }}>
+      <Link
+        href={href}
+        className="inline-flex items-center justify-center"
+        style={{
+          background: isPrimary ? 'var(--accent-primary)' : 'var(--bg-secondary)',
+          color: isPrimary ? 'white' : 'var(--text-primary)',
+          padding: size === 'large' ? '16px 40px' : '12px 24px',
+          borderRadius: 'var(--radius)',
+          fontFamily: isPrimary ? 'var(--font-serif)' : 'var(--font-sans)',
+          fontSize: size === 'large' ? '16px' : '14px',
+          fontWeight: isPrimary ? 600 : 500,
+          letterSpacing: isPrimary ? '0.02em' : 'normal',
+          border: isPrimary ? 'none' : '1px solid var(--border-default)',
+          boxShadow: 'var(--shadow-sm)',
+          transition: 'all var(--duration-normal) var(--ease-default)',
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = isPrimary
+            ? 'var(--accent-hover)'
+            : 'var(--bg-hover)'
+          e.currentTarget.style.boxShadow = 'var(--shadow-card-hover)'
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = isPrimary
+            ? 'var(--accent-primary)'
+            : 'var(--bg-secondary)'
+          e.currentTarget.style.boxShadow = 'var(--shadow-sm)'
+        }}
+      >
+        {children}
+      </Link>
+    </motion.div>
+  )
+}
+
+// CTA 文案常量
+export const CTA_COPY = {
+  hero: {
+    button: '90秒，开启你的自我探索 →',
+    hint: '只需出生日期，开始认识自己的生活策略'
+  },
+  final: {
+    button: '我准备好了，开启探索 →',
+    hint: '只需出生日期 · 90秒开始 · 永久免费的基础版'
+  }
+}
+```
+
+### 2.8 心理学家卡片组件
+
+```tsx
+// components/landing/PsychologistCard.tsx
+'use client'
+import { motion } from 'framer-motion'
+import Image from 'next/image'
+
+interface PsychologistCardProps {
+  name: string
+  name_en: string
+  title: string
+  contribution: string
+  quote: string
+  connection: string
+  action_insight: string
+  imageSrc: string
+  highlight?: boolean
+}
+
+export function PsychologistCard({
+  name, name_en, title, contribution, quote, connection, action_insight, imageSrc, highlight = false
+}: PsychologistCardProps) {
+  return (
+    <motion.div
+      style={{
+        background: 'var(--bg-elevated)',
+        border: highlight
+          ? '2px solid var(--accent-primary)'
+          : '1px solid var(--border-default)',
+        borderRadius: 'var(--radius)',
+        padding: 'var(--space-6)',
+        boxShadow: 'var(--shadow-sm)',
+      }}
+      whileHover={{ boxShadow: 'var(--shadow-card-hover)' }}
+    >
+      {/* Header */}
+      <div className="flex items-start gap-4 mb-4">
+        <div
+          className="w-20 h-20 rounded-full overflow-hidden flex-shrink-0"
+          style={{
+            border: `2px solid ${highlight ? 'var(--accent-primary)' : 'var(--perma-relationship)'}`,
+          }}
+        >
+          <Image
+            src={imageSrc}
+            alt={name}
+            width={80}
+            height={80}
+            className="w-full h-full object-cover grayscale hover:grayscale-[50%] transition-all"
+          />
+        </div>
+        <div>
+          <h3
+            className="serif-heading"
+            style={{
+              fontFamily: 'var(--font-serif)',
+              fontSize: '18px',
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+            }}
+          >
+            {name}
+          </h3>
+          <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+            {name_en}
+          </p>
+          <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+            {title}
+          </p>
+        </div>
+      </div>
+
+      {/* Contribution */}
+      <p className="text-sm mb-3" style={{ color: 'var(--text-secondary)' }}>
+        {contribution}
+      </p>
+
+      {/* Quote */}
+      <blockquote
+        className="pl-4 mb-4 italic"
+        style={{
+          borderLeft: `2px solid ${highlight ? 'var(--accent-primary)' : 'var(--perma-relationship)'}`,
+          fontFamily: 'var(--font-serif)',
+          color: 'var(--text-secondary)',
+        }}
+      >
+        {quote}
+      </blockquote>
+
+      {/* Connection & Action Insight */}
+      <p className="text-xs mb-2" style={{ color: 'var(--perma-accomplishment)' }}>
+        ✦ {connection}
+      </p>
+      <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+        → {action_insight}
+      </p>
+    </motion.div>
+  )
+}
+
+// 心理学家数据
+export const PSYCHOLOGISTS_DATA = [
+  {
+    name: '卡尔·荣格',
+    name_en: 'Carl Jung',
+    title: '分析心理学创始人',
+    contribution: '12原型理论 · 阴影概念 · 个体化',
+    quote: '"认识你自己的阴影，是通往完整的必经之路。"',
+    connection: '我们的四维模型和原型系统，源自荣格的集体无意识理论',
+    action_insight: '阴影不是要消灭的敌人，而是要整合的潜能',
+    imageSrc: '/images/psychologists/psychologist-jung.jpg'
+  },
+  {
+    name: '西格蒙德·弗洛伊德',
+    name_en: 'Sigmund Freud',
+    title: '精神分析学派创始人',
+    contribution: '意识·前意识·无意识',
+    quote: '"未被表达的情绪永远不会消亡，它们只是被活埋，终有一天会以更丑陋的方式爆发。"',
+    connection: '我们对"内心"与"阴影"的区分，受益于弗洛伊德的意识层次理论',
+    action_insight: '觉察无意识的模式，是改变的第一步',
+    imageSrc: '/images/psychologists/psychologist-freud.jpg'
+  },
+  {
+    name: '阿尔弗雷德·阿德勒',
+    name_en: 'Alfred Adler',
+    title: '个体心理学创始人',
+    contribution: '目的论 · 社会兴趣 · 生活风格 · 勇气',
+    quote: '"重要的不是你生来是什么，而是你用你所拥有的做了什么。"',
+    connection: '我们的"勇气系统"和"行动建议"，基于阿德勒的目的论心理学',
+    action_insight: '人被未来的目标牵引，而非被过去决定。改变需要勇气，而勇气可以培养。',
+    imageSrc: '/images/psychologists/psychologist-adler.jpg',
+    highlight: true
+  }
+]
+```
+
+### 2.9 信任标识组件
+
+```tsx
+// components/landing/TrustBadge.tsx
+export function TrustBadge({ icon, text }: { icon: string; text: string }) {
+  return (
+    <div
+      className="inline-flex items-center gap-2 px-4 py-2 rounded-full"
+      style={{ background: 'var(--bg-secondary)' }}
+    >
+      <span style={{ color: 'var(--perma-relationship)' }}>{icon}</span>
+      <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+        {text}
+      </span>
+    </div>
+  )
+}
+
+// 信任标识数据
+export const TRUST_BADGES_DATA = [
+  { icon: '🔒', text: '数据加密，隐私安全' },
+  { icon: '🎓', text: '基于百年心理学研究' },
+  { icon: '🌏', text: '融合东西方智慧体系' },
+  { icon: '💪', text: '10万+用户的勇气选择' }
+]
+```
+
+### 2.10 Omnibar 组件 (悬浮输入框)
+
+```tsx
+// components/landing/Omnibar.tsx
+'use client'
+import { motion } from 'framer-motion'
+import { useState } from 'react'
+
+export function Omnibar() {
+  const [value, setValue] = useState('')
+
+  return (
+    <motion.div
+      className="fixed left-1/2 flex items-center"
+      style={{
+        bottom: '40px',
+        transform: 'translateX(-50%)',
+        width: '100%',
+        maxWidth: '672px',
+        height: '56px',
+        background: 'rgba(255, 255, 255, 0.85)',
+        backdropFilter: 'blur(12px)',
+        border: '1px solid var(--border-default)',
+        borderRadius: '28px',
+        boxShadow: 'var(--shadow-capsule)',
+        padding: '0 var(--space-5)',
+        gap: 'var(--space-3)',
+      }}
+    >
+      {/* Prefix */}
+      <span
+        style={{
+          fontFamily: 'var(--font-serif)',
+          fontStyle: 'italic',
+          color: 'var(--text-tertiary)',
+          fontSize: '16px',
+        }}
+      >
+        /
+      </span>
+
+      {/* Input */}
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="Type '/' for commands or ask anything..."
+        style={{
+          flex: 1,
+          border: 'none',
+          background: 'transparent',
+          fontSize: '14px',
+          color: 'var(--text-primary)',
+          outline: 'none',
+        }}
+      />
+
+      {/* Submit Button */}
+      <motion.button
+        className="flex items-center justify-center"
+        style={{
+          width: '32px',
+          height: '32px',
+          borderRadius: '50%',
+          background: 'var(--accent-primary)',
+          color: 'white',
+          border: 'none',
+          cursor: 'pointer',
+        }}
+        whileHover={{ background: 'var(--accent-hover)' }}
+        whileTap={{ scale: 0.95 }}
+      >
+        →
+      </motion.button>
+    </motion.div>
+  )
+}
+```
+
+---
+
+## 三、Section 标题文案常量
+
+```tsx
+// constants/landing-copy.ts
+
+export const SECTION_COPY = {
+  hero: {
+    title: '重要的不是你生来是什么，而是你用它做了什么',
+    subtitle: '三千年东方智慧 · 两千年西方星象 · 百年深度心理学\n不是告诉你命运，而是帮你做出更好的选择',
+    scrollHint: '向下了解：我们如何陪伴你的选择'
+  },
+  system: {
+    title: '三种智慧，帮助你做出更好的选择',
+    subtitle: '每一种古老智慧都是工具，帮助你回答：面对下一个选择，我可以怎么做？',
+    footer: '三种智慧，都在帮你回答同一个问题：面对下一个选择，我可以怎么做？'
+  },
+  dimension: {
+    title: '你的生活策略，有四个维度',
+    subtitle: '大多数性格测试只看到一面。我们看到四面——包括你尚未发展的那一面。',
+    footer: '四维不一致？这恰恰说明你很灵活。了解差异，不是为了统一它们，而是为了更有意识地选择在什么情境用什么策略。'
+  },
+  archetype: {
+    title: '12种面对世界的方式',
+    subtitle: '每种原型都是面对世界的一种策略。没有高低，关键是：它是否带有社会兴趣？你是否有灵活性？',
+    footer: '你当前呈现某个主原型，这是你面对世界的主要策略。但记住：你可以学习任何原型的能力。阴影原型不是你的对立面，而是你尚未发展的潜能。'
+  },
+  psychology: {
+    title: '三位心理学巨匠的智慧',
+    subtitle: '我们不是发明了什么新东西，而是把经过百年验证的智慧，转化为帮助你选择和行动的工具。'
+  },
+  eastWest: {
+    title: '东方与西方，都在回答同一个问题',
+    subtitle: '相隔万里的古人，用不同的语言，发展出不同的工具——都是为了帮助人做出更好的选择。',
+    footer: '东方智慧说"知命"，西方占星说"了解自己"。但我们相信阿德勒说的：重要的不是你生来是什么，而是你用它做了什么。这三种智慧，都是帮助你做出更好选择的工具。'
+  },
+  finalCta: {
+    title: '你有勇气，开始这段旅程吗？',
+    subtitle: '了解自己，不是为了接受一个标签。\n而是为了知道——当下一个选择来临时，我有更多可能性，也有勇气去选择。'
+  }
+}
+```
+
+---
+
+## 四、Tailwind 配置扩展
+
+```javascript
+// tailwind.config.js
+module.exports = {
+  theme: {
+    extend: {
+      colors: {
+        bg: {
+          primary: 'var(--bg-primary)',
+          secondary: 'var(--bg-secondary)',
+          elevated: 'var(--bg-elevated)',
+          hover: 'var(--bg-hover)',
+        },
+        text: {
+          primary: 'var(--text-primary)',
+          secondary: 'var(--text-secondary)',
+          tertiary: 'var(--text-tertiary)',
+        },
+        accent: {
+          primary: 'var(--accent-primary)',
+          muted: 'var(--accent-muted)',
+          hover: 'var(--accent-hover)',
+        },
+        border: {
+          default: 'var(--border-default)',
+          hover: 'var(--border-hover)',
+          subtle: 'var(--border-subtle)',
+        },
+        perma: {
+          positive: 'var(--perma-positive)',
+          engagement: 'var(--perma-engagement)',
+          relationship: 'var(--perma-relationship)',
+          meaning: 'var(--perma-meaning)',
+          accomplishment: 'var(--perma-accomplishment)',
+        },
+        element: {
+          wood: 'var(--element-wood)',
+          fire: 'var(--element-fire)',
+          earth: 'var(--element-earth)',
+          metal: 'var(--element-metal)',
+          water: 'var(--element-water)',
+        },
+      },
+      fontFamily: {
+        sans: ['Inter', 'Noto Sans SC', 'system-ui', 'sans-serif'],
+        serif: ['Playfair Display', 'Noto Serif SC', 'Georgia', 'serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+      },
+      boxShadow: {
+        xs: 'var(--shadow-xs)',
+        sm: 'var(--shadow-sm)',
+        md: 'var(--shadow-md)',
+        lg: 'var(--shadow-lg)',
+        xl: 'var(--shadow-xl)',
+        capsule: 'var(--shadow-capsule)',
+        'card-hover': 'var(--shadow-card-hover)',
+        focus: 'var(--shadow-focus)',
+      },
+      borderRadius: {
+        sm: 'var(--radius-sm)',
+        md: 'var(--radius-md)',
+        DEFAULT: 'var(--radius)',
+        lg: 'var(--radius-lg)',
+        xl: 'var(--radius-xl)',
+      },
+      animation: {
+        'breathe': 'breathe 4s ease-in-out infinite',
+        'spin-slow': 'spin 30s linear infinite',
+      },
+      keyframes: {
+        breathe: {
+          '0%, 100%': { transform: 'scale(1)', opacity: '1' },
+          '50%': { transform: 'scale(1.02)', opacity: '0.9' },
+        },
+      },
+    },
+  },
+}
+```
+
+---
+
+## 五、配色速查表 (v7.2)
+
+| 用途 | CSS 变量 | 色值 | 说明 |
+|------|----------|------|------|
+| 页面背景 | `--bg-primary` | #F8F7F4 | 柔和暖灰 |
+| 次级背景 | `--bg-secondary` | #F2F1EE | Section 交替 |
+| 三级背景 | `--bg-tertiary` | #ECEAE6 | 对比区域 |
+| 卡片背景 | `--bg-elevated` | #FFFFFF | 悬浮元素 |
+| 主文字 | `--ink-800` | #262626 | 深灰非纯黑 |
+| 次级文字 | `--ink-500` | #717171 | 中灰 |
+| 提示文字 | `--ink-400` | #A1A1A1 | 浅灰 |
+| **强调色** | `--accent-primary` | **#7A6B5A** | **高级灰棕** |
+| 强调色悬停 | `--accent-hover` | #6B5C4B | hover 态 |
+| 古金色 | `--gold-500` | #BBA978 | 东方智慧 |
+| 神秘紫 | `--mystic-500` | #8E7FA0 | 灵性洞察 |
+| 边框 | `--border-default` | #E9E9E7 | 分割线 |
+
+---
+
+## 六、字体速查表
+
+| 用途 | 字体 | 大小 | 粗细 |
+|------|------|------|------|
+| Hero 标题 | Playfair Display | 48px | 600 |
+| 副标题 | Inter | 24px | 400 |
+| Section 标题 | Playfair Display | 18px | 600 |
+| 卡片标题 | Inter | 16px | 500 |
+| 正文 | Inter | 14px | 400 |
+| 说明文字 | Inter | 12px | 400 |
+
+---
+
+*文档结束 - VibeLife Landing Page 组件实现规范 v7.2*
+*设计理念: Mentis OS — 道林纸质感 + 高级灰棕强调 + 衬线优雅*
+*配色体系: 高级灰棕 + Morandi 中饱和色系*

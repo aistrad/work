@@ -1,0 +1,321 @@
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from common.a2ui import ValidationError, validate_a2ui
+from common.logging import get_logger
+from integrations import backend_router as be
+from services import task_service
+from services.bazi_report_service import (
+    bazi_report_service,
+    ReportRequest,
+    ReportType,
+    ReportBackend,
+)
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+
+router = APIRouter(prefix="/api/report", tags=["report"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+class ReportSubmitRequest(BaseModel):
+    backend: str = Field("cli", description="cli|gemini")
+    model: str = Field("standard", description="standard|deep_research")
+    system_prompt: Optional[str] = Field(None, description="Optional system prompt override")
+
+
+def _profile_to_birth_data(user: Dict[str, Any]) -> Dict[str, Any]:
+    birthday_local = user["birthday_local"]
+    return {
+        "name": str(user.get("name") or ""),
+        "gender": str(user.get("gender") or ""),
+        "year": int(birthday_local.year),
+        "month": int(birthday_local.month),
+        "day": int(birthday_local.day),
+        "hour": int(birthday_local.hour),
+        "minute": int(birthday_local.minute),
+        "longitude": float((user.get("location") or {}).get("longitude")),
+        "latitude": float((user.get("location") or {}).get("latitude")),
+        "location_name": str((user.get("location") or {}).get("name") or ""),
+    }
+
+
+def _wrap_text_as_a2ui(text: str, summary: str = "") -> Dict[str, Any]:
+    s = (summary or "").strip() or (text.strip().splitlines()[0][:80] if text else "报告")
+    return {"meta": {"summary": s}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": text or "（空）"}]}
+
+
+@router.post("/bazi/submit")
+def submit_bazi_report(req: ReportSubmitRequest, request: Request):
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    user = fortune_db.fetch_one(
+        "SELECT name, gender, birthday_local, location FROM fortune_user WHERE user_id=%s AND deleted_at IS NULL",
+        (user_id,),
+    )
+    if not user:
+        return _err(404, "not_found", "user_not_found")
+
+    backend = (req.backend or "cli").strip().lower()
+    if backend not in ("cli", "gemini"):
+        return _err(400, "invalid_request", "invalid_backend")
+
+    model = (req.model or "standard").strip().lower()
+    if model not in ("standard", "deep_research"):
+        return _err(400, "invalid_request", "invalid_model")
+
+    birth_data = _profile_to_birth_data(user)
+    openid = f"fortune_uid:{user_id}"
+
+    correlation_id = f"report:{user_id}:{int(datetime.utcnow().timestamp())}"
+    job_id, _gemini_user_id, used_default, bazi = task_service.submit_bazi_task_v2(
+        {
+            "openid": openid,
+            "src": "web",
+            "model": model,
+            "system_prompt": (req.system_prompt or None),
+            **birth_data,
+        },
+        correlation_id=correlation_id,
+        backend_hint=backend,
+        force_nonce=str(int(datetime.utcnow().timestamp())),
+    )
+
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_external_job (user_id, session_id, provider, job_type, provider_job_id, status)
+        VALUES (%s, NULL, %s, 'bazi_report', %s, 'processing')
+        ON CONFLICT (provider, provider_job_id) DO UPDATE SET
+          user_id = EXCLUDED.user_id,
+          status = 'processing',
+          updated_at = now()
+        """,
+        (user_id, backend, int(job_id)),
+    )
+
+    logger.info(
+        "bazi report submit",
+        extra={"operation": "bazi_report_submit", "user_id": user_id, "backend": backend, "provider_job_id": int(job_id), "model": model},
+    )
+    return _ok({"job_id": int(job_id), "backend": backend, "status": "processing", "used_default_location": bool(used_default)})
+
+
+@router.get("/bazi/{job_id}")
+def get_bazi_report(job_id: int, request: Request, backend: Optional[str] = None):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    backend_q = (backend or "").strip().lower()
+    if backend_q and backend_q not in ("cli", "gemini"):
+        return _err(400, "invalid_request", "invalid_backend")
+
+    mapping = fortune_db.fetch_one(
+        """
+        SELECT id, provider, status, provider_job_id, output_url, output_a2ui
+        FROM fortune_external_job
+        WHERE user_id=%s AND job_type='bazi_report' AND provider_job_id=%s
+          AND (%s = '' OR provider=%s)
+        """,
+        (user_id, int(job_id), backend_q, backend_q),
+    )
+    if not mapping:
+        return _err(404, "not_found", "job_not_found")
+
+    provider = str(mapping.get("provider") or "")
+    tasks = be.get_tasks_by_job_id(int(job_id), backend=provider) or []
+    if not tasks:
+        fortune_db.execute(
+            "UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s",
+            ("no_tasks", int(mapping["id"])),
+        )
+        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "no_tasks"})
+
+    main = tasks[0]
+    st = int(main.get("status", 0) or 0)
+    if st < 0:
+        fortune_db.execute("UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s", ("task_failed", int(mapping["id"])))
+        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "task_failed"})
+    if st < 10:
+        fortune_db.execute("UPDATE fortune_external_job SET status='processing', updated_at=now(), last_polled_at=now() WHERE id=%s", (int(mapping["id"]),))
+        return _ok({"job_id": int(job_id), "backend": provider, "status": "processing"})
+
+    output_text = main.get("output_text") or ""
+    output_url = main.get("output_url") or ""
+    a2ui: Dict[str, Any]
+    content = ""
+
+    if output_text:
+        try:
+            a2ui = json.loads(output_text)
+            validate_a2ui(a2ui)
+        except ValidationError:
+            content = output_text
+            a2ui = _wrap_text_as_a2ui(output_text, summary="模型返回非规范 A2UI，已按 Markdown 展示")
+        except Exception:
+            content = output_text
+            a2ui = _wrap_text_as_a2ui(output_text)
+    elif output_url:
+        content = f"报告已生成，请点击下载：\n\n[下载报告]({output_url})"
+        a2ui = _wrap_text_as_a2ui(content, summary="报告已生成（文档链接）")
+    else:
+        fortune_db.execute(
+            "UPDATE fortune_external_job SET status='error', error=%s, updated_at=now(), last_polled_at=now() WHERE id=%s",
+            ("task_missing_output", int(mapping["id"])),
+        )
+        return _ok({"job_id": int(job_id), "backend": provider, "status": "error", "message": "task_missing_output"})
+
+    fortune_db.execute(
+        """
+        UPDATE fortune_external_job
+        SET
+          status='completed',
+          updated_at=now(),
+          last_polled_at=now(),
+          output_url=%s,
+          output_a2ui=%s::jsonb
+        WHERE id=%s
+        """,
+        (str(output_url or ""), json.dumps(a2ui, ensure_ascii=False), int(mapping["id"])),
+    )
+
+    return _ok({"job_id": int(job_id), "backend": provider, "status": "completed", "output_url": str(output_url or ""), "a2ui": a2ui, "content": content})
+
+
+# =============================================================================
+# 八字深度报告 (GLM Backend)
+# =============================================================================
+
+class BaziDeepReportRequest(BaseModel):
+    report_type: str = Field("full", description="Report type: full|summary|career|relationship|health")
+    backend: str = Field("glm", description="Backend: glm")
+    model: Optional[str] = Field(None, description="Model name, e.g., glm-4.7")
+    question: Optional[str] = Field(None, max_length=500, description="User's specific question")
+
+
+@router.post("/bazi/deep/submit")
+def submit_bazi_deep_report(req: BaziDeepReportRequest, request: Request):
+    """
+    提交八字深度报告生成任务 (GLM Backend)
+
+    与 /bazi/submit 不同，此接口：
+    - 使用 GLM 后端同步生成
+    - 支持多种报告类型 (full/summary/career/relationship/health)
+    - 返回结构化报告，包含关键发现和行动处方
+    """
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    # 验证报告类型
+    report_type_str = (req.report_type or "full").strip().lower()
+    try:
+        report_type = ReportType(report_type_str)
+    except ValueError:
+        return _err(400, "invalid_request", f"Invalid report_type: {report_type_str}. Must be one of: full, summary, career, relationship, health")
+
+    # 验证后端
+    backend_str = (req.backend or "glm").strip().lower()
+    if backend_str != "glm":
+        return _err(400, "invalid_request", "Only 'glm' backend is supported for deep reports")
+
+    # 构建请求
+    report_request = ReportRequest(
+        user_id=user_id,
+        report_type=report_type,
+        backend=ReportBackend.GLM,
+        model=req.model,
+        extra_context={"question": req.question} if req.question else None,
+    )
+
+    try:
+        result = bazi_report_service.submit_report(report_request)
+    except Exception as e:
+        logger.error(f"bazi deep report generation failed: {e}")
+        return _err(500, "generation_error", f"Report generation failed: {str(e)[:100]}")
+
+    if result.status == "error":
+        return _err(500, "generation_error", result.error_message or "Unknown error")
+
+    logger.info(
+        "bazi deep report generated",
+        extra={
+            "operation": "bazi_deep_report_submit",
+            "user_id": user_id,
+            "report_id": result.report_id,
+            "report_type": report_type_str,
+        },
+    )
+
+    return _ok({
+        "report_id": result.report_id,
+        "backend": "glm",
+        "status": result.status,
+        "output_summary": result.output_summary,
+        "output_markdown": result.output_markdown,
+        "output_a2ui": result.output_a2ui,
+        "key_findings": result.key_findings,
+        "prescriptions": result.prescriptions,
+        "created_at": result.created_at.isoformat() if result.created_at else None,
+        "completed_at": result.completed_at.isoformat() if result.completed_at else None,
+    })
+
+
+@router.get("/bazi/deep/{report_id}")
+def get_bazi_deep_report(report_id: int, request: Request):
+    """
+    获取八字深度报告结果
+
+    返回报告的完整内容，包括：
+    - output_markdown: Markdown 格式报告
+    - output_a2ui: A2UI 格式输出
+    - key_findings: 关键发现列表
+    - prescriptions: 行动处方列表
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    result = bazi_report_service.get_report(report_id, user_id)
+    if not result:
+        return _err(404, "not_found", "Report not found")
+
+    return _ok(result.to_dict())
+
+
+@router.get("/bazi/deep/list")
+def list_bazi_deep_reports(request: Request, limit: int = 10):
+    """
+    列出用户的八字报告历史
+
+    返回报告列表（简化信息）
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    limit = max(1, min(50, limit))
+    reports = bazi_report_service.list_reports(user_id, limit=limit)
+
+    return _ok({"reports": reports})

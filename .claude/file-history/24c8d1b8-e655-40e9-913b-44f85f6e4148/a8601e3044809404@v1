@@ -1,0 +1,440 @@
+"""
+Skill Catalog Repository - 数据库存储的 Skill 商业元数据
+
+提供:
+- Skill 目录查询（列表、分类、精选）
+- 动态配置更新（管理后台）
+- 与 SkillLoader 的集成接口
+
+设计原则:
+- 优先从数据库读取，SKILL.md 作为 fallback
+- 支持热更新，无需重启服务
+- 缓存优化，减少数据库查询
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from functools import lru_cache
+import logging
+
+from .db import get_connection
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data Classes
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SkillPricing:
+    """定价信息"""
+    type: str = "premium"  # free | premium | credits
+    trial_messages: int = 3
+    credits_per_use: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SkillPricing":
+        return cls(
+            type=data.get("type", "premium"),
+            trial_messages=data.get("trial_messages", 3),
+            credits_per_use=data.get("credits_per_use"),
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": self.type,
+            "trial_messages": self.trial_messages,
+            "credits_per_use": self.credits_per_use,
+        }
+
+
+@dataclass
+class SkillShowcase:
+    """展示信息"""
+    tagline: str = ""
+    highlights: List[str] = field(default_factory=list)
+    preview_image: Optional[str] = None
+    demo_prompts: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SkillShowcase":
+        return cls(
+            tagline=data.get("tagline", ""),
+            highlights=data.get("highlights", []),
+            preview_image=data.get("preview_image"),
+            demo_prompts=data.get("demo_prompts", []),
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "tagline": self.tagline,
+            "highlights": self.highlights,
+            "preview_image": self.preview_image,
+            "demo_prompts": self.demo_prompts,
+        }
+
+
+@dataclass
+class SkillSubscriptionConfig:
+    """订阅配置"""
+    auto_subscribe: bool = False
+    can_unsubscribe: bool = True
+    push_default: bool = True
+    min_subscription_days: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SkillSubscriptionConfig":
+        return cls(
+            auto_subscribe=data.get("auto_subscribe", False),
+            can_unsubscribe=data.get("can_unsubscribe", True),
+            push_default=data.get("push_default", True),
+            min_subscription_days=data.get("min_subscription_days", 0),
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "auto_subscribe": self.auto_subscribe,
+            "can_unsubscribe": self.can_unsubscribe,
+            "push_default": self.push_default,
+            "min_subscription_days": self.min_subscription_days,
+        }
+
+
+@dataclass
+class SkillFeature:
+    """功能特性"""
+    name: str
+    description: str
+    icon: str = "✨"
+    tier: str = "free"  # free | basic | premium
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SkillFeature":
+        return cls(
+            name=data.get("name", ""),
+            description=data.get("description", ""),
+            icon=data.get("icon", "✨"),
+            tier=data.get("tier", "free"),
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "icon": self.icon,
+            "tier": self.tier,
+        }
+
+
+@dataclass
+class SkillCatalogEntry:
+    """Skill 目录条目"""
+    skill_id: str
+    name: str
+    description: str
+    version: str = "1.0.0"
+    icon: str = "💡"
+    color: str = "#6B7280"
+    category: str = "professional"
+    triggers: List[str] = field(default_factory=list)
+    pricing: SkillPricing = field(default_factory=SkillPricing)
+    showcase: SkillShowcase = field(default_factory=SkillShowcase)
+    subscription: SkillSubscriptionConfig = field(default_factory=SkillSubscriptionConfig)
+    features: List[SkillFeature] = field(default_factory=list)
+    sort_order: int = 100
+    is_active: bool = True
+    is_featured: bool = False
+    featured_position: Optional[int] = None
+    featured_campaign: Optional[Dict] = None
+
+    def to_dict(self) -> Dict:
+        """转换为字典（用于 API 响应）"""
+        return {
+            "id": self.skill_id,
+            "name": self.name,
+            "description": self.description,
+            "version": self.version,
+            "icon": self.icon,
+            "color": self.color,
+            "category": self.category,
+            "triggers": self.triggers,
+            "pricing": self.pricing.to_dict(),
+            "showcase": self.showcase.to_dict(),
+            "subscription": self.subscription.to_dict(),
+            "features": [f.to_dict() for f in self.features],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Repository
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SkillCatalogRepository:
+    """Skill 目录数据仓库"""
+
+    # 内存缓存
+    _cache: Optional[Dict[str, SkillCatalogEntry]] = None
+    _cache_time: Optional[datetime] = None
+    _cache_ttl_seconds: int = 300  # 5 分钟缓存
+
+    @classmethod
+    async def get(cls, skill_id: str) -> Optional[SkillCatalogEntry]:
+        """获取单个 Skill 目录条目"""
+        catalog = await cls.get_all()
+        return catalog.get(skill_id)
+
+    @classmethod
+    async def get_all(cls, use_cache: bool = True) -> Dict[str, SkillCatalogEntry]:
+        """获取所有活跃 Skill 目录"""
+        # 检查缓存
+        if use_cache and cls._cache is not None and cls._cache_time is not None:
+            elapsed = (datetime.utcnow() - cls._cache_time).total_seconds()
+            if elapsed < cls._cache_ttl_seconds:
+                return cls._cache
+
+        # 从数据库加载
+        catalog = {}
+        query = """
+            SELECT
+                skill_id, name, description, version, icon, color, category,
+                triggers, pricing, showcase, subscription, features,
+                sort_order, is_active, is_featured, featured_position, featured_campaign
+            FROM skill_catalog
+            WHERE is_active = true
+            ORDER BY sort_order, skill_id
+        """
+
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query)
+
+            for row in rows:
+                entry = cls._row_to_entry(row)
+                catalog[entry.skill_id] = entry
+
+            # 更新缓存
+            cls._cache = catalog
+            cls._cache_time = datetime.utcnow()
+
+            logger.debug(f"Loaded {len(catalog)} skills from database")
+
+        except Exception as e:
+            logger.error(f"Failed to load skill catalog from database: {e}")
+            # 如果有缓存，返回缓存
+            if cls._cache is not None:
+                return cls._cache
+            # 否则返回空
+            return {}
+
+        return catalog
+
+    @classmethod
+    async def get_by_category(cls, category: str) -> List[SkillCatalogEntry]:
+        """按分类获取 Skill 列表"""
+        catalog = await cls.get_all()
+        return [
+            entry for entry in catalog.values()
+            if entry.category == category
+        ]
+
+    @classmethod
+    async def get_featured(cls) -> List[SkillCatalogEntry]:
+        """获取精选 Skill 列表"""
+        catalog = await cls.get_all()
+        featured = [
+            entry for entry in catalog.values()
+            if entry.is_featured
+        ]
+        return sorted(featured, key=lambda x: (x.featured_position or 999, x.skill_id))
+
+    @classmethod
+    async def search_by_trigger(cls, keyword: str) -> List[SkillCatalogEntry]:
+        """根据触发词搜索 Skill"""
+        catalog = await cls.get_all()
+        matches = []
+        keyword_lower = keyword.lower()
+
+        for entry in catalog.values():
+            for trigger in entry.triggers:
+                if keyword_lower in trigger.lower():
+                    matches.append(entry)
+                    break
+
+        return matches
+
+    @classmethod
+    async def update(
+        cls,
+        skill_id: str,
+        updates: Dict[str, Any]
+    ) -> Optional[SkillCatalogEntry]:
+        """
+        更新 Skill 目录条目（管理后台使用）
+
+        Args:
+            skill_id: Skill ID
+            updates: 要更新的字段
+
+        Returns:
+            更新后的条目，或 None（如果不存在）
+        """
+        # 构建更新 SQL
+        allowed_fields = {
+            "name", "description", "version", "icon", "color", "category",
+            "triggers", "pricing", "showcase", "subscription", "features",
+            "sort_order", "is_active", "is_featured", "featured_position", "featured_campaign"
+        }
+
+        update_fields = {k: v for k, v in updates.items() if k in allowed_fields}
+        if not update_fields:
+            return await cls.get(skill_id)
+
+        # 构建 SET 子句
+        set_clauses = []
+        params = [skill_id]
+        param_idx = 2
+
+        for field_name, value in update_fields.items():
+            set_clauses.append(f"{field_name} = ${param_idx}")
+            params.append(value)
+            param_idx += 1
+
+        query = f"""
+            UPDATE skill_catalog
+            SET {', '.join(set_clauses)}, updated_at = now()
+            WHERE skill_id = $1
+            RETURNING *
+        """
+
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, *params)
+
+            if row:
+                # 清除缓存
+                cls.clear_cache()
+                return cls._row_to_entry(row)
+
+        except Exception as e:
+            logger.error(f"Failed to update skill {skill_id}: {e}")
+
+        return None
+
+    @classmethod
+    async def create(cls, entry: SkillCatalogEntry) -> bool:
+        """
+        创建新的 Skill 目录条目（管理后台使用）
+
+        Returns:
+            是否创建成功
+        """
+        query = """
+            INSERT INTO skill_catalog (
+                skill_id, name, description, version, icon, color, category,
+                triggers, pricing, showcase, subscription, features,
+                sort_order, is_active, is_featured, featured_position, featured_campaign
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17
+            )
+        """
+
+        try:
+            async with get_connection() as conn:
+                await conn.execute(
+                    query,
+                    entry.skill_id,
+                    entry.name,
+                    entry.description,
+                    entry.version,
+                    entry.icon,
+                    entry.color,
+                    entry.category,
+                    entry.triggers,
+                    entry.pricing.to_dict(),
+                    entry.showcase.to_dict(),
+                    entry.subscription.to_dict(),
+                    [f.to_dict() for f in entry.features],
+                    entry.sort_order,
+                    entry.is_active,
+                    entry.is_featured,
+                    entry.featured_position,
+                    entry.featured_campaign,
+                )
+
+            # 清除缓存
+            cls.clear_cache()
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to create skill {entry.skill_id}: {e}")
+            return False
+
+    @classmethod
+    def clear_cache(cls):
+        """清除缓存（配置更新后调用）"""
+        cls._cache = None
+        cls._cache_time = None
+        logger.debug("Skill catalog cache cleared")
+
+    @classmethod
+    def _row_to_entry(cls, row) -> SkillCatalogEntry:
+        """将数据库行转换为 SkillCatalogEntry"""
+        pricing_data = row["pricing"] if isinstance(row["pricing"], dict) else {}
+        showcase_data = row["showcase"] if isinstance(row["showcase"], dict) else {}
+        subscription_data = row["subscription"] if isinstance(row["subscription"], dict) else {}
+        features_data = row["features"] if isinstance(row["features"], list) else []
+
+        return SkillCatalogEntry(
+            skill_id=row["skill_id"],
+            name=row["name"],
+            description=row["description"] or "",
+            version=row.get("version", "1.0.0") or "1.0.0",
+            icon=row["icon"] or "💡",
+            color=row["color"] or "#6B7280",
+            category=row["category"],
+            triggers=row["triggers"] or [],
+            pricing=SkillPricing.from_dict(pricing_data),
+            showcase=SkillShowcase.from_dict(showcase_data),
+            subscription=SkillSubscriptionConfig.from_dict(subscription_data),
+            features=[SkillFeature.from_dict(f) for f in features_data],
+            sort_order=row["sort_order"] or 100,
+            is_active=row["is_active"],
+            is_featured=row["is_featured"] or False,
+            featured_position=row["featured_position"],
+            featured_campaign=row["featured_campaign"],
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_skill_catalog_entry(skill_id: str) -> Optional[SkillCatalogEntry]:
+    """获取单个 Skill 的目录信息"""
+    return await SkillCatalogRepository.get(skill_id)
+
+
+async def get_all_skill_catalog() -> List[SkillCatalogEntry]:
+    """获取所有 Skill 目录（列表形式）"""
+    catalog = await SkillCatalogRepository.get_all()
+    return list(catalog.values())
+
+
+async def get_skill_categories_summary() -> Dict[str, Dict]:
+    """获取分类统计"""
+    catalog = await SkillCatalogRepository.get_all()
+
+    categories = {
+        "core": {"name": "核心能力", "description": "始终激活的基础能力", "count": 0},
+        "default": {"name": "基础功能", "description": "默认激活，免费使用", "count": 0},
+        "professional": {"name": "专业技能", "description": "需要订阅的高级功能", "count": 0},
+    }
+
+    for entry in catalog.values():
+        if entry.category in categories:
+            categories[entry.category]["count"] += 1
+
+    return categories

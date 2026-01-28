@@ -1,0 +1,1236 @@
+"""
+Soul OS 核心服务层
+
+基于 os_design_claude_mvp.md 的四层架构实现：
+- L0 Firmware: 八字事实快照管理
+- L1 Schema: PERMA + 行为证据汇总
+- L2 Agents: 知识库检索 + Prompt 模板
+- L3 Synthesis: GLM 整合 + A2UI 输出
+
+包含：
+- State Score 计算
+- 反依赖机制
+- JITAI 调节动作库
+- Guidance Card 生成
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from common.logging import get_logger
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+# =============================================================================
+# Enums & Constants
+# =============================================================================
+
+class PersonaStyle(str, Enum):
+    STANDARD = "standard"  # 清晰、中性、专业
+    WARM = "warm"          # 共情、支持性（默认）
+    ROAST = "roast"        # 轻毒舌但不羞辱
+
+
+class CommitmentType(str, Enum):
+    START_TASK = "start_task"        # 立刻开始
+    SCHEDULE_TASK = "schedule_task"  # 加入计划
+    ASK_FOLLOWUP = "ask_followup"    # 澄清问题
+    OPT_OUT = "opt_out"              # 暂停/关闭
+
+
+class CommitmentStatus(str, Enum):
+    SUGGESTED = "suggested"
+    ACTIVE = "active"
+    DONE = "done"
+    SKIPPED = "skipped"
+    CANCELED = "canceled"
+
+
+# JITAI 调节动作库
+JITAI_ACTIONS: Dict[str, Dict[str, str]] = {
+    "焦虑": {
+        "high": "3分钟呼吸降噪：吸气4秒→屏息7秒→呼气8秒，重复3次。",
+        "medium": "写下3个最坏情况，并评估每个发生的概率（0-100%）。",
+        "low": "列出你现在能控制的3件事。",
+    },
+    "低落": {
+        "high": "做一个最小行动：站起来倒杯水，或走到窗边看30秒。",
+        "medium": "回忆一个小成就并写下来：我做到了____。",
+        "low": "给自己一句鼓励：这很正常，我正在经历困难。",
+    },
+    "愤怒": {
+        "high": "用力握拳10秒再松开，重复3次。然后深呼吸5次。",
+        "medium": "写下：我需要的是____。我的底线是____。",
+        "low": "离开当前场景2分钟，做5次深呼吸。",
+    },
+    "困惑": {
+        "high": "写下3个选项和1个最重要的约束条件。",
+        "medium": "列出2个选项，问自己：如果只能选一个，我会选哪个？为什么？",
+        "low": "画一个简单的决策树：选项A→结果；选项B→结果。",
+    },
+    "兴奋": {
+        "high": "写下这个感觉的来源，并把能量转化为一个2分钟行动。",
+        "medium": "记录下这一刻，稍后复盘时用。",
+        "low": "享受这个感觉，同时提醒自己不做冲动决策。",
+    },
+    "平静": {
+        "high": "写下今天最想保留的一个做法。",
+        "medium": "保持当前状态，安排一个5分钟的延续动作。",
+        "low": "保持这个状态，继续当前的事。",
+    },
+}
+
+# 心理学翻译规则：八字概念 → 可操作心理语言
+BAZI_PSYCHOLOGY_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "weak": {
+        "translation": "你的能量更适合借力/合作，而非单打独斗",
+        "action": "本周找一个支持者或合作伙伴",
+    },
+    "strong": {
+        "translation": "你有充沛的内在能量，适合独立行动",
+        "action": "设定一个独立完成的小目标",
+    },
+    "neutral": {
+        "translation": "你的能量相对平衡，灵活度高",
+        "action": "根据具体情况选择独立或合作",
+    },
+    "食伤重": {
+        "translation": "你有强烈的表达欲和创造力",
+        "action": "每天留15分钟自由书写或创作",
+    },
+    "官杀混杂": {
+        "translation": "你可能感受到多重压力或权威冲突",
+        "action": "写清哪些压力是你能控制的，哪些不能",
+    },
+    "桃花星": {
+        "translation": "你在关系中有天然的吸引力和敏感度",
+        "action": "觉察关系中的边界需求",
+    },
+    "驿马星": {
+        "translation": "你有变动/探索的内在驱力",
+        "action": "小范围实验胜过大规模改变",
+    },
+    "华盖": {
+        "translation": "你有独立思考和精神探索的倾向",
+        "action": "每周留1小时独处反思时间",
+    },
+    "天乙贵人": {
+        "translation": "你容易获得贵人相助",
+        "action": "主动寻求帮助，不要独自扛",
+    },
+    "文昌": {
+        "translation": "你在学习和文字方面有天赋",
+        "action": "保持学习习惯，用写作整理思路",
+    },
+}
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class StateScore:
+    """状态分数 - 把"感觉"变成可训练变量"""
+    score: int  # 0-100
+    emotion_signal: int  # 40% 权重
+    action_signal: int   # 40% 权重
+    streak_signal: int   # 20% 权重
+    recovery_action: str  # 分数低时的补救动作
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "score": self.score,
+            "breakdown": {
+                "emotion": self.emotion_signal,
+                "action": self.action_signal,
+                "streak": self.streak_signal,
+            },
+            "recovery_action": self.recovery_action,
+        }
+
+
+@dataclass
+class PermaSnapshot:
+    """PERMA 积极心理学快照"""
+    positive_emotion: Dict[str, Any] = field(default_factory=dict)
+    engagement: Dict[str, Any] = field(default_factory=dict)
+    relationships: Dict[str, Any] = field(default_factory=dict)
+    meaning: Dict[str, Any] = field(default_factory=dict)
+    accomplishment: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "positive_emotion": self.positive_emotion,
+            "engagement": self.engagement,
+            "relationships": self.relationships,
+            "meaning": self.meaning,
+            "accomplishment": self.accomplishment,
+        }
+
+
+@dataclass
+class L1Schema:
+    """L1 特质层数据"""
+    perma: PermaSnapshot
+    cognitive_patterns: Dict[str, Any]
+    strengths_in_use: List[str]
+    preferences: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "perma_snapshot": self.perma.to_dict(),
+            "cognitive_patterns": self.cognitive_patterns,
+            "strengths_in_use": self.strengths_in_use,
+            "preferences": self.preferences,
+        }
+
+
+@dataclass
+class AntiDependencyState:
+    """反依赖状态追踪"""
+    same_question_count: int = 0
+    daily_consult_count: int = 0
+    last_action_days: int = 0
+    should_intervene: bool = False
+    intervention_type: str = ""
+    intervention_message: str = ""
+    suggested_task: Optional[Dict[str, Any]] = None  # 干预时必须返回的任务
+    is_new_user: bool = False  # 是否为新用户（7天内）
+
+
+@dataclass
+class GuidanceCard:
+    """指导卡片"""
+    card_id: str
+    card_type: str
+    conclusion: str
+    why: str
+    prescriptions: List[Dict[str, Any]]
+    time_window: Dict[str, Any]
+    risk_boundary: str
+    commitment_ask: str
+    actions: List[Dict[str, Any]]
+    evidence: Dict[str, Any]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "card_id": self.card_id,
+            "type": self.card_type,
+            "conclusion": self.conclusion,
+            "why": self.why,
+            "prescriptions": self.prescriptions,
+            "time_window": self.time_window,
+            "risk_boundary": self.risk_boundary,
+            "commitment_ask": self.commitment_ask,
+            "actions": self.actions,
+            "evidence": self.evidence,
+            "created_at": self.created_at,
+        }
+
+
+# =============================================================================
+# L0 Firmware Layer - 八字事实快照管理
+# =============================================================================
+
+def get_l0_facts(user_id: int) -> Dict[str, Any]:
+    """获取 L0 层八字事实快照"""
+    snap = fortune_db.fetch_one(
+        """
+        SELECT facts, facts_hash, compute_version
+        FROM fortune_bazi_snapshot
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (int(user_id),),
+    )
+    if not snap:
+        return {"facts": {}, "facts_hash": "", "compute_version": ""}
+    return {
+        "facts": snap.get("facts") or {},
+        "facts_hash": str(snap.get("facts_hash") or ""),
+        "compute_version": str(snap.get("compute_version") or ""),
+    }
+
+
+def translate_bazi_to_psychology(facts: Dict[str, Any]) -> List[Dict[str, str]]:
+    """将八字概念翻译为可操作的心理学语言"""
+    translations = []
+    bazi = facts.get("bazi", {})
+
+    # 旺衰翻译
+    strength = bazi.get("strength", {})
+    status = strength.get("level", "neutral")
+    if status in BAZI_PSYCHOLOGY_TRANSLATIONS:
+        trans = BAZI_PSYCHOLOGY_TRANSLATIONS[status]
+        translations.append({
+            "concept": f"日主{status}",
+            "translation": trans["translation"],
+            "action": trans["action"],
+        })
+
+    # 神煞翻译
+    for shensha in bazi.get("shensha", []):
+        if shensha.get("hit"):
+            name = shensha.get("name", "")
+            if name in BAZI_PSYCHOLOGY_TRANSLATIONS:
+                trans = BAZI_PSYCHOLOGY_TRANSLATIONS[name]
+                translations.append({
+                    "concept": name,
+                    "translation": trans["translation"],
+                    "action": trans["action"],
+                })
+
+    return translations
+
+
+# =============================================================================
+# L1 Schema Layer - PERMA + 行为证据汇总
+# =============================================================================
+
+def get_l1_schema(user_id: int, window_days: int = 7) -> L1Schema:
+    """获取 L1 层特质图式"""
+    uid = int(user_id)
+    window_start = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+    # 获取用户偏好
+    prefs = fortune_db.fetch_one(
+        "SELECT * FROM fortune_user_preferences WHERE user_id = %s",
+        (uid,),
+    ) or {}
+
+    # P: Positive Emotion - 从 checkin 获取
+    checkins = fortune_db.fetch_all(
+        """
+        SELECT mood, intensity, created_at
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 20
+        """,
+        (uid, window_start),
+    )
+
+    positive_moods = ["平静", "兴奋", "开心", "满足", "感恩"]
+    negative_moods = ["焦虑", "愤怒", "沮丧", "悲伤", "恐惧"]
+
+    # 分别计算正负面情绪的平均强度
+    positive_checkins = [c for c in checkins if c.get("mood") in positive_moods]
+    negative_checkins = [c for c in checkins if c.get("mood") in negative_moods]
+
+    pos_avg = sum(c.get("intensity", 5) for c in positive_checkins) / len(positive_checkins) if positive_checkins else 0
+    neg_avg = sum(c.get("intensity", 5) for c in negative_checkins) / len(negative_checkins) if negative_checkins else 0
+
+    # 正向情绪高强度=加分，负向情绪高强度=扣分，基线5分
+    raw_score = pos_avg - neg_avg + 5 if checkins else 5.0
+    positive_count = len(positive_checkins)
+
+    positive_emotion = {
+        "score": round(max(0, min(10, raw_score)), 1),
+        "trend": "up" if positive_count > len(checkins) / 2 else "stable",
+        "recent_count": len(checkins),
+    }
+
+    # E: Engagement - 从 plan enrollment 获取
+    enrollments = fortune_db.fetch_all(
+        """
+        SELECT plan_id, status, current_day
+        FROM fortune_plan_enrollment
+        WHERE user_id = %s AND status = 'active'
+        """,
+        (uid,),
+    )
+
+    # 计算完成率
+    done_count = fortune_db.fetch_one(
+        """
+        SELECT COUNT(*) as cnt
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND created_at >= %s
+        """,
+        (uid, window_start),
+    ) or {}
+
+    suggested_count = fortune_db.fetch_one(
+        """
+        SELECT COUNT(*) as cnt
+        FROM fortune_commitment
+        WHERE user_id = %s AND created_at >= %s
+        """,
+        (uid, window_start),
+    ) or {}
+
+    total = suggested_count.get("cnt", 0) or 1
+    completion_rate = round(done_count.get("cnt", 0) / total, 2) if total else 0
+
+    engagement = {
+        "score": round(completion_rate * 10, 1),  # 0-10 scale
+        "active_plans": len(enrollments),
+        "completion_rate": completion_rate,
+    }
+
+    # R: Relationships - 从对话中提取（简化版）
+    recent_msgs = fortune_db.fetch_all(
+        """
+        SELECT content
+        FROM fortune_conversation_message
+        WHERE user_id = %s AND role = 'user' AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 10
+        """,
+        (uid, window_start),
+    )
+
+    relationship_keywords = ["同事", "朋友", "家人", "伴侣", "关系"]
+    relationship_mentions = sum(
+        1 for m in recent_msgs
+        if any(kw in (m.get("content") or "") for kw in relationship_keywords)
+    )
+
+    relationships = {
+        "score": min(10, relationship_mentions * 2.5),  # 0-10 scale, 4 mentions = 10
+        "recent_mentions": relationship_mentions,
+        "recent_note": "",
+    }
+
+    # M: Meaning - 从计划参与推断
+    aligned_cnt = done_count.get("cnt", 0)
+    meaning = {
+        "score": min(10, aligned_cnt),  # 0-10 scale
+        "core_value": "成长" if enrollments else "探索",
+        "aligned_actions": aligned_cnt,
+    }
+
+    # A: Accomplishment
+    streak = _calculate_streak(uid)
+    weekly_done = done_count.get("cnt", 0)
+    accomplishment = {
+        "score": min(10, weekly_done + streak * 0.5),  # 0-10 scale
+        "weekly_done": weekly_done,
+        "streak": streak,
+    }
+
+    perma = PermaSnapshot(
+        positive_emotion=positive_emotion,
+        engagement=engagement,
+        relationships=relationships,
+        meaning=meaning,
+        accomplishment=accomplishment,
+    )
+
+    return L1Schema(
+        perma=perma,
+        cognitive_patterns={"identified_schemas": [], "reframe_count": 0},
+        strengths_in_use=[],
+        preferences={
+            "persona_style": prefs.get("persona_style", "warm"),
+            "push_enabled": prefs.get("push_enabled", True),
+        },
+    )
+
+
+def _calculate_streak(user_id: int) -> int:
+    """计算连续行动天数"""
+    rows = fortune_db.fetch_all(
+        """
+        SELECT DATE(done_at) as done_date
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND done_at IS NOT NULL
+        ORDER BY done_at DESC
+        LIMIT 30
+        """,
+        (int(user_id),),
+    )
+
+    if not rows:
+        return 0
+
+    dates = sorted(set(r["done_date"] for r in rows if r.get("done_date")), reverse=True)
+    if not dates:
+        return 0
+
+    today = date.today()
+    streak = 0
+    expected = today
+
+    for d in dates:
+        if d == expected or d == expected - timedelta(days=1):
+            streak += 1
+            expected = d - timedelta(days=1)
+        else:
+            break
+
+    return streak
+
+
+# =============================================================================
+# State Score 计算
+# =============================================================================
+
+def calculate_state_score(user_id: int, window: str = "24h") -> StateScore:
+    """
+    计算状态分数（0-100）
+
+    三信号计算：
+    - emotion_signal (40%): 情绪基线
+    - action_signal (40%): 行动完成
+    - streak_signal (20%): 连续记录
+    """
+    uid = int(user_id)
+
+    # 确定时间窗口
+    if window == "24h":
+        window_start = datetime.now(timezone.utc) - timedelta(hours=24)
+    elif window == "7d":
+        window_start = datetime.now(timezone.utc) - timedelta(days=7)
+    else:
+        window_start = datetime.now(timezone.utc) - timedelta(hours=24)
+
+    # 信号1: 情绪基线（40%权重）
+    checkin = fortune_db.fetch_one(
+        """
+        SELECT mood, intensity
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (uid, window_start),
+    )
+
+    if checkin:
+        mood = checkin.get("mood", "")
+        intensity = int(checkin.get("intensity", 5))
+        positive_moods = ["平静", "兴奋", "开心", "满足", "感恩"]
+
+        if mood in positive_moods:
+            # 正向情绪：强度越高越好
+            emotion_signal = intensity * 4
+        else:
+            # 负向情绪：强度越高越差
+            emotion_signal = max(0, (10 - intensity)) * 4
+    else:
+        emotion_signal = 20  # 无打卡给中性分
+
+    # 信号2: 行动完成（40%权重）
+    done_result = fortune_db.fetch_one(
+        """
+        SELECT COUNT(*) as cnt
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+        """,
+        (uid, window_start),
+    ) or {}
+    done_count = done_result.get("cnt", 0)
+    action_signal = min(done_count * 10, 40)
+
+    # 信号3: 连续记录（20%权重）
+    streak = _calculate_streak(uid)
+    streak_signal = min(streak * 4, 20)
+
+    # 总分
+    score = emotion_signal + action_signal + streak_signal
+
+    # 补救动作
+    recovery_action = _get_recovery_action(score, checkin)
+
+    return StateScore(
+        score=score,
+        emotion_signal=emotion_signal,
+        action_signal=action_signal,
+        streak_signal=streak_signal,
+        recovery_action=recovery_action,
+    )
+
+
+def _get_recovery_action(score: int, last_checkin: Optional[Dict[str, Any]]) -> str:
+    """根据分数和最近打卡生成补救动作"""
+    if score >= 70:
+        return "保持这个状态！今天再完成一个小任务来巩固。"
+    elif score >= 50:
+        return "做一个2分钟的最小行动，把分数拉上来。"
+    elif score >= 30:
+        if last_checkin:
+            mood = last_checkin.get("mood", "")
+            intensity = last_checkin.get("intensity", 5)
+            return get_jitai_action(mood, intensity)
+        return "先做3分钟呼吸降噪，然后完成一个最小任务。"
+    else:
+        return "先照顾好自己：喝杯水，做几次深呼吸，然后选一个最小的事情开始。"
+
+
+# =============================================================================
+# JITAI 调节动作库
+# =============================================================================
+
+def get_jitai_action(mood: str, intensity: int) -> str:
+    """获取 JITAI 即时适应性干预动作"""
+    mood = (mood or "").strip()
+    intensity = max(0, min(10, int(intensity)))
+
+    # 确定强度级别
+    if intensity >= 7:
+        level = "high"
+    elif intensity >= 4:
+        level = "medium"
+    else:
+        level = "low"
+
+    # 查找匹配的动作
+    for keyword, actions in JITAI_ACTIONS.items():
+        if keyword in mood:
+            return actions.get(level, actions.get("medium", ""))
+
+    # 默认动作
+    if intensity >= 7:
+        return "先做3分钟呼吸锚点：1分钟呼吸→1分钟身体感受→1分钟选择下一步。"
+    return "写下：我现在最需要被满足的一个需求是什么？然后做一个2分钟版本。"
+
+
+def create_checkin_with_jitai(
+    user_id: int,
+    *,
+    mood: str,
+    intensity: int,
+    note: str = "",
+) -> Dict[str, Any]:
+    """创建情绪打卡并返回 JITAI 推荐动作"""
+    uid = int(user_id)
+    mood = (mood or "")[:50]
+    intensity = max(0, min(10, int(intensity)))
+    note = (note or "")[:1000]
+
+    # 获取推荐动作
+    action = get_jitai_action(mood, intensity)
+
+    # 写入打卡记录
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_checkin (user_id, mood, intensity, note, recommended_action)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (uid, mood, intensity, note, action),
+    )
+
+    # 创建建议任务
+    task_id = str(uuid4())
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_commitment (task_id, user_id, source, commitment_type, title, details, status)
+        VALUES (%s::uuid, %s, 'bento', 'start_task', %s, %s::jsonb, 'suggested')
+        """,
+        (
+            task_id,
+            uid,
+            (action[:200] if action else "情绪调节动作"),
+            json.dumps({"from": "checkin", "mood": mood, "intensity": intensity}, ensure_ascii=False),
+        ),
+    )
+
+    logger.info(
+        "checkin created with jitai",
+        extra={"operation": "checkin_jitai", "user_id": uid, "mood": mood, "intensity": intensity},
+    )
+
+    return {
+        "mood": mood,
+        "intensity": intensity,
+        "recommended_action": action,
+        "task_id": task_id,
+    }
+
+
+# =============================================================================
+# 反依赖机制
+# =============================================================================
+
+def check_anti_dependency(user_id: int, current_message: str = "") -> AntiDependencyState:
+    """
+    检查反依赖触发条件（优化版）
+
+    优化策略（基于 os_design_claude_mvp v1.md §5）：
+    1. 新用户豁免期：注册7天内不触发 anti-dependency
+    2. 提升日消息阈值：从5提升到8（有活跃任务时降为5）
+    3. 干预时必须返回至少1个可执行任务
+    """
+    uid = int(user_id)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    state = AntiDependencyState()
+
+    # 检查用户注册时间，判断是否为新用户
+    user_info = fortune_db.fetch_one(
+        """
+        SELECT created_at, onboarding_completed
+        FROM fortune_user
+        WHERE user_id = %s
+        """,
+        (uid,),
+    )
+    if user_info and user_info.get("created_at"):
+        created_at = user_info["created_at"]
+        if hasattr(created_at, "tzinfo") and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        days_since_register = (datetime.now(timezone.utc) - created_at).days
+        onboarding_completed = user_info.get("onboarding_completed", False)
+
+        # 新用户豁免期：注册7天内且未完成引导
+        if days_since_register < 7 and not onboarding_completed:
+            state.is_new_user = True
+            return state  # 新用户直接返回，不触发 anti-dependency
+    else:
+        days_since_register = 999
+
+    # 检查是否有活跃任务
+    active_task = fortune_db.fetch_one(
+        """
+        SELECT task_id, title
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'active'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (uid,),
+    )
+    has_active_commitment = active_task is not None
+
+    # 动态阈值：有活跃任务时降低阈值
+    daily_message_limit = 5 if has_active_commitment else 8
+
+    # 检查当日咨询次数
+    daily_count = fortune_db.fetch_one(
+        """
+        SELECT COUNT(*) as cnt
+        FROM fortune_conversation_message
+        WHERE user_id = %s AND role = 'user' AND created_at >= %s
+        """,
+        (uid, today_start),
+    ) or {}
+    state.daily_consult_count = daily_count.get("cnt", 0)
+
+    # 检查最近行动天数
+    last_action = fortune_db.fetch_one(
+        """
+        SELECT done_at
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done'
+        ORDER BY done_at DESC
+        LIMIT 1
+        """,
+        (uid,),
+    )
+    if last_action and last_action.get("done_at"):
+        done_at = last_action["done_at"]
+        if hasattr(done_at, "tzinfo") and done_at.tzinfo is None:
+            done_at = done_at.replace(tzinfo=timezone.utc)
+        days_since = (datetime.now(timezone.utc) - done_at).days
+        state.last_action_days = days_since
+    else:
+        state.last_action_days = 999
+
+    # 检查是否连续问同一问题（简化：检查最近3条消息相似度）
+    if current_message:
+        recent_msgs = fortune_db.fetch_all(
+            """
+            SELECT content
+            FROM fortune_conversation_message
+            WHERE user_id = %s AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT 3
+            """,
+            (uid,),
+        )
+        similar_count = sum(
+            1 for m in recent_msgs
+            if _message_similarity(current_message, m.get("content", "")) > 0.7
+        )
+        state.same_question_count = similar_count
+
+    # 获取或创建最小可执行任务（干预时必须返回）
+    def get_or_create_minimal_task() -> Dict[str, Any]:
+        # 优先返回已有的活跃任务
+        if active_task:
+            return {
+                "task_id": str(active_task.get("task_id", "")),
+                "title": active_task.get("title", "完成当前任务"),
+                "minutes": 5,
+                "source": "existing_active",
+            }
+        # 否则返回一个默认的最小任务
+        return {
+            "task_id": None,
+            "title": "做3分钟呼吸锚点：专注呼吸进出，走神时温和拉回",
+            "minutes": 3,
+            "source": "default_minimal",
+        }
+
+    # 判断是否需要干预
+    if state.same_question_count >= 3:
+        state.should_intervene = True
+        state.intervention_type = "repeated_question"
+        state.suggested_task = get_or_create_minimal_task()
+        state.intervention_message = (
+            "我注意到你多次问了类似的问题。信息足够了，现在最重要的是做一个小实验。\n\n"
+            f"请先完成这个任务：\n> **{state.suggested_task['title']}**（约{state.suggested_task['minutes']}分钟）\n\n"
+            "完成后我们再继续。"
+        )
+    elif state.daily_consult_count >= daily_message_limit:
+        state.should_intervene = True
+        state.intervention_type = "daily_limit"
+        state.suggested_task = get_or_create_minimal_task()
+        state.intervention_message = (
+            "今天我们聊了很多，信息已经足够了。\n\n"
+            f"现在最重要的是**先行动**：\n> **{state.suggested_task['title']}**（约{state.suggested_task['minutes']}分钟）\n\n"
+            "完成后我们再继续。"
+        )
+    elif state.last_action_days >= 7 and not state.is_new_user:
+        # 对新用户不触发 no_action 干预
+        state.should_intervene = True
+        state.intervention_type = "no_action"
+        state.suggested_task = get_or_create_minimal_task()
+        state.intervention_message = (
+            "看起来你已经有一段时间没有完成行动了。\n\n"
+            "没关系，我们可以从一个更小的任务开始：\n"
+            f"> **{state.suggested_task['title']}**（约{state.suggested_task['minutes']}分钟）\n\n"
+            "完成后告诉我。"
+        )
+
+    return state
+
+
+def _message_similarity(msg1: str, msg2: str) -> float:
+    """简单的消息相似度计算（基于词重叠）"""
+    if not msg1 or not msg2:
+        return 0.0
+
+    words1 = set(msg1.replace("？", " ").replace("。", " ").split())
+    words2 = set(msg2.replace("？", " ").replace("。", " ").split())
+
+    if not words1 or not words2:
+        return 0.0
+
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+
+    return intersection / union if union > 0 else 0.0
+
+
+# =============================================================================
+# L2 Agents Layer - 知识库检索 + Prompt 模板
+# =============================================================================
+
+def search_knowledge_base(query: str, top_k: int = 12) -> List[Dict[str, Any]]:
+    """从知识库检索相关内容"""
+    if not query:
+        return []
+
+    # PostgreSQL FTS 检索
+    results = fortune_db.fetch_all(
+        """
+        SELECT c.chunk_id, c.doc_id, c.page_no, c.chunk_no,
+               ts_rank(c.content_tsv, plainto_tsquery('simple', %s)) AS rank,
+               c.content,
+               d.file_name, d.title
+        FROM bazi_kb_chunk c
+        JOIN bazi_kb_document d ON c.doc_id = d.doc_id
+        WHERE c.content_tsv @@ plainto_tsquery('simple', %s)
+        ORDER BY rank DESC
+        LIMIT %s
+        """,
+        (query, query, top_k),
+    )
+
+    kb_refs = []
+    for r in results or []:
+        kb_refs.append({
+            "kb_ref": f"kb:doc:{r['doc_id']}:page:{r['page_no']}:chunk:{r['chunk_no']}",
+            "content": (r.get("content") or "")[:500],
+            "source": r.get("title") or r.get("file_name") or "",
+            "rank": r.get("rank", 0),
+        })
+
+    return kb_refs
+
+
+def get_advisor_perspectives(question: str, facts: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """获取四个原型顾问的视角（Prompt 模板参数化）"""
+    perspectives = [
+        {
+            "advisor": "关系视角",
+            "optimization": "和谐 + 秩序",
+            "prompt_hint": "考虑对方感受，先稳定关系，再解决问题",
+            "applicable_for": ["人际冲突", "沟通问题", "家庭关系"],
+        },
+        {
+            "advisor": "第一性原理视角",
+            "optimization": "真相 + 效率",
+            "prompt_hint": "问题的本质是什么？最小验证是什么？",
+            "applicable_for": ["决策困境", "职业选择", "重大决定"],
+        },
+        {
+            "advisor": "系统思维视角",
+            "optimization": "风险 + 概率",
+            "prompt_hint": "有哪些变量？因果链是什么？最坏情况概率多少？",
+            "applicable_for": ["复杂问题", "风险评估", "长期规划"],
+        },
+        {
+            "advisor": "效能整合视角",
+            "optimization": "平衡 + 可持续",
+            "prompt_hint": "重要且不紧急的事优先，建立可持续节奏",
+            "applicable_for": ["时间管理", "精力分配", "习惯养成"],
+        },
+    ]
+
+    return perspectives
+
+
+# =============================================================================
+# L3 Synthesis Layer - GLM 整合 + A2UI 输出
+# =============================================================================
+
+def build_system_prompt(
+    user_id: int,
+    persona_style: str = "warm",
+) -> str:
+    """构建 GLM System Prompt（对齐 OS 设计文档附录 A）"""
+
+    return f"""你是 Fortune AI 的对话 Agent，角色是积极心理学教练（Performance Coach）。
+
+【产品定位】
+人生导航 / 陪伴 / 提升。系统和交互保持"有效而极简"。
+
+【四层架构理解】
+- L0（定数）：用户的八字事实，作为先验约束，不做宿命论解读
+- L1（特质）：用户的心理图式和当前状态，作为个性化调节
+- L2（策略）：知识库和规则，作为专业依据
+- L3（意识）：你的输出，作为整合与行动引导
+
+【你的优先级（不可逆）】
+Coach > Teaching Assistant > Customer Support > Sales
+
+【硬性规则（必须遵守）】
+1) 禁止恐吓、羞辱、宿命论断言；负面信息必须紧接"你可以做什么"的行动处方。
+2) 禁止自行计算八字事实；只能基于提供的 facts + evidence 输出。
+3) 每次输出必须包含：结论(conclusion) + 依据(why) + ≤3条处方(prescriptions) + 承诺邀请(commitment_ask)。
+4) 处方必须包含 if_then（如果____→那么____）。
+5) 时间窗口默认只给干预窗口（intervention）；forecast 只能条件句+低置信度。
+6) 输出必须是 A2UI JSON，且第一组件必须是 markdown_text。
+7) 必须给出可点击 actions（start_task / schedule_task / open_panel / opt_out）。
+
+【语言风格 persona_style = {persona_style}】
+standard：清晰、中性、专业
+warm：共情、支持性（默认）
+roast：轻毒舌但不羞辱、不对人格做负面定性
+
+【输出格式（A2UI JSON）】
+{{
+  "meta": {{"summary": "一句话摘要"}},
+  "ui_components": [
+    {{"type": "markdown_text", "title": "输出", "data": "### 结论要点\\n...\\n### 行动处方\\n...\\n### 承诺\\n..."}},
+    {{"type": "action_buttons", "title": "下一步", "data": [{{"label": "开始行动", "action": {{"type": "start_task"}}}}]}}
+  ]
+}}
+"""
+
+
+def build_user_context(user_id: int) -> Dict[str, Any]:
+    """构建用户上下文（L0 + L1 + State Score）"""
+    uid = int(user_id)
+
+    # L0: 八字事实
+    l0 = get_l0_facts(uid)
+    facts = l0.get("facts", {})
+
+    # 心理学翻译
+    translations = translate_bazi_to_psychology(facts)
+
+    # L1: 特质图式
+    l1 = get_l1_schema(uid)
+
+    # State Score
+    state_score = calculate_state_score(uid)
+
+    return {
+        "l0_facts": facts,
+        "l0_facts_hash": l0.get("facts_hash", ""),
+        "l0_translations": translations,
+        "l1_schema": l1.to_dict(),
+        "state_score": state_score.to_dict(),
+    }
+
+
+def build_evidence(user_id: int, query: str = "") -> Dict[str, Any]:
+    """构建证据（kb_refs + rule_ids + facts_hash）"""
+    l0 = get_l0_facts(user_id)
+
+    # 知识库检索
+    kb_refs = []
+    if query:
+        kb_results = search_knowledge_base(query)
+        kb_refs = [r["kb_ref"] for r in kb_results]
+
+    # 规则 ID
+    rule_ids = []
+    facts = l0.get("facts", {})
+    bazi = facts.get("bazi", {})
+
+    if bazi.get("strength", {}).get("rule_id"):
+        rule_ids.append(bazi["strength"]["rule_id"])
+
+    for shensha in bazi.get("shensha", []):
+        if shensha.get("hit") and shensha.get("rule_id"):
+            rule_ids.append(shensha["rule_id"])
+
+    return {
+        "facts_hash": l0.get("facts_hash", ""),
+        "kb_refs": kb_refs,
+        "rule_ids": rule_ids,
+    }
+
+
+def guidance_card_to_a2ui(card: Dict[str, Any]) -> Dict[str, Any]:
+    """将 Guidance Card 转换为 A2UI 格式"""
+    title = "今日指引"
+    conclusion = str(card.get("conclusion") or "")
+    why = str(card.get("why") or "")
+    prescriptions = card.get("prescriptions") or []
+    tw = card.get("time_window") or {}
+    commitment_ask = str(card.get("commitment_ask") or "你愿意先做哪一个？")
+    risk = str(card.get("risk_boundary") or "不替代医疗/法律/投资建议")
+
+    lines: List[str] = []
+    lines.append("### 结论要点")
+    if conclusion:
+        lines.append(f"- {conclusion}")
+    lines.append("")
+
+    if why:
+        lines.append("### 为什么（教练视角）")
+        lines.append(why)
+        lines.append("")
+
+    if prescriptions:
+        lines.append("### 行动处方（≤3条）")
+        for i, p in enumerate(prescriptions[:3], start=1):
+            content = p.get("content", "")
+            if_then = p.get("if_then", "")
+            lines.append(f"{i}) {content}")
+            if if_then:
+                lines.append(f"   - 如果犹豫：{if_then}")
+        lines.append("")
+
+    if tw:
+        lines.append("### 时间窗口")
+        lines.append(f"- {tw.get('value') or ''}（置信度：{tw.get('confidence') or ''}）")
+        lines.append("")
+
+    lines.append("### 风险边界")
+    lines.append(risk)
+    lines.append("")
+    lines.append("### 承诺")
+    lines.append(commitment_ask)
+
+    actions = []
+    for a in card.get("actions") or []:
+        if not isinstance(a, dict):
+            continue
+        label = str(a.get("label") or "")
+        payload = {"type": str(a.get("type") or "")}
+        if a.get("task_id"):
+            payload["task_id"] = str(a["task_id"])
+        actions.append({"label": label, "action": payload})
+
+    return {
+        "meta": {"summary": conclusion[:80] or title},
+        "ui_components": [
+            {"type": "markdown_text", "title": title, "data": "\n".join(lines).strip()},
+            {"type": "action_buttons", "title": "下一步", "data": actions},
+        ],
+    }
+
+
+# =============================================================================
+# Commitment 管理
+# =============================================================================
+
+def create_commitment(
+    user_id: int,
+    *,
+    session_id: Optional[str] = None,
+    card_id: str,
+    source: str,
+    commitment_type: str,
+    title: str,
+    details: Dict[str, Any],
+    due_at: Optional[datetime] = None,
+) -> str:
+    """创建承诺任务"""
+    task_id = str(uuid4())
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_commitment (task_id, user_id, session_id, card_id, source, commitment_type, title, details, status, due_at)
+        VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, 'suggested', %s)
+        """,
+        (
+            task_id,
+            int(user_id),
+            session_id,
+            card_id,
+            source,
+            commitment_type,
+            (title or "")[:200],
+            json.dumps(details or {}, ensure_ascii=False),
+            due_at,
+        ),
+    )
+
+    logger.info(
+        "commitment created",
+        extra={"operation": "commitment_create", "user_id": int(user_id), "task_id": task_id, "source": source},
+    )
+
+    return task_id
+
+
+def accept_commitment(user_id: int, task_id: str) -> bool:
+    """接受承诺"""
+    result = fortune_db.execute(
+        """
+        UPDATE fortune_commitment
+        SET status = 'active', accepted_at = NOW()
+        WHERE task_id = %s::uuid AND user_id = %s AND status = 'suggested'
+        """,
+        (task_id, int(user_id)),
+    )
+
+    if result > 0:
+        logger.info(
+            "commitment accepted",
+            extra={"operation": "commitment_accept", "user_id": int(user_id), "task_id": task_id},
+        )
+
+    return result > 0
+
+
+def complete_commitment(user_id: int, task_id: str, note: str = "") -> Dict[str, Any]:
+    """完成承诺"""
+    result = fortune_db.execute(
+        """
+        UPDATE fortune_commitment
+        SET status = 'done', done_at = NOW()
+        WHERE task_id = %s::uuid AND user_id = %s AND status IN ('suggested', 'active')
+        """,
+        (task_id, int(user_id)),
+    )
+
+    if result > 0:
+        # 计算新的 State Score
+        new_score = calculate_state_score(user_id)
+
+        logger.info(
+            "commitment completed",
+            extra={
+                "operation": "commitment_complete",
+                "user_id": int(user_id),
+                "task_id": task_id,
+                "new_score": new_score.score,
+            },
+        )
+
+        return {
+            "success": True,
+            "state_score": new_score.to_dict(),
+            "message": "做得好！你的状态分数已更新。",
+        }
+
+    return {"success": False, "message": "任务不存在或已完成"}
+
+
+def list_commitments(
+    user_id: int,
+    *,
+    status: Optional[List[str]] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """列出承诺任务"""
+    lim = max(1, min(50, int(limit)))
+    sts = status or ["suggested", "active"]
+
+    rows = fortune_db.fetch_all(
+        """
+        SELECT task_id, status, commitment_type, title, details, source, accepted_at, due_at, done_at, created_at
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = ANY(%s)
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (int(user_id), sts, lim),
+    )
+
+    items = []
+    for r in rows or []:
+        items.append({
+            "task_id": str(r["task_id"]),
+            "status": str(r.get("status") or ""),
+            "commitment_type": str(r.get("commitment_type") or ""),
+            "title": str(r.get("title") or ""),
+            "details": r.get("details") or {},
+            "source": str(r.get("source") or ""),
+            "accepted_at": (str(r["accepted_at"]) if r.get("accepted_at") else None),
+            "due_at": (str(r["due_at"]) if r.get("due_at") else None),
+            "done_at": (str(r["done_at"]) if r.get("done_at") else None),
+            "created_at": str(r.get("created_at") or ""),
+        })
+
+    return items
+
+
+# =============================================================================
+# 综合接口
+# =============================================================================
+
+def get_full_context_for_chat(user_id: int, query: str = "") -> Dict[str, Any]:
+    """获取完整的对话上下文（用于 Chat API）"""
+    uid = int(user_id)
+
+    # 用户偏好
+    prefs = fortune_db.fetch_one(
+        "SELECT persona_style FROM fortune_user_preferences WHERE user_id = %s",
+        (uid,),
+    ) or {}
+    persona_style = prefs.get("persona_style", "warm")
+
+    # 用户上下文
+    user_context = build_user_context(uid)
+
+    # 证据
+    evidence = build_evidence(uid, query)
+
+    # 反依赖检查
+    anti_dep = check_anti_dependency(uid, query)
+
+    # System Prompt
+    system_prompt = build_system_prompt(uid, persona_style)
+
+    return {
+        "system_prompt": system_prompt,
+        "persona_style": persona_style,
+        "user_context": user_context,
+        "evidence": evidence,
+        "anti_dependency": {
+            "should_intervene": anti_dep.should_intervene,
+            "intervention_type": anti_dep.intervention_type,
+            "intervention_message": anti_dep.intervention_message,
+        },
+    }

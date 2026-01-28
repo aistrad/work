@@ -1,0 +1,765 @@
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from zoneinfo import ZoneInfo
+
+from common.logging import get_logger
+from services import bazi_facts, plan_service
+from stores import fortune_db
+
+
+logger = get_logger(__name__)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today_for_user(user_id: int) -> date:
+    prefs = fortune_db.fetch_one("SELECT push_timezone FROM fortune_user_preferences WHERE user_id=%s", (int(user_id),)) or {}
+    tz_name = str(prefs.get("push_timezone") or "Asia/Shanghai")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Shanghai")
+    return datetime.now(tz).date()
+
+
+def _insert_commitment(
+    *,
+    user_id: int,
+    session_id: Optional[str],
+    card_id: str,
+    source: str,
+    commitment_type: str,
+    title: str,
+    details: Dict[str, Any],
+    due_at: Optional[datetime] = None,
+) -> str:
+    task_id = str(uuid4())
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_commitment (task_id, user_id, session_id, card_id, source, commitment_type, title, details, status, due_at)
+        VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, 'suggested', %s)
+        """,
+        (
+            task_id,
+            int(user_id),
+            session_id,
+            card_id,
+            source,
+            commitment_type,
+            (title or "")[:200],
+            json.dumps(details or {}, ensure_ascii=False),
+            due_at,
+        ),
+    )
+    return task_id
+
+
+def _guidance_card_to_a2ui(card: Dict[str, Any]) -> Dict[str, Any]:
+    title = "今日指引"
+    conclusion = str(card.get("conclusion") or "")
+    why = str(card.get("why") or "")
+    prescriptions = card.get("prescriptions") or []
+    tw = card.get("time_window") or {}
+    commitment_ask = str(card.get("commitment_ask") or "你愿意先做哪一个？")
+    risk = str(card.get("risk_boundary") or "不替代医疗/法律/投资建议")
+
+    lines: List[str] = []
+    lines.append("### 结论要点")
+    if conclusion:
+        lines.append(f"- {conclusion}")
+    lines.append("")
+    if why:
+        lines.append("### 为什么（教练视角）")
+        lines.append(why)
+        lines.append("")
+    if prescriptions:
+        lines.append("### 行动处方（≤3条）")
+        for i, p in enumerate(prescriptions[:3], start=1):
+            lines.append(f"{i}) {p.get('content')}")
+        lines.append("")
+    if tw:
+        lines.append("### 时间窗口")
+        lines.append(f"- {tw.get('value') or ''}（{tw.get('confidence') or ''}）")
+        lines.append("")
+    lines.append("### 风险边界")
+    lines.append(risk)
+    lines.append("")
+    lines.append("### 承诺")
+    lines.append(commitment_ask)
+
+    actions = []
+    for a in card.get("actions") or []:
+        if not isinstance(a, dict):
+            continue
+        label = str(a.get("label") or "")
+        payload = {"type": str(a.get("type") or "")}
+        if a.get("task_id"):
+            payload["task_id"] = str(a["task_id"])
+        actions.append({"label": label, "action": payload})
+
+    return {
+        "meta": {"summary": conclusion[:80] or title},
+        "ui_components": [
+            {"type": "markdown_text", "title": title, "data": "\n".join(lines).strip()},
+            {"type": "action_buttons", "title": "下一步", "data": actions},
+        ],
+    }
+
+
+def get_today_guidance(user_id: int) -> Dict[str, Any]:
+    today = _today_for_user(user_id)
+    existing = fortune_db.fetch_one(
+        "SELECT card FROM fortune_daily_guidance WHERE user_id=%s AND guidance_date=%s",
+        (int(user_id), today),
+    )
+    if existing and existing.get("card"):
+        card = existing["card"]
+        return {"guidance_date": str(today), "card": card, "a2ui": _guidance_card_to_a2ui(card)}
+
+    snap = bazi_facts.ensure_snapshot_for_user(user_id)
+    facts_hash = str(snap.get("facts_hash") or "")
+
+    enrollment = plan_service.get_active_enrollment(user_id)
+    plan_id = None
+    plan_name = None
+    day_no = None
+    title = ""
+    instruction = ""
+
+    if enrollment:
+        # sync current_day based on user's local date (today)
+        try:
+            plan_service.sync_enrollment_current_day(int(enrollment["enrollment_id"]), today=today)
+        except Exception:
+            pass
+        enrollment = plan_service.get_active_enrollment(user_id) or enrollment
+        plan_id = str(enrollment.get("plan_id") or "")
+        plan_name = str(enrollment.get("name") or "")
+        day_no = int(enrollment.get("current_day") or 1)
+        day = plan_service.get_plan_day(plan_id, day_no) or {}
+        title = str(day.get("title") or "")
+        instruction = str(day.get("instruction") or "")
+
+    if not instruction:
+        plan_id = ""
+        plan_name = ""
+        day_no = None
+        title = "三分钟降噪协议"
+        instruction = "计时3分钟：1分钟呼吸→1分钟身体感受→1分钟选择下一步（一个小动作）。"
+
+    card_id = str(uuid4())
+    task_id = _insert_commitment(
+        user_id=user_id,
+        session_id=None,
+        card_id=card_id,
+        source="bento",
+        commitment_type="start_task",
+        title=title or "今日行动",
+        details={"plan_id": plan_id, "plan_name": plan_name, "day_no": day_no, "instruction": instruction},
+        due_at=None,
+    )
+
+    checkpoint = (today + timedelta(days=7)).isoformat()
+    card = {
+        "card_id": card_id,
+        "type": "daily_guidance",
+        "conclusion": f"今天先做一个最小动作：{title}" if title else "今天先做一个最小动作",
+        "why": f"把不确定性收敛到一个可执行动作，你会更快获得可控感。{('来自计划：'+plan_name) if plan_name else ''}".strip(),
+        "prescriptions": [{"task_id": task_id, "content": instruction, "estimated_minutes": 5}],
+        "time_window": {"type": "intervention", "value": "7天试行", "confidence": "high", "checkpoint_date": checkpoint},
+        "risk_boundary": "不替代医疗/法律/投资建议",
+        "commitment_ask": "你愿意现在开始，还是先加入今日计划？",
+        "actions": [
+            {"type": "start_task", "task_id": task_id, "label": "开始（2-5分钟）"},
+            {"type": "schedule_task", "task_id": task_id, "label": "加入今日计划"},
+            {"type": "open_panel", "label": "打开行动处方"},
+            {"type": "opt_out", "label": "先不需要"},
+        ],
+        "evidence": {"plugin": "bazi", "rule_ids": [], "kb_refs": [], "facts_hash": facts_hash},
+        "created_at": _now_utc().isoformat().replace("+00:00", "Z"),
+    }
+
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_daily_guidance (user_id, guidance_date, card)
+        VALUES (%s, %s, %s::jsonb)
+        ON CONFLICT (user_id, guidance_date) DO NOTHING
+        """,
+        (int(user_id), today, json.dumps(card, ensure_ascii=False)),
+    )
+
+    logger.info(
+        "today guidance created",
+        extra={"operation": "bento_today", "user_id": int(user_id), "guidance_date": str(today), "card_id": card_id, "task_id": task_id},
+    )
+
+    return {"guidance_date": str(today), "card": card, "a2ui": _guidance_card_to_a2ui(card)}
+
+
+def list_commitments(user_id: int, *, status: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+    lim = int(limit or 10)
+    if lim < 1:
+        lim = 1
+    if lim > 50:
+        lim = 50
+    sts = status or ["suggested", "active"]
+    rows = fortune_db.fetch_all(
+        """
+        SELECT task_id, status, commitment_type, title, details, source, accepted_at, due_at, done_at, created_at
+        FROM fortune_commitment
+        WHERE user_id=%s AND status = ANY(%s)
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (int(user_id), sts, lim),
+    )
+    items = []
+    for r in rows or []:
+        items.append(
+            {
+                "task_id": str(r["task_id"]),
+                "status": str(r.get("status") or ""),
+                "commitment_type": str(r.get("commitment_type") or ""),
+                "title": str(r.get("title") or ""),
+                "details": r.get("details") or {},
+                "source": str(r.get("source") or ""),
+                "accepted_at": (str(r["accepted_at"]) if r.get("accepted_at") else None),
+                "due_at": (str(r["due_at"]) if r.get("due_at") else None),
+                "done_at": (str(r["done_at"]) if r.get("done_at") else None),
+                "created_at": str(r.get("created_at") or ""),
+            }
+        )
+    return items
+
+
+def recommend_action(mood: str, intensity: int) -> str:
+    m = (mood or "").strip()[:20]
+    x = int(intensity)
+    if x < 0:
+        x = 0
+    if x > 10:
+        x = 10
+
+    if "焦虑" in m:
+        return "3分钟降噪协议：1分钟呼吸→1分钟身体感受→1分钟选择下一步（一个小动作）。"
+    if "低落" in m or "难过" in m:
+        return "两分钟自我同情：对自己说“我正在经历困难；这很正常；我可以先做一个最小动作”。"
+    if "愤怒" in m or "生气" in m:
+        return "20秒延迟：先离开冲突现场→做5次深呼吸→写下“我的底线是什么”。"
+    if "兴奋" in m:
+        return "把能量转成一个小行动：立刻做一个2分钟版本，并把下一步写进待办。"
+    if "平静" in m:
+        return "保持优势：写下今天最想保留的一个做法，并安排一个5分钟的延续动作。"
+
+    if x >= 7:
+        return "先做3分钟呼吸锚点，再决定下一步。"
+    return "写下：我现在最需要被满足的一个需求是什么？然后做一个2分钟版本。"
+
+
+def create_checkin(user_id: int, *, mood: str, intensity: int, note: str) -> Dict[str, Any]:
+    action = recommend_action(mood, intensity)
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_checkin (user_id, mood, intensity, note, recommended_action)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (int(user_id), (mood or "")[:50], int(intensity), (note or "")[:1000], action),
+    )
+    task_id = str(uuid4())
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_commitment (task_id, user_id, source, commitment_type, title, details, status)
+        VALUES (%s::uuid, %s, 'bento', 'start_task', %s, %s::jsonb, 'suggested')
+        """,
+        (
+            task_id,
+            int(user_id),
+            (action[:200] if action else "情绪调节动作"),
+            json.dumps({"from": "checkin", "mood": mood, "intensity": int(intensity)}, ensure_ascii=False),
+        ),
+    )
+    return {"recommended_action": action, "task_id": task_id}
+
+
+# =============================================================================
+# Decision Brief - 决策模板
+# =============================================================================
+
+def create_decision_brief(
+    user_id: int,
+    *,
+    session_id: Optional[str],
+    topic: str,
+    options: List[str],
+    constraints: List[str],
+    time_horizon_days: int = 30,
+) -> Dict[str, Any]:
+    """
+    创建决策简报 (Decision Brief)
+
+    基于 Options/Constraints/Risks/Next Experiment 结构，
+    帮助用户结构化重大决策，降低 Prompt Anxiety。
+
+    Args:
+        user_id: 用户ID
+        session_id: 会话ID（可选）
+        topic: 决策主题（如"是否换工作"）
+        options: 备选方案列表
+        constraints: 约束条件列表
+        time_horizon_days: 决策时间窗口（天）
+
+    Returns:
+        包含决策简报和推荐实验任务的字典
+    """
+    topic = (topic or "").strip()[:200]
+    options = [str(o).strip()[:100] for o in (options or []) if str(o).strip()][:5]
+    constraints = [str(c).strip()[:100] for c in (constraints or []) if str(c).strip()][:5]
+    time_horizon_days = max(1, min(365, int(time_horizon_days or 30)))
+
+    if not topic:
+        raise ValueError("topic is required")
+    if not options or len(options) < 2:
+        raise ValueError("at least 2 options required")
+
+    # 分析风险（基于约束条件）
+    risks = _analyze_decision_risks(options, constraints)
+
+    # 生成最小验证实验
+    next_experiment = _generate_next_experiment(topic, options, constraints, time_horizon_days)
+
+    # 生成可控/不可控分析
+    controllable, uncontrollable = _split_controllable(constraints)
+
+    # 创建决策简报
+    brief_id = str(uuid4())
+    brief = {
+        "brief_id": brief_id,
+        "topic": topic,
+        "options": options,
+        "constraints": constraints,
+        "risks": risks,
+        "controllable": controllable,
+        "uncontrollable": uncontrollable,
+        "time_horizon_days": time_horizon_days,
+        "next_experiment": next_experiment,
+        "created_at": _now_utc().isoformat().replace("+00:00", "Z"),
+    }
+
+    # 创建实验任务
+    task_id = _insert_commitment(
+        user_id=user_id,
+        session_id=session_id,
+        card_id=brief_id,
+        source="decision_brief",
+        commitment_type="start_task",
+        title=next_experiment["title"],
+        details={
+            "brief_id": brief_id,
+            "topic": topic,
+            "experiment": next_experiment,
+        },
+        due_at=None,
+    )
+
+    # 生成 A2UI
+    a2ui = _decision_brief_to_a2ui(brief, task_id)
+
+    logger.info(
+        "decision brief created",
+        extra={"operation": "decision_brief", "user_id": int(user_id), "brief_id": brief_id, "topic": topic},
+    )
+
+    return {"brief": brief, "task_id": task_id, "a2ui": a2ui}
+
+
+def _analyze_decision_risks(options: List[str], constraints: List[str]) -> List[Dict[str, Any]]:
+    """分析每个选项的风险"""
+    risks = []
+    for opt in options:
+        opt_lower = opt.lower()
+        risk_level = "low"
+        risk_note = "标准风险范围"
+
+        # 简单的风险评估规则
+        if any(kw in opt_lower for kw in ["离职", "跳槽", "辞职", "换工作"]):
+            risk_level = "medium"
+            risk_note = "收入中断风险，建议有3-6个月储备"
+        elif any(kw in opt_lower for kw in ["创业", "自己做", "单干"]):
+            risk_level = "high"
+            risk_note = "高不确定性，建议先做最小可行验证"
+        elif any(kw in opt_lower for kw in ["留下", "不动", "维持"]):
+            risk_level = "low"
+            risk_note = "机会成本风险，注意长期发展"
+        elif any(kw in opt_lower for kw in ["分手", "离婚", "分开"]):
+            risk_level = "medium"
+            risk_note = "情感成本，建议先明确核心需求"
+
+        risks.append({
+            "option": opt,
+            "level": risk_level,
+            "note": risk_note,
+        })
+    return risks
+
+
+def _split_controllable(constraints: List[str]) -> Tuple[List[str], List[str]]:
+    """将约束分为可控和不可控"""
+    controllable = []
+    uncontrollable = []
+
+    uncontrollable_keywords = ["经济", "市场", "大环境", "政策", "他人", "对方", "老板", "公司", "行业"]
+    controllable_keywords = ["时间", "精力", "学习", "准备", "沟通", "态度", "选择", "技能"]
+
+    for c in constraints:
+        c_lower = c.lower()
+        if any(kw in c_lower for kw in uncontrollable_keywords):
+            uncontrollable.append(c)
+        elif any(kw in c_lower for kw in controllable_keywords):
+            controllable.append(c)
+        else:
+            # 默认归类为可控（鼓励用户掌控感）
+            controllable.append(c)
+
+    return controllable, uncontrollable
+
+
+def _generate_next_experiment(
+    topic: str,
+    options: List[str],
+    constraints: List[str],
+    time_horizon_days: int,
+) -> Dict[str, Any]:
+    """生成下一步最小验证实验"""
+    topic_lower = topic.lower()
+
+    # 根据主题类型生成实验
+    if any(kw in topic_lower for kw in ["工作", "职业", "跳槽", "离职"]):
+        return {
+            "title": "48小时内找1位目标领域的人聊15分钟",
+            "description": "收集真实信息，降低不确定性焦虑",
+            "estimated_minutes": 15,
+            "success_criteria": "获得至少1个新视角或信息点",
+        }
+    elif any(kw in topic_lower for kw in ["感情", "关系", "分手", "结婚"]):
+        return {
+            "title": "写下3个核心需求并排序",
+            "description": "明确自己的底线和非谈判项",
+            "estimated_minutes": 10,
+            "success_criteria": "清晰列出优先级排序",
+        }
+    elif any(kw in topic_lower for kw in ["学习", "考试", "技能"]):
+        return {
+            "title": "用25分钟做一个最小版本的尝试",
+            "description": "验证自己对这件事的真实兴趣和适配度",
+            "estimated_minutes": 25,
+            "success_criteria": "体验后写下感受：是否想继续",
+        }
+    elif any(kw in topic_lower for kw in ["投资", "买房", "理财"]):
+        return {
+            "title": "列出3个可量化的决策标准",
+            "description": "把模糊判断变成可比较的指标",
+            "estimated_minutes": 15,
+            "success_criteria": "每个选项按标准打分",
+        }
+    else:
+        return {
+            "title": f"用10分钟写下{options[0]}的最小验证方式",
+            "description": "找到一个24小时内可以做的小动作来收集信息",
+            "estimated_minutes": 10,
+            "success_criteria": "产出一个明天可以执行的具体步骤",
+        }
+
+
+def _decision_brief_to_a2ui(brief: Dict[str, Any], task_id: str) -> Dict[str, Any]:
+    """将决策简报转换为 A2UI 格式"""
+    topic = brief.get("topic", "")
+    options = brief.get("options", [])
+    constraints = brief.get("constraints", [])
+    risks = brief.get("risks", [])
+    controllable = brief.get("controllable", [])
+    uncontrollable = brief.get("uncontrollable", [])
+    experiment = brief.get("next_experiment", {})
+    time_horizon = brief.get("time_horizon_days", 30)
+
+    lines = []
+    lines.append(f"## 决策简报：{topic}")
+    lines.append("")
+    lines.append("### 备选方案")
+    for i, opt in enumerate(options, 1):
+        risk = risks[i - 1] if i <= len(risks) else {}
+        risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(risk.get("level", "low"), "⚪")
+        lines.append(f"{i}. {opt} {risk_emoji}")
+    lines.append("")
+    lines.append("### 约束条件")
+    if controllable:
+        lines.append("**可控因素：**")
+        for c in controllable:
+            lines.append(f"- ✅ {c}")
+    if uncontrollable:
+        lines.append("**不可控因素：**")
+        for u in uncontrollable:
+            lines.append(f"- ⚠️ {u}")
+    lines.append("")
+    lines.append("### 风险评估")
+    for r in risks:
+        lines.append(f"- **{r.get('option')}**：{r.get('note', '')}")
+    lines.append("")
+    lines.append(f"### 决策窗口：{time_horizon}天")
+    lines.append("")
+    lines.append("### 下一步实验")
+    lines.append(f"**{experiment.get('title', '')}**")
+    lines.append(f"- {experiment.get('description', '')}")
+    lines.append(f"- 预计时间：{experiment.get('estimated_minutes', 10)}分钟")
+    lines.append(f"- 成功标准：{experiment.get('success_criteria', '')}")
+
+    return {
+        "meta": {"summary": f"决策简报：{topic[:40]}"},
+        "ui_components": [
+            {"type": "markdown_text", "title": "决策简报", "data": "\n".join(lines)},
+            {
+                "type": "action_buttons",
+                "title": "下一步",
+                "data": [
+                    {"label": "开始实验", "action": {"type": "start_task", "task_id": task_id}},
+                    {"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": task_id}},
+                    {"label": "暂不决定", "action": {"type": "opt_out"}},
+                ],
+            },
+        ],
+    }
+
+
+# =============================================================================
+# Script Generator - 话术生成器
+# =============================================================================
+
+# 话术场景模板
+SCRIPT_TEMPLATES = {
+    "沟通": {
+        "intro": "当你需要开启一段重要对话时",
+        "structure": ["我观察到…", "我感觉…", "我需要…", "你愿意…吗？"],
+        "example": "我观察到最近我们交流变少了。我感觉有点疏远。我需要更多的连接感。你愿意今晚一起吃饭聊聊吗？",
+    },
+    "边界": {
+        "intro": "当你需要设立或维护边界时",
+        "structure": ["我理解你的需求…", "同时我的边界是…", "我能接受的是…", "不能接受的是…"],
+        "example": "我理解你希望我能帮忙。同时我的边界是周末需要休息。我能接受工作日偶尔加班，不能接受每周都占用休息时间。",
+    },
+    "拒绝": {
+        "intro": "当你需要说"不"而不伤害关系时",
+        "structure": ["感谢你想到我…", "这次我没办法…", "原因是…", "下次如果…"],
+        "example": "感谢你邀请我参加。这次我没办法来。原因是我已经有其他安排了。下次如果提前一周通知，我会更容易安排。",
+    },
+    "谈判": {
+        "intro": "当你需要争取自己的利益时",
+        "structure": ["我理解你的立场是…", "我的期望是…", "我们能否探讨…", "如果…那么…"],
+        "example": "我理解公司目前的预算压力。我的期望是能获得20%的涨幅。我们能否探讨其他补偿方式？如果现金有困难，那么是否可以考虑期权或更灵活的工作时间？",
+    },
+    "道歉": {
+        "intro": "当你需要真诚道歉并修复关系时",
+        "structure": ["我做了…", "这对你造成了…", "我能理解你会感到…", "我会…来弥补"],
+        "example": "我忘了我们的约定，这对你造成了时间和期待上的浪费。我能理解你会感到失望和不被重视。我会设置提醒，确保不再发生类似的事。",
+    },
+    "请求": {
+        "intro": "当你需要向他人寻求帮助时",
+        "structure": ["我正在…", "我需要…方面的帮助", "你能否…", "这对我意味着…"],
+        "example": "我正在准备一个重要的面试。我需要模拟问答方面的帮助。你能否这周花30分钟帮我练习？这对我意味着能更有信心地应对面试。",
+    },
+}
+
+
+def generate_script(
+    user_id: int,
+    *,
+    session_id: Optional[str],
+    scene_type: str,
+    context: str,
+    target_person: Optional[str] = None,
+    tone: str = "平和",
+) -> Dict[str, Any]:
+    """
+    生成对话话术脚本
+
+    Args:
+        user_id: 用户ID
+        session_id: 会话ID（可选）
+        scene_type: 场景类型（沟通/边界/拒绝/谈判/道歉/请求）
+        context: 具体情境描述
+        target_person: 对话对象（如"老板"、"伴侣"）
+        tone: 语气风格（平和/坚定/温柔/正式）
+
+    Returns:
+        包含话术脚本和练习任务的字典
+    """
+    scene_type = (scene_type or "沟通").strip()[:20]
+    context = (context or "").strip()[:500]
+    target_person = (target_person or "对方").strip()[:50]
+    tone = (tone or "平和").strip()[:20]
+
+    if scene_type not in SCRIPT_TEMPLATES:
+        scene_type = "沟通"
+
+    template = SCRIPT_TEMPLATES[scene_type]
+
+    # 生成定制话术
+    script = _generate_custom_script(scene_type, context, target_person, tone, template)
+
+    # 创建练习任务
+    task_id = _insert_commitment(
+        user_id=user_id,
+        session_id=session_id,
+        card_id=str(uuid4()),
+        source="script",
+        commitment_type="start_task",
+        title=f"练习{scene_type}话术（2分钟）",
+        details={
+            "scene_type": scene_type,
+            "context": context,
+            "target_person": target_person,
+            "script": script,
+        },
+        due_at=None,
+    )
+
+    # 生成 A2UI
+    a2ui = _script_to_a2ui(scene_type, script, template, task_id)
+
+    logger.info(
+        "script generated",
+        extra={"operation": "script_generate", "user_id": int(user_id), "scene_type": scene_type},
+    )
+
+    return {
+        "scene_type": scene_type,
+        "script": script,
+        "structure": template["structure"],
+        "tips": _get_script_tips(scene_type, tone),
+        "task_id": task_id,
+        "a2ui": a2ui,
+    }
+
+
+def _generate_custom_script(
+    scene_type: str,
+    context: str,
+    target_person: str,
+    tone: str,
+    template: Dict[str, Any],
+) -> str:
+    """生成定制话术"""
+    structure = template["structure"]
+
+    # 简单的上下文替换（生产环境可接入 LLM）
+    if context:
+        # 基于场景生成话术骨架
+        if scene_type == "沟通":
+            return f"我注意到{context}。我想和{target_person}谈谈这件事。我希望我们能找到一个双方都满意的方式。你愿意聊聊吗？"
+        elif scene_type == "边界":
+            return f"关于{context}，我需要明确一下我的边界。我理解{target_person}的需求，同时我也需要保护自己的时间/精力。我能接受的范围是…"
+        elif scene_type == "拒绝":
+            return f"谢谢{target_person}想到我。关于{context}，这次我没办法答应。不是因为我不重视，而是我需要优先处理其他事情。希望你能理解。"
+        elif scene_type == "谈判":
+            return f"关于{context}，我理解{target_person}的考量。我的期望是…我们能否一起探讨一个双赢的方案？"
+        elif scene_type == "道歉":
+            return f"关于{context}，我需要向{target_person}道歉。我的行为可能让你感到…我会…来改善这种情况。"
+        elif scene_type == "请求":
+            return f"关于{context}，我需要{target_person}的帮助。你能否…这对我来说很重要。"
+
+    return template["example"]
+
+
+def _get_script_tips(scene_type: str, tone: str) -> List[str]:
+    """获取话术使用提示"""
+    tips = {
+        "沟通": [
+            "选择双方都放松的时机",
+            "避免在情绪激动时开口",
+            "先听再说，确认理解",
+        ],
+        "边界": [
+            "边界是保护关系，不是拒绝关系",
+            "用"我需要"代替"你不能"",
+            "保持语气平和但立场坚定",
+        ],
+        "拒绝": [
+            "不需要过度解释原因",
+            "感谢对方的信任是真诚的",
+            "提供替代方案可以软化拒绝",
+        ],
+        "谈判": [
+            "先理解对方立场再表达自己",
+            "关注利益而非立场",
+            "准备好你的BATNA（最佳替代方案）",
+        ],
+        "道歉": [
+            "承认错误，不找借口",
+            "表达你理解对方的感受",
+            "提出具体的弥补措施",
+        ],
+        "请求": [
+            "明确说明需要什么帮助",
+            "告知对方这对你的意义",
+            "给对方拒绝的空间",
+        ],
+    }
+
+    base_tips = tips.get(scene_type, tips["沟通"])
+
+    # 根据语气添加额外提示
+    if tone == "坚定":
+        base_tips.append("保持眼神接触，语速适中")
+    elif tone == "温柔":
+        base_tips.append("放慢语速，使用更多"我们"")
+    elif tone == "正式":
+        base_tips.append("使用敬语，保持专业距离")
+
+    return base_tips
+
+
+def _script_to_a2ui(
+    scene_type: str,
+    script: str,
+    template: Dict[str, Any],
+    task_id: str,
+) -> Dict[str, Any]:
+    """将话术转换为 A2UI 格式"""
+    lines = []
+    lines.append(f"## {scene_type}话术")
+    lines.append("")
+    lines.append(f"*{template['intro']}*")
+    lines.append("")
+    lines.append("### 结构模板")
+    for i, s in enumerate(template["structure"], 1):
+        lines.append(f"{i}. {s}")
+    lines.append("")
+    lines.append("### 你的话术")
+    lines.append(f"> {script}")
+    lines.append("")
+    lines.append("### 使用提示")
+    lines.append("- 先在心里默念一遍")
+    lines.append("- 可以根据实际情况调整")
+    lines.append("- 关注对方的反应并灵活应对")
+
+    return {
+        "meta": {"summary": f"{scene_type}话术"},
+        "ui_components": [
+            {"type": "markdown_text", "title": f"{scene_type}话术", "data": "\n".join(lines)},
+            {
+                "type": "action_buttons",
+                "title": "下一步",
+                "data": [
+                    {"label": "复制话术", "action": {"type": "copy_text", "text": script}},
+                    {"label": "练习一下", "action": {"type": "start_task", "task_id": task_id}},
+                    {"label": "换个场景", "action": {"type": "regenerate"}},
+                ],
+            },
+        ],
+    }
+

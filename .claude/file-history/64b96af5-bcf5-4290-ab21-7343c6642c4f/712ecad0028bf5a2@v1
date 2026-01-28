@@ -1,0 +1,301 @@
+"""
+CoreAgent + Claude API 完整流程测试
+测试智能 skill 选择和工具调用
+"""
+import asyncio
+import os
+import sys
+import json
+from typing import Optional, List, Dict, Any, AsyncGenerator
+
+# 添加项目路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# 设置 Claude API 环境变量
+os.environ["CLAUDE_API_KEY"] = "cr_5b14c030a59e2965a32d574609df6e250a4bf1faee0dc2a9001522cddcf245e1"
+os.environ["CLAUDE_BASE_URL"] = "https://uapi.chat"
+
+from services.agent.core import CoreAgent, AgentContext
+from services.llm.client import LLMClient, LLMMessage, LLMResponse, ToolCall
+import httpx
+
+
+class ClaudeLLMClient(LLMClient):
+    """强制使用 Claude API 的 LLM Client"""
+
+    def __init__(self):
+        super().__init__()
+        self.api_key = os.environ.get("CLAUDE_API_KEY", "")
+        self.base_url = os.environ.get("CLAUDE_BASE_URL", "https://www.zz166.cn/api/v1")
+        self.model = "claude-opus-4-5-20251101"
+
+    async def chat(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        user_tier: str = "free",
+        task: str = "chat",
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        """直接调用 Claude API"""
+        return await self._call_claude(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+
+    async def stream(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        user_tier: str = "free",
+        task: str = "chat",
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """直接流式调用 Claude API"""
+        async for chunk in self._stream_claude(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens
+        ):
+            yield chunk
+
+
+async def test_skill_selection():
+    """测试1: 智能 Skill 选择"""
+    print("\n=== 测试1: 智能 Skill 选择 ===")
+
+    # 创建使用 Claude 的 agent
+    llm = ClaudeLLMClient()
+    agent = CoreAgent(llm=llm, max_iterations=5)
+
+    context = AgentContext(
+        user_id="test_user",
+        user_tier="free",
+        profile={"basic": {"name": "测试用户"}},
+        skill_data={}
+    )
+
+    test_cases = [
+        ("帮我测八字", "bazi"),
+        ("看看我的星座运势", "zodiac"),
+        ("我想换工作，给点建议", "career"),
+        ("帮我抽一张塔罗牌", "tarot"),
+    ]
+
+    results = []
+    for message, expected_skill in test_cases:
+        print(f"\n  测试: '{message}' → 期望 skill: {expected_skill}")
+
+        content = ""
+        tool_calls = []
+
+        try:
+            async for event in agent.run(message, context):
+                if event.type == "content":
+                    content += event.data.get("content", "")
+                elif event.type == "tool_call":
+                    tool_calls.append(event.data)
+                    print(f"    工具调用: {event.data.get('name')}")
+                elif event.type == "done":
+                    break
+                elif event.type == "error":
+                    print(f"    错误: {event.data}")
+                    break
+
+            # 检查是否调用了 use_skill
+            use_skill_called = any(tc.get("name") == "use_skill" for tc in tool_calls)
+            if use_skill_called:
+                print(f"    ✅ 成功调用 use_skill")
+                results.append(True)
+            else:
+                print(f"    ⚠️ 未调用 use_skill，直接回复: {content[:100]}...")
+                results.append(False)
+
+        except Exception as e:
+            print(f"    ❌ 异常: {e}")
+            results.append(False)
+
+    return all(results)
+
+
+async def test_bazi_with_data():
+    """测试2: 八字分析（带命盘数据）"""
+    print("\n=== 测试2: 八字分析（带命盘数据）===")
+
+    llm = ClaudeLLMClient()
+    agent = CoreAgent(llm=llm, max_iterations=5)
+
+    # 模拟已有命盘数据的用户
+    context = AgentContext(
+        user_id="test_user",
+        user_tier="free",
+        profile={
+            "basic": {"name": "小明", "gender": "男"},
+            "birth_info": {"year": 1990, "month": 5, "day": 15, "hour": 10}
+        },
+        skill_data={
+            "bazi": {
+                "chart": {
+                    "day_master": {"stem": "甲", "element": "木"},
+                    "pattern": {"name": "正官格"},
+                    "four_pillars": {
+                        "year": {"stem": "庚", "branch": "午"},
+                        "month": {"stem": "辛", "branch": "巳"},
+                        "day": {"stem": "甲", "branch": "寅"},
+                        "hour": {"stem": "丙", "branch": "巳"}
+                    },
+                    "five_elements": {"wood": 3, "fire": 2, "earth": 1, "metal": 2, "water": 0}
+                }
+            }
+        }
+    )
+
+    # 先激活 bazi skill
+    agent._active_skills = ["bazi"]
+
+    content = ""
+    async for event in agent.run("分析一下我的八字命盘", context):
+        if event.type == "content":
+            content += event.data.get("content", "")
+        elif event.type == "tool_call":
+            print(f"  工具调用: {event.data.get('name')}")
+        elif event.type == "done":
+            break
+        elif event.type == "error":
+            print(f"  错误: {event.data}")
+            return False
+
+    print(f"  回复: {content[:300]}...")
+
+    # 检查是否提到了命盘数据
+    has_analysis = "甲木" in content or "正官" in content or "木" in content
+    if has_analysis:
+        print("  ✅ 成功使用命盘数据进行分析")
+        return True
+    else:
+        print("  ⚠️ 回复中未包含命盘分析")
+        return False
+
+
+async def test_multi_turn():
+    """测试3: 多轮对话"""
+    print("\n=== 测试3: 多轮对话 ===")
+
+    llm = ClaudeLLMClient()
+    agent = CoreAgent(llm=llm, max_iterations=5)
+
+    context = AgentContext(
+        user_id="test_user",
+        user_tier="free",
+        profile={"basic": {"name": "小红"}},
+        skill_data={},
+        history=[
+            {"role": "user", "content": "我是1995年8月20日出生的"},
+            {"role": "assistant", "content": "好的，我记住了你的出生日期。你是狮子座，出生在夏天。"}
+        ]
+    )
+
+    content = ""
+    async for event in agent.run("那我是什么星座？", context):
+        if event.type == "content":
+            content += event.data.get("content", "")
+        elif event.type == "done":
+            break
+        elif event.type == "error":
+            print(f"  错误: {event.data}")
+            return False
+
+    print(f"  回复: {content[:200]}...")
+
+    # 检查是否记住了上下文
+    if "狮子" in content or "8月" in content:
+        print("  ✅ 成功保持上下文")
+        return True
+    else:
+        print("  ⚠️ 未能保持上下文")
+        return False
+
+
+async def test_streaming():
+    """测试4: 流式响应"""
+    print("\n=== 测试4: 流式响应 ===")
+
+    llm = ClaudeLLMClient()
+    agent = CoreAgent(llm=llm, max_iterations=3)
+
+    context = AgentContext(
+        user_id="test_user",
+        user_tier="free"
+    )
+
+    chunks = []
+    async for event in agent.run("你好，简单介绍一下你自己", context):
+        if event.type == "content":
+            chunk = event.data.get("content", "")
+            chunks.append(chunk)
+            print(chunk, end="", flush=True)
+        elif event.type == "done":
+            break
+        elif event.type == "error":
+            print(f"\n  错误: {event.data}")
+            return False
+
+    print()  # 换行
+
+    if len(chunks) > 1:
+        print(f"  ✅ 流式响应正常，共 {len(chunks)} 个 chunks")
+        return True
+    else:
+        print(f"  ⚠️ 流式响应异常，只有 {len(chunks)} 个 chunk")
+        return False
+
+
+async def main():
+    print("=" * 60)
+    print("CoreAgent + Claude API 完整流程测试")
+    print("=" * 60)
+
+    tests = [
+        ("智能 Skill 选择", test_skill_selection),
+        ("八字分析（带数据）", test_bazi_with_data),
+        ("多轮对话", test_multi_turn),
+        ("流式响应", test_streaming),
+    ]
+
+    results = []
+    for name, test_func in tests:
+        try:
+            result = await test_func()
+            results.append((name, result))
+        except Exception as e:
+            print(f"\n❌ {name} 测试异常: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append((name, False))
+
+    print("\n" + "=" * 60)
+    print("测试结果汇总")
+    print("=" * 60)
+
+    passed = 0
+    for name, result in results:
+        status = "✅ 通过" if result else "❌ 失败"
+        print(f"  {name}: {status}")
+        if result:
+            passed += 1
+
+    print(f"\n总计: {passed}/{len(results)} 通过")
+    return passed == len(results)
+
+
+if __name__ == "__main__":
+    success = asyncio.run(main())
+    sys.exit(0 if success else 1)

@@ -1,0 +1,235 @@
+"""
+Term Service - Auto-extracted professional terminology management
+
+Provides:
+- LLM-driven term extraction during ingestion
+- Jieba dictionary loading for tokenization
+- Skill-specific term management
+"""
+import json
+import os
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+
+# Set jieba cache directory before importing jieba (use environment variable)
+_jieba_tmpdir = os.getenv('VIBELIFE_JIEBA_TMPDIR', '/tmp/vibelife/jieba')
+os.environ.setdefault('TMPDIR', _jieba_tmpdir)
+os.makedirs(_jieba_tmpdir, exist_ok=True)
+
+import jieba
+
+from stores.db import get_connection
+from services.model_router.client import chat as llm_chat
+
+
+@dataclass
+class SkillConfig:
+    """Skill configuration for RAG"""
+    skill_id: str
+    display_name: str
+    extract_terms: bool
+    term_min_frequency: int
+    rag_top_k: int
+    rag_max_chars: int
+    profile_fields: List[str]
+    field_formats: Dict[str, str]
+    context_keywords: Dict[str, List[str]]
+
+
+class TermService:
+    """Manage skill-specific terms for Jieba tokenization"""
+
+    _loaded_skills: set = set()
+    _skill_configs: Dict[str, SkillConfig] = {}
+
+    # LLM prompt for term extraction
+    EXTRACT_PROMPT = """从以下{skill_name}专业文本中提取专业术语。
+
+要求：
+1. 只提取专业术语（非通用词汇）
+2. 保持术语完整性（如"食神格"不要拆成"食神"+"格"）
+3. 每个术语 2-6 个字
+4. 最多提取 20 个术语
+5. 返回 JSON 数组
+
+文本：
+{content}
+
+返回格式（纯 JSON，无其他内容）：
+["术语1", "术语2", ...]"""
+
+    @classmethod
+    async def load_skill_config(cls, skill_id: str) -> Optional[SkillConfig]:
+        """Load skill configuration from database"""
+        if skill_id in cls._skill_configs:
+            return cls._skill_configs[skill_id]
+
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM skill_configs WHERE skill_id = $1 AND is_active = true",
+                skill_id
+            )
+            if not row:
+                return None
+
+            query_config = row["query_config"] or {}
+            # Parse JSON if it's a string
+            if isinstance(query_config, str):
+                query_config = json.loads(query_config) if query_config else {}
+            config = SkillConfig(
+                skill_id=row["skill_id"],
+                display_name=row["display_name"],
+                extract_terms=row["extract_terms"],
+                term_min_frequency=row["term_min_frequency"],
+                rag_top_k=row["rag_top_k"],
+                rag_max_chars=row["rag_max_chars"],
+                profile_fields=query_config.get("profile_fields", []),
+                field_formats=query_config.get("field_formats", {}),
+                context_keywords=query_config.get("context_keywords", {}),
+            )
+            cls._skill_configs[skill_id] = config
+            return config
+
+    @classmethod
+    async def load_terms_to_jieba(cls, skill_id: str) -> int:
+        """Load skill terms into Jieba dictionary"""
+        if skill_id in cls._loaded_skills:
+            return 0
+
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT term FROM skill_terms
+                WHERE skill_id = $1 AND is_active = true
+                """,
+                skill_id
+            )
+
+        count = 0
+        for row in rows:
+            term = row["term"]
+            jieba.add_word(term)
+            count += 1
+
+        cls._loaded_skills.add(skill_id)
+        return count
+
+    @classmethod
+    async def load_all_terms(cls) -> int:
+        """Load all active terms into Jieba (call at startup)"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT term FROM skill_terms WHERE is_active = true"
+            )
+
+        count = 0
+        for row in rows:
+            jieba.add_word(row["term"])
+            count += 1
+
+        return count
+
+    @classmethod
+    async def extract_terms_from_content(
+        cls,
+        content: str,
+        skill_id: str,
+        source_doc_id: Optional[str] = None,
+    ) -> List[str]:
+        """Extract professional terms from content using LLM"""
+        config = await cls.load_skill_config(skill_id)
+        if not config or not config.extract_terms:
+            return []
+
+        # Truncate content for LLM
+        content_truncated = content[:3000]
+
+        try:
+            response = await llm_chat(
+                messages=[{
+                    "role": "user",
+                    "content": cls.EXTRACT_PROMPT.format(
+                        skill_name=config.display_name,
+                        content=content_truncated
+                    )
+                }],
+                capability="analysis",
+                skill=skill_id,
+                task="term_extraction",
+                temperature=0.3,
+                max_tokens=500,
+            )
+
+            # Parse JSON response
+            text = response.content.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            terms = json.loads(text)
+
+            # Filter valid terms
+            valid_terms = [
+                t.strip() for t in terms
+                if isinstance(t, str) and 2 <= len(t.strip()) <= 20
+            ]
+
+            # Save to database
+            if valid_terms:
+                await cls.save_terms(skill_id, valid_terms, source_doc_id)
+
+            return valid_terms
+
+        except Exception as e:
+            print(f"Term extraction failed: {e}")
+            return []
+
+    @classmethod
+    async def save_terms(
+        cls,
+        skill_id: str,
+        terms: List[str],
+        source_doc_id: Optional[str] = None,
+    ) -> int:
+        """Save extracted terms to database"""
+        async with get_connection() as conn:
+            count = 0
+            for term in terms:
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO skill_terms (skill_id, term, source_doc_id)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (skill_id, term)
+                        DO UPDATE SET frequency = skill_terms.frequency + 1
+                        """,
+                        skill_id, term, source_doc_id
+                    )
+                    # Add to Jieba immediately
+                    jieba.add_word(term)
+                    count += 1
+                except Exception:
+                    pass
+            return count
+
+    @classmethod
+    async def get_terms(cls, skill_id: str) -> List[str]:
+        """Get all active terms for a skill"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT term FROM skill_terms
+                WHERE skill_id = $1 AND is_active = true
+                ORDER BY frequency DESC
+                """,
+                skill_id
+            )
+        return [row["term"] for row in rows]
+
+
+# Convenience function for startup
+async def init_term_service():
+    """Initialize term service at application startup"""
+    count = await TermService.load_all_terms()
+    print(f"Loaded {count} terms into Jieba")
+    return count

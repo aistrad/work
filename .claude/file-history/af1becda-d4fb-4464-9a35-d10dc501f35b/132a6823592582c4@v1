@@ -1,0 +1,193 @@
+/**
+ * Chat utilities using Vercel AI SDK
+ * Based on: vibelife spec v3.0
+ */
+
+import { useChat as useAIChat, Message } from "ai/react";
+import { getTokens } from "./api";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api/v1";
+
+export type VoiceMode = "warm" | "sarcastic";
+
+export interface UseChatOptions {
+  skill: string;
+  conversationId?: string;
+  voiceMode?: VoiceMode;
+  onConversationStart?: (id: string) => void;
+  onError?: (error: Error) => void;
+}
+
+/**
+ * Custom useChat hook that wraps Vercel AI SDK's useChat
+ * with VibeLife-specific configuration
+ */
+export function useVibeChat({
+  skill,
+  conversationId,
+  voiceMode = "warm",
+  onConversationStart,
+  onError,
+}: UseChatOptions) {
+  const { accessToken } = getTokens();
+
+  const chat = useAIChat({
+    api: `${API_BASE}/chat/stream`,
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken && { Authorization: `Bearer ${accessToken}` }),
+    },
+    body: {
+      skill,
+      conversation_id: conversationId,
+      voice_mode: voiceMode,
+    },
+    onResponse: (response) => {
+      // Extract conversation_id from response headers if new conversation
+      const newConvoId = response.headers.get("X-Conversation-Id");
+      if (newConvoId && !conversationId) {
+        onConversationStart?.(newConvoId);
+      }
+    },
+    onError: (error) => {
+      console.error("Chat error:", error);
+      onError?.(error);
+    },
+  });
+
+  return {
+    ...chat,
+    // Add convenience methods
+    sendMessage: (content: string) => {
+      chat.append({
+        role: "user",
+        content,
+      });
+    },
+  };
+}
+
+/**
+ * Stream chat response using fetch (fallback for non-AI SDK usage)
+ */
+export async function* streamChatResponse(
+  message: string,
+  skill: string,
+  options: {
+    conversationId?: string;
+    voiceMode?: VoiceMode;
+  } = {}
+): AsyncGenerator<string, void, unknown> {
+  const { accessToken } = getTokens();
+
+  const response = await fetch(`${API_BASE}/chat/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken && { Authorization: `Bearer ${accessToken}` }),
+    },
+    body: JSON.stringify({
+      message,
+      skill,
+      conversation_id: options.conversationId,
+      voice_mode: options.voiceMode || "warm",
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Chat failed: ${response.statusText}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("No response body");
+  }
+
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const text = decoder.decode(value);
+    const lines = text.split("\n");
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const data = line.slice(6);
+        if (data === "[DONE]") {
+          return;
+        }
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === "chunk" && parsed.content) {
+            yield parsed.content;
+          }
+        } catch {
+          // Not JSON, yield as-is
+          yield data;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Parse SSE stream from backend
+ */
+export function parseSSEStream(
+  onChunk: (content: string) => void,
+  onDone: (metadata?: { conversation_id?: string; skill?: string }) => void,
+  onError: (error: Error) => void
+) {
+  return async (response: Response) => {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      onError(new Error("No response body"));
+      return;
+    }
+
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          onDone();
+          break;
+        }
+
+        const text = decoder.decode(value);
+        const lines = text.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.type === "chunk") {
+                onChunk(parsed.content);
+              } else if (parsed.type === "done") {
+                onDone({
+                  conversation_id: parsed.conversation_id,
+                  skill: parsed.skill,
+                });
+                return;
+              } else if (parsed.type === "error") {
+                onError(new Error(parsed.message));
+                return;
+              }
+            } catch {
+              // Not JSON, treat as raw chunk
+              if (data !== "[DONE]") {
+                onChunk(data);
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+}

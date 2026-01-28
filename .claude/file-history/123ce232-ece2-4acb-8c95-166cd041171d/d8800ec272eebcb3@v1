@@ -1,0 +1,377 @@
+"""
+Dashboard API Route - Dashboard 数据聚合端点
+
+从 UnifiedProfileRepository 获取真实用户数据，不使用任何 Mock Data。
+
+数据来源:
+- vibe.target: 北极星、目标、专注点
+- skills.lifecoach: 周大石头、今日杠杆
+- skills.bazi: 运势数据
+- 节气: 根据日期计算
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends
+
+from services.identity import get_current_user, CurrentUser
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Solar Term Calculation
+# ═══════════════════════════════════════════════════════════════════════════
+
+SOLAR_TERMS = [
+    (1, 5, "小寒"), (1, 20, "大寒"),
+    (2, 4, "立春"), (2, 19, "雨水"),
+    (3, 6, "惊蛰"), (3, 21, "春分"),
+    (4, 5, "清明"), (4, 20, "谷雨"),
+    (5, 6, "立夏"), (5, 21, "小满"),
+    (6, 6, "芒种"), (6, 21, "夏至"),
+    (7, 7, "小暑"), (7, 23, "大暑"),
+    (8, 8, "立秋"), (8, 23, "处暑"),
+    (9, 8, "白露"), (9, 23, "秋分"),
+    (10, 8, "寒露"), (10, 24, "霜降"),
+    (11, 8, "立冬"), (11, 22, "小雪"),
+    (12, 7, "大雪"), (12, 22, "冬至"),
+]
+
+
+def get_current_solar_term() -> str:
+    """根据当前日期获取节气"""
+    now = datetime.now()
+    month = now.month
+    day = now.day
+
+    current_term = "冬至"  # 默认值
+
+    for m, d, term in SOLAR_TERMS:
+        if month > m or (month == m and day >= d):
+            current_term = term
+        else:
+            break
+
+    return current_term
+
+
+def get_greeting(display_name: Optional[str] = None) -> str:
+    """根据时间生成问候语"""
+    hour = datetime.now().hour
+
+    if hour < 6:
+        greeting = "夜深了"
+    elif hour < 12:
+        greeting = "早上好"
+    elif hour < 18:
+        greeting = "下午好"
+    else:
+        greeting = "晚上好"
+
+    if display_name:
+        greeting = f"{greeting}，{display_name}"
+
+    return greeting
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Dashboard Endpoint
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("")
+async def get_dashboard(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    获取 Dashboard 数据
+
+    数据来源：
+    - ambient: 问候语、节气（实时计算）
+    - lifecoach: 北极星、周大石头、今日杠杆（来自 vibe.target + skills.lifecoach）
+    - mySkills: 八字运势等（来自 skills.bazi）
+    - status: 用户状态（来自 preferences）
+
+    Returns:
+        DashboardDTO 格式的数据
+    """
+    user_id = current_user.user_id
+
+    # 并行获取所有数据
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+    account = await UnifiedProfileRepository.get_account_full(user_id)
+    vibe_target = await UnifiedProfileRepository.get_vibe_target(user_id)
+    lifecoach_data = await UnifiedProfileRepository.get_skill_data(user_id, "lifecoach")
+    bazi_data = await UnifiedProfileRepository.get_skill_data(user_id, "bazi")
+    subscribed_ids = await UnifiedProfileRepository.get_subscribed_skill_ids(user_id)
+
+    display_name = account.get("display_name")
+    now = datetime.now(timezone.utc)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Ambient Layer
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    ambient = {
+        "greeting": get_greeting(display_name),
+        "quote": None,  # 可以从用户偏好或推荐系统获取
+        "date": now.strftime("%Y年%m月%d日"),
+        "solarTerm": get_current_solar_term(),
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Status Layer
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 从 preferences 或 state 获取签到状态
+    preferences = profile.get("preferences", {}) if profile else {}
+    state = profile.get("state", {}) if profile else {}
+
+    status = {
+        "streak": preferences.get("streak", 0),
+        "checkedIn": state.get("checked_in_today", False),
+        "energy": preferences.get("energy", 80),
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Lifecoach Layer
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 北极星优先从 vibe.target，回退到 skills.lifecoach
+    north_star = vibe_target.get("north_star")
+    if isinstance(north_star, dict):
+        north_star = north_star.get("description") or north_star.get("vision")
+    elif not north_star:
+        north_star = lifecoach_data.get("north_star")
+        if isinstance(north_star, dict):
+            north_star = north_star.get("description") or north_star.get("vision")
+
+    # 周大石头（Week Rocks）
+    week_rocks_raw = vibe_target.get("goals", []) or lifecoach_data.get("week_rocks", [])
+    week_rocks = []
+    for i, rock in enumerate(week_rocks_raw[:5]):
+        if isinstance(rock, dict):
+            week_rocks.append({
+                "id": rock.get("id", f"rock-{i}"),
+                "text": rock.get("text") or rock.get("title") or rock.get("description", ""),
+                "role": rock.get("role", ""),
+                "completed": rock.get("completed", False),
+            })
+        elif isinstance(rock, str):
+            week_rocks.append({
+                "id": f"rock-{i}",
+                "text": rock,
+                "role": "",
+                "completed": False,
+            })
+
+    # 今日杠杆（Today Levers）
+    today_levers_raw = lifecoach_data.get("today_levers", []) or vibe_target.get("focus", {}).get("tasks", [])
+    today_levers = []
+    for i, lever in enumerate(today_levers_raw[:5]):
+        if isinstance(lever, dict):
+            today_levers.append({
+                "id": lever.get("id", f"lever-{i}"),
+                "text": lever.get("text") or lever.get("title") or lever.get("description", ""),
+                "completed": lever.get("completed", False),
+            })
+        elif isinstance(lever, str):
+            today_levers.append({
+                "id": f"lever-{i}",
+                "text": lever,
+                "completed": False,
+            })
+
+    lifecoach = {
+        "northStar": north_star,
+        "monthlyProject": lifecoach_data.get("monthly_project"),
+        "todayLevers": today_levers,
+        "weekRocks": week_rocks,
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # My Skills Layer (八字运势等)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    my_skills = []
+
+    # 八字 Skill 卡片
+    if bazi_data:
+        daily_fortune = bazi_data.get("daily_fortune", {})
+        insights = daily_fortune.get("insights", [])
+        if not insights:
+            # 从 chart 分析中提取洞察
+            chart = bazi_data.get("chart", {})
+            if chart:
+                insights = chart.get("insights", [])
+
+        rating = daily_fortune.get("rating")
+        if not rating and daily_fortune.get("score"):
+            score = daily_fortune["score"]
+            rating = {
+                "overall": score,
+                "label": "吉" if score >= 7 else ("中" if score >= 4 else "凶"),
+            }
+
+        my_skills.append({
+            "skillId": "bazi",
+            "cardId": "bazi-daily",
+            "title": "八字命盘",
+            "icon": "🌟",
+            "content": {
+                "headline": daily_fortune.get("headline") or "查看今日运势",
+                "insights": insights[:3] if insights else [],
+                "rating": rating,
+            },
+            "computedAt": daily_fortune.get("computed_at") or now.isoformat(),
+            "actionLabel": "查看详情",
+            "actionRoute": "/chat?skill=bazi",
+        })
+
+    # 可以添加其他已订阅的 Skill 卡片
+    # zodiac_data = await UnifiedProfileRepository.get_skill_data(user_id, "zodiac")
+    # if zodiac_data and "zodiac" in subscribed_ids: ...
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Discover Layer (推荐未订阅的 Skills)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 这里可以从 skill registry 获取推荐，目前返回空
+    discover = []
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Response
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    return {
+        "success": True,
+        "data": {
+            "userId": str(user_id),
+            "generatedAt": now.isoformat(),
+            "ambient": ambient,
+            "status": status,
+            "lifecoach": lifecoach,
+            "mySkills": my_skills,
+            "discover": discover,
+        },
+        "meta": {
+            "cached": False,
+            "generatedAt": now.isoformat(),
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Lever Toggle Endpoint
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.patch("/lever/{lever_id}")
+async def toggle_lever(
+    lever_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    切换今日杠杆完成状态
+
+    更新 skills.lifecoach.today_levers 中对应项的 completed 状态
+    """
+    user_id = current_user.user_id
+
+    # 获取当前 lifecoach 数据
+    lifecoach_data = await UnifiedProfileRepository.get_skill_data(user_id, "lifecoach")
+    today_levers = lifecoach_data.get("today_levers", [])
+
+    # 找到并切换状态
+    found = False
+    for lever in today_levers:
+        if isinstance(lever, dict) and lever.get("id") == lever_id:
+            lever["completed"] = not lever.get("completed", False)
+            found = True
+            break
+
+    if not found:
+        return {"success": False, "error": "Lever not found"}
+
+    # 保存更新
+    lifecoach_data["today_levers"] = today_levers
+    await UnifiedProfileRepository.update_skill_data(user_id, "lifecoach", lifecoach_data)
+
+    # 计算进度
+    completed_count = len([l for l in today_levers if isinstance(l, dict) and l.get("completed")])
+    total_count = len(today_levers)
+
+    return {
+        "success": True,
+        "data": {
+            "lever": {"id": lever_id, "completed": not found or lever.get("completed", False)},
+            "progress": {
+                "completed": completed_count,
+                "total": total_count,
+                "percentage": round(completed_count / total_count * 100) if total_count > 0 else 0,
+            },
+            "allCompleted": completed_count == total_count,
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Rock Toggle Endpoint
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.patch("/rock/{rock_id}")
+async def toggle_rock(
+    rock_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    切换本周大石头完成状态
+
+    更新 vibe.target.goals 或 skills.lifecoach.week_rocks 中对应项的 completed 状态
+    """
+    user_id = current_user.user_id
+
+    # 优先从 vibe.target 获取
+    vibe_target = await UnifiedProfileRepository.get_vibe_target(user_id)
+    goals = vibe_target.get("goals", [])
+
+    # 找到并切换状态
+    found = False
+    for goal in goals:
+        if isinstance(goal, dict) and goal.get("id") == rock_id:
+            goal["completed"] = not goal.get("completed", False)
+            found = True
+            break
+
+    if found:
+        # 保存到 vibe.target
+        vibe_target["goals"] = goals
+        await UnifiedProfileRepository.update_vibe_target(user_id, vibe_target)
+    else:
+        # 回退到 lifecoach.week_rocks
+        lifecoach_data = await UnifiedProfileRepository.get_skill_data(user_id, "lifecoach")
+        week_rocks = lifecoach_data.get("week_rocks", [])
+
+        for rock in week_rocks:
+            if isinstance(rock, dict) and rock.get("id") == rock_id:
+                rock["completed"] = not rock.get("completed", False)
+                found = True
+                break
+
+        if found:
+            lifecoach_data["week_rocks"] = week_rocks
+            await UnifiedProfileRepository.update_skill_data(user_id, "lifecoach", lifecoach_data)
+
+    if not found:
+        return {"success": False, "error": "Rock not found"}
+
+    return {
+        "success": True,
+        "data": {
+            "rockId": rock_id,
+            "completed": True,  # 已切换
+        },
+    }

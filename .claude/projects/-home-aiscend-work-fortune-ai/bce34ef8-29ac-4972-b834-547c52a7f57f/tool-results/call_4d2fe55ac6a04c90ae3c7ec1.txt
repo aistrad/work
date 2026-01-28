@@ -1,0 +1,852 @@
+     1→from datetime import datetime
+     2→from typing import Any, Dict, List, Optional, Tuple
+     3→from copy import deepcopy
+     4→
+     5→from common.logging import get_logger
+     6→from services.tieban import ruleset_loader, store
+     7→from services.tieban.normalizer import normalize_input
+     8→from services.tieban.candidate_pool import build_candidate_pool
+     9→from services.tieban.mapping import apply_linear_offsets, secret_jump_search
+    10→from services.tieban.report_builder import build_report
+    11→from services.bazi_engine import DEFAULT_LOCATION
+    12→from user_store import get_fortune_user_by_name, create_fortune_user
+    13→
+    14→logger = get_logger(__name__)
+    15→
+    16→MODULE_CODE = "tieban_12k"
+    17→
+    18→DEFAULT_LOCK_REQUIRED_FIELDS = ("father_zodiac", "mother_zodiac")
+    19→DEFAULT_MAX_RETURN_CANDIDATES = 50
+    20→DEFAULT_EVIDENCE_PREVIEW_LIMIT = 3
+    21→DEFAULT_OCCURRED_PREVIEW_LIMIT = 6
+    22→
+    23→ZODIAC_ANIMAL_TO_BRANCH = {
+    24→    "鼠": "子",
+    25→    "牛": "丑",
+    26→    "虎": "寅",
+    27→    "兔": "卯",
+    28→    "龙": "辰",
+    29→    "蛇": "巳",
+    30→    "马": "午",
+    31→    "羊": "未",
+    32→    "猴": "申",
+    33→    "鸡": "酉",
+    34→    "狗": "戌",
+    35→    "猪": "亥",
+    36→}
+    37→
+    38→BRANCH_TO_ENUM = {
+    39→    "子": "ZI",
+    40→    "丑": "CHOU",
+    41→    "寅": "YIN",
+    42→    "卯": "MAO",
+    43→    "辰": "CHEN",
+    44→    "巳": "SI",
+    45→    "午": "WU",
+    46→    "未": "WEI",
+    47→    "申": "SHEN",
+    48→    "酉": "YOU",
+    49→    "戌": "XU",
+    50→    "亥": "HAI",
+    51→}
+    52→
+    53→
+    54→def _normalize_date_input(date_str: str) -> str:
+    55→    raw = (date_str or "").strip()
+    56→    if "/" in raw:
+    57→        parts = raw.split("/")
+    58→        if len(parts) == 3 and len(parts[2]) == 4:
+    59→            try:
+    60→                m = int(parts[0])
+    61→                d = int(parts[1])
+    62→                y = int(parts[2])
+    63→                normalized = f"{y:04d}-{m:02d}-{d:02d}"
+    64→                logger.info(
+    65→                    "tieban input parsed",
+    66→                    extra={"operation": "tieban_input_parse", "raw_date": raw, "normalized_date": normalized},
+    67→                )
+    68→                return normalized
+    69→            except Exception:
+    70→                pass
+    71→    return raw
+    72→
+    73→
+    74→def _parse_birth_local(date_str: str, time_str: str) -> datetime:
+    75→    date_str = _normalize_date_input(date_str)
+    76→    if not time_str:
+    77→        time_str = "00:00:00"
+    78→    if len(time_str.split(":")) == 2:
+    79→        time_str = time_str + ":00"
+    80→    return datetime.fromisoformat(f"{date_str} {time_str}")
+    81→
+    82→
+    83→def _ensure_location(location_name: str | None, longitude: float | None, latitude: float | None) -> Dict[str, Any]:
+    84→    if longitude is None or latitude is None:
+    85→        return {
+    86→            "name": location_name or DEFAULT_LOCATION["name"],
+    87→            "longitude": DEFAULT_LOCATION["longitude"],
+    88→            "latitude": DEFAULT_LOCATION["latitude"],
+    89→            "used_default": True,
+    90→        }
+    91→    return {
+    92→        "name": location_name or "",
+    93→        "longitude": float(longitude),
+    94→        "latitude": float(latitude),
+    95→        "used_default": False,
+    96→    }
+    97→
+    98→
+    99→def _ensure_user(name: str, birth_local: datetime, location: Dict[str, Any], pillars: Dict[str, str]) -> int:
+   100→    user = get_fortune_user_by_name(name)
+   101→    if user and user.get("user_id") is not None:
+   102→        return int(user["user_id"])
+   103→    bazi_digest = f"{pillars['year']}-{pillars['month']}-{pillars['day']}-{pillars['hour']}"
+   104→    base_url = "https://gemini.local/user"
+   105→    import os
+   106→
+   107→    base_url = os.getenv("GEMINI_BASE_URL", base_url)
+   108→    gemini_url = f"{base_url}/tieban-{int(birth_local.timestamp())}"
+   109→    created = create_fortune_user(
+   110→        name=name,
+   111→        birthday=birth_local.strftime("%Y-%m-%d %H:%M:%S"),
+   112→        location={"name": location.get("name"), "longitude": location.get("longitude"), "latitude": location.get("latitude")},
+   113→        bazi_digest=bazi_digest,
+   114→        gemini_url=gemini_url,
+   115→        notes="tieban",
+   116→    )
+   117→    return int(created["user_id"])
+   118→
+   119→
+   120→def _candidate_id(candidate: Dict[str, Any]) -> str:
+   121→    return f"{candidate.get('context_id')}:{candidate.get('base')}:{candidate.get('ke')}"
+   122→
+   123→
+   124→def _brief_verse(v: Dict[str, Any]) -> Dict[str, Any]:
+   125→    return {
+   126→        "verse_id": int(v["verse_id"]),
+   127→        "age_start": int(v.get("age_start", 0) or 0),
+   128→        "age_end": int(v.get("age_end", 0) or 0),
+   129→        "category": v.get("category"),
+   130→        "content_raw": v.get("content_raw"),
+   131→        "fact_meta": v.get("fact_meta") or {},
+   132→    }
+   133→
+   134→
+   135→def _compute_xusui_age(birth_local: datetime, as_of: datetime | None = None) -> int:
+   136→    now = as_of or datetime.now()
+   137→    age = int(now.year) - int(birth_local.year) + 1
+   138→    return max(age, 1)
+   139→
+   140→
+   141→def _lock_required_fields(ruleset: Dict[str, Any]) -> Tuple[str, ...]:
+   142→    cfg = ruleset.get("lock") or {}
+   143→    fields = cfg.get("required_fields")
+   144→    if isinstance(fields, list) and fields:
+   145→        cleaned: List[str] = []
+   146→        for f in fields:
+   147→            if f is None:
+   148→                continue
+   149→            s = str(f).strip()
+   150→            if not s:
+   151→                continue
+   152→            cleaned.append(s)
+   153→        if cleaned:
+   154→            return tuple(cleaned)
+   155→    return DEFAULT_LOCK_REQUIRED_FIELDS
+   156→
+   157→
+   158→def _extract_fact_value(meta: Dict[str, Any], field: str) -> Any:
+   159→    if not meta:
+   160→        return None
+   161→    if field in meta:
+   162→        return meta.get(field)
+   163→    # Backward compatibility: legacy nested parents_zodiac
+   164→    if field in ("father_zodiac", "mother_zodiac"):
+   165→        parents = meta.get("parents_zodiac")
+   166→        if isinstance(parents, dict):
+   167→            if field == "father_zodiac":
+   168→                return parents.get("father")
+   169→            return parents.get("mother")
+   170→    # Backward compatibility: dotted fields
+   171→    if field == "father_zodiac":
+   172→        return meta.get("parents_zodiac.father")
+   173→    if field == "mother_zodiac":
+   174→        return meta.get("parents_zodiac.mother")
+   175→    return None
+   176→
+   177→
+   178→def _verse_contradicts_facts(meta: Dict[str, Any], facts: Dict[str, Any], ignore_field: str | None = None) -> bool:
+   179→    """True iff verse explicitly asserts a fact that conflicts with provided facts."""
+   180→    if not meta or not facts:
+   181→        return False
+   182→    for field, expected in facts.items():
+   183→        if ignore_field and field == ignore_field:
+   184→            continue
+   185→        actual = _extract_fact_value(meta, field)
+   186→        if actual is None:
+   187→            continue
+   188→        actual_norm = _normalize_answer_value(field, actual)
+   189→        expected_norm = _normalize_answer_value(field, expected)
+   190→        if actual_norm != expected_norm:
+   191→            return True
+   192→    return False
+   193→
+   194→
+   195→def _build_fact_index(verses: List[Dict[str, Any]]) -> Dict[str, Dict[Any, set]]:
+   196→    def iter_fact_pairs(meta: Dict[str, Any]):
+   197→        for field, value in (meta or {}).items():
+   198→            if value is None:
+   199→                continue
+   200→            # Backward compatibility: legacy nested parents_zodiac
+   201→            if field == "parents_zodiac" and isinstance(value, dict):
+   202→                f = value.get("father")
+   203→                m = value.get("mother")
+   204→                if f is not None:
+   205→                    yield "father_zodiac", f
+   206→                if m is not None:
+   207→                    yield "mother_zodiac", m
+   208→                continue
+   209→            # Backward compatibility: dotted fields
+   210→            if field == "parents_zodiac.father":
+   211→                yield "father_zodiac", value
+   212→                continue
+   213→            if field == "parents_zodiac.mother":
+   214→                yield "mother_zodiac", value
+   215→                continue
+   216→            yield field, value
+   217→
+   218→    index: Dict[str, Dict[Any, set]] = {}
+   219→    for v in verses:
+   220→        meta = v.get("fact_meta") or {}
+   221→        for field, value in iter_fact_pairs(meta):
+   222→            if value is None:
+   223→                continue
+   224→            if isinstance(value, (list, dict)):
+   225→                continue
+   226→            if isinstance(value, str) and not value.strip():
+   227→                continue
+   228→            value_norm = _normalize_answer_value(field, value)
+   229→            index.setdefault(field, {}).setdefault(value_norm, set()).add(int(v["verse_id"]))
+   230→    return index
+   231→
+   232→
+   233→def _normalize_facts(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+   234→    """Normalize user facts to v8 flat schema; accepts legacy nested payloads."""
+   235→    if not payload:
+   236→        return {}
+   237→
+   238→    out: Dict[str, Any] = {}
+   239→
+   240→    # legacy: {"parents_zodiac": {"father": "...", "mother": "..."}}
+   241→    parents = payload.get("parents_zodiac")
+   242→    if isinstance(parents, dict):
+   243→        if parents.get("father") is not None:
+   244→            out["father_zodiac"] = _normalize_answer_value("father_zodiac", parents.get("father"))
+   245→        if parents.get("mother") is not None:
+   246→            out["mother_zodiac"] = _normalize_answer_value("mother_zodiac", parents.get("mother"))
+   247→
+   248→    for k, v in payload.items():
+   249→        if k == "parents_zodiac":
+   250→            continue
+   251→        if isinstance(v, dict):
+   252→            for kk, vv in v.items():
+   253→                out[f"{k}.{kk}"] = _normalize_answer_value(f"{k}.{kk}", vv)
+   254→            continue
+   255→        out[k] = _normalize_answer_value(k, v)
+   256→
+   257→    legacy_field_map = {
+   258→        "parents_zodiac.father": "father_zodiac",
+   259→        "parents_zodiac.mother": "mother_zodiac",
+   260→    }
+   261→    for legacy, canonical in legacy_field_map.items():
+   262→        if legacy in out and canonical not in out:
+   263→            out[canonical] = out.pop(legacy)
+   264→
+   265→    # Drop empty values
+   266→    cleaned: Dict[str, Any] = {}
+   267→    for k, v in out.items():
+   268→        if v is None:
+   269→            continue
+   270→        if isinstance(v, str) and not v.strip():
+   271→            continue
+   272→        cleaned[k] = v
+   273→    return cleaned
+   274→
+   275→
+   276→def _apply_fact_updates(existing: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+   277→    out = dict(existing or {})
+   278→    for k, v in (updates or {}).items():
+   279→        if v is None:
+   280→            out.pop(k, None)
+   281→            continue
+   282→        if isinstance(v, str) and not v.strip():
+   283→            out.pop(k, None)
+   284→            continue
+   285→        out[k] = v
+   286→    return out
+   287→
+   288→
+   289→def _rank_candidates(
+   290→    candidate_pool: List[Dict[str, Any]],
+   291→    contexts_by_id: Dict[str, Dict[str, Any]],
+   292→    facts: Dict[str, Any],
+   293→    ruleset: Dict[str, Any],
+   294→    secret_keys: Optional[List[int]] = None,
+   295→    rescue_stage: Optional[str] = None,
+   296→    as_of_age: Optional[int] = None,
+   297→) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+   298→    max_return = int(ruleset.get("candidate_pool", {}).get("max_return", DEFAULT_MAX_RETURN_CANDIDATES))
+   299→    preview_limit = int(ruleset.get("candidate_pool", {}).get("evidence_preview_limit", DEFAULT_EVIDENCE_PREVIEW_LIMIT))
+   300→    occurred_preview_limit = int(
+   301→        ruleset.get("candidate_pool", {}).get("occurred_preview_limit", DEFAULT_OCCURRED_PREVIEW_LIMIT)
+   302→    )
+   303→    required_fields_set = set(_lock_required_fields(ruleset))
+   304→
+   305→    def _transform_sequence(ids: List[int]) -> List[int]:
+   306→        if rescue_stage == "linear_offsets":
+   307→            return apply_linear_offsets(ids, ruleset)
+   308→        if rescue_stage == "secret_jump":
+   309→            return secret_jump_search(ids, secret_keys or [], ruleset)
+   310→        return ids
+   311→
+   312→    # Collect verses for fact index, considering rescue transformations.
+   313→    verse_ids_set = set()
+   314→    for c in candidate_pool:
+   315→        seq_raw = list(c.get("verse_ids") or [])
+   316→        verse_ids_set.update(_transform_sequence(seq_raw))
+   317→    verse_ids = sorted(verse_ids_set)
+   318→    verses = store.get_verses_by_ids(verse_ids)
+   319→    verse_by_id = {int(v["verse_id"]): v for v in verses}
+   320→    fact_index = _build_fact_index(verses)
+   321→
+   322→    ranked: List[Dict[str, Any]] = []
+   323→    for c in candidate_pool:
+   324→        cid = _candidate_id(c)
+   325→        context_id = str(c.get("context_id", ""))
+   326→        pillars = contexts_by_id.get(context_id, {}).get("pillars")
+   327→        seq_raw = list(c.get("verse_ids") or [])
+   328→        seq = set(_transform_sequence(seq_raw))
+   329→
+   330→        hit_count = 0
+   331→        total_hits = 0
+   332→        required_hits = 0
+   333→        matched_fields = 0
+   334→        missing_fields: List[str] = []
+   335→        evidence_preview: Dict[str, Any] = {}
+   336→        evidence_ids: set[int] = set()
+   337→        for field, value in (facts or {}).items():
+   338→            match_set = fact_index.get(field, {}).get(value, set())
+   339→            hits = sorted(seq.intersection(match_set))
+   340→            consistent_hits = [vid for vid in hits if not _verse_contradicts_facts(verse_by_id.get(vid, {}).get("fact_meta") or {}, facts, ignore_field=field)]
+   341→            if consistent_hits:
+   342→                hit_count += 1
+   343→                total_hits += len(consistent_hits)
+   344→                matched_fields += 1
+   345→                if field in required_fields_set:
+   346→                    required_hits += 1
+   347→                evidence_ids.update(int(vid) for vid in consistent_hits)
+   348→                evidence_preview[field] = {
+   349→                    "value": value,
+   350→                    "matched_count": len(consistent_hits),
+   351→                    "matched": [_brief_verse(verse_by_id[vid]) for vid in consistent_hits[:preview_limit] if vid in verse_by_id],
+   352→                }
+   353→            else:
+   354→                missing_fields.append(field)
+   355→                evidence_preview[field] = {"value": value, "matched_count": 0, "matched": []}
+   356→
+   357→        occurred_preview: List[Dict[str, Any]] = []
+   358→        if as_of_age is not None and occurred_preview_limit > 0:
+   359→            occurred_items: List[Tuple[int, int]] = []
+   360→            for vid in seq:
+   361→                if int(vid) in evidence_ids:
+   362→                    continue
+   363→                vv = verse_by_id.get(int(vid))
+   364→                if not vv:
+   365→                    continue
+   366→                age_start = int(vv.get("age_start", 0) or 0)
+   367→                age_end = int(vv.get("age_end", 0) or 0)
+   368→                if age_start == 0 and age_end == 0:
+   369→                    continue
+   370→                start_key = age_start if age_start > 0 else age_end
+   371→                if start_key <= 0:
+   372→                    continue
+   373→                if int(as_of_age) < start_key:
+   374→                    continue
+   375→                end_key = age_end if age_end > 0 else age_start
+   376→                occurred_items.append((int(vid), int(end_key)))
+   377→            # pick most recent occurred verses for comparison (closer to current age)
+   378→            occurred_items.sort(key=lambda x: (-int(x[1]), int(x[0])))
+   379→            picked_ids = [vid for vid, _ in occurred_items[:occurred_preview_limit]]
+   380→            occurred_preview = [_brief_verse(verse_by_id[vid]) for vid in picked_ids if vid in verse_by_id]
+   381→
+   382→        ranked.append(
+   383→            {
+   384→                "candidate_id": cid,
+   385→                "context_id": context_id,
+   386→                "pillars": pillars,
+   387→                "base": c.get("base"),
+   388→                "ke": c.get("ke"),
+   389→                "engine": c.get("engine"),
+   390→                "pillar": c.get("pillar"),
+   391→                "score": {"hit_count": hit_count, "total_hits": total_hits, "matched_facts": matched_fields},
+   392→                "evidence_preview": evidence_preview,
+   393→                "missing_fields": missing_fields,
+   394→                "occurred_preview": occurred_preview,
+   395→                "occurred_preview_as_of_age": as_of_age,
+   396→                "_required_hits": required_hits,
+   397→            }
+   398→        )
+   399→
+   400→    ranked.sort(
+   401→        key=lambda c: (
+   402→            -int(c.get("score", {}).get("hit_count", 0)),
+   403→            -int(c.get("score", {}).get("total_hits", 0)),
+   404→            -int(c.get("_required_hits", 0)),
+   405→            str(c.get("context_id", "")),
+   406→            int(c.get("base", 0) or 0),
+   407→            int(c.get("ke", 0) or 0),
+   408→        )
+   409→    )
+   410→
+   411→    filtered = ranked
+   412→    if facts:
+   413→        filtered = [c for c in ranked if len(c.get("missing_fields") or []) == 0]
+   414→    returned = filtered[:max_return] if max_return > 0 else filtered
+   415→    for c in returned:
+   416→        c.pop("_required_hits", None)
+   417→    return returned, {"count": len(candidate_pool), "returned": len(returned)}
+   418→
+   419→
+   420→def _rank_with_rescue(
+   421→    candidate_pool: List[Dict[str, Any]],
+   422→    pool_truncated: bool,
+   423→    pillars_contexts: List[Dict[str, Any]],
+   424→    contexts_by_id: Dict[str, Dict[str, Any]],
+   425→    facts: Dict[str, Any],
+   426→    ruleset: Dict[str, Any],
+   427→    tables: Dict[str, Any],
+   428→    as_of_age: Optional[int] = None,
+   429→) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str], List[Dict[str, Any]], bool]:
+   430→    secret_keys = tables.get("secret_keys") or []
+   431→    ranked, stats = _rank_candidates(candidate_pool, contexts_by_id, facts, ruleset, secret_keys=secret_keys, as_of_age=as_of_age)
+   432→    if not facts or ranked:
+   433→        return ranked, stats, None, candidate_pool, pool_truncated
+   434→
+   435→    # L1: linear offsets
+   436→    ranked, stats = _rank_candidates(
+   437→        candidate_pool,
+   438→        contexts_by_id,
+   439→        facts,
+   440→        ruleset,
+   441→        secret_keys=secret_keys,
+   442→        rescue_stage="linear_offsets",
+   443→        as_of_age=as_of_age,
+   444→    )
+   445→    if ranked:
+   446→        return ranked, stats, "linear_offsets", candidate_pool, pool_truncated
+   447→
+   448→    # L2: include secondary day mutation (rebuild pool)
+   449→    alt_ruleset = deepcopy(ruleset)
+   450→    day_cfg = alt_ruleset.get("day_mutation", {})
+   451→    if not day_cfg.get("include_secondary", False):
+   452→        day_cfg["include_secondary"] = True
+   453→        alt_ruleset["day_mutation"] = day_cfg
+   454→    alt_pool = build_candidate_pool(pillars_contexts, alt_ruleset, tables)
+   455→    ranked, stats = _rank_candidates(
+   456→        alt_pool["candidates"],
+   457→        contexts_by_id,
+   458→        facts,
+   459→        alt_ruleset,
+   460→        secret_keys=secret_keys,
+   461→        as_of_age=as_of_age,
+   462→    )
+   463→    if ranked:
+   464→        return ranked, stats, "include_secondary", alt_pool["candidates"], bool(alt_pool.get("truncated", False))
+   465→
+   466→    # L3: secret jump search
+   467→    ranked, stats = _rank_candidates(
+   468→        alt_pool["candidates"],
+   469→        contexts_by_id,
+   470→        facts,
+   471→        alt_ruleset,
+   472→        secret_keys=secret_keys,
+   473→        rescue_stage="secret_jump",
+   474→        as_of_age=as_of_age,
+   475→    )
+   476→    if ranked:
+   477→        return ranked, stats, "secret_jump", alt_pool["candidates"], bool(alt_pool.get("truncated", False))
+   478→
+   479→    return ranked, stats, "conflict", alt_pool["candidates"], bool(alt_pool.get("truncated", False))
+   480→
+   481→
+   482→def _resolve_lock_mode(eligible_candidates: List[Dict[str, Any]]) -> Optional[str]:
+   483→    if len(eligible_candidates) == 1:
+   484→        return "unique_candidate"
+   485→    ke_set = {int(c.get("ke", 0) or 0) for c in eligible_candidates}
+   486→    if len(ke_set) == 1:
+   487→        return "unique_ke"
+   488→    return None
+   489→
+   490→
+   491→def init_tieban(req: Dict[str, Any]) -> Dict[str, Any]:
+   492→    ruleset_names = req.get("ruleset_names") or ["ppx_v6"]
+   493→    ruleset_name = ruleset_names[0]
+   494→    ruleset = ruleset_loader.load_ruleset(ruleset_name)
+   495→    tables = ruleset_loader.load_tables(ruleset, ruleset_name)
+   496→    lock_required_fields = list(_lock_required_fields(ruleset))
+   497→
+   498→    birth_local = _parse_birth_local(req["date"], req["time"])
+   499→    tz_offset_hours = float(req.get("tz_offset_hours", 8))
+   500→    location = _ensure_location(req.get("location_name"), req.get("longitude"), req.get("latitude"))
+   501→    as_of_age = _compute_xusui_age(birth_local)
+   502→
+   503→    norm = normalize_input(birth_local=birth_local, tz_offset_hours=tz_offset_hours, location=location, ruleset=ruleset)
+   504→    pillars_contexts = norm["pillars_contexts"]
+   505→
+   506→    # Use first context for profile
+   507→    primary_pillars = pillars_contexts[0]["pillars"]
+   508→    user_id = _ensure_user(req["name"], birth_local, location, primary_pillars)
+   509→
+   510→    profile_id = store.create_profile(
+   511→        user_id=user_id,
+   512→        name=req["name"],
+   513→        gender=req.get("gender", ""),
+   514→        birth_time_input=birth_local,
+   515→        tz_offset_hours=tz_offset_hours,
+   516→        location=location,
+   517→        true_solar_time=datetime.fromisoformat(norm["tst_time"]),
+   518→        bazi_pillars=primary_pillars,
+   519→    )
+   520→
+   521→    input_snapshot = {
+   522→        "request": req,
+   523→        "normalized": norm,
+   524→        "ruleset_name": ruleset_name,
+   525→        "ruleset_meta": ruleset.get("meta", {}),
+   526→    }
+   527→    run_id = store.create_module_run(profile_id, MODULE_CODE, ruleset_name, input_snapshot)
+   528→
+   529→    pool = build_candidate_pool(pillars_contexts, ruleset, tables)
+   530→    facts = _normalize_facts(req.get("known_facts"))
+   531→    contexts_by_id = {str(c["id"]): c for c in pillars_contexts}
+   532→    candidates, stats, rescue_stage, pool_candidates, pool_truncated = _rank_with_rescue(
+   533→        pool["candidates"],
+   534→        bool(pool.get("truncated", False)),
+   535→        pillars_contexts,
+   536→        contexts_by_id,
+   537→        facts,
+   538→        ruleset,
+   539→        tables,
+   540→        as_of_age=as_of_age,
+   541→    )
+   542→
+   543→    state = {
+   544→        "status": "CANDIDATES",
+   545→        "candidate_pool": pool_candidates,
+   546→        "candidate_pool_truncated": pool_truncated,
+   547→        "facts": facts,
+   548→        "selected_candidate_id": None,
+   549→        "locked_base": None,
+   550→        "true_ke": None,
+   551→        "locked_context_id": None,
+   552→        "rescue_stage": rescue_stage,
+   553→    }
+   554→    state_version = store.upsert_module_state(profile_id, MODULE_CODE, state["status"], 1, state)
+   555→
+   556→    return {
+   557→        "run_id": run_id,
+   558→        "profile_id": profile_id,
+   559→        "status": "CANDIDATES",
+   560→        "pillars_contexts": pillars_contexts,
+   561→        "candidate_stats": {**stats, "truncated": pool_truncated, "rescue_stage": rescue_stage, "as_of_age": as_of_age},
+   562→        "lock_required_fields": lock_required_fields,
+   563→        "candidates": candidates,
+   564→        "boundary_flags": norm.get("boundary_flags"),
+   565→        "conflict": bool(rescue_stage == "conflict" and not candidates),
+   566→        "state_version": state_version,
+   567→    }
+   568→
+   569→
+   570→def solve_tieban(req: Dict[str, Any]) -> Dict[str, Any]:
+   571→    """Batch init + optional auto-lock if unique candidate."""
+   572→    auto_lock = bool(req.get("auto_lock", True))
+   573→    init_res = init_tieban(req)
+   574→    facts = _normalize_facts(req.get("known_facts"))
+   575→    required_fields = init_res.get("lock_required_fields") or list(DEFAULT_LOCK_REQUIRED_FIELDS)
+   576→    missing = [k for k in required_fields if k not in facts]
+   577→    if not auto_lock or missing:
+   578→        init_res["lock"] = None
+   579→        init_res["suggested_fields"] = missing
+   580→        return init_res
+   581→
+   582→    candidates = init_res.get("candidates") or []
+   583→    if len(candidates) != 1:
+   584→        init_res["lock"] = None
+   585→        init_res["suggested_fields"] = missing
+   586→        return init_res
+   587→
+   588→    try:
+   589→        selected = candidates[0]
+   590→        locked = select_tieban(init_res["run_id"], selected["candidate_id"], init_res.get("state_version"))
+   591→    except Exception:
+   592→        init_res["lock"] = None
+   593→        init_res["suggested_fields"] = missing
+   594→        return init_res
+   595→
+   596→    report = locked.get("report") or {}
+   597→    return {
+   598→        "run_id": init_res.get("run_id"),
+   599→        "lock": {
+   600→            "locked_base": report.get("locked_base"),
+   601→            "true_ke": report.get("true_ke"),
+   602→            "locked_context_id": report.get("locked_context_id"),
+   603→        },
+   604→        "report_url": f"/api/tieban/report?run_id={init_res.get('run_id')}",
+   605→        "state_version": locked.get("state_version"),
+   606→    }
+   607→
+   608→
+   609→def verify_tieban(run_id: str, answers: Dict[str, Any], state_version: str | None = None) -> Dict[str, Any]:
+   610→    run = store.get_run(run_id)
+   611→    if not run:
+   612→        raise ValueError("run not found")
+   613→    ruleset_name = run.get("ruleset_name")
+   614→    ruleset = ruleset_loader.load_ruleset(ruleset_name)
+   615→    tables = ruleset_loader.load_tables(ruleset, ruleset_name)
+   616→    lock_required_fields = list(_lock_required_fields(ruleset))
+   617→    profile_id = run["profile_id"]
+   618→    state = store.get_module_state(profile_id, MODULE_CODE)
+   619→    if not state:
+   620→        raise ValueError("state not found")
+   621→    context = state["context_data"]
+   622→    raw_version = state.get("updated_at")
+   623→    current_version = raw_version.isoformat() if hasattr(raw_version, "isoformat") else raw_version
+   624→    if state_version and current_version and state_version != current_version:
+   625→        raise RuntimeError("state_version_conflict")
+   626→
+   627→    if context.get("status") == "LOCKED" and run.get("output_report"):
+   628→        return {"status": "LOCKED", "report": run.get("output_report"), "state_version": current_version}
+   629→
+   630→    candidate_pool = context.get("candidate_pool") or []
+   631→    pool_truncated = bool(context.get("candidate_pool_truncated", False))
+   632→    existing_facts = context.get("facts") or {}
+   633→    updates = _normalize_facts(answers or {})
+   634→    merged_facts = _apply_fact_updates(existing_facts, updates)
+   635→    as_of_age = None
+   636→    try:
+   637→        input_req = (run.get("input_snapshot") or {}).get("request") or {}
+   638→        birth_local = _parse_birth_local(str(input_req.get("date") or ""), str(input_req.get("time") or "00:00:00"))
+   639→        as_of_age = _compute_xusui_age(birth_local)
+   640→    except Exception:
+   641→        as_of_age = None
+   642→
+   643→    contexts_by_id = {
+   644→        str(c["id"]): c
+   645→        for c in run.get("input_snapshot", {}).get("normalized", {}).get("pillars_contexts", [])
+   646→    }
+   647→    ranked, stats, rescue_stage, pool_candidates, pool_truncated = _rank_with_rescue(
+   648→        candidate_pool,
+   649→        pool_truncated,
+   650→        run.get("input_snapshot", {}).get("normalized", {}).get("pillars_contexts", []),
+   651→        contexts_by_id,
+   652→        merged_facts,
+   653→        ruleset,
+   654→        tables,
+   655→        as_of_age=as_of_age,
+   656→    )
+   657→
+   658→    next_step = (state.get("current_step", 1) or 1) + 1
+   659→    context["facts"] = merged_facts
+   660→    context["status"] = "CANDIDATES"
+   661→    context["candidate_pool"] = pool_candidates
+   662→    context["candidate_pool_truncated"] = pool_truncated
+   663→    context["rescue_stage"] = rescue_stage
+   664→    updated_version = store.upsert_module_state(profile_id, MODULE_CODE, "CANDIDATES", next_step, context, expected_updated_at=raw_version)
+   665→
+   666→    logger.info(
+   667→        "tieban facts updated",
+   668→        extra={
+   669→            "operation": "tieban_verify",
+   670→            "run_id": run_id,
+   671→            "profile_id": profile_id,
+   672→            "facts_keys": sorted(merged_facts.keys()),
+   673→            "returned_candidates": stats.get("returned"),
+   674→            "rescue_stage": rescue_stage,
+   675→        },
+   676→    )
+   677→
+   678→    return {
+   679→        "status": "CANDIDATES",
+   680→        "candidate_stats": {**stats, "truncated": pool_truncated, "rescue_stage": rescue_stage, "as_of_age": as_of_age},
+   681→        "lock_required_fields": lock_required_fields,
+   682→        "candidates": ranked,
+   683→        "conflict": bool(rescue_stage == "conflict" and not ranked),
+   684→        "state_version": updated_version,
+   685→    }
+   686→
+   687→
+   688→def select_tieban(run_id: str, candidate_id: str, state_version: str | None = None) -> Dict[str, Any]:
+   689→    run = store.get_run(run_id)
+   690→    if not run:
+   691→        raise ValueError("run not found")
+   692→    ruleset_name = run.get("ruleset_name")
+   693→    ruleset = ruleset_loader.load_ruleset(ruleset_name)
+   694→    tables = ruleset_loader.load_tables(ruleset, ruleset_name)
+   695→    required_fields = list(_lock_required_fields(ruleset))
+   696→    profile_id = run["profile_id"]
+   697→    state = store.get_module_state(profile_id, MODULE_CODE)
+   698→    if not state:
+   699→        raise ValueError("state not found")
+   700→    context = state["context_data"]
+   701→    raw_version = state.get("updated_at")
+   702→    current_version = raw_version.isoformat() if hasattr(raw_version, "isoformat") else raw_version
+   703→    if state_version and current_version and state_version != current_version:
+   704→        raise RuntimeError("state_version_conflict")
+   705→
+   706→    if context.get("status") == "LOCKED" and run.get("output_report"):
+   707→        return {"status": "LOCKED", "report": run.get("output_report"), "state_version": current_version}
+   708→
+   709→    facts = context.get("facts") or {}
+   710→    missing = [k for k in required_fields if k not in facts]
+   711→    if missing:
+   712→        raise ValueError("missing_required_facts:" + ",".join(sorted(missing)))
+   713→
+   714→    candidate_pool = context.get("candidate_pool") or []
+   715→    rescue_stage = context.get("rescue_stage")
+   716→    secret_keys = tables.get("secret_keys") or []
+   717→    selected = None
+   718→    for c in candidate_pool:
+   719→        if _candidate_id(c) == candidate_id:
+   720→            selected = dict(c)
+   721→            break
+   722→    if not selected:
+   723→        raise ValueError("candidate_not_found")
+   724→
+   725→    # Evidence for lock must be explicit and replayable.
+   726→    def _apply_rescue(ids: List[int]) -> List[int]:
+   727→        if rescue_stage == "linear_offsets":
+   728→            return apply_linear_offsets(ids, ruleset)
+   729→        if rescue_stage == "secret_jump":
+   730→            return secret_jump_search(ids, secret_keys, ruleset)
+   731→        return ids
+   732→
+   733→    verse_ids = sorted({vid for c in candidate_pool for vid in _apply_rescue(list(c.get("verse_ids") or []))})
+   734→    verses = store.get_verses_by_ids(verse_ids)
+   735→    verse_by_id = {int(v["verse_id"]): v for v in verses}
+   736→    fact_index = _build_fact_index(verses)
+   737→    seq = set(_apply_rescue(list(selected.get("verse_ids") or [])))
+   738→
+   739→    evidence: Dict[str, Any] = {}
+   740→    for field, value in facts.items():
+   741→        hits = sorted(seq.intersection(fact_index.get(field, {}).get(value, set())))
+   742→        consistent_hits = [
+   743→            vid
+   744→            for vid in hits
+   745→            if not _verse_contradicts_facts((verse_by_id.get(vid) or {}).get("fact_meta") or {}, facts, ignore_field=field)
+   746→        ]
+   747→        evidence[field] = {"value": value, "matched_verse_ids": consistent_hits}
+   748→
+   749→    for field in required_fields:
+   750→        if not evidence.get(field, {}).get("matched_verse_ids"):
+   751→            raise ValueError("required_fact_not_matched")
+   752→
+   753→    # Unique lock rule: only allow if unique candidate or unique true_ke.
+   754→    contexts_by_id = {
+   755→        str(c["id"]): c
+   756→        for c in run.get("input_snapshot", {}).get("normalized", {}).get("pillars_contexts", [])
+   757→    }
+   758→    eligible, _stats = _rank_candidates(
+   759→        candidate_pool,
+   760→        contexts_by_id,
+   761→        facts,
+   762→        ruleset,
+   763→        secret_keys=secret_keys,
+   764→        rescue_stage=rescue_stage if rescue_stage in ("linear_offsets", "secret_jump") else None,
+   765→    )
+   766→    eligible_ids = {c["candidate_id"] for c in eligible}
+   767→    if candidate_id not in eligible_ids:
+   768→        raise ValueError("required_fact_not_matched")
+   769→    lock_mode = _resolve_lock_mode(eligible)
+   770→    if lock_mode is None:
+   771→        raise ValueError("lock_not_unique")
+   772→
+   773→    selected["candidate_id"] = candidate_id
+   774→    selected["evidence"] = {k: v.get("matched_verse_ids", []) for k, v in evidence.items()}
+   775→    selected["evidence_preview"] = {
+   776→        k: [_brief_verse(verse_by_id[vid]) for vid in (v.get("matched_verse_ids") or [])[:DEFAULT_EVIDENCE_PREVIEW_LIMIT] if vid in verse_by_id]
+   777→        for k, v in evidence.items()
+   778→    }
+   779→    selected["verse_ids"] = sorted(seq)
+   780→    selected["lock_mode"] = lock_mode
+   781→
+   782→    report = build_report(run_id, ruleset_name, selected, facts)
+   783→    store.update_run_report(run_id, report)
+   784→
+   785→    locked = {
+   786→        "selected_candidate_id": candidate_id,
+   787→        "locked_base": selected.get("base"),
+   788→        "true_ke": selected.get("ke"),
+   789→        "locked_context_id": selected.get("context_id"),
+   790→        "lock_mode": lock_mode,
+   791→        "facts": facts,
+   792→        "evidence": evidence,
+   793→        "ruleset_hash": (ruleset.get("meta") or {}).get("ruleset_hash"),
+   794→        "source_digest": (ruleset.get("meta") or {}).get("source_digest"),
+   795→    }
+   796→    store.update_profile_verified_facts(profile_id, locked)
+   797→
+   798→    context.update(
+   799→        {
+   800→            "status": "LOCKED",
+   801→            "selected_candidate_id": candidate_id,
+   802→            "locked_base": selected.get("base"),
+   803→            "true_ke": selected.get("ke"),
+   804→            "locked_context_id": selected.get("context_id"),
+   805→            "lock_mode": lock_mode,
+   806→            "evidence": evidence,
+   807→        }
+   808→    )
+   809→    updated_version = store.upsert_module_state(profile_id, MODULE_CODE, "LOCKED", state.get("current_step", 1) or 1, context, expected_updated_at=raw_version)
+   810→    return {"status": "LOCKED", "report": report, "state_version": updated_version}
+   811→
+   812→
+   813→def lock_tieban(run_id: str, state_version: str | None = None) -> Dict[str, Any]:
+   814→    raise ValueError("deprecated_use_select")
+   815→
+   816→
+   817→def get_report(run_id: str) -> Dict[str, Any]:
+   818→    run = store.get_run(run_id)
+   819→    if not run or not run.get("output_report"):
+   820→        raise ValueError("report not found")
+   821→    return run["output_report"]
+   822→
+   823→
+   824→def _normalize_answer_value(field: str, value: Any) -> Any:
+   825→    if value is None:
+   826→        return value
+   827→    if isinstance(value, str):
+   828→        val = value.strip()
+   829→        if "zodiac" in field:
+   830→            return _zodiac_to_enum(val)
+   831→        if field.endswith("siblings_count") and val.isdigit():
+   832→            return int(val)
+   833→        return val
+   834→    if isinstance(value, (int, float)) and field.endswith("siblings_count"):
+   835→        return int(value)
+   836→    return value
+   837→
+   838→
+   839→def _zodiac_to_enum(val: str) -> str:
+   840→    if not val:
+   841→        return val
+   842→    if val in BRANCH_TO_ENUM.values():
+   843→        return val
+   844→    if val in BRANCH_TO_ENUM:
+   845→        return BRANCH_TO_ENUM[val]
+   846→    branch = ZODIAC_ANIMAL_TO_BRANCH.get(val, val)
+   847→    return BRANCH_TO_ENUM.get(branch, branch)
+   848→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

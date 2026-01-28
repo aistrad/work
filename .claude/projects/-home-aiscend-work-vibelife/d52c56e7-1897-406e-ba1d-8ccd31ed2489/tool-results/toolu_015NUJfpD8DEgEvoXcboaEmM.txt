@@ -1,0 +1,270 @@
+     1→"""
+     2→Context Build API - 方案 A: AI SDK 主导 + Python Context
+     3→为前端 AI SDK streamText 提供 context 构建服务
+     4→"""
+     5→import logging
+     6→from typing import Optional, List, Dict, Any
+     7→from uuid import UUID, uuid4
+     8→
+     9→from fastapi import APIRouter, Depends, HTTPException
+    10→from pydantic import BaseModel, Field
+    11→
+    12→from services.identity import get_optional_user, CurrentUser
+    13→from services.vibe_engine.context import (
+    14→    ContextBuilder, get_context_builder,
+    15→    Skill, VoiceMode
+    16→)
+    17→from services.vibe_engine.profile_cache import get_cached_profile_with_skill
+    18→from services.llm.config import ModelConfig
+    19→from services.agent.quota import QuotaTracker
+    20→from stores import message_repo, conversation_repo
+    21→
+    22→router = APIRouter(prefix="/context", tags=["Context"])
+    23→logger = logging.getLogger(__name__)
+    24→
+    25→
+    26→class ContextBuildRequest(BaseModel):
+    27→    """Context 构建请求"""
+    28→    skill: str = Field(default="bazi", description="技能类型: bazi/zodiac")
+    29→    voice_mode: str = Field(default="warm", description="语气模式: warm/sarcastic/wise")
+    30→    message: str = Field(..., description="当前用户消息")
+    31→    conversation_id: Optional[UUID] = Field(None, description="对话 ID")
+    32→
+    33→
+    34→class MessageItem(BaseModel):
+    35→    """消息项"""
+    36→    role: str
+    37→    content: str
+    38→
+    39→
+    40→class LLMConfig(BaseModel):
+    41→    """LLM 配置"""
+    42→    provider: str
+    43→    model: str
+    44→    base_url: Optional[str] = None
+    45→    api_key: str  # 从后端配置获取，前端无需从 process.env 读取
+    46→
+    47→
+    48→class ContextBuildResponse(BaseModel):
+    49→    """Context 构建响应"""
+    50→    system_prompt: str
+    51→    messages: List[MessageItem]
+    52→    llm_config: LLMConfig
+    53→    conversation_id: str  # 新增：返回 conversation_id
+    54→    metadata: Dict[str, Any]
+    55→
+    56→
+    57→@router.post("/build", response_model=ContextBuildResponse)
+    58→async def build_context(
+    59→    request: ContextBuildRequest,
+    60→    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+    61→):
+    62→    """
+    63→    构建 LLM context，返回给前端 AI SDK streamText 使用。
+    64→
+    65→    返回:
+    66→    - system_prompt: 系统提示词 (Persona + Skill + Profile)
+    67→    - messages: 消息列表 (历史 + 当前消息)
+    68→    - llm_config: LLM 配置 { provider, model, base_url? }
+    69→    - conversation_id: 对话 ID (新会话时自动生成)
+    70→    - metadata: 元数据 (topic, has_birth_info 等)
+    71→    """
+    72→    user_id = current_user.user_id if current_user else None
+    73→
+    74→    # 生成或使用现有的 conversation_id
+    75→    conversation_id = request.conversation_id
+    76→    if not conversation_id:
+    77→        # 创建新对话记录
+    78→        try:
+    79→            conv = await conversation_repo.create_conversation(
+    80→                skill=request.skill,
+    81→                user_id=user_id,
+    82→                voice_mode=request.voice_mode,
+    83→            )
+    84→            conversation_id = conv.id
+    85→        except Exception as e:
+    86→            logger.warning(f"Failed to create conversation: {e}")
+    87→            conversation_id = uuid4()  # fallback
+    88→
+    89→    # 解析参数
+    90→    try:
+    91→        skill = Skill(request.skill.lower())
+    92→    except ValueError:
+    93→        skill = Skill.BAZI
+    94→
+    95→    try:
+    96→        voice_mode = VoiceMode(request.voice_mode.lower())
+    97→    except ValueError:
+    98→        voice_mode = VoiceMode.WARM
+    99→
+   100→    # 获取用户 profile 和 skill_data
+   101→    profile = {}
+   102→    skill_data = {}
+   103→    if user_id:
+   104→        try:
+   105→            result = await get_cached_profile_with_skill(user_id, request.skill)
+   106→            profile = result.get("profile", {})
+   107→            skill_data = result.get("skill_data", {})
+   108→        except Exception as e:
+   109→            logger.warning(f"Failed to get user profile: {e}")
+   110→
+   111→    # 获取对话历史
+   112→    history = []
+   113→    if request.conversation_id:
+   114→        try:
+   115→            history = await message_repo.get_messages_for_context(
+   116→                request.conversation_id, limit=10
+   117→            )
+   118→        except Exception as e:
+   119→            logger.warning(f"Failed to get history: {e}")
+   120→
+   121→    # 构建 context
+   122→    builder = get_context_builder()
+   123→    system_prompt, llm_messages = await builder.build(
+   124→        skill=skill,
+   125→        voice_mode=voice_mode,
+   126→        current_message=request.message,
+   127→        profile=profile,
+   128→        skill_data=skill_data,
+   129→        history=history,
+   130→    )
+   131→
+   132→    # 转换消息格式
+   133→    messages = []
+   134→    for msg in llm_messages:
+   135→        if msg.role != "system":  # system prompt 单独返回
+   136→            messages.append(MessageItem(role=msg.role, content=msg.content))
+   137→
+   138→    # 检测话题和出生信息
+   139→    has_birth_info = bool(profile.get("birth_info") or profile.get("basic", {}).get("birth_datetime"))
+   140→    topic = builder._detect_topic(request.message, skill)
+   141→
+   142→    # 获取 LLM 配置 (从 models.yaml)
+   143→    user_tier = "free"
+   144→    if current_user:
+   145→        from services.entitlement import EntitlementService
+   146→        try:
+   147→            entitlements = await EntitlementService.get_entitlements(current_user.user_id)
+   148→            user_tier = entitlements.get("tier", "free")
+   149→        except Exception:
+   150→            pass
+   151→
+   152→    model_selection = ModelConfig.resolve(user_tier=user_tier, task="chat")
+   153→    # 构建 llm_config，为需要的 provider 提供 base_url
+   154→    base_url = None
+   155→    if model_selection.provider in ('deepseek', 'glm', 'openai-compatible'):
+   156→        base_url = ModelConfig.get_base_url(model_selection.provider)
+   157→
+   158→    llm_config = LLMConfig(
+   159→        provider=model_selection.provider,
+   160→        model=model_selection.model,
+   161→        base_url=base_url,
+   162→        api_key=ModelConfig.get_api_key(model_selection.provider),
+   163→    )
+   164→
+   165→    return ContextBuildResponse(
+   166→        system_prompt=system_prompt,
+   167→        messages=messages,
+   168→        llm_config=llm_config,
+   169→        conversation_id=str(conversation_id),
+   170→        metadata={
+   171→            "topic": topic,
+   172→            "has_birth_info": has_birth_info,
+   173→            "active_skills": [request.skill],
+   174→            "user_id": str(user_id) if user_id else None,
+   175→        }
+   176→    )
+   177→
+   178→
+   179→# ============================================================
+   180→# 消息保存和配额记录端点 (供前端 AI SDK 流式完成后调用)
+   181→# ============================================================
+   182→
+   183→class SaveMessageRequest(BaseModel):
+   184→    """消息保存请求"""
+   185→    conversation_id: Optional[UUID] = None
+   186→    role: str = Field(..., description="消息角色: user/assistant")
+   187→    content: str = Field(..., description="消息内容")
+   188→
+   189→
+   190→class RecordQuotaRequest(BaseModel):
+   191→    """配额记录请求"""
+   192→    conversation_id: Optional[UUID] = None
+   193→    prompt_tokens: int = Field(default=0)
+   194→    completion_tokens: int = Field(default=0)
+   195→
+   196→
+   197→@router.post("/messages/save")
+   198→async def save_message(
+   199→    request: SaveMessageRequest,
+   200→    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+   201→):
+   202→    """保存消息到数据库"""
+   203→    if not request.conversation_id:
+   204→        return {"success": False, "error": "conversation_id required"}
+   205→
+   206→    try:
+   207→        await message_repo.create_message(
+   208→            conversation_id=request.conversation_id,
+   209→            role=request.role,
+   210→            content=request.content
+   211→        )
+   212→        return {"success": True}
+   213→    except Exception as e:
+   214→        logger.error(f"Failed to save message: {e}")
+   215→        return {"success": False, "error": str(e)}
+   216→
+   217→
+   218→@router.post("/quota/record")
+   219→async def record_quota(
+   220→    request: RecordQuotaRequest,
+   221→    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+   222→):
+   223→    """记录配额使用"""
+   224→    user_id = current_user.user_id if current_user else None
+   225→
+   226→    try:
+   227→        await QuotaTracker.record(
+   228→            user_id=str(user_id) if user_id else "guest",
+   229→            usage={
+   230→                "calls": 1,
+   231→                "tokens": request.prompt_tokens + request.completion_tokens,
+   232→            }
+   233→        )
+   234→        return {"success": True}
+   235→    except Exception as e:
+   236→        logger.error(f"Failed to record quota: {e}")
+   237→        return {"success": False, "error": str(e)}
+   238→
+   239→
+   240→@router.get("/quota/check")
+   241→async def check_quota(
+   242→    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+   243→):
+   244→    """入口配额检查 - 前端在调用 LLM 前先检查"""
+   245→    user_id = current_user.user_id if current_user else None
+   246→    user_tier = "free"
+   247→
+   248→    if current_user:
+   249→        from services.entitlement import EntitlementService
+   250→        try:
+   251→            entitlements = await EntitlementService.get_entitlements(current_user.user_id)
+   252→            user_tier = entitlements.get("tier", "free")
+   253→        except Exception:
+   254→            pass
+   255→
+   256→    allowed, message = await QuotaTracker.check(
+   257→        user_id=str(user_id) if user_id else "guest",
+   258→        tier=user_tier
+   259→    )
+   260→
+   261→    return {
+   262→        "allowed": allowed,
+   263→        "message": message,
+   264→        "tier": user_tier
+   265→    }
+   266→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

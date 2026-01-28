@@ -1,0 +1,293 @@
+"""
+Conversations Routes - Chat history management API
+
+Endpoints:
+- GET  /conversations              - List conversations
+- POST /conversations              - Create conversation
+- GET  /conversations/{id}         - Get conversation with messages
+- PATCH /conversations/{id}        - Update (rename)
+- DELETE /conversations/{id}       - Soft delete
+"""
+import logging
+from typing import Optional, List
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
+
+from services.identity import get_current_user, CurrentUser
+from stores import conversation_repo, message_repo
+
+router = APIRouter(prefix="/conversations", tags=["Conversations"])
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ConversationItem(BaseModel):
+    """Single conversation in list"""
+    id: str
+    title: Optional[str] = None
+    skill: str
+    updated_at: str
+
+
+class ConversationListResponse(BaseModel):
+    """Paginated conversation list"""
+    conversations: List[ConversationItem]
+    total: int
+    has_more: bool
+
+
+class ConversationCreateRequest(BaseModel):
+    """Create conversation request"""
+    skill: str = Field(default="bazi", description="Skill ID")
+    voice_mode: str = Field(default="warm", description="Voice mode")
+    title: Optional[str] = None
+
+
+class ConversationUpdateRequest(BaseModel):
+    """Update conversation request"""
+    title: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class MessageItem(BaseModel):
+    """Message in conversation detail"""
+    id: str
+    role: str
+    content: str
+    created_at: str
+
+
+class ConversationDetailResponse(BaseModel):
+    """Conversation with messages"""
+    id: str
+    title: Optional[str] = None
+    skill: str
+    voice_mode: str
+    created_at: str
+    updated_at: str
+    messages: List[MessageItem]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("", response_model=ConversationListResponse)
+async def list_conversations(
+    current_user: CurrentUser = Depends(get_current_user),
+    skill: Optional[str] = Query(None, description="Filter by skill"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """
+    List user's conversations (active only).
+    Ordered by updated_at DESC (most recent first).
+    """
+    try:
+        conversations = await conversation_repo.list_conversations(
+            user_id=current_user.user_id,
+            skill=skill,
+            is_active=True,
+            limit=limit + 1,  # Fetch one extra to check has_more
+            offset=offset,
+        )
+
+        # Check if there are more
+        has_more = len(conversations) > limit
+        if has_more:
+            conversations = conversations[:limit]
+
+        # Get total count
+        total = await conversation_repo.count_conversations(
+            user_id=current_user.user_id,
+            skill=skill,
+        )
+
+        return ConversationListResponse(
+            conversations=[
+                ConversationItem(
+                    id=str(c.id),
+                    title=c.title,
+                    skill=c.skill,
+                    updated_at=c.updated_at.isoformat() if c.updated_at else "",
+                )
+                for c in conversations
+            ],
+            total=total,
+            has_more=has_more,
+        )
+    except Exception as e:
+        logger.error(f"Failed to list conversations: {e}")
+        raise HTTPException(status_code=500, detail="获取会话列表失败")
+
+
+@router.post("", response_model=ConversationItem)
+async def create_conversation(
+    request: ConversationCreateRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Create a new conversation"""
+    try:
+        conversation = await conversation_repo.create_conversation(
+            skill=request.skill,
+            user_id=current_user.user_id,
+            voice_mode=request.voice_mode,
+            title=request.title,
+        )
+        return ConversationItem(
+            id=str(conversation.id),
+            title=conversation.title,
+            skill=conversation.skill,
+            updated_at=conversation.updated_at.isoformat() if conversation.updated_at else "",
+        )
+    except Exception as e:
+        logger.error(f"Failed to create conversation: {e}")
+        raise HTTPException(status_code=500, detail="创建会话失败")
+
+
+@router.get("/{conversation_id}", response_model=ConversationDetailResponse)
+async def get_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    messages_limit: int = Query(50, ge=1, le=200),
+):
+    """Get conversation with messages"""
+    try:
+        conversation = await conversation_repo.get_conversation(conversation_id)
+
+        if not conversation:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        # Verify ownership
+        if conversation.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="无权访问此会话")
+
+        # Get messages
+        messages = await message_repo.list_messages(
+            conversation_id=conversation_id,
+            limit=messages_limit,
+            order="asc",
+        )
+
+        return ConversationDetailResponse(
+            id=str(conversation.id),
+            title=conversation.title,
+            skill=conversation.skill,
+            voice_mode=conversation.voice_mode,
+            created_at=conversation.created_at.isoformat() if conversation.created_at else "",
+            updated_at=conversation.updated_at.isoformat() if conversation.updated_at else "",
+            messages=[
+                MessageItem(
+                    id=str(m.id),
+                    role=m.role,
+                    content=m.content,
+                    created_at=m.created_at.isoformat() if m.created_at else "",
+                )
+                for m in messages
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get conversation: {e}")
+        raise HTTPException(status_code=500, detail="获取会话详情失败")
+
+
+@router.patch("/{conversation_id}", response_model=ConversationItem)
+async def update_conversation(
+    conversation_id: UUID,
+    request: ConversationUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Update conversation (rename or soft delete)"""
+    try:
+        conversation = await conversation_repo.get_conversation(conversation_id)
+
+        if not conversation:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        if conversation.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="无权修改此会话")
+
+        updated = await conversation_repo.update_conversation(
+            conversation_id=conversation_id,
+            title=request.title,
+            is_active=request.is_active,
+        )
+
+        if not updated:
+            raise HTTPException(status_code=500, detail="更新失败")
+
+        return ConversationItem(
+            id=str(updated.id),
+            title=updated.title,
+            skill=updated.skill,
+            updated_at=updated.updated_at.isoformat() if updated.updated_at else "",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update conversation: {e}")
+        raise HTTPException(status_code=500, detail="更新会话失败")
+
+
+@router.delete("/{conversation_id}")
+async def delete_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Soft delete conversation (set is_active=false)"""
+    try:
+        conversation = await conversation_repo.get_conversation(conversation_id)
+
+        if not conversation:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        if conversation.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="无权删除此会话")
+
+        # Soft delete
+        await conversation_repo.update_conversation(
+            conversation_id=conversation_id,
+            is_active=False,
+        )
+
+        return {"status": "ok", "message": "会话已删除"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete conversation: {e}")
+        raise HTTPException(status_code=500, detail="删除会话失败")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Title Generation (async helper)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def generate_conversation_title(conversation_id: UUID, first_message: str) -> Optional[str]:
+    """
+    Generate title for conversation based on first message.
+    Called after first assistant response.
+
+    Strategy: Truncate first message to 10 chars + "..."
+    (LLM generation can be added later)
+    """
+    try:
+        # Simple strategy: truncate first message
+        title = first_message[:10].strip()
+        if len(first_message) > 10:
+            title += "..."
+
+        await conversation_repo.update_conversation(
+            conversation_id=conversation_id,
+            title=title,
+        )
+        return title
+    except Exception as e:
+        logger.warning(f"Failed to generate title: {e}")
+        return None

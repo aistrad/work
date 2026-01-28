@@ -1,0 +1,718 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * ChatContainer - v5.2 性能优化版
+     5→ *
+     6→ * 优化点:
+     7→ * 1. 使用 content-visibility 优化长消息列表 (Vercel rule: rendering-content-visibility)
+     8→ * 2. Memoize ChatEmptyState 组件 (Vercel rule: rerender-extract-component)
+     9→ * 3. 使用缓存的 localStorage 工具 (Vercel rule: js-cache-storage)
+    10→ */
+    11→
+    12→import { useRef, useEffect, useMemo, useCallback, useState, memo } from "react";
+    13→import type { Message } from "ai/react";
+    14→import { toast } from "sonner";
+    15→import { ChatMessage } from "./ChatMessage";
+    16→import { ChatInput } from "./ChatInput";
+    17→import { InsightCard, InsightType } from "@/components/insight/InsightCard";
+    18→import { VibeGlyph, BreathAura, type SkillType } from "@/components/core";
+    19→import { DailyGreeting } from "@/components/greeting/DailyGreeting";
+    20→import { ChatWelcomeMessage } from "./ChatWelcomeMessage";
+    21→import { useVibeChat, type SkillId } from "@/hooks/useVibeChat";
+    22→import { getLocalStorageJSON, getLocalStorage, setLocalStorage } from "@/utils/storage";
+    23→import { useDashboardWelcomeData } from "@/hooks/useDashboardWelcomeData";
+    24→import SkillIntroCard from "@/skills/shared/SkillIntroCard";
+    25→import { useSkillIntro, useMarkFirstUse } from "@/skills/shared/SkillIntroCard/hooks/useSkillIntro";
+    26→import type { IntroCardAction } from "@/skills/shared/SkillIntroCard/types";
+    27→import type { DashboardDTO } from "@/types/dashboard";
+    28→
+    29→interface InsightData {
+    30→  id: string;
+    31→  insight_type: InsightType;
+    32→  title: string;
+    33→  content: string;
+    34→}
+    35→
+    36→/**
+    37→ * Extract text content from AI SDK Message
+    38→ */
+    39→function getMessageContent(message: Message): string {
+    40→  return message.content || '';
+    41→}
+    42→
+    43→/**
+    44→ * UUID 生成函数（兼容 SSR 和不支持 crypto.randomUUID 的环境）
+    45→ */
+    46→function generateUUID(): string {
+    47→  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    48→    return crypto.randomUUID();
+    49→  }
+    50→  // Fallback: 使用 crypto.getRandomValues
+    51→  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    52→    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    53→      const r = (crypto.getRandomValues(new Uint8Array(1))[0] & 15) >> (c === "x" ? 0 : 3);
+    54→      return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+    55→    });
+    56→  }
+    57→  // Fallback: Math.random
+    58→  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    59→    const r = (Math.random() * 16) | 0;
+    60→    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+    61→  });
+    62→}
+    63→
+    64→export type VoiceMode = "warm" | "sarcastic" | "wise";
+    65→
+    66→export interface ChatContainerProps {
+    67→  /**
+    68→   * Skill ID - 可选
+    69→   * - 传入时：后端直接使用该 skill
+    70→   * - 不传时：后端 CoreAgent 通过 LLM 自动路由
+    71→   */
+    72→  skillId?: string;
+    73→  /**
+    74→   * Scenario/Rule ID - 可选
+    75→   * - 传入时：后端直接加载对应的 Rule 文件
+    76→   * - 不传时：后端根据 tags 匹配或使用默认 scenario
+    77→   */
+    78→  scenario?: string;
+    79→  /**
+    80→   * 用于 UI 展示的 skill（主题、空状态等）
+    81→   * 当 skillId 不传时，此字段仍可用于 UI 展示
+    82→   */
+    83→  skill?: SkillType;
+    84→  conversationId?: string;
+    85→  voiceMode?: VoiceMode;
+    86→  onConversationStart?: (id: string) => void;
+    87→  /**
+    88→   * 从 URL 传入的初始消息（如从通知跳转）
+    89→   */
+    90→  initialPrompt?: string | null;
+    91→  /**
+    92→   * 初始消息发送后的回调
+    93→   */
+    94→  onInitialPromptSent?: () => void;
+    95→  /**
+    96→   * Dashboard 数据（用于空状态）
+    97→   */
+    98→  dashboardData?: DashboardDTO | null;
+    99→  /**
+   100→   * Dashboard 数据加载状态
+   101→   */
+   102→  isDashboardLoading?: boolean;
+   103→  /**
+   104→   * 签到回调
+   105→   */
+   106→  onCheckIn?: () => Promise<void>;
+   107→  /**
+   108→   * 杠杆打勾回调
+   109→   */
+   110→  onToggleLever?: (leverId: string) => Promise<void>;
+   111→  /**
+   112→   * 大石头打勾回调
+   113→   */
+   114→  onToggleRock?: (rockId: string) => Promise<void>;
+   115→}
+   116→
+   117→// ═══════════════════════════════════════════════════════════════════════════
+   118→// ChatEmptyState - LUMINOUS PAPER Design System
+   119→// 空状态：居中 VibeGlyph + 技能感知文案 + 呼吸光晕
+   120→// ═══════════════════════════════════════════════════════════════════════════
+   121→
+   122→const SKILL_EMPTY_STATE: Record<SkillType, { title: string; subtitle: string }> = {
+   123→  bazi: {
+   124→    title: "探索你的命理",
+   125→    subtitle: "分享你的生辰，开启八字解读之旅",
+   126→  },
+   127→  zodiac: {
+   128→    title: "倾听星辰的声音",
+   129→    subtitle: "让星盘为你揭示宇宙的密语",
+   130→  },
+   131→  mbti: {
+   132→    title: "发现真实的自己",
+   133→    subtitle: "通过对话，探索你的人格特质",
+   134→  },
+   135→  attach: {
+   136→    title: "理解你的依恋模式",
+   137→    subtitle: "探索亲密关系中的自我",
+   138→  },
+   139→  career: {
+   140→    title: "规划你的职业蓝图",
+   141→    subtitle: "让我们一起探索你的职业发展方向",
+   142→  },
+   143→  lifecoach: {
+   144→    title: "开启人生教练之旅",
+   145→    subtitle: "科学方法，助你突破瓶颈，重塑人生",
+   146→  },
+   147→};
+   148→
+   149→// Quick prompts for each skill with icons and categories
+   150→interface QuickPromptItem {
+   151→  icon: string;
+   152→  category: string;
+   153→  question: string;
+   154→  gradient: string;
+   155→}
+   156→
+   157→const SKILL_QUICK_PROMPTS: Record<SkillType, QuickPromptItem[]> = {
+   158→  bazi: [
+   159→    { icon: "🎂", category: "生辰信息", question: "我是1990年5月15日早上8点出生的", gradient: "from-blue-500/10 to-cyan-500/10" },
+   160→    { icon: "📈", category: "运势分析", question: "帮我分析今年的运势", gradient: "from-purple-500/10 to-pink-500/10" },
+   161→    { icon: "💼", category: "事业发展", question: "我的事业运如何？", gradient: "from-orange-500/10 to-red-500/10" },
+   162→    { icon: "⏰", category: "时机选择", question: "什么时候适合做重大决定？", gradient: "from-green-500/10 to-teal-500/10" },
+   163→  ],
+   164→  zodiac: [
+   165→    { icon: "⭐", category: "运势查询", question: "我是双子座，帮我看看本周运势", gradient: "from-purple-500/10 to-pink-500/10" },
+   166→    { icon: "🌙", category: "星盘解读", question: "我的太阳星座和上升星座有什么区别？", gradient: "from-indigo-500/10 to-purple-500/10" },
+   167→    { icon: "💕", category: "关系匹配", question: "双子座和什么星座最配？", gradient: "from-rose-500/10 to-pink-500/10" },
+   168→    { icon: "🌀", category: "星象影响", question: "水逆对我有什么影响？", gradient: "from-blue-500/10 to-cyan-500/10" },
+   169→  ],
+   170→  mbti: [
+   171→    { icon: "🔍", category: "类型测试", question: "帮我测测我的MBTI类型", gradient: "from-blue-500/10 to-cyan-500/10" },
+   172→    { icon: "💼", category: "职业建议", question: "INFP适合什么职业？", gradient: "from-orange-500/10 to-amber-500/10" },
+   173→    { icon: "👥", category: "人际关系", question: "我是INTJ，如何改善人际关系？", gradient: "from-green-500/10 to-teal-500/10" },
+   174→    { icon: "⚡", category: "类型对比", question: "E人和I人有什么本质区别？", gradient: "from-purple-500/10 to-pink-500/10" },
+   175→  ],
+   176→  attach: [
+   177→    { icon: "🔍", category: "类型分析", question: "帮我分析我的依恋类型", gradient: "from-blue-500/10 to-cyan-500/10" },
+   178→    { icon: "💑", category: "关系建设", question: "回避型依恋如何建立亲密关系？", gradient: "from-rose-500/10 to-pink-500/10" },
+   179→    { icon: "🛡️", category: "内心探索", question: "为什么我总是害怕被抛弃？", gradient: "from-amber-500/10 to-orange-500/10" },
+   180→    { icon: "💚", category: "自我疗愈", question: "如何治愈童年的情感创伤？", gradient: "from-green-500/10 to-teal-500/10" },
+   181→  ],
+   182→  career: [
+   183→    { icon: "🎯", category: "职业规划", question: "我该如何规划职业发展？", gradient: "from-blue-500/10 to-cyan-500/10" },
+   184→    { icon: "🚀", category: "方向选择", question: "我适合创业还是打工？", gradient: "from-orange-500/10 to-red-500/10" },
+   185→    { icon: "💪", category: "面试技巧", question: "如何在面试中展现自己？", gradient: "from-green-500/10 to-teal-500/10" },
+   186→    { icon: "🔄", category: "职业转型", question: "转行需要考虑什么？", gradient: "from-purple-500/10 to-pink-500/10" },
+   187→  ],
+   188→  lifecoach: [
+   189→    { icon: "🎯", category: "目标设定", question: "我想找到人生方向，但不知道从哪开始", gradient: "from-red-500/10 to-pink-500/10" },
+   190→    { icon: "🔄", category: "突破瓶颈", question: "我感觉卡住了，想要突破现状", gradient: "from-purple-500/10 to-indigo-500/10" },
+   191→    { icon: "⚡", category: "习惯养成", question: "如何建立高效的日常习惯？", gradient: "from-orange-500/10 to-amber-500/10" },
+   192→    { icon: "💡", category: "价值创造", question: "如何把兴趣变成事业？", gradient: "from-green-500/10 to-teal-500/10" },
+   193→  ],
+   194→};
+   195→
+   196→// API calls now go through Next.js API routes
+   197→
+   198→// 本地 fallback 数据生成
+   199→function getLocalGreetingData(skill: SkillType) {
+   200→  const now = new Date();
+   201→  const hour = now.getHours();
+   202→  const month = now.getMonth();
+   203→  const day = now.getDate();
+   204→  const isoDate = now.toISOString().slice(0, 10);
+   205→
+   206→  // 确定时段
+   207→  type TimeOfDay = "dawn" | "morning" | "afternoon" | "evening" | "night";
+   208→  let timeOfDay: TimeOfDay = "morning";
+   209→  let greeting = "新的一天开始了";
+   210→
+   211→  if (hour >= 5 && hour < 7) {
+   212→    timeOfDay = "dawn";
+   213→    greeting = "晨光熹微";
+   214→  } else if (hour >= 7 && hour < 12) {
+   215→    timeOfDay = "morning";
+   216→    greeting = "愿你能量满满";
+   217→  } else if (hour >= 12 && hour < 18) {
+   218→    timeOfDay = "afternoon";
+   219→    greeting = "保持专注";
+   220→  } else if (hour >= 18 && hour < 21) {
+   221→    timeOfDay = "evening";
+   222→    greeting = "辛苦一天了";
+   223→  } else {
+   224→    timeOfDay = "night";
+   225→    greeting = "夜深了，早点休息";
+   226→  }
+   227→
+   228→  const solarTerms = [
+   229→    "小寒", "大寒", "立春", "雨水", "惊蛰", "春分",
+   230→    "清明", "谷雨", "立夏", "小满", "芒种", "夏至",
+   231→    "小暑", "大暑", "立秋", "处暑", "白露", "秋分",
+   232→    "寒露", "霜降", "立冬", "小雪", "大雪", "冬至",
+   233→  ];
+   234→  const termIdx = month * 2 + (day >= 15 ? 1 : 0);
+   235→  const solarTerm = solarTerms[termIdx % 24];
+   236→
+   237→  const seasonTips: Record<string, string> = {
+   238→    小寒: "冬藏时节，利于回顾与规划", 大寒: "严寒之际，蓄力待发",
+   239→    立春: "万物复苏，适合启动新计划", 雨水: "润物无声，静心滋养",
+   240→    惊蛰: "春雷惊醒，行动起来", 春分: "昼夜平分，调和身心",
+   241→    清明: "天清地明，整理思绪", 谷雨: "雨生百谷，播种希望",
+   242→    立夏: "夏气渐盛，保持活力", 小满: "小有所成，继续努力",
+   243→    芒种: "播种收获，勤勉不懈", 夏至: "阳气鼎盛，适度休息",
+   244→    小暑: "暑气初升，清心宁神", 大暑: "酷暑难耐，静以养心",
+   245→    立秋: "秋意渐起，收获时节", 处暑: "暑气渐消，调整节奏",
+   246→    白露: "秋凉渐浓，收敛心神", 秋分: "秋高气爽，平衡工作与生活",
+   247→    寒露: "露水渐寒，注意保养", 霜降: "霜降水泽，沉淀积累",
+   248→    立冬: "冬季来临，储备能量", 小雪: "雪花初降，内省时刻",
+   249→    大雪: "瑞雪兆丰，静待来年", 冬至: "一阳初生，否极泰来",
+   250→  };
+   251→
+   252→  const baziHints: Record<string, string> = {
+   253→    小寒: "水旺之季，利于思考与规划", 大寒: "水气最盛，适合内省沉淀",
+   254→    立春: "木气初生，宜开启新事业", 春分: "木气旺盛，适合拓展人脉",
+   255→    立夏: "火气渐升，利于表达展现", 夏至: "火气正盛，注意平衡",
+   256→    立秋: "金气初生，适合决断取舍", 秋分: "金气旺盛，利于收获成果",
+   257→    立冬: "水气初生，宜休养生息", 冬至: "一阳复始，厚积薄发",
+   258→  };
+   259→
+   260→  const dateStr = `${month + 1}月${day}日`;
+   261→  const seedStr = `${isoDate}:${skill}:${solarTerm}:${timeOfDay}`;
+   262→  let hash = 0;
+   263→  for (let i = 0; i < seedStr.length; i += 1) {
+   264→    hash = (hash * 31 + seedStr.charCodeAt(i)) % 100000;
+   265→  }
+   266→  const fortuneScore = Math.max(32, Math.min(92, 42 + (hash % 51)));
+   267→  const fortuneHint = skill === "bazi"
+   268→    ? (baziHints[solarTerm] || "今天适合稳住节奏，把力气用在关键处。")
+   269→    : (seasonTips[solarTerm] || "今天适合把注意力收回到自己身上。");
+   270→
+   271→  const actionText =
+   272→    timeOfDay === "dawn" || timeOfDay === "morning"
+   273→      ? "写下今天最重要的一件事，并用 25 分钟启动它"
+   274→      : timeOfDay === "afternoon"
+   275→        ? "把一件悬而未决的小事收尾，给自己一个确定感"
+   276→        : timeOfDay === "evening"
+   277→          ? "用 10 分钟复盘今天：做对了什么、下一步是什么"
+   278→          : "关机前写一句感谢，给大脑一个柔软的结尾";
+   279→
+   280→  return {
+   281→    greeting, solarTerm, timeOfDay, date: dateStr, isoDate,
+   282→    todayTip: seasonTips[solarTerm] || "专注当下，稳步前行",
+   283→    baziHint: skill === "bazi" ? (baziHints[solarTerm] || null) : null,
+   284→    fortuneScore, fortuneHint, actionText, isFromApi: false,
+   285→  };
+   286→}
+   287→
+   288→// 生成当日问候数据 - 使用本地算法生成
+   289→// NOTE: 原 API 调用已移除，因后端 /api/v1/fortune/greeting 未实现
+   290→// 本地算法已提供完整功能：节气、时辰、运势评分等
+   291→function useDailyGreeting(skill: SkillType) {
+   292→  // 初始状态使用默认值，避免 hydration mismatch
+   293→  const [data, setData] = useState(() => ({
+   294→    greeting: "新的一天开始了",
+   295→    timeOfDay: "morning" as "dawn" | "morning" | "afternoon" | "evening" | "night",
+   296→    solarTerm: "立春",
+   297→    isoDate: new Date().toISOString().slice(0, 10),
+   298→    todayTip: "专注当下，稳步前行",
+   299→    baziHint: null as string | null,
+   300→    fortuneScore: 75,
+   301→    fortuneHint: "运势平稳",
+   302→    actionText: "今日宜",
+   303→    isFromApi: false,
+   304→  }));
+   305→  const [loading] = useState(false);
+   306→
+   307→  // 在客户端计算实际的问候数据
+   308→  useEffect(() => {
+   309→    setData(getLocalGreetingData(skill));
+   310→  }, [skill]);
+   311→
+   312→  return { ...data, loading };
+   313→}
+   314→
+   315→// Memoized ChatEmptyState (Vercel rule: rerender-extract-component)
+   316→const ChatEmptyState = memo(function ChatEmptyState({ skill, onQuickPrompt }: { skill: SkillType; onQuickPrompt?: (prompt: string) => void }) {
+   317→  const config = SKILL_EMPTY_STATE[skill] || SKILL_EMPTY_STATE.bazi;
+   318→  const quickPrompts = SKILL_QUICK_PROMPTS[skill] || SKILL_QUICK_PROMPTS.bazi;
+   319→  const dailyData = useDailyGreeting(skill);
+   320→  const actionKey = useMemo(
+   321→    () => `vibelife-daily-action:${skill}:${dailyData.isoDate}`,
+   322→    [skill, dailyData.isoDate]
+   323→  );
+   324→  const [actionCompleted, setActionCompleted] = useState(false);
+   325→
+   326→  useEffect(() => {
+   327→    if (typeof window === "undefined") return;
+   328→    // Use cached localStorage (Vercel rule: js-cache-storage)
+   329→    setActionCompleted(getLocalStorage(actionKey) === "1");
+   330→  }, [actionKey]);
+   331→
+   332→  const toggleAction = useCallback(() => {
+   333→    setActionCompleted((prev) => {
+   334→      const next = !prev;
+   335→      // Use cached localStorage (Vercel rule: js-cache-storage)
+   336→      setLocalStorage(actionKey, next ? "1" : "0");
+   337→      return next;
+   338→    });
+   339→  }, [actionKey]);
+   340→
+   341→  const shareText = useMemo(() => {
+   342→    const term = dailyData.solarTerm ? ` · ${dailyData.solarTerm}` : "";
+   343→    return [
+   344→      `VibeLife${term} · ${dailyData.isoDate}`,
+   345→      dailyData.greeting,
+   346→      `运势指数：${dailyData.fortuneScore}/100`,
+   347→      `今日一步：${dailyData.actionText}`,
+   348→      "#VibeLife",
+   349→    ].join("\n");
+   350→  }, [dailyData]);
+   351→
+   352→  return (
+   353→    <div className="flex flex-col items-center justify-center w-full md:max-w-xl mx-auto px-4 py-6">
+   354→      {/* Daily Greeting 每日问候 */}
+   355→      <DailyGreeting
+   356→        greeting={dailyData.greeting}
+   357→        solarTerm={dailyData.solarTerm}
+   358→        timeOfDay={dailyData.timeOfDay}
+   359→        date={dailyData.isoDate}
+   360→        todayTip={dailyData.todayTip}
+   361→        baziHint={dailyData.baziHint || undefined}
+   362→        fortuneScore={dailyData.fortuneScore}
+   363→        fortuneHint={dailyData.fortuneHint}
+   364→        actionItem={{ text: dailyData.actionText, completed: actionCompleted }}
+   365→        onActionToggle={toggleAction}
+   366→        shareText={shareText}
+   367→        className="mb-6 w-full"
+   368→      />
+   369→
+   370→      {/* Animated glyph with enhanced aura */}
+   371→      <div className="relative flex items-center justify-center mb-4">
+   372→        {/* Outer pulsing ring */}
+   373→        <div className="absolute w-16 h-16 rounded-full border border-skill-primary/20 animate-pulse-slow" />
+   374→        <div className="absolute w-24 h-24 rounded-full border border-skill-primary/10 animate-pulse-slower" />
+   375→
+   376→        {/* Breath aura */}
+   377→        <BreathAura
+   378→          skill={skill}
+   379→          size="sm"
+   380→          position="center"
+   381→          intensity="medium"
+   382→          className="opacity-40"
+   383→        />
+   384→
+   385→        {/* Central glyph */}
+   386→        <VibeGlyph
+   387→          size="sm"
+   388→          skill={skill}
+   389→          showAura={true}
+   390→          animate={true}
+   391→          className="relative z-10"
+   392→        />
+   393→      </div>
+   394→
+   395→      {/* Title */}
+   396→      <h3 className="text-base md:text-lg font-serif font-semibold text-foreground mb-1 text-center">
+   397→        {config.title}
+   398→      </h3>
+   399→
+   400→      {/* Subtitle */}
+   401→      <p className="text-sm text-muted-foreground max-w-sm text-center mb-4">
+   402→        {config.subtitle}
+   403→      </p>
+   404→
+   405→      {/* Quick prompt suggestions */}
+   406→      <div className="w-full space-y-3">
+   407→        <p className="text-xs text-muted-foreground/60 text-center">
+   408→          试试这样问
+   409→        </p>
+   410→        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+   411→          {quickPrompts.slice(0, 4).map((prompt, index) => (
+   412→            <button
+   413→              key={index}
+   414→              onClick={() => onQuickPrompt?.(prompt.question)}
+   415→              className={`
+   416→                group relative px-3 py-3 text-left
+   417→                bg-gradient-to-br ${prompt.gradient}
+   418→                border border-border/50 hover:border-skill-primary/30
+   419→                rounded-xl transition-all duration-200
+   420→                hover:shadow-md hover:-translate-y-0.5
+   421→              `}
+   422→            >
+   423→              <div className="flex items-start gap-2.5">
+   424→                <span className="text-lg flex-shrink-0">{prompt.icon}</span>
+   425→                <div className="flex-1 min-w-0">
+   426→                  <span className="text-[10px] font-medium text-muted-foreground/70 uppercase tracking-wide">
+   427→                    {prompt.category}
+   428→                  </span>
+   429→                  <p className="text-sm text-foreground line-clamp-2 mt-0.5">
+   430→                    {prompt.question}
+   431→                  </p>
+   432→                </div>
+   433→              </div>
+   434→            </button>
+   435→          ))}
+   436→        </div>
+   437→      </div>
+   438→    </div>
+   439→  );
+   440→});
+   441→
+   442→export function ChatContainer({
+   443→  skillId,
+   444→  scenario,
+   445→  skill = "bazi",
+   446→  conversationId: externalConversationId,
+   447→  voiceMode = "warm",
+   448→  onConversationStart,
+   449→  initialPrompt,
+   450→  onInitialPromptSent,
+   451→  dashboardData,
+   452→  isDashboardLoading,
+   453→  onCheckIn,
+   454→  onToggleLever,
+   455→  onToggleRock,
+   456→}: ChatContainerProps) {
+   457→  const messagesEndRef = useRef<HTMLDivElement>(null);
+   458→  const initialPromptSentRef = useRef(false);
+   459→
+   460→  // 生成稳定的 conversationId（如果外部没传入）
+   461→  // 使用 useRef 确保在组件生命周期内保持不变
+   462→  const generatedIdRef = useRef<string | null>(null);
+   463→  if (!generatedIdRef.current) {
+   464→    generatedIdRef.current = generateUUID();
+   465→  }
+   466→  const conversationId = externalConversationId || generatedIdRef.current;
+   467→
+   468→  // UI 展示用的 skill（主题、空状态等）
+   469→  const displaySkill: SkillType = skill || (skillId as SkillType) || "bazi";
+   470→
+   471→  // Skill Intro Card - 首次使用时显示
+   472→  const [showIntroCard, setShowIntroCard] = useState(false);
+   473→  const { data: introData } = useSkillIntro(displaySkill);
+   474→  const { mark: doMarkFirstUse } = useMarkFirstUse(displaySkill);
+   475→
+   476→  // Use AI SDK powered chat hook
+   477→  // skillId 可选：不传时后端 LLM 自动路由
+   478→  const {
+   479→    messages,
+   480→    isLoading,
+   481→    sendMessage,
+   482→    sendQuickPrompt,
+   483→    error,
+   484→  } = useVibeChat({
+   485→    skillId: skillId as SkillId | undefined,
+   486→    scenario,
+   487→    voiceMode,
+   488→    conversationId,
+   489→    onConversationStart,
+   490→    onError: (err) => {
+   491→      console.error("Chat error:", err);
+   492→      // Show user-friendly toast notification with retry option
+   493→      const errorMessage = err instanceof Error ? err.message : "未知错误";
+   494→      const isNetworkError = errorMessage.includes("network") || errorMessage.includes("fetch");
+   495→      const isTimeoutError = errorMessage.includes("timeout") || errorMessage.includes("超时");
+   496→
+   497→      toast.error(
+   498→        isNetworkError ? "网络连接失败" : isTimeoutError ? "请求超时" : "发送失败",
+   499→        {
+   500→          description: isNetworkError
+   501→            ? "请检查您的网络连接后重试"
+   502→            : isTimeoutError
+   503→              ? "服务器响应时间过长，请稍后重试"
+   504→              : "请稍后重试，或刷新页面",
+   505→          duration: 5000,
+   506→        }
+   507→      );
+   508→    },
+   509→  });
+   510→
+   511→  // 检测是否首次使用，显示介绍卡
+   512→  useEffect(() => {
+   513→    if (introData?.is_first_use) {
+   514→      setShowIntroCard(true);
+   515→    }
+   516→  }, [introData?.is_first_use]);
+   517→
+   518→  // 处理介绍卡片动作
+   519→  const handleIntroAction = useCallback((action: IntroCardAction) => {
+   520→    if (action.type === 'dismiss') {
+   521→      setShowIntroCard(false);
+   522→      doMarkFirstUse();
+   523→    } else if (action.type === 'send_prompt') {
+   524→      setShowIntroCard(false);
+   525→      doMarkFirstUse();
+   526→      sendQuickPrompt(action.prompt);
+   527→    }
+   528→  }, [doMarkFirstUse, sendQuickPrompt]);
+   529→
+   530→  // Vercel rule: rerender-defer-reads - 只在 messages 长度变化时滚动
+   531→  const messagesLength = messages.length;
+   532→  const scrollToBottom = useCallback(() => {
+   533→    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+   534→  }, []);
+   535→
+   536→  useEffect(() => {
+   537→    scrollToBottom();
+   538→  }, [messagesLength, scrollToBottom]);
+   539→
+   540→  // 处理从 URL 传入的初始消息（如从通知跳转）
+   541→  // Vercel rule: rerender-dependencies - 使用 ref 避免 sendMessage 依赖
+   542→  const sendMessageRef = useRef(sendMessage);
+   543→  sendMessageRef.current = sendMessage;
+   544→
+   545→  useEffect(() => {
+   546→    if (initialPrompt && !initialPromptSentRef.current && !isLoading) {
+   547→      initialPromptSentRef.current = true;
+   548→      sendMessageRef.current(initialPrompt).then(() => {
+   549→        onInitialPromptSent?.();
+   550→      });
+   551→    }
+   552→  }, [initialPrompt, isLoading, onInitialPromptSent]);
+   553→
+   554→  // 重置标记当 initialPrompt 变化时
+   555→  useEffect(() => {
+   556→    if (!initialPrompt) {
+   557→      initialPromptSentRef.current = false;
+   558→    }
+   559→  }, [initialPrompt]);
+   560→
+   561→  // Handle send from ChatInput
+   562→  const handleSend = useCallback(
+   563→    async (content: string) => {
+   564→      await sendMessage(content);
+   565→    },
+   566→    [sendMessage]
+   567→  );
+   568→
+   569→  // Handle quick prompt from empty state
+   570→  const handleQuickPrompt = useCallback(
+   571→    async (content: string) => {
+   572→      await sendQuickPrompt(content);
+   573→    },
+   574→    [sendQuickPrompt]
+   575→  );
+   576→
+   577→  const hasMessages = messages.length > 0;
+   578→
+   579→  // DailyGreeting 数据
+   580→  const dailyData = useDailyGreeting(displaySkill);
+   581→  const actionKey = useMemo(
+   582→    () => `vibelife-daily-action:${displaySkill}:${dailyData.isoDate}`,
+   583→    [displaySkill, dailyData.isoDate]
+   584→  );
+   585→  const [actionCompleted, setActionCompleted] = useState(false);
+   586→
+   587→  useEffect(() => {
+   588→    if (typeof window === "undefined") return;
+   589→    setActionCompleted(getLocalStorage(actionKey) === "1");
+   590→  }, [actionKey]);
+   591→
+   592→  const toggleAction = useCallback(() => {
+   593→    setActionCompleted((prev) => {
+   594→      const next = !prev;
+   595→      setLocalStorage(actionKey, next ? "1" : "0");
+   596→      return next;
+   597→    });
+   598→  }, [actionKey]);
+   599→
+   600→  const shareText = useMemo(() => {
+   601→    const term = dailyData.solarTerm ? ` · ${dailyData.solarTerm}` : "";
+   602→    return [
+   603→      `VibeLife${term} · ${dailyData.isoDate}`,
+   604→      dailyData.greeting,
+   605→      `运势指数：${dailyData.fortuneScore}/100`,
+   606→      `今日一步：${dailyData.actionText}`,
+   607→      "#VibeLife",
+   608→    ].join("\n");
+   609→  }, [dailyData]);
+   610→
+   611→  // 默认回调（如果没有传入）
+   612→  const handleCheckIn = useCallback(async () => {
+   613→    if (onCheckIn) {
+   614→      await onCheckIn();
+   615→    } else {
+   616→      toast.success("签到成功！");
+   617→    }
+   618→  }, [onCheckIn]);
+   619→
+   620→  const handleToggleLever = useCallback(async (leverId: string) => {
+   621→    if (onToggleLever) {
+   622→      await onToggleLever(leverId);
+   623→    }
+   624→  }, [onToggleLever]);
+   625→
+   626→  const handleToggleRock = useCallback(async (rockId: string) => {
+   627→    if (onToggleRock) {
+   628→      await onToggleRock(rockId);
+   629→    }
+   630→  }, [onToggleRock]);
+   631→
+   632→  // 转换 Dashboard 数据为欢迎消息格式
+   633→  const welcomeData = useDashboardWelcomeData(dashboardData);
+   634→
+   635→  return (
+   636→    <div className="flex flex-col h-full" data-skill={displaySkill}>
+   637→      {/* Messages area - always flex-1 to push input to bottom */}
+   638→      <main
+   639→        id="main-content"
+   640→        className="flex-1 overflow-y-auto relative min-h-0"
+   641→        role="log"
+   642→        aria-label="对话消息"
+   643→        aria-live="polite"
+   644→      >
+   645→        {!hasMessages ? (
+   646→          /* Empty state with Welcome Message or Skill Intro */
+   647→          <div className="flex flex-col items-center justify-end h-full pb-4">
+   648→            {/* 首次使用时显示 Skill 介绍卡 */}
+   649→            {showIntroCard && (
+   650→              <div className="w-full max-w-3xl px-4 mb-4">
+   651→                <SkillIntroCard
+   652→                  skillId={displaySkill}
+   653→                  variant="compact"
+   654→                  dismissible
+   655→                  onAction={handleIntroAction}
+   656→                />
+   657→              </div>
+   658→            )}
+   659→
+   660→            {isDashboardLoading ? (
+   661→              <div className="flex items-center justify-center">
+   662→                <div className="text-sm text-muted-foreground">加载中...</div>
+   663→              </div>
+   664→            ) : welcomeData ? (
+   665→              <ChatWelcomeMessage
+   666→                data={welcomeData}
+   667→                onCheckIn={handleCheckIn}
+   668→                onSendPrompt={handleQuickPrompt}
+   669→                className="w-full max-w-3xl"
+   670→              />
+   671→            ) : (
+   672→              <div className="flex items-center justify-center">
+   673→                <div className="text-sm text-muted-foreground">欢迎回来</div>
+   674→              </div>
+   675→            )}
+   676→          </div>
+   677→        ) : (
+   678→          /* Messages list - 所有设备居中，PC端响应式增宽 */
+   679→          <div className="px-4 pt-4 pb-2 max-w-3xl xl:max-w-4xl 2xl:max-w-5xl mx-auto">
+   680→            {messages.map((message) => (
+   681→              // Use chat-message-item class for content-visibility optimization (Vercel rule: rendering-content-visibility)
+   682→              <div key={message.id} className="chat-message-item">
+   683→                <ChatMessage
+   684→                  role={message.role as "user" | "assistant"}
+   685→                  content={getMessageContent(message)}
+   686→                  skill={displaySkill}
+   687→                  isStreaming={isLoading && message.role === "assistant" && message === messages[messages.length - 1]}
+   688→                  onSendMessage={sendMessage}
+   689→                />
+   690→              </div>
+   691→            ))}
+   692→            {/* Show loading indicator when waiting for first response chunk */}
+   693→            {isLoading && messages.length > 0 && messages[messages.length - 1].role === "user" && (
+   694→              <ChatMessage
+   695→                role="assistant"
+   696→                content=""
+   697→                skill={displaySkill}
+   698→                isStreaming
+   699→              />
+   700→            )}
+   701→            {/* Error is now handled via toast notification in onError callback */}
+   702→            <div ref={messagesEndRef} />
+   703→          </div>
+   704→        )}
+   705→      </main>
+   706→
+   707→      {/* Input - fixed at bottom */}
+   708→      <div className="flex-shrink-0">
+   709→        <ChatInput onSend={handleSend} disabled={isLoading} />
+   710→      </div>
+   711→    </div>
+   712→  );
+   713→}
+   714→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

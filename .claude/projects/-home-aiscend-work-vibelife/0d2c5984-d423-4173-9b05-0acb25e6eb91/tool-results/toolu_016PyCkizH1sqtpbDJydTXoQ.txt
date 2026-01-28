@@ -1,0 +1,567 @@
+     1→"""
+     2→Chat Routes V5 - Unified chat endpoint with CoreAgent
+     3→Based on: Claude Agent SDK style architecture
+     4→
+     5→Features:
+     6→- Single /chat/stream endpoint
+     7→- CoreAgent with LLM-based skill selection
+     8→- Quota check at entry + usage recording
+     9→- OpenAI compatible SSE format (works with AI SDK 4.x useChat)
+    10→- 分阶段渐进式加载（Phase 1: Skill 选择, Phase 2: Skill 执行）
+    11→- 历史消息从数据库获取（不依赖前端传入）
+    12→
+    13→v3.0 更新 (2026-01-20):
+    14→- 移除 Protocol 状态管理（改为 LLM 自己管理）
+    15→- 添加 scenario 参数支持
+    16→- 简化 SSE 事件流
+    17→
+    18→v2.0 更新 (2026-01-20):
+    19→- 删除前端传入 history 机制，改为数据库查询
+    20→- 分阶段加载：Phase 1 不加载 profile，Phase 2 按需加载
+    21→- use_skill 同轮重载上下文
+    22→"""
+    23→import json
+    24→import logging
+    25→import time
+    26→from typing import Optional
+    27→from uuid import UUID, uuid4
+    28→
+    29→from fastapi import APIRouter, Depends, Request
+    30→from fastapi.responses import StreamingResponse
+    31→from slowapi import Limiter
+    32→from slowapi.util import get_remote_address
+    33→
+    34→limiter = Limiter(key_func=get_remote_address)
+    35→from pydantic import BaseModel, Field
+    36→from sse_starlette.sse import EventSourceResponse
+    37→
+    38→from services.identity import get_optional_user, CurrentUser
+    39→from services.agent import CoreAgent, AgentContext, QuotaTracker, create_agent, get_adapter, AgentEvent
+    40→from stores.profile_cache import get_cached_profile_with_skill
+    41→from stores import message_repo, conversation_repo
+    42→from stores.skill_repo import SkillRepository
+    43→
+    44→router = APIRouter(prefix="/chat/v5", tags=["Chat V5"])
+    45→logger = logging.getLogger(__name__)
+    46→
+    47→
+    48→# ═══════════════════════════════════════════════════════════════════════════
+    49→# Request/Response Models
+    50→# ═══════════════════════════════════════════════════════════════════════════
+    51→
+    52→class MessageItem(BaseModel):
+    53→    """Single message in AI SDK format"""
+    54→    role: str
+    55→    content: str
+    56→
+    57→
+    58→class ChatRequestV5(BaseModel):
+    59→    """V5 Chat request - supports both simple and AI SDK format"""
+    60→    message: Optional[str] = Field(None, description="User message (simple format)")
+    61→    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK format, used for user message extraction only)")
+    62→    conversation_id: Optional[UUID] = Field(None, description="Conversation ID")
+    63→    skill: Optional[str] = Field(None, description="Skill ID (bazi/zodiac/career/tarot)")
+    64→    scenario: Optional[str] = Field(None, description="Scenario/Rule ID (dankoe/covey/weekly-review)")
+    65→    voice_mode: Optional[str] = Field(None, description="Voice mode (warm/sarcastic)")
+    66→
+    67→    def get_user_message(self) -> str:
+    68→        """Extract user message from either format"""
+    69→        if self.message:
+    70→            return self.message
+    71→        if self.messages:
+    72→            # Get the last user message from the array
+    73→            for msg in reversed(self.messages):
+    74→                if msg.role == "user":
+    75→                    return msg.content
+    76→        return ""
+    77→
+    78→    # 注意：get_history() 已删除，历史消息从数据库获取
+    79→
+    80→
+    81→class GuestChatRequestV5(BaseModel):
+    82→    """Guest chat request - supports both simple and AI SDK format"""
+    83→    message: Optional[str] = Field(None, description="User message (simple format)")
+    84→    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK format)")
+    85→
+    86→    def get_user_message(self) -> str:
+    87→        """Extract user message from either format"""
+    88→        if self.message:
+    89→            return self.message
+    90→        if self.messages:
+    91→            for msg in reversed(self.messages):
+    92→                if msg.role == "user":
+    93→                    return msg.content
+    94→        return ""
+    95→
+    96→
+    97→# ═══════════════════════════════════════════════════════════════════════════
+    98→# Helper Functions
+    99→# ═══════════════════════════════════════════════════════════════════════════
+   100→
+   101→async def get_user_context(user_id: Optional[UUID], skill: Optional[str] = None) -> tuple:
+   102→    """
+   103→    Get user profile and skill data (分阶段加载)
+   104→
+   105→    v11 更新：
+   106→    - Phase 1 (skill=None): 加载轻量画像 (identity + vibe + subscribed_skills)
+   107→    - Phase 2 (skill 有值): 加载完整数据 (profile + skill_data)
+   108→    """
+   109→    if not user_id:
+   110→        return {}, {}
+   111→
+   112→    try:
+   113→        if not skill:
+   114→            # v11: Phase 1 也加载轻量画像（用于个性化路由）
+   115→            vibe_profile = await get_vibe_profile_lite(user_id)
+   116→            return vibe_profile, {}
+   117→
+   118→        # Phase 2: 加载完整数据
+   119→        result = await get_cached_profile_with_skill(user_id, skill)
+   120→        return result.get("profile", {}), result.get("skill_data", {})
+   121→    except Exception as e:
+   122→        logger.error(f"Failed to get user context: {e}")
+   123→        return {}, {}
+   124→
+   125→
+   126→async def get_vibe_profile_lite(user_id: UUID) -> dict:
+   127→    """
+   128→    获取轻量 VibeProfile（Phase 1 用）
+   129→
+   130→    包含：
+   131→    - identity (display_name, birth_info)
+   132→    - vibe (insight, target)
+   133→    - subscribed_skills (已订阅的 Skill ID 列表)
+   134→
+   135→    约 150 tokens
+   136→    """
+   137→    from stores.unified_profile_repo import UnifiedProfileRepository
+   138→
+   139→    try:
+   140→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   141→        if not profile:
+   142→            return {}
+   143→
+   144→        # 获取订阅信息
+   145→        subscribed_skills = await UnifiedProfileRepository.get_subscribed_skill_ids(user_id)
+   146→
+   147→        # v9.1: get_profile() 已自动规范化数据结构，无需手动兼容
+   148→        identity = profile.get("identity", {})
+   149→        # 从 account 补充 display_name（如果 identity 中没有）
+   150→        if not identity.get("display_name") and profile.get("account", {}).get("display_name"):
+   151→            identity = {**identity, "display_name": profile.get("account", {}).get("display_name")}
+   152→
+   153→        return {
+   154→            "identity": identity,
+   155→            "vibe": profile.get("vibe", {}),
+   156→            "subscribed_skills": subscribed_skills,
+   157→        }
+   158→    except Exception as e:
+   159→        logger.error(f"Failed to get vibe profile lite: {e}")
+   160→        return {}
+   161→
+   162→
+   163→async def get_conversation_history(conversation_id: Optional[UUID], skill: Optional[str] = None) -> list:
+   164→    """
+   165→    Goal-Anchored History：第一条消息 + 最近 N 条
+   166→
+   167→    v10.1 更新：借鉴 Planning-with-Files 的 Attention Manipulation 原则
+   168→    - 第一条消息 = 用户原始意图 = Goal
+   169→    - 通过保留第一条消息，解决长对话后"目标遗忘"问题
+   170→
+   171→    Phase 1 (skill=None): 第一条 + 最近 4 条 = 5 条
+   172→    Phase 2 (skill 有值): 第一条 + 最近 14 条 = 15 条
+   173→    """
+   174→    if not conversation_id:
+   175→        return []
+   176→
+   177→    # 根据阶段决定最近消息数量
+   178→    limit = 4 if not skill else 14
+   179→
+   180→    try:
+   181→        # v10.1: 使用 Goal-Anchored History
+   182→        messages = await message_repo.get_messages_anchored(conversation_id, limit)
+   183→        return messages
+   184→    except Exception as e:
+   185→        logger.error(f"Failed to get history: {e}")
+   186→        return []
+   187→
+   188→
+   189→async def ensure_conversation_exists(
+   190→    conversation_id: UUID,
+   191→    user_id: Optional[UUID],
+   192→    skill: Optional[str] = None,
+   193→    voice_mode: Optional[str] = None
+   194→) -> None:
+   195→    """Ensure conversation exists in database, create if not"""
+   196→    try:
+   197→        existing = await conversation_repo.get_conversation(conversation_id)
+   198→        if not existing:
+   199→            await conversation_repo.create_conversation(
+   200→                skill=skill or "core",
+   201→                user_id=user_id,
+   202→                voice_mode=voice_mode or "warm",
+   203→                conversation_id=conversation_id
+   204→            )
+   205→    except Exception as e:
+   206→        logger.warning(f"Failed to ensure conversation: {e}")
+   207→
+   208→
+   209→async def save_message(conversation_id: UUID, role: str, content: str) -> None:
+   210→    """Save message to database"""
+   211→    try:
+   212→        await message_repo.create_message(
+   213→            conversation_id=conversation_id,
+   214→            role=role,
+   215→            content=content
+   216→        )
+   217→    except Exception as e:
+   218→        logger.warning(f"Failed to save message: {e}")
+   219→
+   220→
+   221→async def generate_conversation_title(conversation_id: UUID, first_message: str) -> None:
+   222→    """
+   223→    Generate title for conversation based on first user message.
+   224→    Strategy: Truncate to 10 chars + "..."
+   225→    """
+   226→    try:
+   227→        # Check if conversation already has a title
+   228→        conv = await conversation_repo.get_conversation(conversation_id)
+   229→        if conv and conv.title:
+   230→            return  # Already has a title
+   231→
+   232→        # Simple strategy: truncate first message
+   233→        title = first_message[:10].strip()
+   234→        if len(first_message) > 10:
+   235→            title += "..."
+   236→
+   237→        await conversation_repo.update_conversation(
+   238→            conversation_id=conversation_id,
+   239→            title=title
+   240→        )
+   241→        logger.info(f"Generated title for conversation {conversation_id}: {title}")
+   242→    except Exception as e:
+   243→        logger.warning(f"Failed to generate title: {e}")
+   244→
+   245→
+   246→async def save_zodiac_insight(
+   247→    user_id: UUID,
+   248→    chart_data: dict,
+   249→    ai_interpretation: str,
+   250→    conversation_id: UUID
+   251→) -> None:
+   252→    """
+   253→    Save zodiac chart analysis as an insight.
+   254→
+   255→    Auto-saves:
+   256→    - Chart data (planets, aspects, etc.)
+   257→    - AI interpretation text
+   258→    """
+   259→    if not ai_interpretation or len(ai_interpretation) < 50:
+   260→        # Skip if interpretation is too short (likely not a real analysis)
+   261→        return
+   262→
+   263→    try:
+   264→        # Build title from chart data
+   265→        sun_sign = chart_data.get("sunSign") or chart_data.get("sun_sign", "")
+   266→        moon_sign = chart_data.get("moonSign") or chart_data.get("moon_sign", "")
+   267→        rising_sign = chart_data.get("risingSign") or chart_data.get("rising_sign", "")
+   268→
+   269→        title = f"星盘分析 - {sun_sign}"
+   270→        if moon_sign:
+   271→            title += f"/{moon_sign}"
+   272→        if rising_sign:
+   273→            title += f"/{rising_sign}"
+   274→
+   275→        # Save insight
+   276→        await SkillRepository.create_insight(
+   277→            user_id=user_id,
+   278→            skill_id="zodiac",
+   279→            insight_type="chart_analysis",
+   280→            title=title,
+   281→            content=ai_interpretation,
+   282→            evidence={
+   283→                "chart_data": chart_data,
+   284→                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+   285→            },
+   286→            confidence=0.9,
+   287→            conversation_id=conversation_id
+   288→        )
+   289→        logger.info(f"Saved zodiac insight for user {user_id}: {title}")
+   290→    except Exception as e:
+   291→        logger.warning(f"Failed to save zodiac insight: {e}")
+   292→
+   293→
+   294→# ═══════════════════════════════════════════════════════════════════════════
+   295→# Endpoints
+   296→# ═══════════════════════════════════════════════════════════════════════════
+   297→
+   298→@router.post("/stream")
+   299→@limiter.limit("30/minute")
+   300→async def chat_stream_v5(
+   301→    body: ChatRequestV5,
+   302→    request: Request,
+   303→    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+   304→):
+   305→    """
+   306→    V5 Chat endpoint with CoreAgent.
+   307→
+   308→    Features:
+   309→    - CoreAgent decides skill via LLM (no keyword matching)
+   310→    - Supports multi-skill fusion
+   311→    - Quota check at entry
+   312→    - Vercel AI SDK compatible SSE
+   313→
+   314→    Test mode:
+   315→    - Add header `X-Test-Tier: paid` to simulate paid user
+   316→    - Add header `X-Test-Tier: free` to simulate free user
+   317→    """
+   318→    user_id = current_user.user_id if current_user else None
+   319→    user_tier = "free"
+   320→
+   321→    # Test mode: allow tier override via header
+   322→    test_tier = request.headers.get("x-test-tier")
+   323→    if test_tier and test_tier in ("free", "paid", "guest"):
+   324→        user_tier = test_tier
+   325→        logger.info(f"Test mode: using tier={test_tier}")
+   326→    elif user_id:
+   327→        from services.entitlement import EntitlementService
+   328→        entitlements = await EntitlementService.get_entitlements(user_id)
+   329→        user_tier = entitlements.get("tier", "free")
+   330→
+   331→    # [A] Entry quota check
+   332→    quota_ok, quota_message = await QuotaTracker.check(
+   333→        user_id=str(user_id) if user_id else "guest",
+   334→        tier=user_tier
+   335→    )
+   336→
+   337→    if not quota_ok:
+   338→        return EventSourceResponse(_quota_exceeded_response(quota_message, user_tier))
+   339→
+   340→    conversation_id = body.conversation_id or uuid4()
+   341→
+   342→    async def generate():
+   343→        try:
+   344→            perf_start = time.time()
+   345→            perf_log = {}
+   346→
+   347→            # [PERF T3] Get user context (分阶段加载)
+   348→            # Phase 1: skill=None 时不加载 profile
+   349→            # Phase 2: skill 有值时按需加载
+   350→            t3_start = time.time()
+   351→            profile, skill_data = await get_user_context(user_id, body.skill)
+   352→            perf_log["T3_user_context_ms"] = int((time.time() - t3_start) * 1000)
+   353→            perf_log["phase"] = "phase2" if body.skill else "phase1"
+   354→
+   355→            # Save user message first (needed for history query)
+   356→            user_message = body.get_user_message()
+   357→            if not user_message:
+   358→                # AI SDK 4.x error format: 3:"error message"
+   359→                yield f'3:{json.dumps("No user message provided")}\n'
+   360→                yield f'd:{json.dumps({"finishReason": "error", "usage": {"promptTokens": 0, "completionTokens": 0}})}\n'
+   361→                return
+   362→
+   363→            # [PERF T4] Ensure conversation exists before saving messages
+   364→            t4_start = time.time()
+   365→            await ensure_conversation_exists(
+   366→                conversation_id=conversation_id,
+   367→                user_id=user_id,
+   368→                skill=body.skill,
+   369→                voice_mode=body.voice_mode
+   370→            )
+   371→            perf_log["T4_ensure_conv_ms"] = int((time.time() - t4_start) * 1000)
+   372→
+   373→            # [v8] 从 conversation 恢复 skill（如果前端没传）
+   374→            active_skill = body.skill
+   375→            active_scenario = body.scenario
+   376→            if not active_skill:
+   377→                try:
+   378→                    conv = await conversation_repo.get_conversation(conversation_id)
+   379→                    # [P5] 安全检查：验证 conversation 属于当前用户
+   380→                    if conv and user_id and str(conv.user_id) != str(user_id):
+   381→                        logger.warning(f"[v8] Conversation user mismatch: {conv.user_id} vs {user_id}")
+   382→                        conv = None  # 不恢复不属于当前用户的对话
+   383→                    if conv and conv.skill and conv.skill != "core":
+   384→                        active_skill = conv.skill
+   385→                        # 恢复了 skill，需要重新加载 profile 和 skill_data
+   386→                        profile, skill_data = await get_user_context(user_id, active_skill)
+   387→                        perf_log["phase"] = "phase2"
+   388→                        perf_log["skill_restored"] = active_skill
+   389→                        logger.info(f"[v8] Restored skill from conversation: {active_skill}")
+   390→                except Exception as e:
+   391→                    logger.warning(f"[v8] Failed to restore skill: {e}")
+   392→
+   393→            # [PERF T5] Save user message
+   394→            t5_start = time.time()
+   395→            await save_message(conversation_id, "user", user_message)
+   396→            perf_log["T5_save_msg_ms"] = int((time.time() - t5_start) * 1000)
+   397→
+   398→            # [NEW] Get history from database (not from request)
+   399→            t_history_start = time.time()
+   400→            history = await get_conversation_history(conversation_id, active_skill)
+   401→            perf_log["T_history_ms"] = int((time.time() - t_history_start) * 1000)
+   402→            perf_log["history_count"] = len(history)
+   403→
+   404→            # Build agent context with scenario support
+   405→            context = AgentContext(
+   406→                user_id=str(user_id) if user_id else "guest",
+   407→                user_tier=user_tier,
+   408→                profile=profile,
+   409→                skill_data=skill_data,
+   410→                history=history,  # 从数据库获取，不再依赖前端传入
+   411→                skill=active_skill,  # v8: 可能从 conversation 恢复
+   412→                scenario=active_scenario,  # v8.1: 支持 scenario 传递
+   413→                voice_mode=body.voice_mode,
+   414→                conversation_id=str(conversation_id)
+   415→            )
+   416→
+   417→            # Create agent and adapter
+   418→            agent = create_agent()
+   419→            adapter = get_adapter("simple")
+   420→
+   421→            logger.info(f"[PERF] Pre-agent: {perf_log}")
+   422→
+   423→            # [PERF T6-T9] Stream through adapter (converts AgentEvent → AI SDK 4.x format)
+   424→            t_agent_start = time.time()
+   425→            first_token_time = None
+   426→            full_content = ""
+   427→            zodiac_chart_data = None  # Track zodiac chart for insight saving
+   428→            async for event in adapter.adapt(agent.run(user_message, context)):
+   429→                # SimpleToolAdapter returns "0:\"text\"\n" format strings
+   430→                if isinstance(event, str):
+   431→                    # Record first token time
+   432→                    if first_token_time is None and event.startswith('0:'):
+   433→                        first_token_time = time.time()
+   434→                        perf_log["TTFT_ms"] = int((first_token_time - t_agent_start) * 1000)
+   435→                        logger.info(f"[PERF] First token: TTFT={perf_log['TTFT_ms']}ms")
+   436→                    yield event
+   437→                    # Extract actual content from AI SDK 4.x format: 0:"content"\n
+   438→                    if event.startswith('0:'):
+   439→                        try:
+   440→                            content = json.loads(event[2:].rstrip('\n'))
+   441→                            # Check for zodiac chart tool results
+   442→                            if isinstance(content, str) and content.startswith('[[TOOL:'):
+   443→                                # Parse tool marker: [[TOOL:toolName:{...}]]
+   444→                                if 'show_card' in content and ('zodiac_chart' in content or 'sunSign' in content or 'sun_sign' in content):
+   445→                                    try:
+   446→                                        # Extract JSON from marker
+   447→                                        marker_match = content[content.index('{'):content.rindex('}')+1]
+   448→                                        tool_data = json.loads(marker_match)
+   449→                                        # Check if this is a zodiac chart card
+   450→                                        data = tool_data.get("data", {})
+   451→                                        if data.get("sunSign") or data.get("sun_sign"):
+   452→                                            zodiac_chart_data = data
+   453→                                            logger.info(f"Captured zodiac chart data for user {user_id}")
+   454→                                    except Exception as parse_err:
+   455→                                        logger.debug(f"Failed to parse zodiac tool marker: {parse_err}")
+   456→                            else:
+   457→                                # Regular content, add to full_content
+   458→                                full_content += content
+   459→                        except:
+   460→                            pass
+   461→                else:
+   462→                    # Other adapters return dicts - convert to SSE string for StreamingResponse
+   463→                    data_str = event.get("data", "") if isinstance(event, dict) else str(event)
+   464→                    yield f"data: {data_str}\n\n"
+   465→                    if '"delta"' in data_str and '"content"' in data_str:
+   466→                        try:
+   467→                            data = json.loads(data_str)
+   468→                            delta = data.get("choices", [{}])[0].get("delta", {})
+   469→                            full_content += delta.get("content", "")
+   470→                        except:
+   471→                            pass
+   472→
+   473→            # [PERF] Agent done
+   474→            perf_log["agent_total_ms"] = int((time.time() - t_agent_start) * 1000)
+   475→
+   476→            # Save assistant message
+   477→            if full_content:
+   478→                await save_message(conversation_id, "assistant", full_content)
+   479→
+   480→                # Generate title for new conversations (after first response)
+   481→                await generate_conversation_title(conversation_id, user_message)
+   482→
+   483→            # Save zodiac insight if chart was generated
+   484→            if zodiac_chart_data and user_id and full_content:
+   485→                await save_zodiac_insight(
+   486→                    user_id=user_id,
+   487→                    chart_data=zodiac_chart_data,
+   488→                    ai_interpretation=full_content,
+   489→                    conversation_id=conversation_id
+   490→                )
+   491→
+   492→            # [C] Record usage
+   493→            await QuotaTracker.record(
+   494→                user_id=str(user_id) if user_id else "guest",
+   495→                usage=agent.usage
+   496→            )
+   497→
+   498→            # [PERF] Total time
+   499→            perf_log["total_ms"] = int((time.time() - perf_start) * 1000)
+   500→            logger.info(f"[PERF] Complete: {perf_log}")
+   501→
+   502→        except Exception as e:
+   503→            logger.error(f"Chat error: {e}", exc_info=True)
+   504→            yield f"\n\n❌ Error: {str(e)}"
+   505→
+   506→    # 使用 StreamingResponse 输出 AI SDK 4.x data stream 格式
+   507→    return StreamingResponse(
+   508→        generate(),
+   509→        media_type="text/plain; charset=utf-8",
+   510→        headers={
+   511→            "X-Content-Type-Options": "nosniff",
+   512→            "X-Vercel-AI-Data-Stream": "v1"  # AI SDK 4.x 必需的 header
+   513→        }
+   514→    )
+   515→
+   516→
+   517→@router.post("/guest/stream")
+   518→@limiter.limit("10/minute")
+   519→async def guest_chat_stream_v5(body: GuestChatRequestV5, request: Request):
+   520→    """
+   521→    Guest chat endpoint (no auth, limited functionality).
+   522→    """
+   523→    async def generate():
+   524→        try:
+   525→            context = AgentContext(
+   526→                user_id="guest",
+   527→                user_tier="guest",
+   528→                profile={},
+   529→                skill_data={}
+   530→            )
+   531→
+   532→            agent = create_agent(max_iterations=5)
+   533→            adapter = get_adapter("text")
+   534→
+   535→            user_message = body.get_user_message()
+   536→            if not user_message:
+   537→                yield {"data": json.dumps({"type": "error", "errorText": "No user message provided"})}
+   538→                return
+   539→
+   540→            # Stream through adapter
+   541→            async for event in adapter.adapt(agent.run(user_message, context)):
+   542→                yield event
+   543→
+   544→        except Exception as e:
+   545→            logger.error(f"Guest chat error: {e}")
+   546→            yield {"data": json.dumps({"type": "error", "errorText": str(e)})}
+   547→
+   548→    headers = {"x-vercel-ai-ui-message-stream": "v1"}
+   549→    return EventSourceResponse(generate(), headers=headers)
+   550→
+   551→
+   552→async def _quota_exceeded_response(message: str, tier: str):
+   553→    """Generate quota exceeded SSE response"""
+   554→    yield {
+   555→        "event": "error",
+   556→        "data": json.dumps({
+   557→            "type": "quota_exceeded",
+   558→            "message": message,
+   559→            "tier": tier,
+   560→            "upgrade_url": "/membership"
+   561→        })
+   562→    }
+   563→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

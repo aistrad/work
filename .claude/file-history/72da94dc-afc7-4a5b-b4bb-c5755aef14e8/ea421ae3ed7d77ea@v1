@@ -1,0 +1,127 @@
+"""
+Chat Routes - Skill conversation endpoints
+"""
+from typing import Optional, List
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from services.identity import get_current_user, get_optional_user, CurrentUser
+from services.agent import AgentRuntime
+
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    skill_id: str
+    conversation_id: Optional[UUID] = None
+
+
+class ChatResponse(BaseModel):
+    content: str
+    conversation_id: UUID
+    intent: Optional[str] = None
+    tools_used: Optional[List[str]] = None
+    knowledge_used: bool = False
+    insight: Optional[dict] = None
+    suggestions: Optional[List[str]] = None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Send a message and get response"""
+    try:
+        response = await AgentRuntime.process_message(
+            user_id=current_user.user_id,
+            skill_id=request.skill_id,
+            message=request.message,
+            conversation_id=request.conversation_id
+        )
+
+        return ChatResponse(
+            content=response.content,
+            conversation_id=response.conversation_id,
+            intent=response.intent.value if response.intent else None,
+            tools_used=response.tools_used,
+            knowledge_used=response.knowledge_used,
+            insight=response.insight,
+            suggestions=response.suggestions
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Send a message and get streaming response (SSE)"""
+
+    async def generate():
+        try:
+            async for chunk in AgentRuntime.stream_message(
+                user_id=current_user.user_id,
+                skill_id=request.skill_id,
+                message=request.message,
+                conversation_id=request.conversation_id
+            ):
+                yield f"data: {chunk}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+@router.post("/guest")
+async def chat_guest(request: ChatRequest):
+    """
+    Guest chat (limited functionality, no persistence).
+    For landing page demo.
+    """
+    # For guest users, use a simple direct LLM call
+    from services.vibe_engine import LLMOrchestrator, LLMMessage
+    from services.agent import PersonaManager
+
+    persona = PersonaManager.get_persona(request.skill_id)
+
+    messages = [
+        LLMMessage(role="system", content=persona),
+        LLMMessage(role="user", content=request.message)
+    ]
+
+    try:
+        # Note: some GLM models may spend a large portion of tokens on reasoning
+        # before producing final `content`. Use a safer default budget for guest mode.
+        response = await LLMOrchestrator.chat(messages, max_tokens=1024)
+
+        return {
+            "content": response.content or "你好，我在这里。你想从哪里开始聊起？",
+            "is_guest": True,
+            "suggestion": "注册后可以获得完整的个性化分析"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

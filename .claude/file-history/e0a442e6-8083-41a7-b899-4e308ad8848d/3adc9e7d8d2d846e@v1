@@ -1,0 +1,200 @@
+"""
+LLM 调用性能测试 (Mock)
+
+测试 LLM 调用路径的非网络开销
+"""
+import pytest
+import asyncio
+import time
+from typing import List
+from unittest.mock import AsyncMock, patch, MagicMock
+
+
+class TestLLMRouterBenchmark:
+    """LLM 路由器性能测试"""
+
+    def test_model_config_load(self):
+        """模型配置加载 - 目标: < 10ms"""
+        from services.model_router.config import get_model_config, _model_config
+
+        # 清除缓存强制重新加载
+        import services.model_router.config as config_module
+        config_module._model_config = None
+
+        times: List[float] = []
+        for _ in range(10):
+            config_module._model_config = None
+            start = time.perf_counter()
+            config = get_model_config()
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  Config load (cold): avg={avg_ms:.3f}ms")
+        print(f"  Providers: {len(config.providers)}")
+        print(f"  Models: {len(config.models)}")
+
+        assert avg_ms < 50.0, f"Config load avg {avg_ms:.3f}ms exceeds 50ms target"
+
+    def test_model_config_cached(self):
+        """模型配置缓存 - 目标: < 0.5ms"""
+        from services.model_router.config import get_model_config
+
+        # 预热
+        get_model_config()
+
+        times: List[float] = []
+        for _ in range(1000):
+            start = time.perf_counter()
+            get_model_config()
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  Config load (cached): avg={avg_ms:.6f}ms")
+
+        assert avg_ms < 0.5, f"Cached config load avg {avg_ms:.6f}ms exceeds 0.5ms target"
+
+    def test_fallback_chain(self):
+        """Fallback 链获取 - 目标: < 1ms"""
+        from services.model_router.config import get_model_config
+
+        config = get_model_config()
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            chain = config.get_fallback_chain("chat", "free")
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  get_fallback_chain: avg={avg_ms:.3f}ms")
+        print(f"  Chain length: {len(chain) if chain else 0}")
+
+        assert avg_ms < 1.0, f"Fallback chain avg {avg_ms:.3f}ms exceeds 1ms target"
+
+    def test_router_overhead_mock(self):
+        """路由器开销 (Mock LLM) - 目标: < 10ms"""
+        mock_response = {
+            "content": "这是一个测试响应",
+            "usage": {"input_tokens": 100, "output_tokens": 50}
+        }
+
+        async def mock_call(*args, **kwargs):
+            return mock_response
+
+        with patch('services.model_router.client._call_llm', new=mock_call):
+            from services.model_router.client import chat
+
+            times: List[float] = []
+            for _ in range(50):
+                start = time.perf_counter()
+                asyncio.get_event_loop().run_until_complete(
+                    chat(
+                        messages=[{"role": "user", "content": "test"}],
+                        capability="chat"
+                    )
+                )
+                times.append((time.perf_counter() - start) * 1000)
+
+            avg_ms = sum(times) / len(times)
+            p95_ms = sorted(times)[int(len(times) * 0.95)]
+
+            print(f"\n  Router overhead (mock LLM): avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+            assert avg_ms < 10.0, f"Router overhead avg {avg_ms:.3f}ms exceeds 10ms target"
+
+
+class TestQuotaBenchmark:
+    """配额检查性能测试"""
+
+    def test_quota_check(self):
+        """配额检查 - 目标: < 5ms"""
+        from services.model_router.router import get_model_router, ModelContext
+
+        router = get_model_router()
+        context = ModelContext(user_id="test_user", user_tier="free")
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(
+                router._quota.check_quota(context, "glm:glm-4-flash")
+            )
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+        p95_ms = sorted(times)[95]
+
+        print(f"\n  Quota check: avg={avg_ms:.3f}ms, p95={p95_ms:.3f}ms")
+
+        assert avg_ms < 5.0, f"Quota check avg {avg_ms:.3f}ms exceeds 5ms target"
+
+    def test_usage_record(self):
+        """使用量记录 - 目标: < 5ms"""
+        from services.model_router.router import get_model_router, ModelContext, ModelSelection
+
+        router = get_model_router()
+        context = ModelContext(user_id="test_user", user_tier="free")
+        selection = ModelSelection(
+            provider="glm",
+            model="glm-4-flash",
+            model_id="glm:glm-4-flash",
+            was_downgraded=False
+        )
+
+        times: List[float] = []
+        for _ in range(100):
+            start = time.perf_counter()
+            asyncio.get_event_loop().run_until_complete(
+                router.record_completion(
+                    selection=selection,
+                    context=context,
+                    input_tokens=100,
+                    output_tokens=50,
+                    status="success"
+                )
+            )
+            times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  Usage record: avg={avg_ms:.3f}ms")
+
+        assert avg_ms < 5.0, f"Usage record avg {avg_ms:.3f}ms exceeds 5ms target"
+
+
+class TestStreamAdapterBenchmark:
+    """流式适配器性能测试"""
+
+    def test_aisdk_v6_adapter(self):
+        """AI SDK v6 适配器 - 目标: < 1ms per chunk"""
+        from services.agent.stream_adapter import AISDKv6Adapter, StreamConfig
+
+        config = StreamConfig(
+            format="ai-sdk-v6",
+            include_usage=True,
+            include_thinking=False
+        )
+        adapter = AISDKv6Adapter(config)
+
+        # 模拟事件
+        events = [
+            {"type": "content", "data": {"content": "这是一段测试内容"}},
+            {"type": "tool_call", "data": {"name": "show_chart", "arguments": {}}},
+            {"type": "done", "data": {"usage": {"input": 100, "output": 50}}},
+        ]
+
+        times: List[float] = []
+        for _ in range(100):
+            for event in events:
+                start = time.perf_counter()
+                list(adapter.format_event(event["type"], event["data"]))
+                times.append((time.perf_counter() - start) * 1000)
+
+        avg_ms = sum(times) / len(times)
+
+        print(f"\n  AI SDK v6 format_event: avg={avg_ms:.6f}ms")
+
+        assert avg_ms < 1.0, f"Adapter format avg {avg_ms:.6f}ms exceeds 1ms target"

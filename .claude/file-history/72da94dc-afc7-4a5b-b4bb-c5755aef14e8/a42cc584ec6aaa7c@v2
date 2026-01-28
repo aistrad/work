@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+VibeLife Reminder Scheduler Runner
+运行提醒调度器 - 可以通过 Cron 或独立进程运行
+
+Usage:
+    # 单次运行 (适合 Cron)
+    python scripts/run_scheduler.py --once
+
+    # 持续运行 (作为服务)
+    python scripts/run_scheduler.py --daemon --interval 3600
+
+    # 测试模式
+    python scripts/run_scheduler.py --dry-run
+"""
+
+import asyncio
+import argparse
+import logging
+from datetime import datetime
+import os
+import sys
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stores.db import get_db_pool, close_db_pool
+from services.reminder import ReminderScheduler, ContentGenerator, NotificationService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("scheduler")
+
+
+async def run_scheduler(dry_run: bool = False):
+    """运行一次调度扫描"""
+    logger.info(f"Starting scheduler run at {datetime.now()}")
+
+    pool = await get_db_pool()
+
+    try:
+        scheduler = ReminderScheduler(pool)
+        content_gen = ContentGenerator(pool)
+        notification_svc = NotificationService(pool)
+
+        # 扫描并生成提醒任务
+        tasks = await scheduler.scan_and_schedule()
+        logger.info(f"Found {len(tasks)} reminder tasks to process")
+
+        if dry_run:
+            logger.info("DRY RUN - Not sending notifications")
+            for task in tasks:
+                logger.info(f"  Would send: {task.reminder_type.value} to {task.user_id}")
+            return
+
+        # 处理每个任务
+        sent_count = 0
+        for task in tasks:
+            try:
+                # 生成个性化内容
+                content = await content_gen.generate_reminder_content(
+                    user_id=task.user_id,
+                    reminder_type=task.reminder_type,
+                    event_name=task.event_name,
+                    event_date=task.event_date
+                )
+
+                # 发送通知
+                success = await notification_svc.send_notification(
+                    user_id=task.user_id,
+                    notification_type=task.reminder_type.value,
+                    title=content.title,
+                    content=content.body,
+                    data={"event_id": task.event_id}
+                )
+
+                if success:
+                    sent_count += 1
+                    logger.info(f"Sent {task.reminder_type.value} to {task.user_id}")
+                else:
+                    logger.warning(f"Failed to send {task.reminder_type.value} to {task.user_id}")
+
+            except Exception as e:
+                logger.error(f"Error processing task for {task.user_id}: {e}")
+
+        logger.info(f"Scheduler run complete. Sent {sent_count}/{len(tasks)} notifications")
+
+    finally:
+        await close_db_pool()
+
+
+async def run_daemon(interval_seconds: int = 3600):
+    """持续运行模式"""
+    logger.info(f"Starting scheduler daemon with {interval_seconds}s interval")
+
+    while True:
+        try:
+            await run_scheduler()
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+
+        logger.info(f"Sleeping for {interval_seconds} seconds...")
+        await asyncio.sleep(interval_seconds)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VibeLife Reminder Scheduler")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--interval", type=int, default=3600, help="Daemon interval in seconds")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run (no notifications)")
+
+    args = parser.parse_args()
+
+    if args.daemon:
+        asyncio.run(run_daemon(args.interval))
+    else:
+        asyncio.run(run_scheduler(dry_run=args.dry_run))
+
+
+if __name__ == "__main__":
+    main()

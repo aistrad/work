@@ -1,0 +1,462 @@
+"""
+Skill Subscription Repository - Data access layer for Skill subscriptions
+
+Handles:
+- Skill 订阅/取消订阅
+- 推送开关
+- 试用次数追踪
+- 使用记录
+"""
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any
+from uuid import UUID
+
+from .db import get_connection
+
+
+@dataclass
+class SkillSubscription:
+    """Skill 订阅数据类"""
+    skill_id: str
+    status: str  # subscribed | unsubscribed
+    push_enabled: bool
+    subscribed_at: Optional[datetime]
+    unsubscribed_at: Optional[datetime]
+    trial_messages_used: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "status": self.status,
+            "push_enabled": self.push_enabled,
+            "subscribed_at": self.subscribed_at.isoformat() if self.subscribed_at else None,
+            "unsubscribed_at": self.unsubscribed_at.isoformat() if self.unsubscribed_at else None,
+            "trial_messages_used": self.trial_messages_used,
+        }
+
+
+class SkillSubscriptionRepository:
+    """Repository for Skill subscription operations"""
+
+    # ─────────────────────────────────────────────────────────────────
+    # 基础查询
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get(user_id: UUID, skill_id: str) -> Optional[SkillSubscription]:
+        """获取单个订阅"""
+        query = """
+            SELECT skill_id, status, push_enabled, subscribed_at, unsubscribed_at, trial_messages_used
+            FROM user_skill_subscriptions
+            WHERE user_id = $1 AND skill_id = $2
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            if row:
+                return SkillSubscription(
+                    skill_id=row["skill_id"],
+                    status=row["status"],
+                    push_enabled=row["push_enabled"],
+                    subscribed_at=row["subscribed_at"],
+                    unsubscribed_at=row["unsubscribed_at"],
+                    trial_messages_used=row["trial_messages_used"],
+                )
+        return None
+
+    @staticmethod
+    async def get_user_subscriptions(user_id: UUID) -> List[SkillSubscription]:
+        """获取用户所有订阅"""
+        query = """
+            SELECT skill_id, status, push_enabled, subscribed_at, unsubscribed_at, trial_messages_used
+            FROM user_skill_subscriptions
+            WHERE user_id = $1
+            ORDER BY subscribed_at DESC NULLS LAST
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, user_id)
+            return [
+                SkillSubscription(
+                    skill_id=row["skill_id"],
+                    status=row["status"],
+                    push_enabled=row["push_enabled"],
+                    subscribed_at=row["subscribed_at"],
+                    unsubscribed_at=row["unsubscribed_at"],
+                    trial_messages_used=row["trial_messages_used"],
+                )
+                for row in rows
+            ]
+
+    @staticmethod
+    async def get_subscribed_skill_ids(user_id: UUID) -> List[str]:
+        """获取用户已订阅的 Skill ID 列表"""
+        query = """
+            SELECT skill_id
+            FROM user_skill_subscriptions
+            WHERE user_id = $1 AND status = 'subscribed'
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, user_id)
+            return [row["skill_id"] for row in rows]
+
+    # ─────────────────────────────────────────────────────────────────
+    # 订阅管理
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def subscribe(
+        user_id: UUID,
+        skill_id: str,
+        push_enabled: bool = True
+    ) -> SkillSubscription:
+        """订阅 Skill"""
+        query = """
+            INSERT INTO user_skill_subscriptions (user_id, skill_id, status, push_enabled, subscribed_at)
+            VALUES ($1, $2, 'subscribed', $3, now())
+            ON CONFLICT (user_id, skill_id)
+            DO UPDATE SET
+                status = 'subscribed',
+                push_enabled = $3,
+                subscribed_at = now(),
+                unsubscribed_at = NULL,
+                updated_at = now()
+            RETURNING skill_id, status, push_enabled, subscribed_at, unsubscribed_at, trial_messages_used
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id, push_enabled)
+            return SkillSubscription(
+                skill_id=row["skill_id"],
+                status=row["status"],
+                push_enabled=row["push_enabled"],
+                subscribed_at=row["subscribed_at"],
+                unsubscribed_at=row["unsubscribed_at"],
+                trial_messages_used=row["trial_messages_used"],
+            )
+
+    @staticmethod
+    async def unsubscribe(user_id: UUID, skill_id: str) -> SkillSubscription:
+        """取消订阅 Skill"""
+        query = """
+            UPDATE user_skill_subscriptions
+            SET status = 'unsubscribed', push_enabled = false, unsubscribed_at = now(), updated_at = now()
+            WHERE user_id = $1 AND skill_id = $2
+            RETURNING skill_id, status, push_enabled, subscribed_at, unsubscribed_at, trial_messages_used
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            if row:
+                return SkillSubscription(
+                    skill_id=row["skill_id"],
+                    status=row["status"],
+                    push_enabled=row["push_enabled"],
+                    subscribed_at=row["subscribed_at"],
+                    unsubscribed_at=row["unsubscribed_at"],
+                    trial_messages_used=row["trial_messages_used"],
+                )
+            # 如果不存在，返回一个默认的取消订阅状态
+            return SkillSubscription(
+                skill_id=skill_id,
+                status="unsubscribed",
+                push_enabled=False,
+                subscribed_at=None,
+                unsubscribed_at=datetime.utcnow(),
+                trial_messages_used=0,
+            )
+
+    # ─────────────────────────────────────────────────────────────────
+    # 推送控制
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def update_push(
+        user_id: UUID,
+        skill_id: str,
+        enabled: bool
+    ) -> Optional[SkillSubscription]:
+        """更新推送状态"""
+        query = """
+            UPDATE user_skill_subscriptions
+            SET push_enabled = $3, updated_at = now()
+            WHERE user_id = $1 AND skill_id = $2
+            RETURNING skill_id, status, push_enabled, subscribed_at, unsubscribed_at, trial_messages_used
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id, enabled)
+            if row:
+                return SkillSubscription(
+                    skill_id=row["skill_id"],
+                    status=row["status"],
+                    push_enabled=row["push_enabled"],
+                    subscribed_at=row["subscribed_at"],
+                    unsubscribed_at=row["unsubscribed_at"],
+                    trial_messages_used=row["trial_messages_used"],
+                )
+            return None
+
+    @staticmethod
+    async def is_push_enabled(user_id: UUID, skill_id: str) -> bool:
+        """检查推送是否开启（用于 ProactiveEngine）"""
+        query = """
+            SELECT push_enabled
+            FROM user_skill_subscriptions
+            WHERE user_id = $1 AND skill_id = $2 AND status = 'subscribed'
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            return row["push_enabled"] if row else False
+
+    @staticmethod
+    async def get_users_with_push_enabled(skill_id: str) -> List[UUID]:
+        """获取某 Skill 开启推送的所有用户 ID（用于批量推送）"""
+        query = """
+            SELECT user_id
+            FROM user_skill_subscriptions
+            WHERE skill_id = $1 AND status = 'subscribed' AND push_enabled = true
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, skill_id)
+            return [row["user_id"] for row in rows]
+
+    # ─────────────────────────────────────────────────────────────────
+    # 试用管理
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def increment_trial_usage(user_id: UUID, skill_id: str) -> int:
+        """增加试用次数，返回新的使用次数"""
+        query = """
+            INSERT INTO user_skill_subscriptions (user_id, skill_id, trial_messages_used, status)
+            VALUES ($1, $2, 1, 'not_subscribed')
+            ON CONFLICT (user_id, skill_id)
+            DO UPDATE SET trial_messages_used = user_skill_subscriptions.trial_messages_used + 1, updated_at = now()
+            RETURNING trial_messages_used
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            return row["trial_messages_used"]
+
+    @staticmethod
+    async def get_trial_usage(user_id: UUID, skill_id: str) -> int:
+        """获取试用次数"""
+        query = """
+            SELECT trial_messages_used
+            FROM user_skill_subscriptions
+            WHERE user_id = $1 AND skill_id = $2
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            return row["trial_messages_used"] if row else 0
+
+    # ─────────────────────────────────────────────────────────────────
+    # 状态检查
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def is_subscribed(user_id: UUID, skill_id: str) -> bool:
+        """检查是否已订阅"""
+        query = """
+            SELECT 1
+            FROM user_skill_subscriptions
+            WHERE user_id = $1 AND skill_id = $2 AND status = 'subscribed'
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            return row is not None
+
+    @staticmethod
+    async def can_use_skill(
+        user_id: UUID,
+        skill_id: str,
+        skill_category: str,
+        trial_limit: int = 3
+    ) -> tuple[bool, str]:
+        """
+        检查用户是否可以使用 Skill
+
+        Returns:
+            (can_use, reason)
+            - (True, "subscribed") - 已订阅
+            - (True, "default") - 默认 Skill
+            - (True, "core") - Core Skill
+            - (True, "trial") - 试用中
+            - (False, "trial_exhausted") - 试用次数用完
+            - (False, "not_subscribed") - 未订阅
+        """
+        # Core Skill 始终可用
+        if skill_category == "core":
+            return True, "core"
+
+        subscription = await SkillSubscriptionRepository.get(user_id, skill_id)
+
+        # Default Skill: 如果没有订阅记录或已订阅，则可用
+        if skill_category == "default":
+            if not subscription or subscription.status == "subscribed":
+                return True, "default"
+            return False, "unsubscribed"
+
+        # Professional Skill: 需要订阅或在试用期内
+        if subscription and subscription.status == "subscribed":
+            return True, "subscribed"
+
+        # 检查试用
+        trial_used = subscription.trial_messages_used if subscription else 0
+        if trial_used < trial_limit:
+            return True, "trial"
+
+        return False, "trial_exhausted"
+
+
+class SkillUsageRepository:
+    """Repository for Skill usage logging"""
+
+    @staticmethod
+    async def log_usage(
+        user_id: UUID,
+        skill_id: str,
+        action: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """记录 Skill 使用"""
+        query = """
+            INSERT INTO skill_usage_log (user_id, skill_id, action, metadata)
+            VALUES ($1, $2, $3, $4)
+        """
+        async with get_connection() as conn:
+            await conn.execute(
+                query,
+                user_id,
+                skill_id,
+                action,
+                metadata or {}
+            )
+
+    @staticmethod
+    async def get_user_skill_usage(
+        user_id: UUID,
+        skill_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """获取用户 Skill 使用记录"""
+        if skill_id:
+            query = """
+                SELECT skill_id, action, metadata, created_at
+                FROM skill_usage_log
+                WHERE user_id = $1 AND skill_id = $2
+                ORDER BY created_at DESC
+                LIMIT $3
+            """
+            params = [user_id, skill_id, limit]
+        else:
+            query = """
+                SELECT skill_id, action, metadata, created_at
+                FROM skill_usage_log
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            """
+            params = [user_id, limit]
+
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, *params)
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def get_skill_usage_count(
+        user_id: UUID,
+        skill_id: str,
+        since: Optional[datetime] = None
+    ) -> int:
+        """获取 Skill 使用次数"""
+        if since:
+            query = """
+                SELECT COUNT(*)
+                FROM skill_usage_log
+                WHERE user_id = $1 AND skill_id = $2 AND created_at >= $3
+            """
+            params = [user_id, skill_id, since]
+        else:
+            query = """
+                SELECT COUNT(*)
+                FROM skill_usage_log
+                WHERE user_id = $1 AND skill_id = $2
+            """
+            params = [user_id, skill_id]
+
+        async with get_connection() as conn:
+            count = await conn.fetchval(query, *params)
+            return count or 0
+
+    @staticmethod
+    async def get_frequently_used_skills(
+        user_id: UUID,
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """获取用户最常用的 Skill（用于推荐）"""
+        query = """
+            SELECT skill_id, COUNT(*) as usage_count, MAX(created_at) as last_used
+            FROM skill_usage_log
+            WHERE user_id = $1
+            GROUP BY skill_id
+            ORDER BY usage_count DESC, last_used DESC
+            LIMIT $2
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, user_id, limit)
+            return [dict(row) for row in rows]
+
+
+class SkillRecommendationBlockRepository:
+    """Repository for Skill recommendation blocks"""
+
+    @staticmethod
+    async def block_skill(
+        user_id: UUID,
+        skill_id: str,
+        block_type: str = "permanent",
+        expires_at: Optional[datetime] = None
+    ) -> None:
+        """屏蔽 Skill 推荐"""
+        query = """
+            INSERT INTO skill_recommendation_blocks (user_id, skill_id, block_type, expires_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, skill_id)
+            DO UPDATE SET block_type = $3, expires_at = $4
+        """
+        async with get_connection() as conn:
+            await conn.execute(query, user_id, skill_id, block_type, expires_at)
+
+    @staticmethod
+    async def unblock_skill(user_id: UUID, skill_id: str) -> None:
+        """取消屏蔽 Skill 推荐"""
+        query = """
+            DELETE FROM skill_recommendation_blocks
+            WHERE user_id = $1 AND skill_id = $2
+        """
+        async with get_connection() as conn:
+            await conn.execute(query, user_id, skill_id)
+
+    @staticmethod
+    async def get_blocked_skills(user_id: UUID) -> List[str]:
+        """获取用户屏蔽的 Skill 列表"""
+        query = """
+            SELECT skill_id
+            FROM skill_recommendation_blocks
+            WHERE user_id = $1
+            AND (expires_at IS NULL OR expires_at > now())
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(query, user_id)
+            return [row["skill_id"] for row in rows]
+
+    @staticmethod
+    async def is_blocked(user_id: UUID, skill_id: str) -> bool:
+        """检查 Skill 是否被屏蔽"""
+        query = """
+            SELECT 1
+            FROM skill_recommendation_blocks
+            WHERE user_id = $1 AND skill_id = $2
+            AND (expires_at IS NULL OR expires_at > now())
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, user_id, skill_id)
+            return row is not None

@@ -1,0 +1,795 @@
+# 数据架构重构方案：vibe_users 精简为账户核心表
+
+## 目标
+
+将 `vibe_users` 表从"账户+业务数据混合表"精简为"纯账户核心表"，所有业务数据迁移到 `unified_profiles`。
+
+## 当前状态
+
+### vibe_users (混合表)
+- **账户核心**: id, vibe_id, status, tier, created_at, updated_at
+- **业务数据**: display_name, avatar_url, birth_datetime, birth_location, gender, timezone, language
+- **删除管理**: deletion_requested_at, deletion_scheduled_at
+- **计费**: daily_quota, billing_summary
+
+### unified_profiles (JSONB)
+- **已同步**: profile.account (vibe_id, display_name, tier, status) - 通过 trigger
+- **未同步**: avatar_url, timezone, language, deletion_*, birth_info
+- **独立管理**: preferences, skill_data, life_context, extracted
+
+### 关键约束
+- **19 个表** 通过 FK 依赖 vibe_users.id（必须保留）
+- **vibe_user_auth** 存储认证方法，依赖 vibe_users
+- **认证层** 需要快速检查 vibe_users.status
+- **零停机** 要求渐进式迁移
+
+---
+
+## 最终目标架构
+
+### vibe_users (精简后)
+```sql
+vibe_users (
+  id UUID PRIMARY KEY,
+  vibe_id VARCHAR(20) UNIQUE NOT NULL,
+  status VARCHAR(20) DEFAULT 'active',    -- 认证检查用
+  tier VARCHAR(20) DEFAULT 'free',        -- 计费层级 ✅ 保留
+  daily_quota INTEGER DEFAULT 10,          -- 每日配额 ✅ 保留
+  billing_summary JSONB DEFAULT '{}',      -- 账单摘要 ✅ 保留
+  created_at TIMESTAMP DEFAULT NOW(),      -- 注册时间 ✅ 保留
+  updated_at TIMESTAMP DEFAULT NOW()
+)
+```
+
+**设计原则**：
+- **账户核心**: id, vibe_id, status, created_at (不可变)
+- **计费相关**: tier, daily_quota, billing_summary (快速查询)
+- **业务数据**: 全部迁移到 unified_profiles
+
+### unified_profiles.profile (完整)
+```json
+{
+  "account": {
+    "vibe_id": "VB-xxx",
+    "display_name": "用户昵称",
+    "avatar_url": "https://...",
+    "tier": "free",
+    "status": "active",
+    "deletion_requested_at": null,
+    "deletion_scheduled_at": null
+  },
+  "birth_info": {
+    "date": "1990-05-15",
+    "time": "14:30:00",
+    "place": "北京",
+    "gender": "male",
+    "timezone": "Asia/Shanghai"
+  },
+  "preferences": {
+    "timezone": "Asia/Shanghai",
+    "language": "zh-CN",
+    "voice_mode": "warm",
+    ...
+  },
+  "skill_data": {...},
+  "life_context": {...},
+  "extracted": {...}
+}
+```
+
+---
+
+## 实施计划（4 周，零停机）
+
+### Week 1: 基础设施 (Migration 021)
+
+#### Day 1-2: Schema 增强
+**文件**: `apps/api/stores/migrations/021_migrate_to_unified_profile.sql`
+
+```sql
+-- 1. 增强 sync trigger（替换 Migration 019）
+CREATE OR REPLACE FUNCTION sync_account_to_profile_enhanced()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- 确保 unified_profiles 记录存在
+    INSERT INTO unified_profiles (user_id, profile)
+    VALUES (NEW.id, '{}'::jsonb)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    -- 同步所有字段到 unified_profiles
+    UPDATE unified_profiles
+    SET profile = jsonb_set(
+        jsonb_set(
+            jsonb_set(
+                COALESCE(profile, '{}'::jsonb),
+                '{account}',
+                jsonb_build_object(
+                    'vibe_id', NEW.vibe_id,
+                    'display_name', COALESCE(NEW.display_name, ''),
+                    'avatar_url', NEW.avatar_url,
+                    'tier', COALESCE(NEW.tier, 'free'),
+                    'status', COALESCE(NEW.status, 'active'),
+                    'deletion_requested_at', NEW.deletion_requested_at,
+                    'deletion_scheduled_at', NEW.deletion_scheduled_at
+                )
+            ),
+            '{preferences}',
+            jsonb_set(
+                jsonb_set(
+                    COALESCE(profile -> 'preferences', '{}'::jsonb),
+                    '{timezone}',
+                    to_jsonb(COALESCE(NEW.timezone, 'Asia/Shanghai'))
+                ),
+                '{language}',
+                to_jsonb(COALESCE(NEW.language, 'zh-CN'))
+            )
+        ),
+        '{birth_info}',
+        CASE
+            WHEN NEW.birth_datetime IS NOT NULL THEN
+                jsonb_build_object(
+                    'date', to_char(NEW.birth_datetime, 'YYYY-MM-DD'),
+                    'time', to_char(NEW.birth_datetime, 'HH24:MI:SS'),
+                    'place', COALESCE(NEW.birth_location, ''),
+                    'gender', COALESCE(NEW.gender, ''),
+                    'timezone', COALESCE(NEW.timezone, 'Asia/Shanghai')
+                )
+            ELSE
+                COALESCE(profile -> 'birth_info', '{}'::jsonb)
+        END
+    ),
+    updated_at = NOW()
+    WHERE user_id = NEW.id;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. 创建/替换 trigger（监听所有相关字段）
+DROP TRIGGER IF EXISTS trigger_sync_account_to_profile ON vibe_users;
+CREATE TRIGGER trigger_sync_account_to_profile
+    AFTER INSERT OR UPDATE OF
+        vibe_id, display_name, avatar_url, tier, status,
+        birth_datetime, birth_location, gender,
+        timezone, language,
+        deletion_requested_at, deletion_scheduled_at
+    ON vibe_users
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_account_to_profile_enhanced();
+
+-- 3. Backfill 现有数据
+DO $$
+DECLARE
+    migrated_count INT;
+BEGIN
+    -- 对所有现有用户执行同步
+    WITH updated AS (
+        UPDATE unified_profiles up
+        SET profile = (
+            SELECT jsonb_build_object(
+                'account', jsonb_build_object(
+                    'vibe_id', vu.vibe_id,
+                    'display_name', COALESCE(vu.display_name, ''),
+                    'avatar_url', vu.avatar_url,
+                    'tier', COALESCE(vu.tier, 'free'),
+                    'status', COALESCE(vu.status, 'active'),
+                    'deletion_requested_at', vu.deletion_requested_at,
+                    'deletion_scheduled_at', vu.deletion_scheduled_at
+                ),
+                'birth_info', CASE
+                    WHEN vu.birth_datetime IS NOT NULL THEN
+                        jsonb_build_object(
+                            'date', to_char(vu.birth_datetime, 'YYYY-MM-DD'),
+                            'time', to_char(vu.birth_datetime, 'HH24:MI:SS'),
+                            'place', COALESCE(vu.birth_location, ''),
+                            'gender', COALESCE(vu.gender, ''),
+                            'timezone', COALESCE(vu.timezone, 'Asia/Shanghai')
+                        )
+                    ELSE COALESCE(up.profile -> 'birth_info', '{}'::jsonb)
+                END,
+                'preferences', jsonb_set(
+                    jsonb_set(
+                        COALESCE(up.profile -> 'preferences', '{}'::jsonb),
+                        '{timezone}',
+                        to_jsonb(COALESCE(vu.timezone, 'Asia/Shanghai'))
+                    ),
+                    '{language}',
+                    to_jsonb(COALESCE(vu.language, 'zh-CN'))
+                )
+            ) || COALESCE(up.profile, '{}'::jsonb)
+        ),
+        updated_at = NOW()
+        FROM vibe_users vu
+        WHERE up.user_id = vu.id
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO migrated_count FROM updated;
+
+    RAISE NOTICE 'Migrated % user profiles', migrated_count;
+END $$;
+
+-- 4. 添加索引优化 JSONB 查询
+CREATE INDEX IF NOT EXISTS idx_profile_account_status
+    ON unified_profiles ((profile->'account'->>'status'));
+
+CREATE INDEX IF NOT EXISTS idx_profile_account_vibe_id
+    ON unified_profiles ((profile->'account'->>'vibe_id'));
+```
+
+#### Day 3: 验证数据一致性
+**文件**: `apps/api/scripts/verify_migration_021.py`
+
+```python
+async def verify_all_users():
+    """验证所有用户数据已正确同步"""
+    async with get_connection() as conn:
+        mismatches = await conn.fetch("""
+            SELECT
+                vu.id,
+                vu.vibe_id,
+                vu.display_name AS vu_name,
+                up.profile->'account'->>'display_name' AS up_name,
+                vu.status AS vu_status,
+                up.profile->'account'->>'status' AS up_status
+            FROM vibe_users vu
+            LEFT JOIN unified_profiles up ON vu.id = up.user_id
+            WHERE
+                vu.display_name IS DISTINCT FROM (up.profile->'account'->>'display_name')
+                OR vu.status IS DISTINCT FROM (up.profile->'account'->>'status')
+        """)
+
+        if mismatches:
+            logger.error(f"Found {len(mismatches)} mismatches!")
+            return False
+
+        logger.info("✅ All data verified consistent")
+        return True
+```
+
+#### Day 4-5: Repository 层增强
+**文件**: `apps/api/stores/unified_profile_repo.py`
+
+添加新方法：
+```python
+@staticmethod
+async def get_account_full(user_id: UUID) -> Dict[str, Any]:
+    """获取完整账户信息（替代 UserRepository.get_by_id）"""
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+    if not profile:
+        return {}
+
+    account = profile.get("account", {})
+    prefs = profile.get("preferences", {})
+
+    return {
+        "vibe_id": account.get("vibe_id"),
+        "display_name": account.get("display_name"),
+        "avatar_url": account.get("avatar_url"),
+        "tier": account.get("tier", "free"),
+        "status": account.get("status", "active"),
+        "timezone": prefs.get("timezone", "Asia/Shanghai"),
+        "language": prefs.get("language", "zh-CN"),
+        "deletion_requested_at": account.get("deletion_requested_at"),
+        "deletion_scheduled_at": account.get("deletion_scheduled_at"),
+    }
+
+@staticmethod
+async def update_account_info(
+    user_id: UUID,
+    display_name: str = None,
+    avatar_url: str = None
+) -> None:
+    """更新账户信息（双写到 vibe_users 保持同步）"""
+    update_data = {}
+    if display_name is not None:
+        update_data["display_name"] = display_name
+    if avatar_url is not None:
+        update_data["avatar_url"] = avatar_url
+
+    if update_data:
+        # Week 1-3: 写入 vibe_users，trigger 自动同步
+        await UserRepository.update(user_id, **update_data)
+        # Week 4: 直接写入 unified_profiles
+
+@staticmethod
+async def update_deletion_status(
+    user_id: UUID,
+    status: str,
+    deletion_requested_at: datetime = None,
+    deletion_scheduled_at: datetime = None
+) -> None:
+    """更新删除状态"""
+    # Week 1-3: 写入 vibe_users
+    await UserRepository.update(
+        user_id,
+        status=status,
+        deletion_requested_at=deletion_requested_at,
+        deletion_scheduled_at=deletion_scheduled_at
+    )
+```
+
+---
+
+### Week 2: Service 层迁移（双写期）
+
+#### Day 1-2: OAuth Services
+**文件**: `apps/api/services/identity/oauth.py`
+
+```python
+# 修改 google_login() - L116-141
+# 修改 apple_login() - L260-285
+
+# BEFORE:
+user = await UserRepository.create(
+    display_name=google_user.get("name"),
+    birth_datetime=onboarding_data.get("birth_datetime"),
+    birth_location=onboarding_data.get("birth_location"),
+    gender=onboarding_data.get("gender")
+)
+
+# AFTER:
+# 1. 仅创建账户核心（vibe_users）
+user = await UserRepository.create()
+
+# 2. 通过 vibe_users 更新触发同步（双写期）
+if onboarding_data:
+    await UserRepository.update(
+        user["id"],
+        display_name=google_user.get("name"),
+        birth_datetime=onboarding_data.get("birth_datetime"),
+        birth_location=onboarding_data.get("birth_location"),
+        gender=onboarding_data.get("gender")
+    )
+    # Trigger 自动同步到 unified_profiles
+
+# 3. 创建 Skill profile（如果提供）
+if onboarding_data and onboarding_data.get("skill"):
+    await UserRepository.create_skill_profile(...)
+```
+
+**文件**: `apps/api/services/identity/wechat.py` - 类似修改 L319-323
+
+#### Day 3: Guest Session Service
+**文件**: `apps/api/services/identity/guest_session.py`
+
+```python
+# 修改 link_to_user() - L111-121
+
+# BEFORE:
+update_data = {}
+if session.get("birth_datetime"):
+    update_data["birth_datetime"] = session["birth_datetime"]
+# ...
+await UserRepository.update(user_id, **update_data)
+
+# AFTER:
+# 仍然通过 vibe_users 更新（trigger 同步）
+update_data = {}
+if session.get("birth_datetime"):
+    update_data["birth_datetime"] = session["birth_datetime"]
+if session.get("birth_location"):
+    update_data["birth_location"] = session["birth_location"]
+if session.get("gender"):
+    update_data["gender"] = session["gender"]
+
+if update_data:
+    await UserRepository.update(user_id, **update_data)
+    # Trigger 自动同步到 unified_profiles
+```
+
+#### Day 4-5: 监控双写一致性
+
+部署监控脚本，持续验证：
+```python
+# 每小时运行
+async def monitor_sync_health():
+    """监控 vibe_users 和 unified_profiles 同步健康度"""
+    mismatches = await check_data_consistency()
+    if mismatches > 0:
+        send_alert(f"Found {mismatches} sync mismatches!")
+```
+
+---
+
+### Week 3: API 层迁移
+
+#### Day 1-2: Account API (GET endpoints)
+**文件**: `apps/api/routes/account.py`
+
+```python
+# 修改 get_profile() - L455-472
+@router.get("/profile", response_model=ProfileResponse)
+async def get_profile(current_user: CurrentUser = Depends(get_current_user)):
+    # BEFORE:
+    # user = await UserRepository.get_by_id(current_user.user_id)
+
+    # AFTER:
+    account = await UnifiedProfileRepository.get_account_full(current_user.user_id)
+    birth_info = await UnifiedProfileRepository.get_birth_info(current_user.user_id)
+
+    # 构造返回
+    birth_datetime = None
+    if birth_info and birth_info.get("date"):
+        birth_datetime = f"{birth_info['date']} {birth_info.get('time', '12:00:00')}"
+
+    # created_at 从 vibe_users 获取
+    user = await UserRepository.get_by_id(current_user.user_id)
+
+    return ProfileResponse(
+        user_id=str(current_user.user_id),
+        vibe_id=account.get("vibe_id"),
+        display_name=account.get("display_name"),
+        avatar_url=account.get("avatar_url"),
+        birth_datetime=birth_datetime,
+        birth_location=birth_info.get("place"),
+        timezone=account.get("timezone"),
+        language=account.get("language"),
+        created_at=user["created_at"] if user else datetime.utcnow()
+    )
+
+# 修改 get_me() - L248-265
+@router.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: CurrentUser = Depends(get_current_user)):
+    # 从 unified_profiles 读取
+    account = await UnifiedProfileRepository.get_account_full(current_user.user_id)
+
+    # Email 仍从 vibe_user_auth 获取
+    email = None
+    auth_record = await UserRepository.get_auth_by_user_id(current_user.user_id, "email")
+    if auth_record:
+        email = auth_record.get("auth_identifier")
+
+    return UserResponse(
+        user_id=str(current_user.user_id),
+        vibe_id=account.get("vibe_id"),
+        display_name=account.get("display_name"),
+        avatar_url=account.get("avatar_url"),
+        email=email
+    )
+```
+
+#### Day 3: Account API (PUT endpoints)
+```python
+# 修改 update_profile() - L475-497
+@router.put("/profile", response_model=ProfileResponse)
+async def update_profile(
+    request: ProfileUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    update_data = request.model_dump(exclude_unset=True)
+
+    # 分离字段更新
+    if "display_name" in update_data or "avatar_url" in update_data:
+        await UnifiedProfileRepository.update_account_info(
+            current_user.user_id,
+            display_name=update_data.get("display_name"),
+            avatar_url=update_data.get("avatar_url")
+        )
+
+    if "birth_datetime" in update_data or "birth_location" in update_data:
+        # 解析 birth_datetime
+        dt = update_data.get("birth_datetime")
+        await UnifiedProfileRepository.update_birth_info(
+            current_user.user_id,
+            {
+                "date": dt.date().isoformat() if dt else None,
+                "time": dt.time().isoformat() if dt else "12:00:00",
+                "place": update_data.get("birth_location")
+            }
+        )
+
+    if "timezone" in update_data or "language" in update_data:
+        await UnifiedProfileRepository.update_preferences(
+            current_user.user_id,
+            {
+                "timezone": update_data.get("timezone"),
+                "language": update_data.get("language")
+            }
+        )
+
+    # 返回更新后的 profile
+    return await get_profile(current_user)
+```
+
+#### Day 4-5: Account Deletion Service
+**文件**: `apps/api/services/identity/account_deletion.py`
+
+```python
+# 修改 request_deletion() - L62-67
+async def request_deletion(user_id: UUID):
+    await UnifiedProfileRepository.update_deletion_status(
+        user_id,
+        status="pending_deletion",
+        deletion_requested_at=now,
+        deletion_scheduled_at=scheduled_at
+    )
+
+# 修改 cancel_deletion() - L100-105
+async def cancel_deletion(user_id: UUID):
+    await UnifiedProfileRepository.update_deletion_status(
+        user_id,
+        status="active",
+        deletion_requested_at=None,
+        deletion_scheduled_at=None
+    )
+
+# 修改 _hard_delete_user() - L281-298
+# 删除 unified_profiles 记录（CASCADE 会自动处理）
+await conn.execute("DELETE FROM unified_profiles WHERE user_id = $1", user_id)
+
+# vibe_users 保留 tombstone（保留 id, vibe_id, status, tier, created_at 用于 audit）
+await conn.execute("""
+    UPDATE vibe_users
+    SET status = 'deleted',
+        daily_quota = 0,
+        billing_summary = '{}'::jsonb,
+        updated_at = NOW()
+    WHERE id = $1
+""", user_id)
+
+# 注意：移除代码中对 email, phone 列的引用（这些在 vibe_user_auth 表）
+```
+
+---
+
+### Week 4: Schema 清理 (Migration 022)
+
+#### Day 1-3: 集成测试（1000+ 测试用户）
+
+运行完整测试套件：
+```bash
+# 注册流程测试
+pytest tests/integration/test_oauth_registration.py
+
+# Profile CRUD 测试
+pytest tests/integration/test_profile_api.py
+
+# 账户删除测试
+pytest tests/integration/test_account_deletion.py
+
+# 数据一致性测试
+python scripts/verify_migration_021.py
+```
+
+#### Day 4: 创建反向同步 trigger（status only）
+
+**文件**: `apps/api/stores/migrations/022_cleanup_vibe_users.sql`
+
+```sql
+-- Part 1: 反向同步 trigger（仅 status）
+CREATE OR REPLACE FUNCTION sync_status_from_profile()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- 仅当 status 改变时才更新 vibe_users
+    IF OLD.profile->'account'->>'status' IS DISTINCT FROM NEW.profile->'account'->>'status' THEN
+        UPDATE vibe_users
+        SET status = NEW.profile->'account'->>'status',
+            updated_at = NOW()
+        WHERE id = NEW.user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_sync_status_from_profile
+    AFTER UPDATE OF profile ON unified_profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_status_from_profile();
+```
+
+#### Day 5: 删除业务字段（维护窗口）
+
+```sql
+-- Part 2: 删除业务字段（保留账户和计费字段）
+ALTER TABLE vibe_users
+    DROP COLUMN IF EXISTS display_name CASCADE,
+    DROP COLUMN IF EXISTS avatar_url CASCADE,
+    DROP COLUMN IF EXISTS birth_datetime CASCADE,
+    DROP COLUMN IF EXISTS birth_location CASCADE,
+    DROP COLUMN IF EXISTS gender CASCADE,
+    DROP COLUMN IF EXISTS timezone CASCADE,
+    DROP COLUMN IF EXISTS language CASCADE,
+    DROP COLUMN IF EXISTS deletion_requested_at CASCADE,
+    DROP COLUMN IF EXISTS deletion_scheduled_at CASCADE;
+
+-- 保留的列：
+-- id, vibe_id, status, tier, daily_quota, billing_summary, created_at, updated_at
+
+-- Part 3: 添加注释
+COMMENT ON TABLE vibe_users IS
+'Account core table - stores only authentication essentials. All business data in unified_profiles.';
+
+COMMENT ON COLUMN vibe_users.status IS
+'Account status for auth check: active | pending_deletion | deleted';
+
+-- Part 4: 验证最终结构
+DO $$
+DECLARE
+    expected_cols TEXT[] := ARRAY['id', 'vibe_id', 'status', 'tier', 'daily_quota', 'billing_summary', 'created_at', 'updated_at'];
+    actual_col_count INT;
+BEGIN
+    SELECT COUNT(*) INTO actual_col_count
+    FROM information_schema.columns
+    WHERE table_name = 'vibe_users'
+    AND column_name = ANY(expected_cols);
+
+    IF actual_col_count < 8 THEN
+        RAISE EXCEPTION 'vibe_users cleanup incomplete! Expected 8 columns, found %', actual_col_count;
+    END IF;
+
+    RAISE NOTICE '✅ vibe_users cleanup complete. Retained columns: id, vibe_id, status, tier, daily_quota, billing_summary, created_at, updated_at';
+END $$;
+```
+
+---
+
+## 回滚方案
+
+### Week 1-3 回滚（字段未删除）
+1. 关闭新代码路径（Feature Flag）
+2. 恢复到 UserRepository 读取
+3. 数据仍在 vibe_users，无数据丢失
+
+### Week 4 回滚（字段已删除）
+```sql
+-- 1. 恢复 vibe_users schema
+ALTER TABLE vibe_users
+    ADD COLUMN display_name VARCHAR(100),
+    ADD COLUMN avatar_url TEXT,
+    ADD COLUMN birth_datetime TIMESTAMP,
+    ADD COLUMN birth_location VARCHAR(255),
+    ADD COLUMN gender VARCHAR(10),
+    ADD COLUMN timezone VARCHAR(50) DEFAULT 'Asia/Shanghai',
+    ADD COLUMN language VARCHAR(10) DEFAULT 'zh-CN',
+    ADD COLUMN deletion_requested_at TIMESTAMPTZ,
+    ADD COLUMN deletion_scheduled_at TIMESTAMPTZ;
+
+-- 2. 从 unified_profiles 回填数据
+UPDATE vibe_users vu
+SET
+    display_name = up.profile->'account'->>'display_name',
+    avatar_url = up.profile->'account'->>'avatar_url',
+    birth_datetime = (
+        (up.profile->'birth_info'->>'date' || ' ' ||
+         COALESCE(up.profile->'birth_info'->>'time', '12:00:00'))::timestamp
+    ),
+    birth_location = up.profile->'birth_info'->>'place',
+    gender = up.profile->'birth_info'->>'gender',
+    timezone = up.profile->'preferences'->>'timezone',
+    language = up.profile->'preferences'->>'language',
+    status = up.profile->'account'->>'status',
+    deletion_requested_at = (up.profile->'account'->>'deletion_requested_at')::timestamptz,
+    deletion_scheduled_at = (up.profile->'account'->>'deletion_scheduled_at')::timestamptz
+FROM unified_profiles up
+WHERE vu.id = up.user_id;
+
+-- 3. 恢复正向 trigger
+DROP TRIGGER IF EXISTS trigger_sync_account_to_profile ON vibe_users;
+CREATE TRIGGER trigger_sync_account_to_profile...
+```
+
+---
+
+## 风险评估
+
+| 风险 | 严重度 | 缓解措施 |
+|------|--------|---------|
+| Trigger 性能开销 | 中 | 仅在 UPDATE 时触发，不影响 SELECT；添加 GIN 索引优化 JSONB 查询 |
+| JSONB 查询性能 | 中 | 添加表达式索引 `(profile->'account'->>'status')`；监控查询时间 |
+| 数据不一致 | 高 | 双写期持续监控；自动化一致性检查；告警机制 |
+| 认证系统中断 | 严重 | 保留 vibe_users.status；反向同步 trigger；快速回滚能力 |
+| 回滚复杂度 | 中 | 测试回滚脚本；保留完整的数据恢复 SQL |
+| FK 完整性破坏 | 严重 | 仅删除列，不删除表；19 个 FK 保持不变 |
+
+---
+
+## 关键文件清单
+
+### 新建文件
+- `apps/api/stores/migrations/021_migrate_to_unified_profile.sql` (核心迁移)
+- `apps/api/stores/migrations/022_cleanup_vibe_users.sql` (清理)
+- `apps/api/scripts/verify_migration_021.py` (验证工具)
+
+### 修改文件
+- `apps/api/stores/unified_profile_repo.py` (+150 行，新增 get_account_full, update_account_info, update_deletion_status)
+- `apps/api/services/identity/oauth.py` (L116-141, L260-285)
+- `apps/api/services/identity/wechat.py` (L319-323)
+- `apps/api/services/identity/guest_session.py` (L111-121)
+- `apps/api/routes/account.py` (L248-265, L455-497)
+- `apps/api/services/identity/account_deletion.py` (L62-67, L100-105, L281-298)
+
+---
+
+## 验证清单
+
+### 数据迁移验证
+- [ ] 所有 vibe_users 记录都有对应的 unified_profiles
+- [ ] display_name 字段 100% 一致
+- [ ] birth_datetime 正确转换为 birth_info (date + time)
+- [ ] deletion_* 字段正确迁移
+- [ ] avatar_url, timezone, language 正确迁移
+
+### 功能验证
+- [ ] OAuth 注册流程（Google, Apple, WeChat）
+- [ ] 访客转正式用户
+- [ ] GET /profile 返回完整数据
+- [ ] PUT /profile 更新成功
+- [ ] 账户删除流程（软删除 + 硬删除）
+- [ ] 认证检查（status 验证）
+
+### 性能验证
+- [ ] Trigger 执行时间 < 10ms
+- [ ] JSONB 查询时间与关系查询持平
+- [ ] API 响应时间增幅 < 5%
+
+---
+
+## 架构决策（已确认）
+
+### ✅ 1. 计费字段保留在 vibe_users
+- **tier, daily_quota, billing_summary** 保留在 vibe_users
+- **原因**: 计费系统需要快速查询，避免 JSONB 解析开销
+
+### ✅ 2. created_at 保留在 vibe_users
+- **created_at** 是账户级别的不可变信息
+- **API 实现**: ProfileResponse 需要从 vibe_users 读取 created_at
+
+### ✅ 3. 删除策略：保留 tombstone
+- 硬删除后保留 vibe_users 记录（id, vibe_id, status='deleted', created_at）
+- **原因**: Audit trail + 防止 vibe_id 复用
+
+### ✅ 4. email/phone 字段处理
+- 这些字段在 vibe_user_auth 表中（auth_identifier）
+- account_deletion.py 的 SQL 可能已过时，需要移除这两列的引用
+
+### ✅ 5. vibe_users 和 vibe_user_auth 保持分离
+
+**当前架构**：
+```
+vibe_users (账户+计费表)
+├── id, vibe_id, status, tier
+├── daily_quota, billing_summary
+└── created_at, updated_at
+
+vibe_user_auth (认证方法表)
+├── user_id FK → vibe_users.id
+├── auth_type: 'email' | 'phone' | 'google' | 'apple' | 'wechat'
+├── auth_identifier: email 地址 | 手机号 | OAuth provider_id
+└── auth_credential: 密码 hash (仅 email/phone 类型)
+```
+
+**代码证据**：
+```python
+# user_repo.py L215-222
+async def get_user_auths(user_id: UUID) -> List[dict]:
+    """Get all auth methods for user"""
+    # 返回 List 说明支持多个认证方式
+
+# account_deletion.py L212-215
+await conn.execute(
+    "DELETE FROM vibe_user_auth WHERE user_id = $1",
+    user_id
+)
+# 删除时清理认证记录，保留 vibe_users tombstone
+```
+
+**当前实际使用模式**：
+- 每个用户只有一个认证方式（注册时创建）
+- 不支持账号绑定（添加第二种登录方式）
+- OAuth 注册时检查 email 防止重复账号（oauth.py L102-113）
+
+**分离的优势**：
+1. **灵活性**: 表结构支持一个用户有多个认证方式（虽然当前未实现账号绑定）
+2. **安全性**: 认证凭证（auth_credential）与用户数据物理隔离
+3. **可扩展性**: 容易添加新的认证方式（WebAuthn, SAML, 生物识别等）
+4. **职责清晰**: vibe_users 管理"账户身份"，vibe_user_auth 管理"认证方法"
+5. **行业标准**: 符合 RBAC 和 Identity Provider 设计模式
+
+**不建议合并的原因**：
+- ❌ 未来账号绑定是常见需求（微信+手机+邮箱同时登录一个账号）
+- ❌ 合并后难以扩展到多认证方式（需要重新拆表）
+- ❌ 当前分离设计没有性能问题（19 个表已有 FK 依赖，JOIN 开销可忽略）
+- ❌ 迁移成本高，收益不明显（代码改动大，测试复杂）
+- ❌ 安全最佳实践：认证数据应独立存储（便于审计和加密策略）
+
+**结论**: **强烈建议保持 vibe_users 和 vibe_user_auth 分离**，这是经过验证的架构模式。

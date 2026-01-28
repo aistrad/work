@@ -1,0 +1,725 @@
+"""
+JITAI (Just-In-Time Adaptive Interventions) Service.
+
+REQ: REQ-JITAI-001 ~ REQ-JITAI-004
+Design: §3.5.1
+HOS-REF: §6.1, §6.2
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from models.jitai import (
+    InterventionType,
+    JITAICondition,
+    JITAICooldown,
+    JITAIEvaluationResult,
+    JITAIIntervention,
+    JITAITrigger,
+    TriggerCategory,
+    TriggerEvaluationResult,
+)
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+# =============================================================================
+# Predefined Triggers (TASK-6.1.2)
+# =============================================================================
+
+JITAI_TRIGGERS: List[JITAITrigger] = [
+    # Morning check-in trigger
+    JITAITrigger(
+        trigger_id="morning_checkin",
+        name="早安打卡提醒",
+        description="每天早上提醒用户进行情绪打卡",
+        category=TriggerCategory.TIME_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="time",
+                time_condition={
+                    "type": "time_range",
+                    "start_time": "07:00:00",
+                    "end_time": "09:00:00",
+                },
+            ),
+            JITAICondition(
+                condition_type="event",
+                event_condition={
+                    "type": "no_activity",
+                    "hours_since": 12,
+                    "event_type": "checkin",
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.PUSH,
+        intervention_template={
+            "title": "早安 ☀️",
+            "body": "新的一天开始了，花1分钟记录一下你的状态吧",
+            "action": {"type": "checkin"},
+        },
+        priority=7,
+        cooldown_hours=20,
+    ),
+
+    # Low energy intervention
+    JITAITrigger(
+        trigger_id="low_energy_intervention",
+        name="低能量干预",
+        description="当用户能量值过低时提供支持",
+        category=TriggerCategory.STATE_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="state",
+                state_condition={
+                    "type": "twin_field",
+                    "field_path": "dimension_scores.energy",
+                    "operator": "lt",
+                    "value": 30,
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.IN_APP,
+        intervention_template={
+            "title": "能量补给站",
+            "body": "检测到你的能量有点低，试试这个3分钟的能量重启练习？",
+            "action": {"type": "commitment", "template": "energy_boost_3min"},
+            "card_type": "suggestion",
+        },
+        priority=8,
+        cooldown_hours=6,
+    ),
+
+    # Retrograde warning
+    JITAITrigger(
+        trigger_id="retrograde_warning",
+        name="水逆预警",
+        description="水星逆行期间的提醒",
+        category=TriggerCategory.ASTRO_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="state",
+                state_condition={
+                    "type": "twin_field",
+                    "field_path": "dynamic_astro.mercury_retrograde",
+                    "operator": "eq",
+                    "value": True,
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.PUSH,
+        intervention_template={
+            "title": "水逆期间小贴士",
+            "body": "水星逆行中，建议多检查沟通细节，避免重大决定",
+            "action": {"type": "read_more", "topic": "mercury_retrograde"},
+        },
+        priority=5,
+        cooldown_hours=72,
+    ),
+
+    # Streak celebration
+    JITAITrigger(
+        trigger_id="streak_celebration",
+        name="连续打卡庆祝",
+        description="庆祝用户的连续打卡成就",
+        category=TriggerCategory.EVENT_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="state",
+                state_condition={
+                    "type": "streak",
+                    "field_path": "growth_streak",
+                    "operator": "gte",
+                    "value": 7,
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.IN_APP,
+        intervention_template={
+            "title": "🎉 连续 {streak} 天！",
+            "body": "太棒了！你已经连续坚持了 {streak} 天，继续保持！",
+            "action": {"type": "share", "card_type": "achievement"},
+            "card_type": "celebration",
+        },
+        priority=6,
+        cooldown_hours=168,  # 7 days
+    ),
+
+    # Commitment reminder
+    JITAITrigger(
+        trigger_id="commitment_reminder",
+        name="承诺提醒",
+        description="提醒用户完成即将到期的承诺",
+        category=TriggerCategory.EVENT_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="event",
+                event_condition={
+                    "type": "commitment_due",
+                    "hours_since": 2,  # Due within 2 hours
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.PUSH,
+        intervention_template={
+            "title": "任务提醒",
+            "body": "你的任务「{commitment_title}」即将到期，现在完成它？",
+            "action": {"type": "commitment", "commitment_id": "{commitment_id}"},
+        },
+        priority=9,
+        cooldown_hours=4,
+    ),
+
+    # Plan daily reminder
+    JITAITrigger(
+        trigger_id="plan_daily",
+        name="计划每日提醒",
+        description="提醒用户完成当天的计划任务",
+        category=TriggerCategory.TIME_BASED,
+        conditions=[
+            JITAICondition(
+                condition_type="time",
+                time_condition={
+                    "type": "time_range",
+                    "start_time": "09:00:00",
+                    "end_time": "10:00:00",
+                },
+            ),
+            JITAICondition(
+                condition_type="event",
+                event_condition={
+                    "type": "plan_day",
+                },
+            ),
+        ],
+        conditions_logic="all",
+        intervention_type=InterventionType.PUSH,
+        intervention_template={
+            "title": "今日计划",
+            "body": "第 {day_no} 天：{day_title}",
+            "action": {"type": "plan", "enrollment_id": "{enrollment_id}"},
+        },
+        priority=7,
+        cooldown_hours=20,
+    ),
+]
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _get_trigger_by_id(trigger_id: str) -> Optional[JITAITrigger]:
+    """Get trigger configuration by ID."""
+    for trigger in JITAI_TRIGGERS:
+        if trigger.trigger_id == trigger_id:
+            return trigger
+    return None
+
+
+# =============================================================================
+# Cooldown Management
+# =============================================================================
+
+def is_cooldown_active(user_id: int, trigger_id: str) -> bool:
+    """Check if cooldown is active for a trigger."""
+    row = fortune_db.fetch_one(
+        """
+        SELECT expires_at FROM fortune_jitai_cooldown
+        WHERE user_id = %s AND trigger_id = %s
+        """,
+        [user_id, trigger_id],
+    )
+
+    if not row:
+        return False
+
+    return row["expires_at"] > _now_utc()
+
+
+def set_cooldown(user_id: int, trigger_id: str, hours: int) -> None:
+    """Set cooldown for a trigger."""
+    expires_at = _now_utc() + timedelta(hours=hours)
+
+    fortune_db.execute(
+        """
+        INSERT INTO fortune_jitai_cooldown (user_id, trigger_id, expires_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id, trigger_id) DO UPDATE SET
+            expires_at = %s
+        """,
+        [user_id, trigger_id, expires_at, expires_at],
+    )
+
+
+def clear_expired_cooldowns() -> int:
+    """Clear expired cooldowns. Returns count of cleared."""
+    result = fortune_db.execute(
+        "DELETE FROM fortune_jitai_cooldown WHERE expires_at < %s",
+        [_now_utc()],
+    )
+    return result
+
+
+# =============================================================================
+# Condition Evaluation
+# =============================================================================
+
+def _parse_time_value(value: Any) -> time:
+    """
+    Parse time value from various formats.
+
+    Handles:
+    - datetime.time objects (from Pydantic model_dump)
+    - str in "HH:MM:SS" format
+    - str in "HH:MM" format
+    """
+    if isinstance(value, time):
+        return value
+    if isinstance(value, str):
+        # Try HH:MM:SS format first
+        try:
+            return datetime.strptime(value, "%H:%M:%S").time()
+        except ValueError:
+            pass
+        # Try HH:MM format
+        try:
+            return datetime.strptime(value, "%H:%M").time()
+        except ValueError:
+            pass
+    raise ValueError(f"Cannot parse time value: {value}")
+
+
+def _evaluate_time_condition(condition: Dict[str, Any], user_tz_offset: float = 8.0) -> bool:
+    """
+    Evaluate a time-based condition.
+
+    Handles both time objects and string formats for compatibility
+    with Pydantic model_dump() output.
+    """
+    now = _now_utc()
+    # Convert to user's local time
+    user_now = now + timedelta(hours=user_tz_offset)
+    current_time = user_now.time()
+
+    cond_type = condition.get("type")
+
+    if cond_type == "time_range":
+        try:
+            start = _parse_time_value(condition["start_time"])
+            end = _parse_time_value(condition["end_time"])
+            return start <= current_time <= end
+        except (KeyError, ValueError) as e:
+            logger.warning("Invalid time_range condition: %s", str(e))
+            return False
+
+    elif cond_type == "specific_time":
+        try:
+            target = _parse_time_value(condition["specific_time"])
+            # Allow 30 minute window
+            target_dt = datetime.combine(user_now.date(), target)
+            diff = abs((user_now - target_dt).total_seconds())
+            return diff <= 1800  # 30 minutes
+        except (KeyError, ValueError) as e:
+            logger.warning("Invalid specific_time condition: %s", str(e))
+            return False
+
+    elif cond_type == "day_of_week":
+        days = condition.get("days", [])
+        return user_now.weekday() in days
+
+    return False
+
+
+def _evaluate_state_condition(condition: Dict[str, Any], twin_data: Dict[str, Any]) -> bool:
+    """Evaluate a state-based condition."""
+    cond_type = condition.get("type")
+
+    if cond_type == "twin_field":
+        field_path = condition.get("field_path", "")
+        operator = condition.get("operator")
+        target_value = condition.get("value")
+
+        # Navigate to field
+        current = twin_data
+        for part in field_path.split("."):
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                return False
+
+        if current is None:
+            return False
+
+        # Compare
+        if operator == "lt":
+            return current < target_value
+        elif operator == "gt":
+            return current > target_value
+        elif operator == "eq":
+            return current == target_value
+        elif operator == "lte":
+            return current <= target_value
+        elif operator == "gte":
+            return current >= target_value
+        elif operator == "between":
+            value_max = condition.get("value_max")
+            return target_value <= current <= value_max
+
+    elif cond_type == "streak":
+        streak = twin_data.get("growth_streak", 0)
+        operator = condition.get("operator")
+        target = condition.get("value")
+
+        if operator == "gte":
+            return streak >= target
+        elif operator == "eq":
+            return streak == target
+
+    return False
+
+
+def _evaluate_event_condition(condition: Dict[str, Any], user_id: int) -> bool:
+    """Evaluate an event-based condition."""
+    cond_type = condition.get("type")
+
+    if cond_type == "no_activity":
+        hours_since = condition.get("hours_since", 24)
+        event_type = condition.get("event_type")
+
+        # Check last activity
+        if event_type == "checkin":
+            row = fortune_db.fetch_one(
+                """
+                SELECT created_at FROM fortune_checkin
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [user_id],
+            )
+        else:
+            row = fortune_db.fetch_one(
+                """
+                SELECT created_at FROM fortune_conversation_message
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [user_id],
+            )
+
+        if not row:
+            return True  # No activity ever
+
+        last_activity = row["created_at"]
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+
+        hours_elapsed = (_now_utc() - last_activity).total_seconds() / 3600
+        return hours_elapsed >= hours_since
+
+    elif cond_type == "commitment_due":
+        hours_until = condition.get("hours_since", 2)
+        now = _now_utc()
+        due_threshold = now + timedelta(hours=hours_until)
+
+        row = fortune_db.fetch_one(
+            """
+            SELECT task_id, title FROM fortune_commitment
+            WHERE user_id = %s AND status = 'active' AND due_at IS NOT NULL
+            AND due_at <= %s AND due_at > %s
+            ORDER BY due_at
+            LIMIT 1
+            """,
+            [user_id, due_threshold, now],
+        )
+
+        return row is not None
+
+    elif cond_type == "plan_day":
+        # Check if user has active plan enrollment
+        row = fortune_db.fetch_one(
+            """
+            SELECT e.enrollment_id, e.current_day, p.name, pd.title
+            FROM fortune_plan_enrollment e
+            JOIN fortune_plan p ON e.plan_id = p.plan_id
+            JOIN fortune_plan_day pd ON e.plan_id = pd.plan_id AND e.current_day = pd.day_no
+            WHERE e.user_id = %s AND e.status = 'active'
+            LIMIT 1
+            """,
+            [user_id],
+        )
+
+        return row is not None
+
+    return False
+
+
+# =============================================================================
+# Main Evaluation (TASK-6.1.3)
+# =============================================================================
+
+def evaluate_trigger(
+    trigger: JITAITrigger,
+    user_id: int,
+    twin_data: Dict[str, Any],
+) -> TriggerEvaluationResult:
+    """Evaluate a single trigger for a user."""
+    result = TriggerEvaluationResult(
+        trigger_id=trigger.trigger_id,
+        triggered=False,
+    )
+
+    # Check cooldown
+    if is_cooldown_active(user_id, trigger.trigger_id):
+        result.cooldown_active = True
+        return result
+
+    # Evaluate conditions
+    conditions_met = []
+    conditions_failed = []
+
+    for i, condition in enumerate(trigger.conditions):
+        cond_name = f"condition_{i}"
+        met = False
+
+        if condition.condition_type == "time" and condition.time_condition:
+            met = _evaluate_time_condition(condition.time_condition.model_dump())
+        elif condition.condition_type == "state" and condition.state_condition:
+            met = _evaluate_state_condition(condition.state_condition.model_dump(), twin_data)
+        elif condition.condition_type == "event" and condition.event_condition:
+            met = _evaluate_event_condition(condition.event_condition.model_dump(), user_id)
+
+        if met:
+            conditions_met.append(cond_name)
+        else:
+            conditions_failed.append(cond_name)
+
+    result.conditions_met = conditions_met
+    result.conditions_failed = conditions_failed
+
+    # Check if trigger fires
+    if trigger.conditions_logic == "all":
+        result.triggered = len(conditions_failed) == 0 and len(conditions_met) > 0
+    else:  # "any"
+        result.triggered = len(conditions_met) > 0
+
+    # Create intervention if triggered
+    if result.triggered:
+        result.intervention = JITAIIntervention(
+            user_id=user_id,
+            trigger_id=trigger.trigger_id,
+            intervention_type=trigger.intervention_type,
+            content=trigger.intervention_template.copy(),
+            priority=trigger.priority,
+        )
+
+    return result
+
+
+def evaluate_jitai(user_id: int) -> List[JITAIIntervention]:
+    """
+    Evaluate all JITAI triggers for a user.
+
+    REQ: REQ-JITAI-003
+    Design: §3.5.1
+
+    Returns list of triggered interventions, sorted by priority.
+    """
+    # Get user's twin data
+    from services import twin_service
+
+    try:
+        twin = twin_service.get_twin(user_id, auto_create=False)
+        twin_data = twin.model_dump()
+    except twin_service.TwinNotFoundError:
+        twin_data = {}
+
+    interventions = []
+
+    for trigger in JITAI_TRIGGERS:
+        if not trigger.enabled:
+            continue
+
+        result = evaluate_trigger(trigger, user_id, twin_data)
+
+        if result.triggered and result.intervention:
+            interventions.append(result.intervention)
+
+    # Sort by priority (higher first)
+    interventions.sort(key=lambda x: x.priority, reverse=True)
+
+    return interventions
+
+
+def execute_intervention(intervention: JITAIIntervention) -> int:
+    """
+    Execute an intervention (record and send push).
+
+    REQ: REQ-JITAI-004
+    Design: §3.5.2
+
+    Steps:
+    1. Record intervention in database
+    2. Send push notification via push_service
+    3. Set cooldown
+
+    Returns intervention_id.
+    """
+    now = _now_utc()
+
+    # Record intervention
+    row = fortune_db.execute_returning_one(
+        """
+        INSERT INTO fortune_jitai_intervention (
+            user_id, trigger_id, intervention_type, content, priority, delivered_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING intervention_id
+        """,
+        [
+            intervention.user_id,
+            intervention.trigger_id,
+            intervention.intervention_type.value,
+            json.dumps(intervention.content),
+            intervention.priority,
+            now,
+        ],
+    )
+
+    intervention_id = row["intervention_id"] if row else 0
+
+    # Send push notification if intervention type is PUSH
+    if intervention.intervention_type == InterventionType.PUSH:
+        try:
+            from services import push_service
+
+            push_service.send_jitai_push(
+                user_id=intervention.user_id,
+                trigger_id=intervention.trigger_id,
+                intervention_content=intervention.content,
+                intervention_id=intervention_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to send JITAI push: user=%s trigger=%s error=%s",
+                intervention.user_id, intervention.trigger_id, str(e)
+            )
+
+    # Set cooldown
+    trigger = _get_trigger_by_id(intervention.trigger_id)
+    if trigger:
+        set_cooldown(intervention.user_id, intervention.trigger_id, trigger.cooldown_hours)
+
+    logger.info(
+        "jitai_intervention user=%s trigger=%s type=%s intervention_id=%s",
+        intervention.user_id, intervention.trigger_id, intervention.intervention_type.value, intervention_id
+    )
+
+    return intervention_id
+
+
+def mark_intervention_clicked(intervention_id: int) -> None:
+    """Mark an intervention as clicked."""
+    fortune_db.execute(
+        "UPDATE fortune_jitai_intervention SET clicked_at = %s WHERE intervention_id = %s",
+        [_now_utc(), intervention_id],
+    )
+
+
+def mark_intervention_dismissed(intervention_id: int) -> None:
+    """Mark an intervention as dismissed."""
+    fortune_db.execute(
+        "UPDATE fortune_jitai_intervention SET dismissed_at = %s WHERE intervention_id = %s",
+        [_now_utc(), intervention_id],
+    )
+
+
+# =============================================================================
+# Cron Job
+# =============================================================================
+
+def get_active_users(hours: int = 24) -> List[int]:
+    """Get users who have been active in the last N hours."""
+    threshold = _now_utc() - timedelta(hours=hours)
+
+    rows = fortune_db.fetch_all(
+        """
+        SELECT DISTINCT user_id FROM fortune_conversation_message
+        WHERE created_at > %s
+        UNION
+        SELECT DISTINCT user_id FROM fortune_checkin
+        WHERE created_at > %s
+        UNION
+        SELECT DISTINCT user_id FROM fortune_plan_enrollment
+        WHERE status = 'active'
+        """,
+        [threshold, threshold],
+    )
+
+    return [row["user_id"] for row in rows]
+
+
+def run_jitai_cron() -> Dict[str, Any]:
+    """
+    Run JITAI evaluation for all active users.
+
+    Called by cron endpoint.
+    """
+    import time as time_module
+
+    start_time = time_module.time()
+
+    # Clear expired cooldowns
+    clear_expired_cooldowns()
+
+    # Get active users
+    active_users = get_active_users(hours=48)
+
+    evaluated = 0
+    intervened = 0
+    errors = 0
+    interventions_by_trigger: Dict[str, int] = {}
+
+    for user_id in active_users:
+        try:
+            interventions = evaluate_jitai(user_id)
+            evaluated += 1
+
+            # Execute top intervention (if any)
+            if interventions:
+                top_intervention = interventions[0]
+                execute_intervention(top_intervention)
+                intervened += 1
+
+                trigger_id = top_intervention.trigger_id
+                interventions_by_trigger[trigger_id] = interventions_by_trigger.get(trigger_id, 0) + 1
+
+        except Exception as e:
+            logger.error("jitai_cron_error user=%s error=%s", user_id, str(e))
+            errors += 1
+
+    duration_ms = int((time_module.time() - start_time) * 1000)
+
+    logger.info(
+        "jitai_cron_complete evaluated=%s intervened=%s errors=%s duration_ms=%s",
+        evaluated, intervened, errors, duration_ms
+    )
+
+    return {
+        "evaluated": evaluated,
+        "intervened": intervened,
+        "errors": errors,
+        "duration_ms": duration_ms,
+        "interventions_by_trigger": interventions_by_trigger,
+    }

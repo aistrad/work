@@ -1,0 +1,398 @@
+"""
+Prompt Builder v10 - System Prompt 构建
+
+从 core.py 拆分出来的 Prompt 构建逻辑，支持：
+- Phase 1/Phase 2 分阶段 Prompt
+- 会话恢复 Prompt（断点续传）
+- SOP 规则注入
+- 案例匹配
+
+与 ContextManager 协作：
+- 读取会话上下文
+- 注入断点信息
+"""
+import json
+import logging
+from typing import Optional, Dict, Any, List
+
+from .skill_loader import (
+    load_skill, build_system_prompt,
+    skill_requires_birth_info, skill_requires_compute,
+    get_skill_compute_type, get_skill_compute_tool, get_skill_collect_tool
+)
+from .routing_config import get_phase1_prompt, get_sop_template
+from .context_manager import SessionContext
+
+logger = logging.getLogger(__name__)
+
+
+class PromptBuilder:
+    """
+    System Prompt 构建器
+
+    职责：
+    1. 根据 Phase 构建不同的 Prompt
+    2. 注入会话恢复上下文
+    3. 注入 SOP 规则
+    4. 动态加载案例
+    """
+
+    def __init__(self):
+        self.case_index = None  # Lazy init
+
+    async def build(
+        self,
+        skill_id: Optional[str],
+        rule_id: Optional[str],
+        message: str,
+        profile: Optional[Dict[str, Any]] = None,
+        skill_data: Optional[Dict[str, Any]] = None,
+        session_context: Optional[SessionContext] = None,
+        protocol_prompt: Optional[str] = None
+    ) -> str:
+        """
+        构建 System Prompt
+
+        Args:
+            skill_id: 当前技能 ID
+            rule_id: 当前规则 ID
+            message: 用户消息
+            profile: 用户 Profile
+            skill_data: Skill 数据
+            session_context: 会话上下文（断点续传）
+            protocol_prompt: 协议专用 Prompt（可选）
+
+        Returns:
+            完整的 System Prompt
+        """
+        parts = []
+
+        # ═══════════════════════════════════════════════════════════════
+        # 协议模式：使用协议专用 Prompt
+        # ═══════════════════════════════════════════════════════════════
+        if protocol_prompt:
+            skill = load_skill("lifecoach")
+            if skill:
+                parts.append(f"# {skill.name}\n\n{skill.expert_persona}")
+            parts.append("\n---\n")
+            parts.append(protocol_prompt)
+            return "\n".join(parts)
+
+        if skill_id:
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 2: Skill 执行阶段 - 完整上下文
+            # ═══════════════════════════════════════════════════════════════
+
+            # 基础 Skill Prompt
+            user_ctx = dict(profile) if profile else {}
+            base_prompt = build_system_prompt(skill_id, rule_id, user_ctx)
+            parts.append(base_prompt)
+
+            # 会话恢复上下文（断点续传核心）
+            if session_context and session_context.has_checkpoint:
+                resume_context = session_context.to_prompt_context()
+                if resume_context:
+                    parts.append(resume_context)
+
+            # SOP 规则
+            sop_rules = self._build_sop_rules(skill_id, profile, skill_data)
+            if sop_rules:
+                parts.append(sop_rules)
+
+            # 案例匹配
+            cases_text = await self._match_cases(skill_id, skill_data)
+            if cases_text:
+                parts.append(cases_text)
+
+            # 用户数据
+            if skill_data:
+                compute_type = get_skill_compute_type(skill_id) or skill_id
+                data = skill_data.get(compute_type, {})
+                if data:
+                    parts.append(f"\n## 用户数据\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+
+        else:
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 1: Skill 选择阶段 - 轻量级
+            # ═══════════════════════════════════════════════════════════════
+
+            core_prompt = get_phase1_prompt()
+            if not core_prompt:
+                # Fallback
+                core_prompt = self._get_fallback_phase1_prompt()
+
+            parts.append(core_prompt)
+
+        return "\n".join(parts)
+
+    def _build_sop_rules(
+        self,
+        skill_id: str,
+        profile: Optional[Dict[str, Any]],
+        skill_data: Optional[Dict[str, Any]]
+    ) -> str:
+        """
+        构建 SOP 规则（自然语言版）
+
+        根据当前状态生成教练式指导。
+        """
+        needs_birth = skill_requires_birth_info(skill_id)
+        needs_compute = skill_requires_compute(skill_id)
+
+        # 计算当前状态
+        status = self._compute_status(skill_id, profile, skill_data)
+
+        # 如果已经可以分析，使用简洁的状态提示
+        if status["ready_for_analysis"]:
+            template = get_sop_template("ready_for_analysis")
+            if template:
+                chart_summary = self._extract_chart_summary(skill_id, skill_data)
+                return template.format(
+                    chart_summary=chart_summary,
+                    skill_id=skill_id
+                )
+            return self._get_ready_prompt()
+
+        rules_parts = []
+
+        # P1: 需要收集信息
+        if needs_birth and not status["has_birth_info"]:
+            collect_tool = get_skill_collect_tool(skill_id) or "request_info"
+            template = get_sop_template("need_birth_info")
+            if template:
+                rules_parts.append(template.format(collect_tool=collect_tool))
+            else:
+                rules_parts.append(self._get_need_birth_prompt(collect_tool))
+
+        # P2: 需要计算
+        elif needs_compute and not status["has_chart_data"]:
+            compute_type = get_skill_compute_type(skill_id) or skill_id
+            compute_tool = get_skill_compute_tool(skill_id) or f"calculate_{compute_type}"
+
+            template = get_sop_template("need_compute")
+            if template:
+                rules_parts.append(template.format(compute_tool=compute_tool, has_chart="否"))
+            else:
+                rules_parts.append(self._get_need_compute_prompt(compute_tool))
+
+        return "\n".join(rules_parts)
+
+    def _compute_status(
+        self,
+        skill_id: str,
+        profile: Optional[Dict[str, Any]],
+        skill_data: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """计算当前 SOP 状态"""
+        needs_birth = skill_requires_birth_info(skill_id)
+        needs_compute = skill_requires_compute(skill_id)
+
+        # 检查出生信息
+        has_birth = False
+        if profile:
+            identity = profile.get("identity", {})
+            birth_info = identity.get("birth_info", {})
+            has_birth = bool(birth_info.get("birth_date") or birth_info.get("date"))
+
+        # 检查命盘数据
+        has_chart = False
+        if skill_data:
+            compute_type = get_skill_compute_type(skill_id) or skill_id
+            data = skill_data.get(compute_type, {})
+            has_chart = bool(data.get("chart") or data.get("cards"))
+
+        return {
+            "skill_id": skill_id,
+            "needs_birth_info": needs_birth,
+            "has_birth_info": has_birth,
+            "needs_compute": needs_compute,
+            "has_chart_data": has_chart,
+            "ready_for_analysis": (not needs_birth or has_birth) and (not needs_compute or has_chart)
+        }
+
+    def _extract_chart_summary(
+        self,
+        skill_id: str,
+        skill_data: Optional[Dict[str, Any]]
+    ) -> str:
+        """从命盘数据中提取关键摘要"""
+        if not skill_data:
+            return "无命盘数据"
+
+        compute_type = get_skill_compute_type(skill_id) or skill_id
+        data = skill_data.get(compute_type, {})
+
+        if not data:
+            return "无命盘数据"
+
+        summary_parts = []
+
+        # 八字
+        if compute_type == "bazi" and "chart" in data:
+            chart = data["chart"]
+            if "pillars" in chart and len(chart["pillars"]) > 2:
+                day_pillar = chart["pillars"][2]
+                summary_parts.append(f"日主{day_pillar.get('day_stem', '')}{day_pillar.get('day_branch', '')}")
+            if "month_order" in chart:
+                summary_parts.append(f"月令{chart['month_order']}")
+
+        # 星盘
+        elif compute_type == "zodiac" and "chart" in data:
+            chart = data["chart"]
+            planets = chart.get("planets", {})
+            if "sun" in planets:
+                summary_parts.append(f"太阳{planets['sun'].get('sign', '')}")
+            if "moon" in planets:
+                summary_parts.append(f"月亮{planets['moon'].get('sign', '')}")
+
+        # 塔罗
+        elif compute_type == "tarot" and "cards" in data:
+            cards = data["cards"]
+            if isinstance(cards, list) and len(cards) > 0:
+                summary_parts.append(f"{len(cards)}张牌")
+
+        if summary_parts:
+            return "、".join(summary_parts)
+        else:
+            return "已生成命盘"
+
+    async def _match_cases(
+        self,
+        skill_id: str,
+        skill_data: Optional[Dict[str, Any]]
+    ) -> str:
+        """匹配相关案例"""
+        if not skill_data:
+            return ""
+
+        try:
+            from .case_index import get_case_index, extract_features
+
+            if self.case_index is None:
+                self.case_index = get_case_index()
+
+            features = extract_features(skill_data)
+            if not features:
+                return ""
+
+            cases = await self.case_index.get_matched_cases(skill_id, features, top_k=2)
+            if not cases:
+                return ""
+
+            cases_text = "\n## 相关案例\n\n"
+            for case in cases:
+                cases_text += f"### {case.name}\n{case.content}\n\n"
+
+            return cases_text
+
+        except Exception as e:
+            logger.warning(f"[PromptBuilder] Case matching failed: {e}")
+            return ""
+
+    def _get_fallback_phase1_prompt(self) -> str:
+        """Fallback Phase 1 Prompt"""
+        return """# Vibe
+
+你是 Vibe，生命对话者。你的任务是理解用户意图，引导 Ta 到合适的服务。
+
+## 行为准则
+
+1. **识别意图 → 调用工具**：不要只用文字回复，要调用工具
+2. **简短回应 + 工具**：调用工具时配合一句暖心的话
+3. **不确定 → 推荐**：调用 recommend_skills 让用户选择
+
+## 语气
+
+温暖、简洁、不啰嗦。像一个懂你的老朋友。
+
+示例：
+- "嗨～ 今天想聊点什么？"
+- "好的，让我来帮你看看～"
+- "迷茫的时候来找我就对了。"
+"""
+
+    def _get_ready_prompt(self) -> str:
+        """已准备好分析的 Prompt"""
+        return """## 当前状态
+
+用户信息已完整，命盘已生成。你可以开始分析了。
+
+**分析流程**：
+1. 快速扫描命盘中的关键特征
+2. 根据用户问题聚焦分析
+3. 用 `show_xxx` 工具展示分析结果
+4. 回答用户的追问
+"""
+
+    def _get_need_birth_prompt(self, collect_tool: str) -> str:
+        """需要收集出生信息的 Prompt"""
+        return f"""## 当前状态
+
+用户还没有告诉你出生信息。在深入分析之前，你需要先了解 Ta 的出生时间。
+
+**下一步**：调用 `{collect_tool}` 工具，让用户填写出生信息表单。
+不要用文字问"请问你的生日是？"——表单体验更好。
+"""
+
+    def _get_need_compute_prompt(self, compute_tool: str) -> str:
+        """需要计算的 Prompt"""
+        return f"""## 当前状态
+
+用户已提供出生信息，但还没有生成命盘。
+
+**下一步**：调用 `{compute_tool}` 工具生成命盘数据。
+计算完成后你就可以开始分析了。
+"""
+
+    def build_session_resume_prompt(
+        self,
+        session_context: SessionContext,
+        rule_name: Optional[str] = None
+    ) -> str:
+        """
+        构建会话恢复 Prompt（用于 SOP 模板）
+
+        专门用于断点续传场景
+        """
+        if not session_context or not session_context.has_checkpoint:
+            return ""
+
+        cp = session_context.checkpoint
+        session = session_context.session
+
+        lines = ["## 会话恢复模式\n"]
+
+        if cp:
+            lines.append(f"用户上次完成了 {cp.step} 个步骤。\n")
+
+            if cp.collected_data:
+                lines.append("**已收集信息**：")
+                for key, value in cp.collected_data.items():
+                    lines.append(f"- {key}: {value}")
+                lines.append("")
+
+            next_step = cp.step + 1
+            lines.append(f"**下一步**：")
+            lines.append(f"继续第 {next_step} 个问题\n")
+
+        lines.append("**处理方式**：")
+        lines.append("1. 简短问候：「欢迎回来！上次我们聊到了...」")
+        lines.append("2. 快速回顾（1-2 句）")
+        lines.append("3. 直接问下一个问题")
+
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_prompt_builder: Optional[PromptBuilder] = None
+
+
+def get_prompt_builder() -> PromptBuilder:
+    """获取 PromptBuilder 单例"""
+    global _prompt_builder
+    if _prompt_builder is None:
+        _prompt_builder = PromptBuilder()
+    return _prompt_builder

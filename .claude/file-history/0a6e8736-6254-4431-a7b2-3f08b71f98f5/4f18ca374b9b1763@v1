@@ -1,0 +1,420 @@
+"""
+User Repository - Data access layer for users
+"""
+import secrets
+import string
+from datetime import datetime
+from typing import Optional, List
+from uuid import UUID
+
+# bcrypt is only needed for legacy password auth. In test/minimal envs it may
+# be unavailable; fall back to a simple (non-secure) stub so imports succeed.
+try:  # pragma: no cover - presence depends on environment
+    import bcrypt as _bcrypt  # type: ignore
+except Exception:  # pragma: no cover
+    _bcrypt = None  # type: ignore
+
+from .db import get_connection
+
+
+def generate_vibe_id() -> str:
+    """Generate unique Vibe ID (e.g., VB-A1B2C3D4)"""
+    chars = string.ascii_uppercase + string.digits
+    code = ''.join(secrets.choice(chars) for _ in range(8))
+    return f"VB-{code}"
+
+
+def hash_password(password: str) -> str:
+    """Hash password with bcrypt when available; otherwise use a stub.
+
+    Note: The stub is ONLY for tests and should not be used in production.
+    """
+    if _bcrypt is not None:
+        return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+    else:
+        import os, hashlib
+        salt = os.urandom(16).hex()
+        digest = hashlib.sha256(password.encode() + salt.encode()).hexdigest()
+        return f"stub${salt}${digest}"
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify password against hash or stub hash."""
+    if _bcrypt is not None and not hashed.startswith("stub$"):
+        return _bcrypt.checkpw(password.encode(), hashed.encode())
+    if hashed.startswith("stub$"):
+        import hashlib
+        try:
+            _, salt, digest = hashed.split("$", 2)
+        except ValueError:
+            return False
+        return hashlib.sha256(password.encode() + salt.encode()).hexdigest() == digest
+    return False
+
+
+class UserRepository:
+    """Repository for user operations"""
+
+    # ─────────────────────────────────────────────────────────────────
+    # User CRUD
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create(
+        display_name: Optional[str] = None,
+        birth_datetime: Optional[datetime] = None,
+        birth_location: Optional[str] = None,
+        gender: Optional[str] = None,
+        timezone: str = "Asia/Shanghai",
+        language: str = "zh-CN",
+    ) -> dict:
+        """Create a new user (Migration 022 compatible)
+
+        Post-Migration 022:
+        - vibe_users: 8 columns (id, vibe_id, status, tier, daily_quota, billing_summary, created_at, updated_at)
+        - unified_profiles: JSONB (account, birth_info, preferences, skill_data, life_context, state)
+        """
+        vibe_id = generate_vibe_id()
+
+        async with get_connection() as conn:
+            # Step 1: Create core account record in vibe_users (8 columns only)
+            row = await conn.fetchrow(
+                """
+                INSERT INTO vibe_users (vibe_id, status, tier)
+                VALUES ($1, 'active', 'free')
+                RETURNING *
+                """,
+                vibe_id
+            )
+
+            user_id = row['id']
+
+            # Step 2: Create business data record in unified_profiles
+            # Build profile JSONB structure
+            profile = {
+                'account': {
+                    'vibe_id': vibe_id,
+                    'display_name': display_name or '',
+                    'avatar_url': None,
+                    'tier': 'free',
+                    'status': 'active'
+                },
+                'preferences': {
+                    'timezone': timezone,
+                    'language': language
+                }
+            }
+
+            # Add birth_info if provided
+            if birth_datetime or birth_location or gender:
+                profile['birth_info'] = {}
+                if birth_datetime:
+                    profile['birth_info']['date'] = birth_datetime.strftime('%Y-%m-%d')
+                    profile['birth_info']['time'] = birth_datetime.strftime('%H:%M')
+                if birth_location:
+                    profile['birth_info']['place'] = birth_location
+                if gender:
+                    profile['birth_info']['gender'] = gender
+                if timezone:
+                    profile['birth_info']['timezone'] = timezone
+
+            # Insert into unified_profiles
+            await conn.execute(
+                """
+                INSERT INTO unified_profiles (user_id, profile)
+                VALUES ($1, $2::jsonb)
+                """,
+                user_id,
+                profile
+            )
+
+            return dict(row)
+
+    @staticmethod
+    async def get_by_id(user_id: UUID) -> Optional[dict]:
+        """Get user by ID"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM vibe_users WHERE id = $1",
+                user_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def get_by_vibe_id(vibe_id: str) -> Optional[dict]:
+        """Get user by Vibe ID"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM vibe_users WHERE vibe_id = $1",
+                vibe_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def update(user_id: UUID, **kwargs) -> Optional[dict]:
+        """Update user fields"""
+        if not kwargs:
+            return await UserRepository.get_by_id(user_id)
+
+        # Build SET clause
+        fields = []
+        values = []
+        idx = 1
+        for key, value in kwargs.items():
+            if value is not None:
+                fields.append(f"{key} = ${idx}")
+                values.append(value)
+                idx += 1
+
+        if not fields:
+            return await UserRepository.get_by_id(user_id)
+
+        values.append(user_id)
+        query = f"""
+            UPDATE vibe_users
+            SET {', '.join(fields)}, updated_at = NOW()
+            WHERE id = ${idx}
+            RETURNING *
+        """
+
+        async with get_connection() as conn:
+            row = await conn.fetchrow(query, *values)
+            return dict(row) if row else None
+
+    @staticmethod
+    async def delete(user_id: UUID) -> bool:
+        """Delete user"""
+        async with get_connection() as conn:
+            result = await conn.execute(
+                "DELETE FROM vibe_users WHERE id = $1",
+                user_id
+            )
+            return result == "DELETE 1"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Authentication
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_auth(
+        user_id: UUID,
+        auth_type: str,
+        auth_identifier: str,
+        auth_credential: Optional[str] = None,
+    ) -> dict:
+        """Create authentication method for user"""
+        # Hash password if it's email/phone auth
+        if auth_type in ('email', 'phone') and auth_credential:
+            auth_credential = hash_password(auth_credential)
+
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO vibe_user_auth (
+                    user_id, auth_type, auth_identifier, auth_credential
+                )
+                VALUES ($1, $2, $3, $4)
+                RETURNING *
+                """,
+                user_id, auth_type, auth_identifier, auth_credential
+            )
+            return dict(row)
+
+    @staticmethod
+    async def get_auth_by_identifier(
+        auth_type: str,
+        auth_identifier: str
+    ) -> Optional[dict]:
+        """Get auth by type and identifier"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT ua.*, vu.*
+                FROM vibe_user_auth ua
+                JOIN vibe_users vu ON ua.user_id = vu.id
+                WHERE ua.auth_type = $1 AND ua.auth_identifier = $2
+                """,
+                auth_type, auth_identifier
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def verify_auth(
+        auth_type: str,
+        auth_identifier: str,
+        password: str
+    ) -> Optional[dict]:
+        """Verify authentication and return user"""
+        auth = await UserRepository.get_auth_by_identifier(auth_type, auth_identifier)
+        if not auth:
+            return None
+
+        # Verify password
+        if not verify_password(password, auth['auth_credential']):
+            return None
+
+        return await UserRepository.get_by_id(auth['user_id'])
+
+    @staticmethod
+    async def get_user_auths(user_id: UUID) -> List[dict]:
+        """Get all auth methods for user"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM vibe_user_auth WHERE user_id = $1",
+                user_id
+            )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def get_auth_by_user_id(user_id: UUID, auth_type: str) -> Optional[dict]:
+        """Get specific auth method for user by type"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM vibe_user_auth WHERE user_id = $1 AND auth_type = $2",
+                user_id, auth_type
+            )
+            return dict(row) if row else None
+
+    # ─────────────────────────────────────────────────────────────────
+    # Data Consent
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def set_consent(
+        user_id: UUID,
+        source_skill: str,
+        target_skill: str,
+        data_type: str,
+        consent_granted: bool
+    ) -> dict:
+        """Set data sharing consent"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO vibe_data_consents (
+                    user_id, source_skill, target_skill, data_type,
+                    consent_granted, granted_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (user_id, source_skill, target_skill, data_type)
+                DO UPDATE SET
+                    consent_granted = $5,
+                    granted_at = CASE WHEN $5 THEN NOW() ELSE granted_at END,
+                    revoked_at = CASE WHEN NOT $5 THEN NOW() ELSE NULL END
+                RETURNING *
+                """,
+                user_id, source_skill, target_skill, data_type,
+                consent_granted, datetime.utcnow() if consent_granted else None
+            )
+            return dict(row)
+
+    @staticmethod
+    async def get_consents(
+        user_id: UUID,
+        source_skill: Optional[str] = None
+    ) -> List[dict]:
+        """Get user's data consents"""
+        async with get_connection() as conn:
+            if source_skill:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM vibe_data_consents
+                    WHERE user_id = $1 AND source_skill = $2
+                    """,
+                    user_id, source_skill
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM vibe_data_consents WHERE user_id = $1",
+                    user_id
+                )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def check_consent(
+        user_id: UUID,
+        source_skill: str,
+        target_skill: str,
+        data_type: str
+    ) -> bool:
+        """Check if consent is granted"""
+        async with get_connection() as conn:
+            result = await conn.fetchval(
+                """
+                SELECT consent_granted FROM vibe_data_consents
+                WHERE user_id = $1 AND source_skill = $2
+                  AND target_skill = $3 AND data_type = $4
+                """,
+                user_id, source_skill, target_skill, data_type
+            )
+            return result is True
+
+    # ─────────────────────────────────────────────────────────────────
+    # Skill Profiles
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_skill_profile(
+        user_id: UUID,
+        skill: str,
+        voice_mode: str = "warm",
+        profile_data: Optional[dict] = None
+    ) -> dict:
+        """Create or update skill profile with voice_mode and profile_data"""
+        import json
+        # Merge voice_mode into profile_data since table doesn't have voice_mode column
+        merged_data = profile_data or {}
+        merged_data['voice_mode'] = voice_mode
+
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO skill_profiles (
+                    user_id, skill_id, profile_data
+                )
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, skill_id)
+                DO UPDATE SET
+                    profile_data = skill_profiles.profile_data || $3,
+                    last_use_at = NOW()
+                RETURNING *
+                """,
+                user_id, skill, json.dumps(merged_data)
+            )
+            return dict(row) if row else {}
+
+    @staticmethod
+    async def get_skill_profile(
+        user_id: UUID,
+        skill: str
+    ) -> Optional[dict]:
+        """Get skill profile for user"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM skill_profiles
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def update_skill_voice_mode(
+        user_id: UUID,
+        skill: str,
+        voice_mode: str
+    ) -> Optional[dict]:
+        """Update voice_mode for a skill profile"""
+        import json
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE skill_profiles
+                SET profile_data = profile_data || $3, last_use_at = NOW()
+                WHERE user_id = $1 AND skill_id = $2
+                RETURNING *
+                """,
+                user_id, skill, json.dumps({'voice_mode': voice_mode})
+            )
+            return dict(row) if row else None

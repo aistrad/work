@@ -1,0 +1,257 @@
+"""
+Agent Service Client.
+
+REQ: REQ-CHAT-001
+Design: §10.5.3 Agent Service Integration
+
+Provides HTTP client for calling the Vercel AI SDK-based agent_service.
+Falls back gracefully to FastAPI direct implementation if unavailable.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from common.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# Configuration
+AGENT_SERVICE_URL = os.getenv("AGENT_SERVICE_URL", "http://localhost:3002")
+AGENT_SERVICE_TOKEN = os.getenv("AGENT_SERVICE_TOKEN", "")
+AGENT_SERVICE_TIMEOUT = float(os.getenv("AGENT_SERVICE_TIMEOUT", "30"))
+
+
+class AgentServiceError(Exception):
+    """Base exception for agent service errors."""
+    pass
+
+
+class AgentServiceUnavailable(AgentServiceError):
+    """Agent service is not available."""
+    pass
+
+
+@dataclass
+class AgentResponse:
+    """Response from agent service."""
+    text: str
+    a2ui: Optional[Dict[str, Any]] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+def is_agent_service_configured() -> bool:
+    """Check if agent service is configured."""
+    return bool(AGENT_SERVICE_URL and AGENT_SERVICE_TOKEN)
+
+
+def _json_safe(data: Any) -> Any:
+    """Best-effort conversion to JSON-serializable payload (datetime -> str, etc.)."""
+    try:
+        return json.loads(json.dumps(data, ensure_ascii=False, default=str))
+    except Exception:
+        return data
+
+
+async def call_agent_service(
+    user_id: int,
+    session_id: str,
+    messages: List[Dict[str, str]],
+    user_context: Dict[str, Any],
+    facts: Dict[str, Any],
+    persona_style: str = "warm",
+) -> AgentResponse:
+    """
+    Call the agent service for chat completion.
+
+    REQ: REQ-CHAT-001
+    Design: §10.5.3
+
+    Args:
+        user_id: User ID
+        session_id: Chat session ID
+        messages: Chat history messages
+        user_context: User profile and preferences
+        facts: Bazi facts snapshot
+        persona_style: Persona style (warm, standard, roast)
+
+    Returns:
+        AgentResponse with text and optional A2UI components
+
+    Raises:
+        AgentServiceUnavailable: If service is not reachable
+        AgentServiceError: For other errors
+    """
+    if not is_agent_service_configured():
+        raise AgentServiceUnavailable("Agent service not configured")
+
+    payload = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "messages": messages,
+        "context": {
+            "user": user_context,
+            "facts": facts,
+            "persona_style": persona_style,
+        },
+    }
+    payload = _json_safe(payload)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AGENT_SERVICE_TOKEN}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=AGENT_SERVICE_TIMEOUT) as client:
+            response = await client.post(
+                f"{AGENT_SERVICE_URL}/api/chat",
+                json=payload,
+                headers=headers,
+            )
+
+            if response.status_code == 503:
+                raise AgentServiceUnavailable("Agent service temporarily unavailable")
+
+            if response.status_code != 200:
+                error_text = response.text
+                logger.error(
+                    "agent_service_error status=%s body=%s",
+                    response.status_code, error_text[:500]
+                )
+                raise AgentServiceError(f"Agent service error: {response.status_code}")
+
+            data = response.json()
+
+            return AgentResponse(
+                text=data.get("text", ""),
+                a2ui=data.get("a2ui") or data.get("a2Ui"),
+                tool_calls=data.get("tool_calls") or data.get("toolCalls"),
+                metadata=data.get("metadata") or data.get("meta"),
+            )
+
+    except httpx.ConnectError:
+        logger.warning("agent_service_unavailable url=%s", AGENT_SERVICE_URL)
+        raise AgentServiceUnavailable("Cannot connect to agent service")
+    except httpx.TimeoutException:
+        logger.warning("agent_service_timeout url=%s", AGENT_SERVICE_URL)
+        raise AgentServiceUnavailable("Agent service timeout")
+    except json.JSONDecodeError as e:
+        logger.error("agent_service_invalid_json error=%s", str(e))
+        raise AgentServiceError("Invalid response from agent service")
+
+
+def call_agent_service_sync(
+    user_id: int,
+    session_id: str,
+    messages: List[Dict[str, str]],
+    user_context: Dict[str, Any],
+    facts: Dict[str, Any],
+    persona_style: str = "warm",
+) -> AgentResponse:
+    """
+    Synchronous wrapper for call_agent_service.
+
+    For use in non-async contexts.
+    """
+    if not is_agent_service_configured():
+        raise AgentServiceUnavailable("Agent service not configured")
+
+    payload = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "messages": messages,
+        "context": {
+            "user": user_context,
+            "facts": facts,
+            "persona_style": persona_style,
+        },
+    }
+    payload = _json_safe(payload)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AGENT_SERVICE_TOKEN}",
+    }
+
+    try:
+        with httpx.Client(timeout=AGENT_SERVICE_TIMEOUT) as client:
+            response = client.post(
+                f"{AGENT_SERVICE_URL}/api/chat",
+                json=payload,
+                headers=headers,
+            )
+
+            if response.status_code == 503:
+                raise AgentServiceUnavailable("Agent service temporarily unavailable")
+
+            if response.status_code != 200:
+                error_text = response.text
+                logger.error(
+                    "agent_service_error status=%s body=%s",
+                    response.status_code, error_text[:500]
+                )
+                raise AgentServiceError(f"Agent service error: {response.status_code}")
+
+            data = response.json()
+
+            return AgentResponse(
+                text=data.get("text", ""),
+                a2ui=data.get("a2ui") or data.get("a2Ui"),
+                tool_calls=data.get("tool_calls") or data.get("toolCalls"),
+                metadata=data.get("metadata") or data.get("meta"),
+            )
+
+    except httpx.ConnectError:
+        logger.warning("agent_service_unavailable url=%s", AGENT_SERVICE_URL)
+        raise AgentServiceUnavailable("Cannot connect to agent service")
+    except httpx.TimeoutException:
+        logger.warning("agent_service_timeout url=%s", AGENT_SERVICE_URL)
+        raise AgentServiceUnavailable("Agent service timeout")
+    except json.JSONDecodeError as e:
+        logger.error("agent_service_invalid_json error=%s", str(e))
+        raise AgentServiceError("Invalid response from agent service")
+
+
+def health_check() -> Dict[str, Any]:
+    """
+    Check agent service health.
+
+    Returns status and latency information.
+    """
+    if not is_agent_service_configured():
+        return {"status": "not_configured", "url": None}
+
+    import time
+    start = time.time()
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(f"{AGENT_SERVICE_URL}/health")
+            latency_ms = int((time.time() - start) * 1000)
+
+            if response.status_code == 200:
+                return {
+                    "status": "healthy",
+                    "url": AGENT_SERVICE_URL,
+                    "latency_ms": latency_ms,
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "url": AGENT_SERVICE_URL,
+                    "status_code": response.status_code,
+                }
+    except Exception as e:
+        return {
+            "status": "unreachable",
+            "url": AGENT_SERVICE_URL,
+            "error": str(e),
+        }

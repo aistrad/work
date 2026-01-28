@@ -1,0 +1,381 @@
+"""
+WeChat OAuth Service - QR Code Login for Web
+
+Implements WeChat's "网站应用" (Website Application) OAuth flow:
+1. Generate QR code with unique scene_id
+2. User scans with WeChat mobile app
+3. Poll status until user confirms
+4. Exchange code for access_token and user info
+5. Create/login user account
+
+Reference: https://developers.weixin.qq.com/doc/oplatform/Website_App/WeChat_Login/Wechat_Login.html
+"""
+import os
+import secrets
+import httpx
+from datetime import datetime, timedelta
+from typing import Optional
+from uuid import UUID
+
+from .jwt import JWTService
+from stores.user_repo import UserRepository
+from stores.db import get_connection
+
+
+class WechatService:
+    """WeChat OAuth service for QR code login"""
+
+    # Configuration from environment
+    APP_ID = os.getenv("WECHAT_APP_ID", "")
+    APP_SECRET = os.getenv("WECHAT_APP_SECRET", "")
+
+    # QR code expiry (5 minutes)
+    QR_CODE_EXPIRY_MINUTES = 5
+
+    # OAuth endpoints
+    OAUTH_AUTHORIZE_URL = "https://open.weixin.qq.com/connect/qrconnect"
+    OAUTH_TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token"
+    OAUTH_USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo"
+
+    # ─────────────────────────────────────────────────────────────────
+    # QR Code Generation
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def generate_qrcode(cls, redirect_uri: str) -> dict:
+        """
+        Generate a QR code URL for WeChat login.
+
+        Returns:
+            dict with:
+            - scene_id: Unique identifier for this login session
+            - qrcode_url: URL to display as QR code (or redirect user to)
+            - expires_at: When the QR code expires
+        """
+        if not cls.APP_ID:
+            raise ValueError("WeChat APP_ID not configured")
+
+        # Generate unique scene_id
+        scene_id = secrets.token_urlsafe(32)
+
+        # Calculate expiry
+        expires_at = datetime.utcnow() + timedelta(minutes=cls.QR_CODE_EXPIRY_MINUTES)
+
+        # Store session in database
+        async with get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO wechat_login_sessions (scene_id, status, expires_at)
+                VALUES ($1, 'pending', $2)
+                """,
+                scene_id, expires_at
+            )
+
+        # Build QR code URL
+        # This URL should be embedded in a QR code or user can be redirected to it
+        qrcode_url = (
+            f"{cls.OAUTH_AUTHORIZE_URL}"
+            f"?appid={cls.APP_ID}"
+            f"&redirect_uri={redirect_uri}"
+            f"&response_type=code"
+            f"&scope=snsapi_login"
+            f"&state={scene_id}"
+            "#wechat_redirect"
+        )
+
+        return {
+            "scene_id": scene_id,
+            "qrcode_url": qrcode_url,
+            "expires_at": expires_at.isoformat()
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Status Polling
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def poll_status(cls, scene_id: str) -> dict:
+        """
+        Poll the status of a QR code login session.
+
+        Returns:
+            dict with:
+            - status: 'pending' | 'scanned' | 'confirmed' | 'expired'
+            - tokens: (only if confirmed) JWT tokens for the user
+            - user: (only if confirmed) User info
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM wechat_login_sessions
+                WHERE scene_id = $1
+                """,
+                scene_id
+            )
+
+        if not row:
+            return {"status": "expired", "message": "Session not found"}
+
+        session = dict(row)
+
+        # Check if expired
+        if session["expires_at"] < datetime.utcnow():
+            return {"status": "expired", "message": "QR code expired"}
+
+        # Return current status
+        if session["status"] == "pending":
+            return {"status": "pending"}
+
+        elif session["status"] == "scanned":
+            return {"status": "scanned", "message": "User scanned, waiting for confirmation"}
+
+        elif session["status"] == "confirmed":
+            # Session was confirmed, return tokens
+            # The tokens should have been stored when callback was processed
+            user_info = session.get("user_info", {})
+            return {
+                "status": "confirmed",
+                "tokens": user_info.get("tokens"),
+                "user": user_info.get("user")
+            }
+
+        return {"status": session["status"]}
+
+    # ─────────────────────────────────────────────────────────────────
+    # OAuth Callback
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def handle_callback(
+        cls,
+        code: str,
+        state: str,
+        onboarding_data: Optional[dict] = None
+    ) -> Optional[dict]:
+        """
+        Handle WeChat OAuth callback after user authorizes.
+
+        Args:
+            code: Authorization code from WeChat
+            state: The scene_id we sent (for verification)
+            onboarding_data: Optional onboarding data for new users
+
+        Returns:
+            dict with tokens and user info, or None if failed
+        """
+        if not cls.APP_ID or not cls.APP_SECRET:
+            raise ValueError("WeChat credentials not configured")
+
+        # Verify the state/scene_id exists
+        async with get_connection() as conn:
+            session = await conn.fetchrow(
+                """
+                SELECT * FROM wechat_login_sessions
+                WHERE scene_id = $1 AND status = 'pending'
+                  AND expires_at > NOW()
+                """,
+                state
+            )
+
+        if not session:
+            return None
+
+        try:
+            async with httpx.AsyncClient() as client:
+                # Exchange code for access_token
+                token_response = await client.get(
+                    cls.OAUTH_TOKEN_URL,
+                    params={
+                        "appid": cls.APP_ID,
+                        "secret": cls.APP_SECRET,
+                        "code": code,
+                        "grant_type": "authorization_code"
+                    }
+                )
+
+                if token_response.status_code != 200:
+                    return None
+
+                token_data = token_response.json()
+
+                if "errcode" in token_data:
+                    return None
+
+                access_token = token_data.get("access_token")
+                openid = token_data.get("openid")
+                unionid = token_data.get("unionid")
+
+                if not access_token or not openid:
+                    return None
+
+                # Get user info
+                userinfo_response = await client.get(
+                    cls.OAUTH_USERINFO_URL,
+                    params={
+                        "access_token": access_token,
+                        "openid": openid
+                    }
+                )
+
+                if userinfo_response.status_code != 200:
+                    return None
+
+                wechat_user = userinfo_response.json()
+
+                if "errcode" in wechat_user:
+                    return None
+
+                # Process login/registration
+                result = await cls.wechat_login(
+                    openid=openid,
+                    unionid=unionid,
+                    user_info=wechat_user,
+                    onboarding_data=onboarding_data
+                )
+
+                if result:
+                    # Update session status to confirmed and store result
+                    import json
+                    async with get_connection() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE wechat_login_sessions
+                            SET status = 'confirmed',
+                                openid = $1,
+                                unionid = $2,
+                                user_info = $3
+                            WHERE scene_id = $4
+                            """,
+                            openid, unionid,
+                            json.dumps({
+                                "wechat": wechat_user,
+                                "tokens": {
+                                    "access_token": result["access_token"],
+                                    "refresh_token": result["refresh_token"],
+                                    "token_type": result["token_type"],
+                                    "expires_in": result["expires_in"]
+                                },
+                                "user": result["user"]
+                            }),
+                            state
+                        )
+
+                return result
+
+        except Exception:
+            return None
+
+    # ─────────────────────────────────────────────────────────────────
+    # User Login/Registration
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def wechat_login(
+        cls,
+        openid: str,
+        unionid: Optional[str] = None,
+        user_info: Optional[dict] = None,
+        onboarding_data: Optional[dict] = None
+    ) -> Optional[dict]:
+        """
+        Login or register user with WeChat credentials.
+
+        Uses unionid as primary identifier if available (for cross-app identification),
+        falls back to openid.
+        """
+        user_info = user_info or {}
+
+        # Prefer unionid for identification (cross-app), fallback to openid
+        auth_identifier = unionid if unionid else openid
+
+        # Check if user exists with this WeChat ID
+        existing_auth = await UserRepository.get_auth_by_identifier(
+            "wechat", auth_identifier
+        )
+
+        if existing_auth:
+            # User exists, return tokens
+            user = await UserRepository.get_by_id(existing_auth["user_id"])
+            if not user:
+                return None
+
+            # Check account status
+            if user.get("status") == "pending_deletion":
+                # Reactivate account on login
+                await UserRepository.update(
+                    user["id"],
+                    status="active",
+                    deletion_requested_at=None,
+                    deletion_scheduled_at=None
+                )
+                user["status"] = "active"
+            elif user.get("status") != "active":
+                return None
+        else:
+            # Create new user
+            nickname = user_info.get("nickname", "微信用户")
+            avatar = user_info.get("headimgurl")
+
+            user = await UserRepository.create(
+                display_name=nickname,
+                birth_datetime=onboarding_data.get("birth_datetime") if onboarding_data else None,
+                birth_location=onboarding_data.get("birth_location") if onboarding_data else None,
+                gender=onboarding_data.get("gender") if onboarding_data else None
+            )
+
+            # Update avatar if provided
+            if avatar:
+                await UserRepository.update(user["id"], avatar_url=avatar)
+
+            # Create WeChat auth
+            await UserRepository.create_auth(
+                user_id=user["id"],
+                auth_type="wechat",
+                auth_identifier=auth_identifier,
+                auth_credential=None  # OAuth, no password
+            )
+
+            # Create skill profile if onboarding data provided
+            if onboarding_data and onboarding_data.get("skill"):
+                await UserRepository.create_skill_profile(
+                    user_id=user["id"],
+                    skill=onboarding_data["skill"],
+                    voice_mode=onboarding_data.get("voice_mode", "warm"),
+                    profile_data={
+                        "interview_responses": onboarding_data.get("interview_responses", {}),
+                        "focus_areas": onboarding_data.get("focus_areas", [])
+                    }
+                )
+
+        # Generate tokens
+        access_token = JWTService.create_access_token(
+            str(user["id"]), user["vibe_id"]
+        )
+        refresh_token = JWTService.create_refresh_token(
+            str(user["id"]), user["vibe_id"]
+        )
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": JWTService.get_token_expiry(),
+            "user": {
+                "user_id": str(user["id"]),
+                "vibe_id": user["vibe_id"],
+                "display_name": user.get("display_name")
+            }
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def cleanup_expired_sessions(cls) -> int:
+        """Clean up expired QR code sessions."""
+        async with get_connection() as conn:
+            result = await conn.fetchval(
+                "SELECT cleanup_expired_wechat_sessions()"
+            )
+            return result or 0

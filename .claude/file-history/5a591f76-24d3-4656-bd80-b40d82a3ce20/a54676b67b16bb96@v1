@@ -1,0 +1,247 @@
+"use client";
+
+/**
+ * useConversations Hook - Chat History Management
+ *
+ * Uses SWR for data fetching with infinite scroll support
+ * Based on: React Best Practices - client-swr-dedup
+ */
+
+import useSWR from "swr";
+import useSWRInfinite from "swr/infinite";
+import { useCallback } from "react";
+import { apiClient } from "@/lib/api";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface ConversationItem {
+  id: string;
+  title: string | null;
+  skill: string;
+  updated_at: string;
+}
+
+export interface ConversationListResponse {
+  conversations: ConversationItem[];
+  total: number;
+  has_more: boolean;
+}
+
+export interface ConversationDetail {
+  id: string;
+  title: string | null;
+  skill: string;
+  voice_mode: string;
+  created_at: string;
+  updated_at: string;
+  messages: Array<{
+    id: string;
+    role: string;
+    content: string;
+    created_at: string;
+  }>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fetchers
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PAGE_SIZE = 20;
+
+async function fetcher(url: string): Promise<ConversationListResponse> {
+  const { data } = await apiClient.get<ConversationListResponse>(url);
+  return data;
+}
+
+async function detailFetcher(url: string): Promise<ConversationDetail> {
+  const { data } = await apiClient.get<ConversationDetail>(url);
+  return data;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// useConversations - List with infinite scroll
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function useConversations(skill?: string) {
+  const getKey = (pageIndex: number, previousPageData: ConversationListResponse | null) => {
+    // Reached the end
+    if (previousPageData && !previousPageData.has_more) return null;
+
+    // First page
+    const offset = pageIndex * PAGE_SIZE;
+    const params = new URLSearchParams({
+      limit: String(PAGE_SIZE),
+      offset: String(offset),
+    });
+    if (skill) params.set("skill", skill);
+
+    return `/conversations?${params.toString()}`;
+  };
+
+  const { data, error, isLoading, isValidating, size, setSize, mutate } =
+    useSWRInfinite<ConversationListResponse>(getKey, fetcher, {
+      revalidateOnFocus: false,
+      revalidateFirstPage: false,
+      dedupingInterval: 60000,
+    });
+
+  // Flatten pages into single array
+  const conversations = data
+    ? data.flatMap((page) => page.conversations)
+    : [];
+  const total = data?.[0]?.total ?? 0;
+  const hasMore = data ? data[data.length - 1]?.has_more : false;
+  const isLoadingMore =
+    isLoading || (size > 0 && data && typeof data[size - 1] === "undefined");
+
+  const loadMore = useCallback(() => {
+    if (!isLoadingMore && hasMore) {
+      setSize(size + 1);
+    }
+  }, [isLoadingMore, hasMore, setSize, size]);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Actions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Create a new conversation
+   */
+  const createConversation = useCallback(
+    async (skillId: string, voiceMode: string = "warm") => {
+      const { data: newConversation } = await apiClient.post<ConversationItem>(
+        "/conversations",
+        {
+          skill: skillId,
+          voice_mode: voiceMode,
+        }
+      );
+
+      // Optimistic update - prepend to list
+      mutate(
+        (pages) => {
+          if (!pages || pages.length === 0) {
+            return [{ conversations: [newConversation], total: 1, has_more: false }];
+          }
+          const newPages = [...pages];
+          newPages[0] = {
+            ...newPages[0],
+            conversations: [newConversation, ...newPages[0].conversations],
+            total: newPages[0].total + 1,
+          };
+          return newPages;
+        },
+        false
+      );
+
+      return newConversation;
+    },
+    [mutate]
+  );
+
+  /**
+   * Rename a conversation
+   */
+  const renameConversation = useCallback(
+    async (conversationId: string, title: string) => {
+      // Optimistic update
+      mutate(
+        (pages) => {
+          if (!pages) return pages;
+          return pages.map((page) => ({
+            ...page,
+            conversations: page.conversations.map((c) =>
+              c.id === conversationId ? { ...c, title } : c
+            ),
+          }));
+        },
+        false
+      );
+
+      try {
+        await apiClient.patch(`/conversations/${conversationId}`, { title });
+      } catch (err) {
+        // Revert on error
+        mutate();
+        throw err;
+      }
+    },
+    [mutate]
+  );
+
+  /**
+   * Delete a conversation (soft delete)
+   */
+  const deleteConversation = useCallback(
+    async (conversationId: string) => {
+      // Optimistic update - remove from list
+      mutate(
+        (pages) => {
+          if (!pages) return pages;
+          return pages.map((page) => ({
+            ...page,
+            conversations: page.conversations.filter((c) => c.id !== conversationId),
+            total: page.total - 1,
+          }));
+        },
+        false
+      );
+
+      try {
+        await apiClient.delete(`/conversations/${conversationId}`);
+      } catch (err) {
+        // Revert on error
+        mutate();
+        throw err;
+      }
+    },
+    [mutate]
+  );
+
+  /**
+   * Refresh the list
+   */
+  const refresh = useCallback(() => {
+    return mutate();
+  }, [mutate]);
+
+  return {
+    conversations,
+    total,
+    isLoading,
+    isLoadingMore,
+    hasMore,
+    error,
+    loadMore,
+    createConversation,
+    renameConversation,
+    deleteConversation,
+    refresh,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// useConversationDetail - Single conversation with messages
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function useConversationDetail(conversationId: string | null) {
+  const { data, error, isLoading, mutate } = useSWR<ConversationDetail>(
+    conversationId ? `/conversations/${conversationId}` : null,
+    detailFetcher,
+    {
+      revalidateOnFocus: false,
+      dedupingInterval: 30000,
+    }
+  );
+
+  return {
+    conversation: data,
+    isLoading,
+    error,
+    refresh: mutate,
+  };
+}
+
+export default useConversations;

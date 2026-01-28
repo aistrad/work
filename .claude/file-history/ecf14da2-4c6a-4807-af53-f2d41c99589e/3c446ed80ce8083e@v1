@@ -1,0 +1,1081 @@
+# VibeLife v9.2 Claude SDK 模式实战案例
+
+> **版本**: 9.2
+> **日期**: 2026-01-24
+> **案例**: 职场时机教练 (Career Timing Intelligence)
+> **架构**: Claude SDK 标准模式 + routing.yaml + Skills 协同
+
+---
+
+## 1. 架构全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Claude SDK 标准模式 (Agentic Loop)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  用户消息: "下周适合谈加薪吗？"                                           │
+│       ↓                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │  LLMClient.stream(messages, tools)                                  │ │
+│  │  ↓                                                                  │ │
+│  │  LLM 思考: "用户问加薪时机，需要：                                   │ │
+│  │    1. 用户出生信息（计算命理时机）                                   │ │
+│  │    2. 用户职业背景（个性化建议）                                     │ │
+│  │    3. 当前运势数据（时机分析）"                                     │ │
+│  │  ↓                                                                  │ │
+│  │  LLM 调用: get_user_profile(fields=["identity.birth_info",          │ │
+│  │                                      "skills.bazi",                 │ │
+│  │                                      "life_context.occupation"])    │ │
+│  │  ↓                                                                  │ │
+│  │  Tool 返回: {birth_info: {...}, bazi: {chart: {...}}, ...}          │ │
+│  │  ↓                                                                  │ │
+│  │  LLM 调用: analyze_career_timing(decision_type="加薪",              │ │
+│  │                                  target_date="next_week")           │ │
+│  │  ↓                                                                  │ │
+│  │  Tool 返回: {best_windows: [...], advice: [...]}                    │ │
+│  │  ↓                                                                  │ │
+│  │  LLM 调用: show_timing_card(timing_data={...})                      │ │
+│  │  ↓                                                                  │ │
+│  │  LLM 生成: "根据您的八字，下周三木星入财帛宫，是谈加薪的最佳时机..." │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 核心协同机制
+
+### 2.1 三层配置协同
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         配置层级协同                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  routing.yaml (全局路由配置)                                             │
+│  ├── phase1_prompt: 路由 Prompt                                         │
+│  ├── skills.career_timing:                                              │
+│  │   ├── triggers: [跳槽时机, 加薪, 职业窗口...]                         │
+│  │   ├── requires_birth_info: true                                      │
+│  │   ├── skill_data: [bazi, zodiac]  # 依赖数据                         │
+│  │   └── global_tools: [get_user_profile, search_db]                    │
+│  └── sop_templates: 流程模板                                            │
+│       ↓                                                                  │
+│  skills/career_timing/SKILL.md (Skill 专家身份)                         │
+│  ├── 专家身份定义                                                        │
+│  ├── 对话原则                                                            │
+│  └── 工具调用规则                                                        │
+│       ↓                                                                  │
+│  skills/career_timing/tools/tools.yaml (工具定义)                       │
+│  ├── analyze_career_timing: 时机分析                                    │
+│  ├── track_decision: 决策追踪                                           │
+│  └── generate_negotiation_script: 话术生成                              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 数据流协同
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         数据流协同                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  VibeProfile (统一数据源)                                                │
+│  ├── identity.birth_info          ← get_user_profile 获取               │
+│  ├── skills.bazi.chart           ← get_user_profile 获取               │
+│  ├── skills.zodiac.chart         ← get_user_profile 获取               │
+│  ├── skills.career_timing        ← 新 Skill 数据存储                    │
+│  │   ├── active_decisions: []    # 进行中的决策                         │
+│  │   ├── decision_history: []    # 历史决策（飞轮数据）                  │
+│  │   └── timing_preferences: {}  # 用户偏好                             │
+│  └── life_context.occupation     ← 职业背景                             │
+│                                                                          │
+│  数据获取方式：                                                          │
+│  ├── LLM 调用 get_user_profile → 按需获取                               │
+│  ├── LLM 调用 Skill 工具 → 计算/分析                                    │
+│  └── LLM 调用 save_xxx → 持久化                                         │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 完整实现方案
+
+### 3.1 新增 routing.yaml 配置
+
+**文件**: `skills/core/config/routing.yaml`
+
+```yaml
+skills:
+  # ... 现有 skills ...
+
+  career_timing:
+    name: 职场时机教练
+    short_desc: 融合命理智慧的职业决策时机分析
+    category: professional
+    triggers:
+      - 跳槽时机
+      - 加薪时机
+      - 什么时候谈
+      - 职业窗口
+      - 面试时机
+      - offer选择
+      - 最佳时机
+    requires_birth_info: true
+    requires_compute: true
+    compute_type: bazi  # 依赖八字计算
+    compute_tool: calculate_bazi
+    skill_data: [bazi, zodiac]  # 加载这些 Skill 的数据
+    global_tools: [get_user_profile, search_db, request_info]
+
+# 新增 SOP 模板
+sop_templates:
+  # ... 现有模板 ...
+
+  career_timing_flow: |
+    ## 职场时机分析流程
+
+    ### 第一步：确认数据
+    检查 get_user_profile 返回的数据：
+    - 有 birth_info + bazi.chart → 直接分析时机
+    - 有 birth_info 无 chart → 调用 calculate_bazi
+    - 无 birth_info → 调用 request_info 收集
+
+    ### 第二步：理解决策
+    用户的决策类型：
+    | 类型 | 分析重点 |
+    |-----|---------|
+    | 跳槽 | 财运 + 贵人 + 流年 |
+    | 加薪 | 财帛宫 + 官禄宫 + 近期运势 |
+    | offer选择 | 比较多个时间点 |
+
+    ### 第三步：给出建议
+    - 最佳时机窗口（具体到周）
+    - 避开时间（水逆、冲克等）
+    - 可执行的行动建议
+```
+
+### 3.2 新增 SKILL.md
+
+**文件**: `skills/career_timing/SKILL.md`
+
+```markdown
+---
+id: career_timing
+name: 职场时机教练
+version: 1.0.0
+description: 融合命理智慧的职业决策时机分析专家
+category: professional
+icon: "⏰"
+color: "#3B82F6"
+---
+
+# 职场时机教练
+
+## 专家身份
+
+我是融合东方命理智慧与现代职场洞察的时机分析专家。
+帮助你找到职业决策的最佳时机窗口，让努力事半功倍。
+
+**核心理念**：
+- 时机决定成败：同样的决定，不同时机结果截然不同
+- 命理是辅助，行动是根本：告诉你"什么时候"，但"做不做"是你的选择
+- 持续追踪：不只给建议，还跟踪结果，让建议越来越准
+
+**知识融合**：
+- 八字命理：财运、官运、贵人运
+- 西方占星：行星周期、逆行影响
+- 职场智慧：谈判策略、行业周期
+
+---
+
+## 对话原则
+
+### 1. 先理解决策，再分析时机
+
+```
+❌ 不要这样：
+用户: 下周适合谈加薪吗？
+AI: 让我看看你的命盘...（立即进入分析）
+
+✅ 应该这样：
+用户: 下周适合谈加薪吗？
+AI: 好的，在分析时机前，能告诉我：
+    - 这次加薪你期望涨多少？
+    - 最近工作有什么可量化的成果？
+    （了解背景后，再结合命理给建议）
+```
+
+### 2. 给具体可操作的建议
+
+```
+❌ 不要这样：
+"下周财运不错，可以试试"
+
+✅ 应该这样：
+"下周三（1月28日）是最佳窗口：
+- 木星入财帛宫，财运旺
+- 老板星座本周情绪稳定
+- 建议用这个开场：'最近完成了XX项目...'"
+```
+
+### 3. 追踪决策结果
+
+完成时机建议后，询问是否要追踪：
+```
+AI: 要不要把这个加薪计划记下来？
+    我可以帮你追踪进度，等结果出来后，
+    也能让我的建议越来越准。
+```
+
+---
+
+## 工具调用规则
+
+| 用户意图 | 调用工具 | 示例 |
+|---------|---------|------|
+| 问时机 | get_user_profile → analyze_career_timing | "什么时候跳槽" |
+| 看运势 | get_user_profile → show_career_fortune | "本月职业运" |
+| 追踪决策 | track_decision | "记录这个决定" |
+| 要话术 | generate_negotiation_script | "怎么跟老板说" |
+| 看历史 | get_user_profile → show_decision_history | "之前的决定" |
+
+---
+
+## 伦理边界
+
+### 绝对禁止
+- 替用户做决定（"你必须跳槽"）
+- 过度神化命理（"命中注定"）
+- 忽视现实因素（市场、能力、准备度）
+- 制造焦虑（"错过就完了"）
+
+### 表达原则
+- 时机是加分项，不是决定因素
+- 准备好了，任何时机都可以
+- 没准备好，最佳时机也没用
+```
+
+### 3.3 新增 tools.yaml
+
+**文件**: `skills/career_timing/tools/tools.yaml`
+
+```yaml
+version: "1.0"
+skill_id: career_timing
+
+# 分析型工具
+analysis:
+  - name: analyze_career_timing
+    description: |
+      分析职业决策的最佳时机窗口。
+      结合八字命理、西方占星、职场周期给出精准时机建议。
+
+      ## 何时调用
+      - 用户问"什么时候跳槽/加薪/面试"
+      - 用户有具体的职业决策需要时机建议
+      - 用户想比较多个时间点
+
+      ## 前置条件
+      必须先调用 get_user_profile 获取 birth_info 和命盘数据。
+      如果没有命盘，先调用 calculate_bazi。
+
+    tool_type: analysis
+    card_type: timing_analysis
+    fallback_type: timeline
+    parameters:
+      - name: decision_type
+        type: string
+        required: true
+        enum: [跳槽, 加薪, 面试, offer选择, 创业, 转行, 晋升]
+        description: 决策类型
+      - name: target_date
+        type: string
+        required: false
+        description: 目标日期/时间范围，如"下周"、"2月"、"Q2"
+      - name: context
+        type: object
+        required: false
+        description: 决策背景信息（行业、公司、期望薪资等）
+
+  - name: show_career_fortune
+    description: |
+      展示职业运势概览（月度/季度）。
+      帮助用户了解整体职业运势走向。
+
+    tool_type: display
+    card_type: career_fortune
+    fallback_type: chart
+    parameters:
+      - name: period
+        type: string
+        enum: [本月, 本季, 本年]
+        default: 本月
+        description: 时间范围
+
+# 追踪型工具
+tracking:
+  - name: track_decision
+    description: |
+      追踪一个职业决策。
+      记录决策、时机选择、预期结果，用于后续验证和优化。
+
+      ## 何时调用
+      - 用户说"记录这个决定"
+      - 给完时机建议后询问用户是否追踪
+
+    tool_type: action
+    card_type: decision_tracker
+    parameters:
+      - name: decision_title
+        type: string
+        required: true
+        description: 决策标题，如"跟张总谈加薪"
+      - name: decision_type
+        type: string
+        required: true
+        enum: [跳槽, 加薪, 面试, offer选择, 创业, 转行, 晋升]
+      - name: target_date
+        type: string
+        required: true
+        description: 计划执行日期
+      - name: expected_outcome
+        type: string
+        required: false
+        description: 期望结果
+      - name: timing_rationale
+        type: string
+        required: false
+        description: 选择此时机的理由
+
+  - name: update_decision_result
+    description: |
+      更新决策结果。
+      记录实际结果，用于飞轮学习。
+
+    tool_type: action
+    parameters:
+      - name: decision_id
+        type: string
+        required: true
+        description: 决策 ID
+      - name: actual_result
+        type: string
+        required: true
+        enum: [成功, 部分成功, 失败, 取消, 延期]
+      - name: notes
+        type: string
+        required: false
+        description: 结果备注
+
+# 辅助型工具
+assist:
+  - name: generate_negotiation_script
+    description: |
+      生成谈判话术。
+      根据用户背景、对方特点、时机因素生成个性化话术。
+
+    tool_type: generate
+    card_type: script
+    parameters:
+      - name: scenario
+        type: string
+        required: true
+        enum: [加薪谈判, offer谈判, 晋升沟通, 跳槽解释]
+      - name: target_outcome
+        type: string
+        required: true
+        description: 期望达成的目标
+      - name: boss_info
+        type: object
+        required: false
+        description: 对方信息（如果知道对方生日/星座）
+
+  - name: show_decision_history
+    description: |
+      展示历史决策记录。
+      包括决策、时机选择、实际结果、学习洞察。
+
+    tool_type: display
+    card_type: decision_history
+    fallback_type: table
+    parameters:
+      - name: filter_type
+        type: string
+        enum: [all, 成功, 失败]
+        default: all
+```
+
+### 3.4 新增 handlers.py
+
+**文件**: `skills/career_timing/tools/handlers.py`
+
+```python
+"""
+职场时机教练 - 工具处理器
+
+v9.2 设计原则：
+- LLM 驱动：LLM 决定调用什么工具、传递什么参数
+- 配置驱动：工具定义在 tools.yaml，handler 只做执行
+- 飞轮数据：记录决策和结果，用于优化建议
+"""
+
+from typing import Dict, Any, List
+from datetime import datetime, timedelta
+import json
+
+from services.agent.tool_registry import tool_handler, ToolContext
+from stores.unified_profile_repo import UnifiedProfileRepository
+from stores.skill_repo import SkillRepository
+
+
+@tool_handler("analyze_career_timing")
+async def execute_analyze_career_timing(args: Dict, context: ToolContext) -> Dict:
+    """
+    分析职业决策的最佳时机窗口
+
+    LLM 应该先调用 get_user_profile 获取命盘数据，
+    然后将数据作为 context 传递给此工具。
+
+    Returns:
+        {
+            "analysis": {
+                "decision_type": "加薪",
+                "target_period": "2026年1月下旬",
+                "best_windows": [
+                    {"date": "1月28日", "score": 92, "reason": "木星入财帛宫"},
+                    {"date": "1月30日", "score": 78, "reason": "财运稳定"}
+                ],
+                "avoid_dates": [
+                    {"date": "1月25日", "reason": "水星逆行开始"}
+                ],
+                "overall_score": 85
+            },
+            "advice": {
+                "preparation": ["准备业绩数据", "整理项目成果"],
+                "timing_tips": "建议上午10-11点，对方精力最好",
+                "approach": "先谈贡献，再提期望"
+            },
+            "track_suggestion": "是否记录这个决策？我可以帮你追踪结果。"
+        }
+    """
+    decision_type = args.get("decision_type")
+    target_date = args.get("target_date", "本月")
+    decision_context = args.get("context", {})
+
+    # 获取用户命盘数据（LLM 应该已经通过 get_user_profile 获取）
+    # 这里从 context 中读取，如果没有，返回提示
+    profile = await UnifiedProfileRepository.get_profile(context.user_id)
+
+    if not profile:
+        return {
+            "error": "未找到用户档案",
+            "hint": "请先调用 get_user_profile 获取用户数据"
+        }
+
+    # 检查必要数据
+    birth_info = profile.get("skills", {}).get("bazi", {}).get("chart")
+    if not birth_info:
+        birth_info = profile.get("identity", {}).get("birth_info")
+
+    if not birth_info:
+        return {
+            "error": "缺少出生信息",
+            "hint": "请先调用 request_info 收集用户出生信息",
+            "suggested_tool": "request_info"
+        }
+
+    # TODO: 调用命理分析服务
+    # 这里是示例返回，实际应该调用 bazi/zodiac 分析服务
+    analysis = _analyze_timing(decision_type, target_date, profile)
+
+    return {
+        "analysis": analysis,
+        "advice": _generate_advice(decision_type, analysis),
+        "track_suggestion": "要不要把这个计划记下来？我可以帮你追踪进度。"
+    }
+
+
+@tool_handler("track_decision")
+async def execute_track_decision(args: Dict, context: ToolContext) -> Dict:
+    """
+    追踪职业决策
+
+    Returns:
+        {
+            "decision_id": "dec_xxx",
+            "status": "created",
+            "message": "已记录！我会在执行日期前提醒你。"
+        }
+    """
+    decision_title = args.get("decision_title")
+    decision_type = args.get("decision_type")
+    target_date = args.get("target_date")
+    expected_outcome = args.get("expected_outcome")
+    timing_rationale = args.get("timing_rationale")
+
+    # 生成决策 ID
+    import uuid
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+
+    # 构造决策数据
+    decision_data = {
+        "id": decision_id,
+        "title": decision_title,
+        "type": decision_type,
+        "target_date": target_date,
+        "expected_outcome": expected_outcome,
+        "timing_rationale": timing_rationale,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "actual_result": None,
+        "result_at": None
+    }
+
+    # 保存到用户 Profile
+    await _save_decision(context.user_id, decision_data)
+
+    return {
+        "decision_id": decision_id,
+        "status": "created",
+        "message": f"已记录「{decision_title}」！\n目标日期：{target_date}\n我会在执行日期前提醒你准备。",
+        "cardType": "decision_tracker",
+        "cardData": decision_data
+    }
+
+
+@tool_handler("update_decision_result")
+async def execute_update_decision_result(args: Dict, context: ToolContext) -> Dict:
+    """
+    更新决策结果 - 飞轮数据收集
+
+    这个数据用于：
+    1. 验证时机建议的准确性
+    2. 优化未来的建议
+    3. 生成用户的决策成功率
+    """
+    decision_id = args.get("decision_id")
+    actual_result = args.get("actual_result")
+    notes = args.get("notes", "")
+
+    # 更新决策状态
+    await _update_decision(context.user_id, decision_id, {
+        "actual_result": actual_result,
+        "result_notes": notes,
+        "result_at": datetime.now().isoformat(),
+        "status": "completed"
+    })
+
+    # 计算飞轮数据
+    flywheel_data = await _calculate_flywheel_metrics(context.user_id)
+
+    return {
+        "status": "updated",
+        "message": f"结果已记录：{actual_result}",
+        "flywheel_insight": flywheel_data.get("insight"),
+        "success_rate": flywheel_data.get("success_rate")
+    }
+
+
+@tool_handler("generate_negotiation_script")
+async def execute_generate_negotiation_script(args: Dict, context: ToolContext) -> Dict:
+    """
+    生成谈判话术
+
+    结合用户特点、对方特点、时机因素生成个性化话术。
+    """
+    scenario = args.get("scenario")
+    target_outcome = args.get("target_outcome")
+    boss_info = args.get("boss_info", {})
+
+    # 获取用户画像
+    profile = await UnifiedProfileRepository.get_profile(context.user_id)
+
+    # TODO: 调用 LLM 生成个性化话术
+    # 这里是示例
+    script = _generate_script(scenario, target_outcome, profile, boss_info)
+
+    return {
+        "scenario": scenario,
+        "target_outcome": target_outcome,
+        "script": script,
+        "tips": [
+            "先肯定对方，再提需求",
+            "用数据说话，不用情绪",
+            "给对方思考时间，不要逼迫"
+        ],
+        "cardType": "negotiation_script",
+        "cardData": {
+            "scenario": scenario,
+            "opening": script["opening"],
+            "key_points": script["key_points"],
+            "closing": script["closing"]
+        }
+    }
+
+
+@tool_handler("show_career_fortune")
+async def execute_show_career_fortune(args: Dict, context: ToolContext) -> Dict:
+    """
+    展示职业运势概览
+    """
+    period = args.get("period", "本月")
+
+    profile = await UnifiedProfileRepository.get_profile(context.user_id)
+    if not profile:
+        return {"error": "未找到用户档案"}
+
+    # TODO: 调用运势计算服务
+    fortune = _calculate_fortune(profile, period)
+
+    return {
+        "period": period,
+        "fortune": fortune,
+        "cardType": "career_fortune",
+        "cardData": fortune
+    }
+
+
+@tool_handler("show_decision_history")
+async def execute_show_decision_history(args: Dict, context: ToolContext) -> Dict:
+    """
+    展示历史决策记录
+    """
+    filter_type = args.get("filter_type", "all")
+
+    profile = await UnifiedProfileRepository.get_profile(context.user_id)
+    if not profile:
+        return {"error": "未找到用户档案"}
+
+    decisions = profile.get("skills", {}).get("career_timing", {}).get("decision_history", [])
+
+    if filter_type != "all":
+        decisions = [d for d in decisions if d.get("actual_result") == filter_type]
+
+    # 计算统计
+    stats = _calculate_decision_stats(decisions)
+
+    return {
+        "decisions": decisions[-10:],  # 最近 10 条
+        "stats": stats,
+        "cardType": "decision_history",
+        "cardData": {
+            "decisions": decisions[-10:],
+            "stats": stats
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+def _analyze_timing(decision_type: str, target_date: str, profile: Dict) -> Dict:
+    """分析时机（示例实现）"""
+    # TODO: 调用真实的命理分析服务
+    return {
+        "decision_type": decision_type,
+        "target_period": target_date,
+        "best_windows": [
+            {"date": "1月28日", "score": 92, "reason": "木星入财帛宫，财运旺"},
+            {"date": "1月30日", "score": 78, "reason": "财运稳定，贵人运佳"}
+        ],
+        "avoid_dates": [
+            {"date": "1月25日", "reason": "水星逆行开始，沟通易有误解"}
+        ],
+        "overall_score": 85,
+        "summary": "整体时机良好，建议1月28日行动"
+    }
+
+
+def _generate_advice(decision_type: str, analysis: Dict) -> Dict:
+    """生成建议（示例实现）"""
+    return {
+        "preparation": [
+            "整理过去半年的工作成果",
+            "准备 2-3 个关键业绩数据",
+            "想好期望薪资区间（给自己留谈判空间）"
+        ],
+        "timing_tips": "建议上午10-11点谈，对方精力最好；避开周一和周五",
+        "approach": "先肯定公司/团队，再展示贡献，最后提出期望",
+        "fallback": "如果这次不成功，3月还有一个窗口"
+    }
+
+
+def _generate_script(scenario: str, target: str, profile: Dict, boss_info: Dict) -> Dict:
+    """生成话术（示例实现）"""
+    return {
+        "opening": "领导，想占用您几分钟时间，聊聊我的工作和发展。",
+        "key_points": [
+            "过去半年，我完成了XX项目，带来了XX结果",
+            "我对团队的贡献包括...",
+            "基于这些，我希望能讨论一下薪资调整"
+        ],
+        "closing": "我很珍惜在这里的机会，也希望能得到与贡献匹配的回报。",
+        "if_rejected": "我理解。那您觉得我需要达到什么样的表现，才能获得调薪机会？"
+    }
+
+
+async def _save_decision(user_id, decision_data: Dict):
+    """保存决策到 Profile"""
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+    if not profile:
+        return
+
+    career_timing = profile.get("skills", {}).get("career_timing", {})
+    if "active_decisions" not in career_timing:
+        career_timing["active_decisions"] = []
+
+    career_timing["active_decisions"].append(decision_data)
+
+    await UnifiedProfileRepository.update_skill_data(
+        user_id, "career_timing", career_timing
+    )
+
+
+async def _update_decision(user_id, decision_id: str, update_data: Dict):
+    """更新决策状态"""
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+    if not profile:
+        return
+
+    career_timing = profile.get("skills", {}).get("career_timing", {})
+    active = career_timing.get("active_decisions", [])
+    history = career_timing.get("decision_history", [])
+
+    # 找到决策并更新
+    for i, d in enumerate(active):
+        if d.get("id") == decision_id:
+            d.update(update_data)
+            # 移到历史
+            history.append(d)
+            active.pop(i)
+            break
+
+    career_timing["active_decisions"] = active
+    career_timing["decision_history"] = history
+
+    await UnifiedProfileRepository.update_skill_data(
+        user_id, "career_timing", career_timing
+    )
+
+
+async def _calculate_flywheel_metrics(user_id) -> Dict:
+    """计算飞轮指标"""
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+    if not profile:
+        return {}
+
+    history = profile.get("skills", {}).get("career_timing", {}).get("decision_history", [])
+
+    if not history:
+        return {"insight": "这是您的第一个决策记录！", "success_rate": None}
+
+    success_count = len([d for d in history if d.get("actual_result") == "成功"])
+    total = len(history)
+    rate = round(success_count / total * 100, 1) if total > 0 else 0
+
+    return {
+        "success_rate": f"{rate}%",
+        "total_decisions": total,
+        "insight": f"您的决策成功率是 {rate}%，共 {total} 次决策记录。"
+    }
+
+
+def _calculate_fortune(profile: Dict, period: str) -> Dict:
+    """计算运势（示例）"""
+    return {
+        "overall_score": 82,
+        "dimensions": [
+            {"name": "财运", "score": 85, "trend": "上升"},
+            {"name": "贵人", "score": 78, "trend": "稳定"},
+            {"name": "事业", "score": 80, "trend": "上升"}
+        ],
+        "highlights": [
+            "1月28日：财运高峰，适合谈判",
+            "2月初：贵人运旺，适合拓展人脉"
+        ],
+        "cautions": [
+            "1月25-26日：水逆期间避免重大决定"
+        ]
+    }
+
+
+def _calculate_decision_stats(decisions: List[Dict]) -> Dict:
+    """计算决策统计"""
+    if not decisions:
+        return {"total": 0}
+
+    success = len([d for d in decisions if d.get("actual_result") == "成功"])
+    partial = len([d for d in decisions if d.get("actual_result") == "部分成功"])
+    failed = len([d for d in decisions if d.get("actual_result") == "失败"])
+
+    return {
+        "total": len(decisions),
+        "success": success,
+        "partial": partial,
+        "failed": failed,
+        "success_rate": f"{round(success/len(decisions)*100, 1)}%" if decisions else "0%"
+    }
+```
+
+---
+
+## 4. Claude SDK 标准 Agentic Loop
+
+### 4.1 核心执行流程
+
+**文件**: `services/agent/core.py`（v9.2 简化版）
+
+```python
+class CoreAgent:
+    """
+    v9.2 Claude SDK 标准模式
+
+    核心原则：
+    1. LLM 完全驱动 - 所有决策由 LLM 做出
+    2. 工具即能力 - 通过工具扩展 LLM 能力
+    3. 配置即规则 - routing.yaml + SKILL.md 定义行为
+    """
+
+    async def run(self, context: AgentContext) -> AsyncGenerator[AgentEvent, None]:
+        """
+        标准 Agentic Loop
+
+        Claude SDK 模式：
+        while has_tool_use:
+            response = llm.create(messages, tools)
+            results = execute_tools(response.tool_use)
+            messages.append(results)
+        """
+        # 1. 构建初始消息
+        messages = await self._build_messages(context)
+
+        # 2. 获取工具集（从 routing.yaml + tools.yaml 动态组装）
+        tools = await self._get_tools(context)
+
+        # 3. 标准 Agentic Loop
+        while True:
+            response_content = ""
+            tool_calls = []
+
+            # 流式调用 LLM
+            async for chunk in self.llm.stream(messages, tools):
+                if chunk["type"] == "content":
+                    response_content += chunk["content"]
+                    yield AgentEvent(type="content", data=chunk)
+                elif chunk["type"] == "tool_call":
+                    tool_calls.append(chunk)
+
+            # 没有工具调用则结束
+            if not tool_calls:
+                break
+
+            # 添加 assistant 消息
+            messages.append({
+                "role": "assistant",
+                "content": response_content,
+                "tool_calls": tool_calls
+            })
+
+            # 执行工具并收集结果
+            tool_results = []
+            for call in tool_calls:
+                result = await self.executor.execute(
+                    call["tool_name"],
+                    call["tool_args"],
+                    context
+                )
+                tool_results.append({
+                    "tool_call_id": call["id"],
+                    "content": json.dumps(result, ensure_ascii=False)
+                })
+                yield AgentEvent(type="tool_result", data=result)
+
+            # 添加工具结果
+            messages.append({"role": "user", "content": tool_results})
+
+    async def _build_messages(self, context: AgentContext) -> List[Dict]:
+        """
+        构建消息列表
+
+        System Prompt 来源：
+        1. routing.yaml 的 phase1_prompt（Phase 1）
+        2. SKILL.md 的专家身份（Phase 2）
+        3. tools.yaml 的工具描述（动态注入）
+        """
+        system_prompt = await self.prompt_builder.build(
+            skill_id=context.skill,
+            profile=None,  # v9.2: 不预加载，LLM 按需获取
+            skill_data=None
+        )
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context.message}
+        ]
+
+    async def _get_tools(self, context: AgentContext) -> List[Dict]:
+        """
+        获取工具集
+
+        来源：
+        1. Core 工具（get_user_profile, activate_skills 等）
+        2. Skill 专属工具（从 tools.yaml 加载）
+        3. routing.yaml 配置的 global_tools
+        """
+        # 始终包含核心工具
+        tools = ToolRegistry.get_core_tools()
+
+        # 如果已激活 Skill，加载 Skill 工具
+        if context.skill:
+            skill_tools = ToolRegistry.get_tools_for_skill(context.skill)
+            tools.extend(skill_tools)
+
+        return tools
+```
+
+---
+
+## 5. 完整交互示例
+
+### 示例 1：用户问加薪时机
+
+```
+用户: 下周适合谈加薪吗？
+
+LLM 思考: 用户问加薪时机，需要：
+  1. 用户命盘数据（分析财运）
+  2. 用户职业背景（个性化建议）
+
+LLM 调用: get_user_profile(fields=["identity.birth_info", "skills.bazi", "life_context.occupation"])
+
+Tool 返回: {
+  "profile": {
+    "identity": {"birth_info": {"birth_date": "1990-05-15", "birth_time": "10:30", "birth_place": "北京"}},
+    "skills": {"bazi": {"chart": {...}}},
+    "life_context": {"occupation": {"title": "产品经理", "industry": "互联网"}}
+  }
+}
+
+LLM 思考: 有命盘数据了，可以分析时机
+
+LLM 调用: analyze_career_timing(decision_type="加薪", target_date="下周")
+
+Tool 返回: {
+  "analysis": {
+    "best_windows": [{"date": "1月28日", "score": 92, "reason": "木星入财帛宫"}],
+    "avoid_dates": [{"date": "1月25日", "reason": "水星逆行"}]
+  },
+  "advice": {...}
+}
+
+LLM 生成:
+根据您的八字，下周的加薪时机分析如下：
+
+📅 最佳时机：1月28日（周三）
+- 木星入财帛宫，财运旺盛
+- 建议上午 10-11 点谈，对方精力最好
+
+⚠️ 避开日期：1月25日
+- 水星逆行开始，沟通容易有误解
+
+💡 准备建议：
+1. 整理过去半年的工作成果
+2. 准备 2-3 个关键业绩数据
+3. 想好期望薪资区间
+
+要不要把这个计划记下来？我可以帮你追踪进度。
+```
+
+### 示例 2：追踪决策
+
+```
+用户: 好的，帮我记录
+
+LLM 调用: track_decision(
+  decision_title="跟张总谈加薪",
+  decision_type="加薪",
+  target_date="2026-01-28",
+  expected_outcome="涨薪 20%",
+  timing_rationale="木星入财帛宫，财运旺"
+)
+
+Tool 返回: {
+  "decision_id": "dec_a1b2c3",
+  "status": "created",
+  "message": "已记录！我会在执行日期前提醒你。"
+}
+
+LLM 生成:
+已帮你记录「跟张总谈加薪」计划！
+
+📝 决策详情：
+- 目标日期：1月28日
+- 期望结果：涨薪 20%
+- 时机依据：木星入财帛宫
+
+我会在 1 月 27 日提醒你准备。
+祝谈判顺利！🤞
+```
+
+---
+
+## 6. 飞轮数据设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         飞轮数据收集                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  用户决策 → 时机建议 → 实际结果 → 学习优化 → 更好建议 → 更多用户        │
+│       ↑                                                    ↓            │
+│       └──────────── 信任建立 ←──── 成功率提升 ←───────────┘            │
+│                                                                          │
+│  数据收集点：                                                            │
+│  1. track_decision: 记录决策和时机选择                                   │
+│  2. update_decision_result: 记录实际结果                                 │
+│  3. _calculate_flywheel_metrics: 计算成功率和洞察                        │
+│                                                                          │
+│  学习应用：                                                              │
+│  1. 相似命盘的成功案例推荐                                               │
+│  2. 时机建议准确率优化                                                   │
+│  3. 个性化建议调整                                                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. 总结
+
+### 7.1 架构协同要点
+
+| 组件 | 职责 | 协同方式 |
+|------|------|---------|
+| `routing.yaml` | 全局路由配置 | 定义 Skill 触发词、依赖、全局工具 |
+| `SKILL.md` | 专家身份定义 | 定义对话原则、伦理边界 |
+| `tools.yaml` | 工具定义 | 定义工具参数、调用时机 |
+| `handlers.py` | 工具执行 | 实现工具逻辑、数据存取 |
+| `CoreAgent` | 执行引擎 | 标准 Agentic Loop |
+| `LLMClient` | LLM 调用 | 兼容多模型 |
+
+### 7.2 LLM 驱动原则
+
+1. **数据按需获取** - LLM 通过 `get_user_profile` 决定获取什么
+2. **工具自主调用** - LLM 根据用户意图选择工具
+3. **流程自主编排** - LLM 决定调用顺序和参数
+4. **配置即规则** - 通过 YAML/MD 文件定义行为，不硬编码
+
+### 7.3 与 bezos.md 建议的对应
+
+| Bezos 建议 | 实现方式 |
+|-----------|---------|
+| 10x Better | 时机精准到日、可执行建议、追踪反馈 |
+| 飞轮效应 | 决策追踪 → 结果学习 → 建议优化 |
+| 深度场景 | 专注职场时机，不泛化 |
+| 指标追踪 | 成功率、决策数、用户留存 |

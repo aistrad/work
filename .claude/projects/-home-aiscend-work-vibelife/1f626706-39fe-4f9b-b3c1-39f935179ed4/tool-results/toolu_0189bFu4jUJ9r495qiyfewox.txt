@@ -1,0 +1,280 @@
+     1→"""
+     2→Knowledge Repository V2 - Data access layer for knowledge system
+     3→
+     4→Uses PostgreSQL SQL functions for efficient hybrid search
+     5→"""
+     6→from typing import Optional, List, Dict, Any
+     7→from uuid import UUID
+     8→
+     9→from .db import get_connection
+    10→
+    11→
+    12→class KnowledgeRepository:
+    13→    """Repository for knowledge operations (V2 with SQL functions)"""
+    14→
+    15→    # ─────────────────────────────────────────────────────────────────
+    16→    # Hybrid Search (using SQL function)
+    17→    # ─────────────────────────────────────────────────────────────────
+    18→
+    19→    @staticmethod
+    20→    async def hybrid_search(
+    21→        query_preprocessed: str,
+    22→        embedding: List[float],
+    23→        skill_id: str,
+    24→        top_k: int = 5,
+    25→        vector_weight: float = 0.7,
+    26→        text_weight: float = 0.3
+    27→    ) -> List[dict]:
+    28→        """
+    29→        Hybrid search using RRF (Reciprocal Rank Fusion)
+    30→
+    31→        Args:
+    32→            query_preprocessed: Jieba-tokenized query string
+    33→            embedding: Query embedding vector
+    34→            skill_id: Skill to search in
+    35→            top_k: Number of results
+    36→            vector_weight: Weight for vector similarity (default 0.7)
+    37→            text_weight: Weight for text match (default 0.3)
+    38→
+    39→        Returns:
+    40→            List of matching chunks with scores
+    41→        """
+    42→        async with get_connection() as conn:
+    43→            rows = await conn.fetch(
+    44→                """
+    45→                SELECT * FROM hybrid_search_v2($1, $2::vector, $3, $4, 60, $5, $6)
+    46→                """,
+    47→                query_preprocessed,
+    48→                embedding,
+    49→                skill_id,
+    50→                top_k,
+    51→                vector_weight,
+    52→                text_weight
+    53→            )
+    54→            return [dict(row) for row in rows]
+    55→
+    56→    # ─────────────────────────────────────────────────────────────────
+    57→    # Vector-Only Search
+    58→    # ─────────────────────────────────────────────────────────────────
+    59→
+    60→    @staticmethod
+    61→    async def vector_search(
+    62→        embedding: List[float],
+    63→        skill_id: str,
+    64→        top_k: int = 5
+    65→    ) -> List[dict]:
+    66→        """Search by vector similarity only"""
+    67→        async with get_connection() as conn:
+    68→            rows = await conn.fetch(
+    69→                "SELECT * FROM vector_search_v2($1::vector, $2, $3)",
+    70→                embedding,
+    71→                skill_id,
+    72→                top_k
+    73→            )
+    74→            return [dict(row) for row in rows]
+    75→
+    76→    # ─────────────────────────────────────────────────────────────────
+    77→    # Text-Only Search
+    78→    # ─────────────────────────────────────────────────────────────────
+    79→
+    80→    @staticmethod
+    81→    async def text_search(
+    82→        query_preprocessed: str,
+    83→        skill_id: str,
+    84→        top_k: int = 5
+    85→    ) -> List[dict]:
+    86→        """Search by full-text search only"""
+    87→        async with get_connection() as conn:
+    88→            rows = await conn.fetch(
+    89→                """
+    90→                SELECT
+    91→                    id, content, content_type, section_title, section_path, metadata,
+    92→                    ts_rank(search_vector, plainto_tsquery('simple', $1)) as score
+    93→                FROM knowledge_chunks_v2
+    94→                WHERE skill_id = $2
+    95→                  AND search_vector @@ plainto_tsquery('simple', $1)
+    96→                ORDER BY score DESC
+    97→                LIMIT $3
+    98→                """,
+    99→                query_preprocessed,
+   100→                skill_id,
+   101→                top_k
+   102→            )
+   103→            return [dict(row) for row in rows]
+   104→
+   105→    # ─────────────────────────────────────────────────────────────────
+   106→    # Chunk Operations
+   107→    # ─────────────────────────────────────────────────────────────────
+   108→
+   109→    @staticmethod
+   110→    async def get_chunk(chunk_id: UUID) -> Optional[dict]:
+   111→        """Get chunk by ID"""
+   112→        async with get_connection() as conn:
+   113→            row = await conn.fetchrow(
+   114→                """
+   115→                SELECT id, document_id, skill_id, chunk_index, content,
+   116→                       content_type, section_path, section_title, metadata,
+   117→                       has_table, has_list, char_count, created_at
+   118→                FROM knowledge_chunks_v2 WHERE id = $1
+   119→                """,
+   120→                chunk_id
+   121→            )
+   122→            return dict(row) if row else None
+   123→
+   124→    @staticmethod
+   125→    async def get_chunks_by_document(document_id: UUID) -> List[dict]:
+   126→        """Get all chunks for a document"""
+   127→        async with get_connection() as conn:
+   128→            rows = await conn.fetch(
+   129→                """
+   130→                SELECT id, chunk_index, content, section_title, char_count
+   131→                FROM knowledge_chunks_v2
+   132→                WHERE document_id = $1
+   133→                ORDER BY chunk_index
+   134→                """,
+   135→                document_id
+   136→            )
+   137→            return [dict(row) for row in rows]
+   138→
+   139→    @staticmethod
+   140→    async def create_chunk(
+   141→        skill_id: str,
+   142→        content: str,
+   143→        search_text_preprocessed: str,
+   144→        embedding: Optional[List[float]] = None,
+   145→        document_id: Optional[UUID] = None,
+   146→        chunk_index: int = 0,
+   147→        content_type: str = "knowledge",
+   148→        section_path: Optional[List[str]] = None,
+   149→        section_title: Optional[str] = None,
+   150→        metadata: Optional[Dict[str, Any]] = None,
+   151→        has_table: bool = False,
+   152→        has_list: bool = False
+   153→    ) -> dict:
+   154→        """Create a knowledge chunk"""
+   155→        async with get_connection() as conn:
+   156→            # Convert embedding to vector string for explicit casting to vector
+   157→            embedding_str = "[" + ",".join(map(str, embedding)) + "]" if embedding is not None else None
+   158→            row = await conn.fetchrow(
+   159→                """
+   160→                INSERT INTO knowledge_chunks_v2 (
+   161→                    document_id, skill_id, chunk_index, content, content_type,
+   162→                    section_path, section_title, metadata,
+   163→                    has_table, has_list, char_count,
+   164→                    search_text_preprocessed, embedding
+   165→                )
+   166→                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::vector)
+   167→                RETURNING id, skill_id, content, content_type, section_title, created_at
+   168→                """,
+   169→                document_id, skill_id, chunk_index, content, content_type,
+   170→                section_path, section_title, metadata or {},
+   171→                has_table, has_list, len(content),
+   172→                search_text_preprocessed, embedding_str
+   173→            )
+   174→            return dict(row)
+   175→
+   176→    @staticmethod
+   177→    async def delete_chunk(chunk_id: UUID) -> bool:
+   178→        """Delete a chunk"""
+   179→        async with get_connection() as conn:
+   180→            result = await conn.execute(
+   181→                "DELETE FROM knowledge_chunks_v2 WHERE id = $1",
+   182→                chunk_id
+   183→            )
+   184→            return "DELETE 1" in result
+   185→
+   186→    @staticmethod
+   187→    async def update_embedding(chunk_id: UUID, embedding: List[float]) -> bool:
+   188→        """Update chunk embedding"""
+   189→        async with get_connection() as conn:
+   190→            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+   191→            result = await conn.execute(
+   192→                "UPDATE knowledge_chunks_v2 SET embedding = $2::vector WHERE id = $1",
+   193→                chunk_id, embedding_str
+   194→            )
+   195→            return "UPDATE 1" in result
+   196→
+   197→    # ─────────────────────────────────────────────────────────────────
+   198→    # Document Operations
+   199→    # ─────────────────────────────────────────────────────────────────
+   200→
+   201→    @staticmethod
+   202→    async def get_document(doc_id: UUID) -> Optional[dict]:
+   203→        """Get document by ID"""
+   204→        async with get_connection() as conn:
+   205→            row = await conn.fetchrow(
+   206→                """
+   207→                SELECT id, skill_id, filename, file_path, file_hash,
+   208→                       file_type, status, chunk_count, error_message,
+   209→                       created_at, updated_at
+   210→                FROM knowledge_documents WHERE id = $1
+   211→                """,
+   212→                doc_id
+   213→            )
+   214→            return dict(row) if row else None
+   215→
+   216→    @staticmethod
+   217→    async def get_documents_by_skill(
+   218→        skill_id: str,
+   219→        status: Optional[str] = None
+   220→    ) -> List[dict]:
+   221→        """Get all documents for a skill"""
+   222→        async with get_connection() as conn:
+   223→            if status:
+   224→                rows = await conn.fetch(
+   225→                    """
+   226→                    SELECT id, filename, file_type, status, chunk_count,
+   227→                           error_message, updated_at
+   228→                    FROM knowledge_documents
+   229→                    WHERE skill_id = $1 AND status = $2
+   230→                    ORDER BY filename
+   231→                    """,
+   232→                    skill_id, status
+   233→                )
+   234→            else:
+   235→                rows = await conn.fetch(
+   236→                    """
+   237→                    SELECT id, filename, file_type, status, chunk_count,
+   238→                           error_message, updated_at
+   239→                    FROM knowledge_documents
+   240→                    WHERE skill_id = $1
+   241→                    ORDER BY filename
+   242→                    """,
+   243→                    skill_id
+   244→                )
+   245→            return [dict(row) for row in rows]
+   246→
+   247→    @staticmethod
+   248→    async def get_pending_count() -> int:
+   249→        """Get count of pending documents"""
+   250→        async with get_connection() as conn:
+   251→            count = await conn.fetchval(
+   252→                "SELECT COUNT(*) FROM knowledge_documents WHERE status = 'pending'"
+   253→            )
+   254→            return count or 0
+   255→
+   256→    # ─────────────────────────────────────────────────────────────────
+   257→    # Statistics
+   258→    # ─────────────────────────────────────────────────────────────────
+   259→
+   260→    @staticmethod
+   261→    async def get_stats() -> List[dict]:
+   262→        """Get knowledge base statistics"""
+   263→        async with get_connection() as conn:
+   264→            rows = await conn.fetch("SELECT * FROM knowledge_stats")
+   265→            return [dict(row) for row in rows]
+   266→
+   267→    @staticmethod
+   268→    async def get_skill_chunk_count(skill_id: str) -> int:
+   269→        """Get total chunk count for a skill"""
+   270→        async with get_connection() as conn:
+   271→            count = await conn.fetchval(
+   272→                "SELECT COUNT(*) FROM knowledge_chunks_v2 WHERE skill_id = $1",
+   273→                skill_id
+   274→            )
+   275→            return count or 0
+   276→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

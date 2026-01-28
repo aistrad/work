@@ -1,0 +1,731 @@
+"""
+Core Skill Tool Handlers - 全局工具执行器 (V7 重构版)
+
+所有 Skill 共享的工具执行器。
+使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+
+V7 变更:
+- 删除: show_service_menu, show_skill_services, recommend_service
+- 删除: show_insight, show_report, show_relationship
+- 删除: show_goal_tree, show_daily_plan, show_checkin_form
+- 删除: schedule_reminder, list_reminders, cancel_reminder
+- 新增: create_trigger, list_triggers, cancel_trigger
+- 新增: show_card (统一卡片展示)
+"""
+import logging
+from datetime import datetime
+from typing import Dict, Any
+
+from services.agent.tool_registry import tool_handler, ToolContext
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 搜索型工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("search_db")
+async def execute_search_db(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """从数据库检索知识或案例"""
+    from services.knowledge.repository import get_knowledge_repository
+
+    table = args.get("table", "knowledge_chunks")
+    query = args.get("query", "")
+    filters = args.get("filters", {})
+    top_k = args.get("top_k", 5)
+
+    # 自动添加当前 skill_id 到 filters
+    if context.skill_id and "skill_id" not in filters:
+        filters["skill_id"] = context.skill_id
+    if context.scenario_id and "scenario_id" not in filters:
+        filters["scenario_id"] = context.scenario_id
+
+    try:
+        repo = get_knowledge_repository()
+        results = await repo.search_db(
+            table=table,
+            query=query,
+            filters=filters,
+            top_k=top_k
+        )
+
+        return {
+            "status": "success",
+            "table": table,
+            "query": query,
+            "count": len(results),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"search_db failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "results": []
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 收集型工具
+# ════════════════════════════════════════════════════��══════════════════════
+
+@tool_handler("ask_user_question")
+async def execute_ask_user_question(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """主动向用户提问"""
+    question = args.get("question", "")
+    options = args.get("options", [])
+
+    return {
+        "status": "asking",
+        "cardType": "question_card",
+        "question": question,
+        "options": options[:4] if options else [],
+    }
+
+
+@tool_handler("request_info")
+async def execute_request_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """向用户请求信息"""
+    info_type = args.get("info_type", "birth")
+    question = args.get("question")
+
+    fields_map = {
+        "birth": [
+            {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+            {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+            {"id": "birthPlace", "label": "出生地点", "type": "text", "required": False, "placeholder": "城市名"},
+            {"id": "gender", "label": "性别", "type": "select", "required": True, "options": [
+                {"value": "male", "label": "男"},
+                {"value": "female", "label": "女"},
+            ]},
+        ],
+        "context": [
+            {"id": "situation", "label": "当前情况", "type": "textarea", "required": True, "placeholder": "描述你目前面临的情况"},
+        ],
+        "goals": [
+            {"id": "goals", "label": "你的目标", "type": "textarea", "required": True, "placeholder": "你想达成什么"},
+        ],
+        "concerns": [
+            {"id": "concerns", "label": "你的困惑", "type": "textarea", "required": True, "placeholder": "最困扰你的是什么"},
+        ],
+    }
+
+    return {
+        "status": "collecting",
+        "cardType": "collect_form",
+        "infoType": info_type,
+        "question": question,
+        "fields": fields_map.get(info_type, fields_map["birth"]),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 用户数据工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("read_user_data")
+async def execute_read_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """读取用户数据"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    path = args.get("path", "")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能读取数据",
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+        data = await UnifiedProfileRepository.read_life_context_path(user_uuid, path)
+
+        if data:
+            return {
+                "status": "success",
+                "path": path,
+                "data": data.to_dict(),
+            }
+        else:
+            return {
+                "status": "not_found",
+                "path": path,
+                "message": f"未找到数据: {path}",
+            }
+    except Exception as e:
+        logger.error(f"read_user_data failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("write_user_data")
+async def execute_write_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """写入用户数据"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    path = args.get("path", "")
+    content = args.get("content", {})
+    expected_version = args.get("expected_version")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能保存数据",
+        }
+
+    if not path:
+        return {
+            "status": "error",
+            "error": "path 参数不能为空",
+        }
+
+    if not content:
+        return {
+            "status": "error",
+            "error": "content 参数不能为空",
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+        data = await UnifiedProfileRepository.write_life_context_path(
+            user_uuid, path, content,
+            expected_version=expected_version
+        )
+
+        return {
+            "status": "success",
+            "path": path,
+            "version": data.version,
+            "message": f"数据已保存到 {path}",
+        }
+    except ValueError as e:
+        # v7.6: UnifiedProfileRepository 抛出 ValueError 代替 VersionConflictError
+        if "Version conflict" in str(e):
+            return {
+                "status": "conflict",
+                "error": str(e),
+                "message": "版本冲突，数据已被其他操作修改",
+            }
+        raise
+    except Exception as e:
+        logger.error(f"write_user_data failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("query_user_data")
+async def execute_query_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """查询用户数据"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    path_prefix = args.get("path_prefix")
+    limit = args.get("limit", 20)
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能查询数据",
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+        # v7.6: query_life_context 不支持 filters 和 sort_by，简化接口
+        results = await UnifiedProfileRepository.query_life_context(
+            user_uuid,
+            path_prefix=path_prefix,
+            limit=limit,
+        )
+
+        return {
+            "status": "success",
+            "count": len(results),
+            "results": [r.to_dict() for r in results],
+        }
+    except Exception as e:
+        logger.error(f"query_user_data failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("delete_user_data")
+async def execute_delete_user_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """删除用户数据"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    path = args.get("path", "")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能删除数据",
+        }
+
+    if not path:
+        return {
+            "status": "error",
+            "error": "path 参数不能为空",
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+        deleted = await UnifiedProfileRepository.delete_life_context_path(user_uuid, path)
+
+        if deleted:
+            return {
+                "status": "success",
+                "path": path,
+                "message": f"已删除: {path}",
+            }
+        else:
+            return {
+                "status": "not_found",
+                "path": path,
+                "message": f"未找到数据: {path}",
+            }
+    except Exception as e:
+        logger.error(f"delete_user_data failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 触发器工具 (V7 新增)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("create_trigger")
+async def execute_create_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """创建用户触发器"""
+    from uuid import UUID
+    from skills.core.services.trigger import get_trigger_service
+
+    trigger_type = args.get("trigger_type", "reminder")
+    title = args.get("title", "")
+    schedule = args.get("schedule")
+    schedule_type = args.get("schedule_type", "daily")
+    trigger_subtype = args.get("trigger_subtype", "custom")
+    condition = args.get("condition")
+    action = args.get("action")
+    source_path = args.get("source_path")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能创建触发器",
+        }
+
+    if not title:
+        return {
+            "status": "error",
+            "error": "title 参数不能为空",
+        }
+
+    # 验证参数
+    if trigger_type in ("reminder", "schedule") and not schedule:
+        return {
+            "status": "error",
+            "error": f"{trigger_type} 类型需要提供 schedule 参数",
+        }
+
+    if trigger_type == "condition" and not condition:
+        return {
+            "status": "error",
+            "error": "condition 类型需要提供 condition 参数",
+        }
+
+    try:
+        service = get_trigger_service()
+        user_uuid = UUID(context.user_id)
+        trigger = await service.create(
+            user_id=user_uuid,
+            trigger_type=trigger_type,
+            title=title,
+            schedule=schedule,
+            schedule_type=schedule_type,
+            trigger_subtype=trigger_subtype,
+            action=action,
+            condition=condition,
+            source_path=source_path,
+        )
+
+        return {
+            "status": "success",
+            "trigger": trigger.to_dict(),
+            "message": f"已创建触发器: {title}",
+        }
+    except Exception as e:
+        logger.error(f"create_trigger failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("list_triggers")
+async def execute_list_triggers(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """列出用户触发器"""
+    from uuid import UUID
+    from skills.core.services.trigger import get_trigger_service
+
+    trigger_type = args.get("trigger_type")
+    status = args.get("status", "active")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能查看触发器",
+        }
+
+    try:
+        service = get_trigger_service()
+        user_uuid = UUID(context.user_id)
+        triggers = await service.list(
+            user_uuid,
+            trigger_type=trigger_type,
+            status=status,
+        )
+
+        return {
+            "status": "success",
+            "count": len(triggers),
+            "triggers": [t.to_dict() for t in triggers],
+        }
+    except Exception as e:
+        logger.error(f"list_triggers failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("cancel_trigger")
+async def execute_cancel_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """取消触发器"""
+    from uuid import UUID
+    from skills.core.services.trigger import get_trigger_service
+
+    trigger_id = args.get("trigger_id", "")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "error",
+            "error": "需要登录才能取消触发器",
+        }
+
+    if not trigger_id:
+        return {
+            "status": "error",
+            "error": "trigger_id 参数不能为空",
+        }
+
+    try:
+        service = get_trigger_service()
+        user_uuid = UUID(context.user_id)
+        trigger_uuid = UUID(trigger_id)
+        cancelled = await service.cancel(user_uuid, trigger_uuid)
+
+        if cancelled:
+            return {
+                "status": "success",
+                "message": "触发器已取消",
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": "未找到该触发器或已取消",
+            }
+    except Exception as e:
+        logger.error(f"cancel_trigger failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 向后兼容: 旧提醒工具映射到新触发器工具
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("schedule_reminder")
+async def execute_schedule_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """设置定时提醒 (向后兼容，映射到 create_trigger)"""
+    # 转换参数
+    new_args = {
+        "trigger_type": "reminder",
+        "title": args.get("title", ""),
+        "schedule": args.get("schedule", ""),
+        "schedule_type": args.get("schedule_type", "daily"),
+        "trigger_subtype": args.get("reminder_type", "custom"),
+    }
+
+    result = await execute_create_trigger(new_args, context)
+
+    # 转换返回格式以保持兼容
+    if result.get("status") == "success" and "trigger" in result:
+        result["reminder"] = result.pop("trigger")
+
+    return result
+
+
+@tool_handler("list_reminders")
+async def execute_list_reminders(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """列出用户提醒 (向后兼容，映射到 list_triggers)"""
+    new_args = {
+        "trigger_type": "reminder",
+        "status": args.get("status", "active"),
+    }
+
+    # 如果指定了 reminder_type，转换为 trigger_subtype 过滤
+    if args.get("reminder_type"):
+        # list_triggers 不直接支持 subtype 过滤，需要在结果中过滤
+        pass
+
+    result = await execute_list_triggers(new_args, context)
+
+    # 转换返回格式
+    if result.get("status") == "success" and "triggers" in result:
+        result["reminders"] = result.pop("triggers")
+
+    return result
+
+
+@tool_handler("cancel_reminder")
+async def execute_cancel_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """取消提醒 (向后兼容，映射到 cancel_trigger)"""
+    new_args = {
+        "trigger_id": args.get("reminder_id", ""),
+    }
+    return await execute_cancel_trigger(new_args, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 展示型工具 (V7 统一)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_card")
+async def execute_show_card(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """统一卡片展示"""
+    from skills.core.services.card import get_card_service
+
+    card_type = args.get("card_type", "list")
+    data_source = args.get("data_source", {})
+    options = args.get("options", {})
+
+    try:
+        service = get_card_service()
+        result = await service.render(
+            card_type=card_type,
+            data_source=data_source,
+            options=options,
+            context={
+                "user_id": context.user_id,
+                "skill_id": context.skill_id,
+                "scenario_id": context.scenario_id,
+            },
+        )
+        return result
+    except Exception as e:
+        logger.error(f"show_card failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 向后兼容: 旧展示工具映射到 show_card
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tool_handler("show_goal_tree")
+async def execute_show_goal_tree(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示目标树 (向后兼容)"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    root_goal_path = args.get("root_goal_path")
+
+    if not context.user_id or context.user_id == "guest":
+        # 返回演示数据
+        return {
+            "status": "success",
+            "cardType": "tree",
+            "nodes": [
+                {
+                    "id": "demo-goal-1",
+                    "title": "2026年目标示例",
+                    "level": "year",
+                    "progress": 25,
+                    "status": "active",
+                    "children": [
+                        {"id": "demo-q1", "title": "Q1: 完成认证", "level": "quarter", "progress": 50, "status": "active"},
+                        {"id": "demo-q2", "title": "Q2: 主导项目", "level": "quarter", "progress": 0, "status": "pending"},
+                    ],
+                }
+            ],
+            "options": {"expandLevel": 2, "showProgress": True},
+            "isDemo": True,
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+
+        # v7.6: 使用 query_life_context，默认查询 goals 路径前缀
+        path_prefix = root_goal_path or "goals/"
+        results = await UnifiedProfileRepository.query_life_context(user_uuid, path_prefix=path_prefix)
+
+        nodes = []
+        for r in results:
+            node = r.content.copy()
+            node["id"] = r.path
+            node["path"] = r.path
+            nodes.append(node)
+
+        return {
+            "status": "success",
+            "cardType": "tree",
+            "nodes": nodes,
+            "options": {"expandLevel": 2, "showProgress": True},
+            "count": len(nodes),
+        }
+    except Exception as e:
+        logger.error(f"show_goal_tree failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("show_daily_plan")
+async def execute_show_daily_plan(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示今日计划 (向后兼容)"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    date_str = args.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "success",
+            "cardType": "list",
+            "items": [
+                {"id": "demo-1", "title": "完成报告", "time": "09:00", "completed": False, "priority": "high"},
+                {"id": "demo-2", "title": "团队会议", "time": "14:00", "completed": False, "priority": "medium"},
+                {"id": "demo-3", "title": "阅读30分钟", "time": "21:00", "completed": False, "priority": "low"},
+            ],
+            "options": {"date": date_str, "emptyText": "今天还没有计划"},
+            "isDemo": True,
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+
+        plan_path = f"plans/daily/{date_str}"
+        data = await UnifiedProfileRepository.read_life_context_path(user_uuid, plan_path)
+
+        if data:
+            return {
+                "status": "success",
+                "cardType": "list",
+                "items": data.content.get("tasks", []),
+                "options": {"date": date_str, "notes": data.content.get("notes", "")},
+            }
+        else:
+            return {
+                "status": "success",
+                "cardType": "list",
+                "items": [],
+                "options": {"date": date_str, "emptyText": "今天还没有计划，要现在创建吗？"},
+            }
+    except Exception as e:
+        logger.error(f"show_daily_plan failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@tool_handler("show_checkin_form")
+async def execute_show_checkin_form(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    """展示打卡表单 (向后兼容)"""
+    from uuid import UUID
+    # v7.6: 使用 UnifiedProfileRepository 替代 UserDataService
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    date_str = args.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+    default_fields = [
+        {"id": "energy", "label": "今日精力", "type": "rating", "max": 5},
+        {"id": "mood", "label": "今日心情", "type": "rating", "max": 5},
+        {"id": "reflection", "label": "今日反思", "type": "textarea", "placeholder": "今天有什么收获或感悟？"},
+    ]
+
+    if not context.user_id or context.user_id == "guest":
+        return {
+            "status": "success",
+            "cardType": "form",
+            "fields": default_fields,
+            "values": {},
+            "options": {
+                "date": date_str,
+                "tasks": [
+                    {"id": "demo-1", "title": "完成报告", "completed": True},
+                    {"id": "demo-2", "title": "团队会议", "completed": True},
+                    {"id": "demo-3", "title": "阅读30分钟", "completed": False},
+                ],
+                "submitLabel": "提交打卡",
+            },
+            "isDemo": True,
+        }
+
+    try:
+        user_uuid = UUID(context.user_id)
+
+        plan_path = f"plans/daily/{date_str}"
+        plan_data = await UnifiedProfileRepository.read_life_context_path(user_uuid, plan_path)
+
+        checkin_path = f"checkins/{date_str}"
+        checkin_data = await UnifiedProfileRepository.read_life_context_path(user_uuid, checkin_path)
+
+        tasks = plan_data.content.get("tasks", []) if plan_data else []
+
+        if checkin_data:
+            completed_ids = set(checkin_data.content.get("completed_tasks", []))
+            for task in tasks:
+                task["completed"] = task.get("id") in completed_ids
+
+        return {
+            "status": "success",
+            "cardType": "form",
+            "fields": default_fields,
+            "values": checkin_data.content if checkin_data else {},
+            "options": {
+                "date": date_str,
+                "tasks": tasks,
+                "submitLabel": "提交打卡",
+                "submitAction": {"type": "write_data", "path": checkin_path},
+            },
+        }
+    except Exception as e:
+        logger.error(f"show_checkin_form failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }

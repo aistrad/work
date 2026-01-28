@@ -1,0 +1,209 @@
+"""
+Rectification Store - SSOT: PostgreSQL
+
+Stores calibration/rectification records in database.
+Replaces file-based storage for horizontal scalability.
+
+Table used:
+- rectification_runs: Stores all rectification records
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from stores.fortune_db import fetchall, fetchone, execute
+
+logger = get_logger(__name__)
+
+# Feature flag: Use DB or fallback to file
+USE_DB_STORE = os.getenv("FORTUNE_USE_DB_STORE", "true").lower() in ("true", "1", "yes")
+
+# Legacy file-based paths (fallback only)
+BASE_DIR = os.path.join("user")
+
+
+# ============================================================================
+# Database Implementation
+# ============================================================================
+
+
+def _db_save_rectification(user_id: int, record: Dict[str, Any]) -> None:
+    """Save rectification record to database."""
+    execute(
+        """
+        INSERT INTO rectification_runs (user_id, name, request_payload, result_payload)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (
+            user_id,
+            record.get("name", ""),
+            json.dumps(record.get("request", {}), ensure_ascii=False),
+            json.dumps(record.get("result", {}), ensure_ascii=False),
+        ),
+    )
+
+
+def _db_load_last_rectification(user_id: int) -> Optional[Dict[str, Any]]:
+    """Load most recent rectification from database."""
+    row = fetchone(
+        """
+        SELECT name, request_payload, result_payload, created_at
+        FROM rectification_runs
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    if not row:
+        return None
+    return {
+        "saved_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "name": row.get("name", ""),
+        "request": row.get("request_payload", {}),
+        "result": row.get("result_payload", {}),
+    }
+
+
+def _db_load_rectification_runs(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """Load rectification history from database."""
+    rows = fetchall(
+        """
+        SELECT name, request_payload, result_payload, created_at
+        FROM rectification_runs
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (user_id, limit),
+    )
+    return [
+        {
+            "saved_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            "name": r.get("name", ""),
+            "request": r.get("request_payload", {}),
+            "result": r.get("result_payload", {}),
+        }
+        for r in rows
+    ]
+
+
+# ============================================================================
+# Legacy File Implementation (Fallback)
+# ============================================================================
+
+
+def _ensure_rectify_dir(user_id: int) -> str:
+    d = os.path.join(BASE_DIR, str(user_id), "rectification")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_json(path: str, data: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _file_save_rectification_run(user_id: int, record: Dict[str, Any]) -> None:
+    d = _ensure_rectify_dir(user_id)
+    # last.json (easy to fetch)
+    _write_json(os.path.join(d, "last.json"), record)
+    # runs.jsonl (history)
+    with open(os.path.join(d, "runs.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _file_load_last_rectification(user_id: int) -> Optional[Dict[str, Any]]:
+    path = os.path.join(BASE_DIR, str(user_id), "rectification", "last.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _file_load_rectification_runs(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    path = os.path.join(BASE_DIR, str(user_id), "rectification", "runs.jsonl")
+    if limit <= 0:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in reversed(lines[-max(1, limit):]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                out.append(obj)
+        except Exception:
+            continue
+    return out
+
+
+# ============================================================================
+# Public API (Auto-switch between DB and file)
+# ============================================================================
+
+
+def save_rectification_run(user_id: int, record: Dict[str, Any]) -> None:
+    """Save rectification record."""
+    if USE_DB_STORE:
+        try:
+            _db_save_rectification(user_id, record)
+            return
+        except Exception as e:
+            logger.warning(f"DB save_rectification_run failed, falling back to file: {e}")
+    _file_save_rectification_run(user_id, record)
+
+
+def load_last_rectification(user_id: int) -> Optional[Dict[str, Any]]:
+    """Load most recent rectification."""
+    if USE_DB_STORE:
+        try:
+            result = _db_load_last_rectification(user_id)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning(f"DB load_last_rectification failed, falling back to file: {e}")
+    return _file_load_last_rectification(user_id)
+
+
+def load_rectification_runs(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """Load rectification history."""
+    if USE_DB_STORE:
+        try:
+            return _db_load_rectification_runs(user_id, limit)
+        except Exception as e:
+            logger.warning(f"DB load_rectification_runs failed, falling back to file: {e}")
+    return _file_load_rectification_runs(user_id, limit)
+
+
+def make_rectification_record(
+    *,
+    name: str,
+    req_payload: Dict[str, Any],
+    result_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create a rectification record dict."""
+    return {
+        "saved_at": datetime.utcnow().isoformat(),
+        "name": name,
+        "request": req_payload,
+        "result": result_payload,
+    }
+

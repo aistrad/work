@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth
+from services import bazi_facts
+from services.bazi_engine import calculate_bazi as engine_calculate_bazi
+
+
+router = APIRouter(prefix="/api/bazi", tags=["bazi"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+# =============================================================================
+# Request Models
+# =============================================================================
+
+class BaziCalculateRequest(BaseModel):
+    """八字计算请求"""
+    year: int = Field(..., ge=1900, le=2100, description="出生年")
+    month: int = Field(..., ge=1, le=12, description="出生月")
+    day: int = Field(..., ge=1, le=31, description="出生日")
+    hour: int = Field(..., ge=0, le=23, description="出生时")
+    minute: int = Field(default=0, ge=0, le=59, description="出生分")
+    location_name: Optional[str] = Field(None, description="出生地点名称")
+    longitude: Optional[float] = Field(None, description="出生地经度")
+    latitude: Optional[float] = Field(None, description="出生地纬度")
+
+
+# =============================================================================
+# 八字计算（供 Agent Runtime Tools 调用）
+# =============================================================================
+
+@router.post("/calculate")
+def calculate_bazi(body: BaziCalculateRequest):
+    """
+    计算八字命盘
+
+    供 Next.js Agent Runtime 的 divine-skills 工具调用。
+    不要求登录，用于即时计算。
+
+    返回：
+    - year_pillar: 年柱
+    - month_pillar: 月柱
+    - day_pillar: 日柱
+    - hour_pillar: 时柱
+    - wuxing: 五行
+    - location: 使用的位置信息
+    """
+    try:
+        location = None
+        if body.longitude is not None:
+            location = {
+                "name": body.location_name or "",
+                "longitude": body.longitude,
+                "latitude": body.latitude or 0.0,
+            }
+
+        result = engine_calculate_bazi(
+            year=body.year,
+            month=body.month,
+            day=body.day,
+            hour=body.hour,
+            minute=body.minute,
+            location=location,
+        )
+
+        # 提取干支信息
+        year_gan = result.year_pillar[0] if len(result.year_pillar) >= 2 else ""
+        year_zhi = result.year_pillar[1] if len(result.year_pillar) >= 2 else ""
+        month_gan = result.month_pillar[0] if len(result.month_pillar) >= 2 else ""
+        month_zhi = result.month_pillar[1] if len(result.month_pillar) >= 2 else ""
+        day_gan = result.day_pillar[0] if len(result.day_pillar) >= 2 else ""
+        day_zhi = result.day_pillar[1] if len(result.day_pillar) >= 2 else ""
+        hour_gan = result.hour_pillar[0] if len(result.hour_pillar) >= 2 else ""
+        hour_zhi = result.hour_pillar[1] if len(result.hour_pillar) >= 2 else ""
+
+        return _ok({
+            "year_pillar": result.year_pillar,
+            "month_pillar": result.month_pillar,
+            "day_pillar": result.day_pillar,
+            "hour_pillar": result.hour_pillar,
+            "year_gan": year_gan,
+            "year_zhi": year_zhi,
+            "month_gan": month_gan,
+            "month_zhi": month_zhi,
+            "day_gan": day_gan,
+            "day_zhi": day_zhi,
+            "hour_gan": hour_gan,
+            "hour_zhi": hour_zhi,
+            "day_master": day_gan,
+            "wuxing": result.wuxing,
+            "used_default_location": result.used_default_location,
+            "location": result.location,
+        })
+    except Exception as e:
+        return _err(500, "calculate_error", f"八字计算失败: {str(e)[:100]}")
+
+
+# =============================================================================
+# 八字事实（需要登录）
+# =============================================================================
+
+@router.get("/facts")
+def get_facts(request: Request):
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+    try:
+        snap = bazi_facts.ensure_snapshot_for_user(user_id)
+    except ValueError as e:
+        msg = str(e)
+        if msg == "user_not_found":
+            return _err(404, "not_found", "user_not_found")
+        return _err(400, "invalid_request", msg)
+    return _ok({"compute_version": snap.get("compute_version") or "", "facts_hash": snap.get("facts_hash") or "", "facts": snap.get("facts") or {}})
+

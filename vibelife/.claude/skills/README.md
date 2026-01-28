@@ -69,6 +69,42 @@ vibelife-skill --phase extract --theme career
 /vibe-review "检查安全性"
 ```
 
+### 4. vibe-manus
+
+**大任务并行处理框架**
+
+使用 Planning with Files + Subagent 模式处理超出 context 窗口的任务。
+
+**核心原理**：
+1. **Planning with Files**: 用文件作为"外部记忆"，持久化中间状态
+2. **Subagent 并行**: 每个 chunk 由独立 subagent 处理，有独立 context
+3. **断点续传**: 支持 /compact 后或新会话继续未完成任务
+
+**适用场景**：
+- 知识抽取：大文件分段抽取 Cases/Scenarios
+- 代码重构：大规模代码修改
+- 批量处理：多文件批量转换/分析
+- 长流程任务：需要多轮交互的复杂任务
+
+**触发词**：`vibe-manus`, `大任务`, `并行处理`, `断点续传`, `manus`
+
+**使用示例**：
+```bash
+# 手动触发
+/vibe-manus 抽取《东方代码启示录》中的所有案例
+
+# 继续上次未完成的任务
+/vibe-manus --resume
+
+# 强制重新开始
+/vibe-manus --force-restart
+```
+
+**自动触发条件**：
+- 文件大小 > 100KB
+- 预估 tokens > 30K
+- 任务需要处理 > 10 个独立单元
+
 ## 目录结构
 
 ```
@@ -91,6 +127,11 @@ vibelife-skill --phase extract --theme career
 │   └── SKILL.md
 ├── vibelife-test/        # 测试环境管理工具
 │   └── SKILL.md
-└── vibe-review/          # Codex CLI 自动代码审查、测试与修复
-    └── SKILL.md
+├── vibe-review/          # Codex CLI 自动代码审查、测试与修复
+│   └── SKILL.md
+└── vibe-manus/           # 大任务并行处理框架
+    ├── SKILL.md
+    └── templates/
+        ├── WORK_STATE.json      # 工作状态模板
+        └── SUBAGENT_PROMPT.md   # Subagent prompt 模板
 ```

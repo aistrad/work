@@ -1,0 +1,619 @@
+"""
+Unified Tool Registry v7 - 统一工具注册表
+
+解决工具注册的硬编码问题：
+1. 从 YAML 加载工具定义 (Single Source of Truth)
+2. 使用 @tool_handler 装饰器动态注册执行器
+3. 消除 if-elif 分发，使用注册表查找
+
+V6.1 更新：
+- 全局工具从 skills/core/tools/ 加载
+- 移除对 GLOBAL_TOOLS 硬编码的依赖
+
+V7.0 更新（跨技能契约）：
+- 支持 Provider/Consumer 双向契约
+- imports ⊆ exports 验证
+- 运行时访问控制（订阅/配额）
+- 审计日志
+
+新增工具只需修改 2 处：
+1. skills/{skill_id}/tools/tools.yaml - 工具定义
+2. skills/{skill_id}/tools/handlers.py - @tool_handler 执行器
+
+用法：
+    from services.agent.tool_registry import tool_handler, ToolRegistry
+
+    @tool_handler("show_bazi_chart")
+    async def execute_show_bazi_chart(args: Dict, context: ToolContext) -> Dict:
+        return {"chart": ...}
+
+    # CoreAgent 中使用
+    tools = ToolRegistry.get_tools_for_skill("bazi")
+    result = await ToolRegistry.execute("show_bazi_chart", args, context)
+"""
+import logging
+import importlib
+import asyncio
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Union
+from dataclasses import dataclass, field
+from functools import wraps
+
+from .tool_schema import ToolDef, load_skill_tools, get_global_tools
+
+logger = logging.getLogger(__name__)
+
+SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+
+
+@dataclass
+class ToolContext:
+    """工具执行上下文"""
+    user_id: str
+    user_tier: str = "free"
+    profile: Dict[str, Any] = field(default_factory=dict)
+    skill_data: Dict[str, Any] = field(default_factory=dict)
+    skill_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+
+
+# 工具执行器类型: 同步或异步函数
+ToolHandler = Callable[[Dict[str, Any], ToolContext], Union[Dict[str, Any], Awaitable[Dict[str, Any]]]]
+
+
+class UnifiedToolRegistry:
+    """
+    统一工具注册表
+
+    - 工具定义从 YAML 加载
+    - 执行器通过 @tool_handler 装饰器注册
+    - 支持全局工具和 Skill 专属工具
+    """
+
+    # 工具定义缓存: {tool_name: ToolDef}
+    _tool_defs: Dict[str, ToolDef] = {}
+
+    # 工具执行器: {tool_name: handler_function}
+    _handlers: Dict[str, ToolHandler] = {}
+
+    # 已加载的 Skill
+    _loaded_skills: set = set()
+
+    # 是否已初始化
+    _initialized: bool = False
+
+    # 订阅与配额（Phase 2）：简单的进程内速率限制计数器
+    # key: f"{user_id}:{provider_skill_id}:{tool_name}:{window_key}" -> {count:int, reset_at:datetime}
+    _rate_counters: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def initialize(cls):
+        """初始化注册表，加载全局工具"""
+        if cls._initialized:
+            return
+
+        # 从 core skill 加载全局工具定义
+        global_tools = get_global_tools()
+        for tool in global_tools:
+            tool.is_global = True
+            cls._tool_defs[tool.name] = tool
+
+        # 加载 core skill 的 handlers
+        cls._load_handlers_module("core")
+
+        # 自动发现并加载所有 Skill 的工具
+        cls._auto_discover_skills()
+
+        # 工具名全局唯一性校验（不同技能不得重名）
+        name_to_owner: Dict[str, Optional[str]] = {}
+        conflicts: List[str] = []
+        for name, tool in cls._tool_defs.items():
+            owner = getattr(tool, 'skill_id', None)
+            if name not in name_to_owner:
+                name_to_owner[name] = owner
+            else:
+                if name_to_owner[name] != owner:
+                    conflicts.append(f"{name} -> {name_to_owner[name]} vs {owner}")
+
+        if conflicts:
+            conflict_msg = (
+                "[Contract] 工具名冲突：不同技能使用了相同的工具名\n" +
+                "\n".join(conflicts) +
+                "\n建议：对工具名进行命名空间化（如 zodiac.calculate_zodiac），或合并为全局工具。"
+            )
+            # 强制失败，避免运行时不确定性
+            raise ValueError(conflict_msg)
+
+        cls._initialized = True
+        logger.info(f"ToolRegistry initialized: {len(cls._tool_defs)} tools, {len(cls._handlers)} handlers")
+
+    @classmethod
+    def _auto_discover_skills(cls):
+        """自动发现并加载所有 Skill"""
+        if not SKILLS_DIR.exists():
+            logger.warning(f"Skills directory not found: {SKILLS_DIR}")
+            return
+
+        for skill_dir in SKILLS_DIR.iterdir():
+            if skill_dir.is_dir() and skill_dir.name != "__pycache__":
+                skill_id = skill_dir.name
+                cls.load_skill(skill_id)
+
+    @classmethod
+    def load_skill(cls, skill_id: str):
+        """加载 Skill 的工具定义和执行器"""
+        if skill_id in cls._loaded_skills:
+            return
+
+        # 1. 从 YAML 加载工具定义
+        tools = load_skill_tools(skill_id)
+        for tool in tools:
+            tool.skill_id = skill_id  # 标记所属 Skill
+            cls._tool_defs[tool.name] = tool
+
+        # 2. 尝试加载执行器模块
+        cls._load_handlers_module(skill_id)
+
+        cls._loaded_skills.add(skill_id)
+        logger.debug(f"Loaded skill '{skill_id}': {len(tools)} tools")
+
+    @classmethod
+    def _load_handlers_module(cls, skill_id: str):
+        """加载 Skill 的 handlers 模块"""
+        handlers_path = SKILLS_DIR / skill_id / "tools" / "handlers.py"
+        if not handlers_path.exists():
+            logger.debug(f"No handlers module for skill '{skill_id}'")
+            return
+
+        try:
+            module_name = f"skills.{skill_id}.tools.handlers"
+            importlib.import_module(module_name)
+            logger.debug(f"Loaded handlers module: {module_name}")
+        except ImportError as e:
+            logger.warning(f"Failed to import handlers for '{skill_id}': {e}")
+
+    @classmethod
+    def register_handler(cls, tool_name: str, handler: ToolHandler):
+        """注册工具执行器"""
+        cls._handlers[tool_name] = handler
+        logger.debug(f"Registered handler: {tool_name}")
+
+    @classmethod
+    def get_tool_def(cls, tool_name: str) -> Optional[ToolDef]:
+        """获取工具定义"""
+        cls.initialize()
+        return cls._tool_defs.get(tool_name)
+
+    @classmethod
+    def get_phase1_tools(cls, skill_id: str = "core") -> List[Dict[str, Any]]:
+        """获取 Phase 1 可用工具 (OpenAI 格式)
+
+        v12: 配置驱动，从 tools.yaml 读取带 phase1: true 标记的工具
+        """
+        cls.initialize()
+
+        tools = []
+        added_tool_names = set()
+
+        # 从全局工具中筛选 phase1: true 的工具
+        all_global_tools = get_global_tools()
+        for tool in all_global_tools:
+            if getattr(tool, 'phase1', False):
+                tools.append(tool.to_openai_format())
+                added_tool_names.add(tool.name)
+
+        logger.debug(f"[ToolRegistry] Phase 1 tools: {list(added_tool_names)}")
+        return tools
+
+    @classmethod
+    def get_tools_for_skill(cls, skill_id: str) -> List[Dict[str, Any]]:
+        """获取 Skill 的所有工具 (OpenAI 格式)
+
+        V6.2 更新：按需加载全局工具
+        V7.0 更新：支持 Provider/Consumer 契约（imports/exports）
+
+        工具加载顺序：
+        1. 全局工具（从 core skill 加载）
+        2. 自身工具
+        3. imports 中声明的授权工具（v7.0 新增）
+        4. external_tools 中声明的特定工具（v7.3 兼容，将被废弃）
+        """
+        cls.initialize()
+
+        tools = []
+        added_tool_names = set()  # 避免重复添加
+
+        # 获取 Skill 声明需要的全局工具（LLM-First：仅从 SKILL.md）
+        from .skill_loader import get_skill_global_tools
+        declared_global_tools = get_skill_global_tools(skill_id)
+
+        # 全局工具（从 core skill 加载）
+        all_global_tools = get_global_tools()
+        for tool in all_global_tools:
+            # 如果声明了 global_tools，只加载声明的；否则加载全部
+            if declared_global_tools:
+                if tool.name in declared_global_tools:
+                    tools.append(tool.to_openai_format())
+                    added_tool_names.add(tool.name)
+            else:
+                # 向后兼容：没有声明则加载全部
+                tools.append(tool.to_openai_format())
+                added_tool_names.add(tool.name)
+
+        # Skill 专属工具（跳过 core，因为已经加载了）
+        if skill_id != "core":
+            for name, tool in cls._tool_defs.items():
+                if getattr(tool, 'skill_id', None) == skill_id:
+                    if name not in added_tool_names:
+                        tools.append(tool.to_openai_format())
+                        added_tool_names.add(name)
+
+        # v7.0: imports 授权工具（Provider/Consumer 契约）
+        from .skill_loader import get_imported_tools_by_provider, get_skill_exports
+        imported_tools = get_imported_tools_by_provider(skill_id)
+
+        for provider_id, tool_names in imported_tools.items():
+            # 获取 Provider 的 exports（用于校验）
+            provider_exports = get_skill_exports(provider_id)
+
+            for tool_name in tool_names:
+                # 如果 Provider 有 exports，校验工具是否被导出
+                if provider_exports and not provider_exports.has_tool(tool_name):
+                    logger.warning(
+                        f"[Contract] {skill_id} imports {tool_name} from {provider_id}, "
+                        f"but it's not in {provider_id}.exports.tools"
+                    )
+                    continue  # 跳过未导出的工具
+
+                # 添加工具
+                if tool_name in cls._tool_defs and tool_name not in added_tool_names:
+                    tools.append(cls._tool_defs[tool_name].to_openai_format())
+                    added_tool_names.add(tool_name)
+                    logger.debug(f"[Contract] {skill_id} imported {tool_name} from {provider_id}")
+                elif tool_name not in cls._tool_defs:
+                    logger.error(
+                        f"[Contract] {skill_id} imports {tool_name} from {provider_id}, "
+                        f"but tool definition not found in registry"
+                    )
+
+        # v7.3: 外部工具（从其他 skill 导入）- 兼容旧配置（将被废弃）
+        from .skill_loader import get_skill_external_tools
+        external_tool_names = get_skill_external_tools(skill_id)
+        if external_tool_names:
+            logger.warning(
+                f"[Deprecated] {skill_id} uses external_tools, "
+                f"please migrate to imports syntax"
+            )
+            for name, tool in cls._tool_defs.items():
+                if name in external_tool_names:
+                    if name not in added_tool_names:
+                        tools.append(tool.to_openai_format())
+                        added_tool_names.add(name)
+
+        return tools
+
+    @classmethod
+    def get_all_tools(cls) -> List[Dict[str, Any]]:
+        """获取所有已注册的工具 (OpenAI 格式)"""
+        cls.initialize()
+        return [tool.to_openai_format() for tool in cls._tool_defs.values()]
+
+    @classmethod
+    def get_card_type(cls, tool_name: str) -> Optional[str]:
+        """获取工具对应的卡片类型"""
+        tool = cls.get_tool_def(tool_name)
+        return tool.card_type if tool else None
+
+    @classmethod
+    def has_handler(cls, tool_name: str) -> bool:
+        """检查是否有注册的执行器"""
+        cls.initialize()
+        return tool_name in cls._handlers
+
+    @classmethod
+    async def execute(
+        cls,
+        tool_name: str,
+        args: Dict[str, Any],
+        context: ToolContext
+    ) -> Dict[str, Any]:
+        """执行工具
+
+        V7.0 更新：跨技能访问控制
+        - 检查 imports 授权
+        - 订阅检查
+        - 配额检查
+        - 审计日志
+        """
+        cls.initialize()
+
+        if tool_name not in cls._handlers:
+            logger.warning(f"No handler for tool: {tool_name}")
+            return {"error": f"Tool handler not found: {tool_name}"}
+
+        # V7.0: 跨技能访问控制
+        tool_def = cls._tool_defs.get(tool_name)
+        provider_skill_id = getattr(tool_def, 'skill_id', None) if tool_def else None
+        consumer_skill_id = context.skill_id
+
+        # 如果是跨技能调用，进行访问控制
+        if provider_skill_id and consumer_skill_id and provider_skill_id != consumer_skill_id:
+            access_result = await cls._check_cross_skill_access(
+                consumer_skill_id=consumer_skill_id,
+                provider_skill_id=provider_skill_id,
+                tool_name=tool_name,
+                user_id=context.user_id,
+            )
+            if not access_result.get("allowed"):
+                return access_result
+
+        handler = cls._handlers[tool_name]
+
+        try:
+            # 支持同步和异步处理器
+            result = handler(args, context)
+            if asyncio.iscoroutine(result):
+                result = await result
+
+            # V7.0: 审计日志（跨技能调用）
+            if provider_skill_id and consumer_skill_id and provider_skill_id != consumer_skill_id:
+                cls._log_cross_skill_call(
+                    consumer_skill_id=consumer_skill_id,
+                    provider_skill_id=provider_skill_id,
+                    tool_name=tool_name,
+                    user_id=context.user_id,
+                    success=True,
+                )
+
+            return result
+        except Exception as e:
+            logger.error(f"Tool execution failed: {tool_name}, error: {e}")
+
+            # V7.0: 审计日志（失败）
+            if provider_skill_id and consumer_skill_id and provider_skill_id != consumer_skill_id:
+                cls._log_cross_skill_call(
+                    consumer_skill_id=consumer_skill_id,
+                    provider_skill_id=provider_skill_id,
+                    tool_name=tool_name,
+                    user_id=context.user_id,
+                    success=False,
+                    error=str(e),
+                )
+
+            return {"error": str(e)}
+
+    @classmethod
+    async def _check_cross_skill_access(
+        cls,
+        consumer_skill_id: str,
+        provider_skill_id: str,
+        tool_name: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """检查跨技能工具访问权限
+
+        Returns:
+            {"allowed": True} 或 {"allowed": False, "error": "...", ...}
+        """
+        from .skill_loader import load_skill_contract, get_skill_exports
+
+        # 1. 获取契约
+        consumer_contract = load_skill_contract(consumer_skill_id)
+        provider_contract = load_skill_contract(provider_skill_id)
+
+        if not consumer_contract:
+            return {"allowed": True}  # 没有契约，允许（兼容期）
+
+        # 2. 检查 imports 声明
+        from .validators import validate_cross_skill_tool_access
+
+        if provider_contract:
+            allowed, error_msg = validate_cross_skill_tool_access(
+                consumer_skill_id=consumer_skill_id,
+                provider_skill_id=provider_skill_id,
+                tool_name=tool_name,
+                consumer_contract=consumer_contract,
+                provider_contract=provider_contract,
+            )
+            if not allowed:
+                logger.warning(f"[Contract] Access denied: {error_msg}")
+                return {
+                    "allowed": False,
+                    "error": "tool_not_imported",
+                    "message": error_msg,
+                }
+
+        # 3. 订阅检查
+        provider_exports = get_skill_exports(provider_skill_id)
+        if provider_exports:
+            # 订阅检查（Phase 2 启用）
+            if provider_exports.access.requires_subscription and not provider_exports.is_free_tool(tool_name):
+                try:
+                    from uuid import UUID
+                    from stores.unified_profile_repo import UnifiedProfileRepository
+                    uid = UUID(user_id) if isinstance(user_id, str) else user_id
+                    has_sub = await UnifiedProfileRepository.is_subscribed(uid, provider_skill_id)
+                except Exception:
+                    has_sub = False
+
+                if not has_sub:
+                    return {
+                        "allowed": False,
+                        "error": "subscription_required",
+                        "skill_id": provider_skill_id,
+                        "action": "show_subscribe_card",
+                    }
+
+            # 配额检查（Phase 2 启用）
+            rate_limit = provider_exports.get_rate_limit(tool_name)
+            if rate_limit and rate_limit != "unlimited":
+                limited, retry_after = cls._enforce_rate_limit(user_id, provider_skill_id, tool_name, rate_limit)
+                if limited:
+                    return {
+                        "allowed": False,
+                        "error": "rate_limited",
+                        "retry_after": retry_after,
+                    }
+
+        return {"allowed": True}
+
+    @classmethod
+    def _enforce_rate_limit(cls, user_id: str, provider_skill_id: str, tool_name: str, rule: str) -> (bool, int):
+        """简单配额：支持 N/day、N/hour、N/min。返回(是否受限, 重试秒数)。"""
+        import re
+        from datetime import datetime, timedelta, timezone
+
+        m = re.match(r"^(\d+)\/(day|hour|min)$", rule.strip())
+        if not m:
+            # 无法解析的规则视为不限制
+            return (False, 0)
+
+        limit = int(m.group(1))
+        unit = m.group(2)
+
+        now = datetime.now(timezone.utc)
+        if unit == "day":
+            window_key = now.strftime("%Y%m%d")
+            reset_at = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+        elif unit == "hour":
+            window_key = now.strftime("%Y%m%d%H")
+            reset_at = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:  # min
+            window_key = now.strftime("%Y%m%d%H%M")
+            reset_at = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+
+        key = f"{user_id}:{provider_skill_id}:{tool_name}:{window_key}"
+        rec = cls._rate_counters.get(key)
+        if rec is None or now >= rec.get("reset_at", now):
+            rec = {"count": 0, "reset_at": reset_at}
+            cls._rate_counters[key] = rec
+
+        if rec["count"] >= limit:
+            retry_after = int((rec["reset_at"] - now).total_seconds())
+            return (True, max(retry_after, 1))
+
+        rec["count"] += 1
+        return (False, 0)
+
+    @classmethod
+    def _log_cross_skill_call(
+        cls,
+        consumer_skill_id: str,
+        provider_skill_id: str,
+        tool_name: str,
+        user_id: str,
+        success: bool,
+        error: Optional[str] = None,
+    ):
+        """记录跨技能调用审计日志"""
+        log_data = {
+            "type": "cross_skill_call",
+            "consumer": consumer_skill_id,
+            "provider": provider_skill_id,
+            "tool": tool_name,
+            "user_id": user_id,
+            "success": success,
+        }
+        if error:
+            log_data["error"] = error
+
+        if success:
+            logger.info(f"[Audit] {consumer_skill_id} -> {provider_skill_id}.{tool_name} (user={user_id})")
+        else:
+            logger.warning(f"[Audit] FAILED: {consumer_skill_id} -> {provider_skill_id}.{tool_name} (user={user_id}): {error}")
+
+    @classmethod
+    def get_schema(cls, skill_id: Optional[str] = None) -> Dict[str, Any]:
+        """获取工具 Schema (用于前端)
+
+        V12 更新：支持 includes 从 routing.yaml
+        """
+        cls.initialize()
+
+        global_tool_names = {t.name for t in get_global_tools()}
+
+        # v7.3: 获取外部工具名
+        external_tool_names = set()
+        if skill_id:
+            from .skill_loader import get_skill_external_tools
+            external_tool_names = set(get_skill_external_tools(skill_id))
+
+        # LLM-First: 不再支持 includes（移除 routing.yaml 聚合）
+        includes_skill_ids = set()
+
+        tools = []
+        for name, tool in cls._tool_defs.items():
+            tool_skill_id = getattr(tool, 'skill_id', None)
+
+            if skill_id:
+                # 包含条件: 自身工具 OR 全局工具 OR 外部工具
+                is_own_tool = tool_skill_id == skill_id
+                is_global = name in global_tool_names
+                is_external = name in external_tool_names
+
+                if not (is_own_tool or is_global or is_external):
+                    continue
+
+            tools.append({
+                "name": tool.name,
+                "description": tool.description,
+                "tool_type": tool.tool_type,
+                "card_type": tool.card_type,
+                "fallback_type": tool.fallback_type,  # V7.1: 降级类型
+                "card_props": tool.card_props,  # 新增: 表单配置等
+                "parameters": [
+                    {
+                        "name": p.name,
+                        "type": p.type,
+                        "required": p.required,
+                        "description": p.description,
+                        "enum": p.enum,
+                        "default": p.default,
+                    }
+                    for p in tool.parameters
+                ],
+                "when_to_call": tool.when_to_call,
+            })
+
+        return {
+            "version": "12.0",
+            "skill_id": skill_id,
+            "tools": tools,
+        }
+
+    @classmethod
+    def clear(cls):
+        """清除所有注册 (用于测试)"""
+        cls._tool_defs.clear()
+        cls._handlers.clear()
+        cls._loaded_skills.clear()
+        cls._initialized = False
+
+
+def tool_handler(tool_name: str):
+    """
+    工具执行器装饰器
+
+    用法:
+        @tool_handler("show_bazi_chart")
+        async def execute_show_bazi_chart(args: Dict, context: ToolContext) -> Dict:
+            return {"chart": ...}
+    """
+    def decorator(func: ToolHandler) -> ToolHandler:
+        @wraps(func)
+        async def wrapper(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+            result = func(args, context)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        # 注册到 Registry
+        UnifiedToolRegistry.register_handler(tool_name, wrapper)
+        return wrapper
+
+    return decorator
+
+
+# 便捷别名
+ToolRegistry = UnifiedToolRegistry

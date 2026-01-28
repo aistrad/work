@@ -1,0 +1,229 @@
+     1→"""
+     2→Unified Skill Gateway - 统一 Skill API 入口
+     3→
+     4→所有 Skill 数据服务通过此路由访问:
+     5→- POST /api/v1/skills/{skill_id}/{action}
+     6→- GET /api/v1/skills/{skill_id}/services
+     7→- GET /api/v1/skills
+     8→
+     9→示例:
+    10→- POST /api/v1/skills/bazi/chart
+    11→- POST /api/v1/skills/zodiac/fortune
+    12→- POST /api/v1/skills/tarot/draw
+    13→"""
+    14→import logging
+    15→from typing import Optional, Dict, Any
+    16→from uuid import UUID
+    17→
+    18→from fastapi import APIRouter, Depends, HTTPException, Header
+    19→from pydantic import BaseModel, Field
+    20→
+    21→from services.identity import get_optional_user, CurrentUser
+    22→from services.agent.skill_service_registry import (
+    23→    SkillServiceRegistry, ServiceContext
+    24→)
+    25→from stores.profile_cache import get_cached_profile_with_skill
+    26→
+    27→router = APIRouter(prefix="/skills", tags=["Skills"])
+    28→logger = logging.getLogger(__name__)
+    29→
+    30→
+    31→# ═══════════════════════════════════════════════════════════════════════════
+    32→# Request/Response Models
+    33→# ═══════════════════════════════════════════════════════════════════════════
+    34→
+    35→class SkillRequest(BaseModel):
+    36→    """通用 Skill 请求"""
+    37→    args: Dict[str, Any] = Field(default_factory=dict, description="服务参数")
+    38→
+    39→
+    40→class SkillResponse(BaseModel):
+    41→    """通用 Skill 响应"""
+    42→    status: str = "success"
+    43→    data: Optional[Dict[str, Any]] = None
+    44→    error: Optional[str] = None
+    45→
+    46→
+    47→class ServiceInfo(BaseModel):
+    48→    """服务信息"""
+    49→    skill_id: str
+    50→    action: str
+    51→    description: str = ""
+    52→    auth_required: bool = True
+    53→    entitlement: Optional[str] = None
+    54→
+    55→
+    56→# ═══════════════════════════════════════════════════════════════════════════
+    57→# Helper Functions
+    58→# ═══════════════════════════════════════════════════════════════════════════
+    59→
+    60→async def build_service_context(
+    61→    user_id: Optional[UUID],
+    62→    skill_id: str,
+    63→    user_tier: str = "free"
+    64→) -> ServiceContext:
+    65→    """构建服务上下文"""
+    66→    profile = {}
+    67→    skill_data = {}
+    68→
+    69→    if user_id:
+    70→        try:
+    71→            result = await get_cached_profile_with_skill(user_id, skill_id)
+    72→            profile = result.get("profile", {})
+    73→            skill_data = result.get("skill_data", {})
+    74→        except Exception as e:
+    75→            logger.warning(f"Failed to get user context: {e}")
+    76→
+    77→    return ServiceContext(
+    78→        user_id=str(user_id) if user_id else None,
+    79→        user_tier=user_tier,
+    80→        profile=profile,
+    81→        skill_data=skill_data
+    82→    )
+    83→
+    84→
+    85→# ═══════════════════════════════════════════════════════════════════════════
+    86→# Endpoints
+    87→# ═══════════════════════════════════════════════════════════════════════════
+    88→
+    89→@router.get("")
+    90→async def list_skills():
+    91→    """
+    92→    列出所有可用的 Skill
+    93→
+    94→    Returns:
+    95→        skills: 可用的 Skill ID 列表
+    96→    """
+    97→    skills = SkillServiceRegistry.list_skills()
+    98→    return {"skills": skills}
+    99→
+   100→
+   101→@router.get("/{skill_id}/services")
+   102→async def list_skill_services(skill_id: str):
+   103→    """
+   104→    列出 Skill 的所有服务
+   105→
+   106→    Args:
+   107→        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+   108→
+   109→    Returns:
+   110→        services: 服务列表
+   111→    """
+   112→    services = SkillServiceRegistry.list_services(skill_id)
+   113→    if not services:
+   114→        raise HTTPException(
+   115→            status_code=404,
+   116→            detail=f"No services found for skill: {skill_id}"
+   117→        )
+   118→    return {"skill_id": skill_id, "services": services}
+   119→
+   120→
+   121→@router.post("/{skill_id}/{action}")
+   122→async def execute_skill_service(
+   123→    skill_id: str,
+   124→    action: str,
+   125→    request: SkillRequest,
+   126→    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+   127→    x_test_tier: Optional[str] = Header(None, alias="x-test-tier")
+   128→):
+   129→    """
+   130→    执行 Skill 服务
+   131→
+   132→    Args:
+   133→        skill_id: Skill 标识 (bazi, zodiac, tarot, career)
+   134→        action: 服务动作 (chart, fortune, draw, etc.)
+   135→        request: 请求参数
+   136→
+   137→    Returns:
+   138→        服务执行结果
+   139→
+   140→    Examples:
+   141→        POST /api/v1/skills/bazi/chart
+   142→        {"args": {"birth_date": "1990-01-01", "birth_time": "12:00"}}
+   143→
+   144→        POST /api/v1/skills/zodiac/fortune
+   145→        {"args": {"date": "2026-01-15"}}
+   146→    """
+   147→    # 检查服务是否存在
+   148→    if not SkillServiceRegistry.has_service(skill_id, action):
+   149→        raise HTTPException(
+   150→            status_code=404,
+   151→            detail=f"Service not found: {skill_id}/{action}"
+   152→        )
+   153→
+   154→    # 获取服务定义
+   155→    service_def = SkillServiceRegistry.get_service(skill_id, action)
+   156→
+   157→    # 检查认证要求
+   158→    if service_def.auth_required and not current_user:
+   159→        raise HTTPException(
+   160→            status_code=401,
+   161→            detail="Authentication required"
+   162→        )
+   163→
+   164→    # 确定用户等级
+   165→    user_id = current_user.user_id if current_user else None
+   166→    user_tier = "free"
+   167→
+   168→    # 测试模式: 允许通过 header 覆盖 tier
+   169→    if x_test_tier and x_test_tier in ("free", "paid", "vip", "guest"):
+   170→        user_tier = x_test_tier
+   171→        logger.info(f"Test mode: using tier={x_test_tier}")
+   172→    elif user_id:
+   173→        try:
+   174→            from services.entitlement import EntitlementService
+   175→            entitlements = await EntitlementService.get_entitlements(user_id)
+   176→            user_tier = entitlements.get("tier", "free")
+   177→        except Exception as e:
+   178→            logger.warning(f"Failed to get entitlements: {e}")
+   179→
+   180→    # 检查权益要求
+   181→    if service_def.entitlement:
+   182→        # TODO: 实现权益检查
+   183→        pass
+   184→
+   185→    # 构建上下文
+   186→    context = await build_service_context(user_id, skill_id, user_tier)
+   187→
+   188→    # 执行服务
+   189→    result = await SkillServiceRegistry.execute(skill_id, action, request.args, context)
+   190→
+   191→    # 检查错误
+   192→    if "error" in result and result.get("status") in ("error", "not_found"):
+   193→        status_code = 404 if result.get("status") == "not_found" else 400
+   194→        raise HTTPException(status_code=status_code, detail=result["error"])
+   195→
+   196→    return result
+   197→
+   198→
+   199→@router.get("/{skill_id}/{action}")
+   200→async def get_skill_service_info(skill_id: str, action: str):
+   201→    """
+   202→    获取服务信息
+   203→
+   204→    Args:
+   205→        skill_id: Skill 标识
+   206→        action: 服务动作
+   207→
+   208→    Returns:
+   209→        服务定义信息
+   210→    """
+   211→    service_def = SkillServiceRegistry.get_service(skill_id, action)
+   212→    if not service_def:
+   213→        raise HTTPException(
+   214→            status_code=404,
+   215→            detail=f"Service not found: {skill_id}/{action}"
+   216→        )
+   217→
+   218→    return {
+   219→        "skill_id": service_def.skill_id,
+   220→        "action": service_def.action,
+   221→        "description": service_def.description,
+   222→        "auth_required": service_def.auth_required,
+   223→        "entitlement": service_def.entitlement
+   224→    }
+   225→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

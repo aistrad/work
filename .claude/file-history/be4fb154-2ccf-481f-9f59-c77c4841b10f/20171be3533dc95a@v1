@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+"""
+Vibe Profile Migration Script - v1 to v2
+
+Migrates old vibe structure to new LLM-First architecture:
+
+Old structure:
+- vibe.current, vibe.insight, vibe.target
+- vibe.profile (different structure)
+
+New structure (v2.0):
+- vibe.profile (identity, context) - Stable traits
+- vibe.state (emotion, energy, focus) - Current state (mapped from current)
+- vibe.goals - Goal list
+- vibe.timeline - Important events
+
+Usage:
+    python scripts/migrate_vibe_v2.py [--dry-run] [--user-id UUID]
+"""
+
+import asyncio
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+from uuid import UUID
+
+# Setup path for imports
+sys.path.insert(0, '/home/aiscend/work/vibelife/apps/api')
+
+from stores.db import fetch, fetchrow, execute
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def extract_archetypes(old_vibe: Dict) -> List[str]:
+    """Extract archetypes from old structure"""
+    archetypes = []
+
+    # From vibe.insight.essence.archetype
+    insight = old_vibe.get("insight", {})
+    essence = insight.get("essence", {})
+    archetype = essence.get("archetype", {})
+
+    if archetype:
+        if archetype.get("primary"):
+            archetypes.append(archetype["primary"])
+        if archetype.get("secondary"):
+            archetypes.append(archetype["secondary"])
+
+    # From vibe.profile.identity.archetypes (if already exists)
+    profile = old_vibe.get("profile", {})
+    identity = profile.get("identity", {})
+    if identity.get("archetypes"):
+        for a in identity["archetypes"]:
+            if a and a not in archetypes:
+                archetypes.append(a)
+
+    return archetypes[:3]  # Max 3
+
+
+def extract_traits(old_vibe: Dict) -> List[str]:
+    """Extract traits from old structure"""
+    traits = []
+
+    # From vibe.insight.essence.traits
+    insight = old_vibe.get("insight", {})
+    essence = insight.get("essence", {})
+    old_traits = essence.get("traits", [])
+
+    for t in old_traits:
+        if isinstance(t, dict) and t.get("trait"):
+            traits.append(t["trait"])
+        elif isinstance(t, str):
+            traits.append(t)
+
+    # From vibe.profile.identity.traits (if already exists)
+    profile = old_vibe.get("profile", {})
+    identity = profile.get("identity", {})
+    if identity.get("traits"):
+        for t in identity["traits"]:
+            if t and t not in traits:
+                traits.append(t)
+
+    return traits[:5]  # Max 5
+
+
+def extract_style(old_vibe: Dict) -> Optional[str]:
+    """Extract communication style from old structure"""
+    # From vibe.insight.essence.communication_style
+    insight = old_vibe.get("insight", {})
+    essence = insight.get("essence", {})
+    style = essence.get("communication_style")
+
+    if style:
+        # Normalize to enum values
+        style_map = {
+            "直接": "direct",
+            "温和": "warm",
+            "理性": "rational",
+            "感性": "emotional",
+        }
+        return style_map.get(style, style)
+
+    # From vibe.profile.identity.style
+    profile = old_vibe.get("profile", {})
+    identity = profile.get("identity", {})
+    return identity.get("style")
+
+
+def extract_context(old_vibe: Dict) -> Dict[str, Any]:
+    """Extract context from old structure"""
+    context = {}
+
+    # From vibe.profile.context
+    profile = old_vibe.get("profile", {})
+    old_context = profile.get("context", {})
+
+    if old_context.get("occupation"):
+        context["occupation"] = old_context["occupation"]
+    if old_context.get("life_stage"):
+        context["life_stage"] = old_context["life_stage"]
+    if old_context.get("interests"):
+        context["interests"] = old_context["interests"][:10]
+    if old_context.get("concerns"):
+        # Map concerns to interests if no interests
+        if not context.get("interests"):
+            context["interests"] = old_context["concerns"][:10]
+
+    return context
+
+
+def extract_state(old_vibe: Dict) -> Dict[str, Any]:
+    """Extract current state from old structure"""
+    state = {}
+
+    # From vibe.current
+    current = old_vibe.get("current", {})
+
+    if current.get("emotion"):
+        # Normalize emotion enum
+        emotion_map = {
+            "焦虑": "anxious",
+            "悲伤": "sad",
+            "平静": "neutral",
+            "满足": "content",
+            "兴奋": "excited",
+            "专注": "focused",
+        }
+        emotion = current["emotion"]
+        state["emotion"] = emotion_map.get(emotion, emotion)
+
+    if current.get("energy"):
+        # Normalize energy enum
+        energy_map = {
+            "低": "low",
+            "中": "medium",
+            "高": "high",
+        }
+        energy = current.get("energy", {})
+        if isinstance(energy, dict):
+            level = energy.get("level", "medium")
+        else:
+            level = energy
+        state["energy"] = energy_map.get(level, level)
+
+    if current.get("focus"):
+        state["focus"] = current["focus"][:3]
+
+    if current.get("topics"):
+        if not state.get("focus"):
+            state["focus"] = current["topics"][:3]
+
+    return state
+
+
+def merge_goals(old_vibe: Dict) -> List[Dict[str, Any]]:
+    """Merge goals from multiple sources"""
+    goals = []
+    seen_titles = set()
+
+    # From vibe.target.goals
+    target = old_vibe.get("target", {})
+    old_goals = target.get("goals", [])
+
+    for g in old_goals:
+        if isinstance(g, dict) and g.get("title"):
+            if g["title"] not in seen_titles:
+                goals.append({
+                    "title": g["title"],
+                    "category": g.get("category", "growth"),
+                    "status": g.get("status", "active"),
+                })
+                seen_titles.add(g["title"])
+
+    # From vibe.profile.goals
+    profile = old_vibe.get("profile", {})
+    profile_goals = profile.get("goals", [])
+
+    for g in profile_goals:
+        if isinstance(g, dict) and g.get("title"):
+            if g["title"] not in seen_titles:
+                goals.append({
+                    "title": g["title"],
+                    "category": g.get("category", "growth"),
+                    "status": g.get("status", "active"),
+                })
+                seen_titles.add(g["title"])
+
+    return goals[:10]  # Max 10
+
+
+def migrate_vibe_structure(old_vibe: Dict) -> Dict[str, Any]:
+    """
+    Transform old vibe structure to new v2.0 structure
+
+    Old:
+    - vibe.current, vibe.insight, vibe.target
+    - vibe.profile (old format)
+
+    New:
+    - vibe.profile (identity, context)
+    - vibe.state (emotion, energy, focus)
+    - vibe.goals
+    - vibe.timeline
+    """
+    new_vibe = {
+        "profile": {
+            "identity": {},
+            "context": {},
+        },
+        "state": {},
+        "goals": [],
+        "timeline": old_vibe.get("timeline", []),  # Keep timeline as-is
+    }
+
+    # Extract identity
+    archetypes = extract_archetypes(old_vibe)
+    if archetypes:
+        new_vibe["profile"]["identity"]["archetypes"] = archetypes
+
+    traits = extract_traits(old_vibe)
+    if traits:
+        new_vibe["profile"]["identity"]["traits"] = traits
+
+    style = extract_style(old_vibe)
+    if style:
+        new_vibe["profile"]["identity"]["style"] = style
+
+    # Extract context
+    context = extract_context(old_vibe)
+    if context:
+        new_vibe["profile"]["context"] = context
+
+    # Extract state
+    state = extract_state(old_vibe)
+    if state:
+        new_vibe["state"] = state
+
+    # Extract goals
+    goals = merge_goals(old_vibe)
+    if goals:
+        new_vibe["goals"] = goals
+
+    # Add migration timestamp
+    new_vibe["_migrated_at"] = datetime.now(timezone.utc).isoformat()
+
+    return new_vibe
+
+
+async def migrate_user(user_id: UUID, dry_run: bool = True) -> bool:
+    """Migrate a single user's vibe data"""
+    try:
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if not profile:
+            logger.warning(f"User {user_id}: No profile found")
+            return False
+
+        old_vibe = profile.get("vibe", {})
+        if not old_vibe:
+            logger.info(f"User {user_id}: No vibe data to migrate")
+            return True
+
+        # Check if already migrated
+        if old_vibe.get("_migrated_at"):
+            logger.info(f"User {user_id}: Already migrated")
+            return True
+
+        # Transform structure
+        new_vibe = migrate_vibe_structure(old_vibe)
+
+        logger.info(f"User {user_id}: Transforming vibe structure")
+        logger.debug(f"  Old: {json.dumps(old_vibe, ensure_ascii=False)[:200]}...")
+        logger.debug(f"  New: {json.dumps(new_vibe, ensure_ascii=False)[:200]}...")
+
+        if dry_run:
+            logger.info(f"User {user_id}: [DRY RUN] Would migrate vibe data")
+            return True
+
+        # Write new structure
+        await execute(
+            """UPDATE unified_profiles
+               SET profile = jsonb_set(
+                   COALESCE(profile, '{}'::jsonb),
+                   '{vibe}',
+                   $2::jsonb
+               ),
+               updated_at = NOW()
+               WHERE user_id = $1""",
+            user_id, json.dumps(new_vibe, ensure_ascii=False, default=str)
+        )
+
+        logger.info(f"User {user_id}: Migration completed")
+        return True
+
+    except Exception as e:
+        logger.error(f"User {user_id}: Migration failed - {e}")
+        return False
+
+
+async def get_all_users_with_vibe() -> List[UUID]:
+    """Get all users that have vibe data"""
+    query = """
+        SELECT user_id FROM unified_profiles
+        WHERE profile -> 'vibe' IS NOT NULL
+        AND profile -> 'vibe' != '{}'::jsonb
+    """
+    rows = await fetch(query)
+    return [row["user_id"] for row in rows]
+
+
+async def run_migration(dry_run: bool = True, user_id: Optional[UUID] = None):
+    """Run the migration"""
+    logger.info(f"Starting Vibe v2.0 migration (dry_run={dry_run})")
+
+    if user_id:
+        users = [user_id]
+    else:
+        users = await get_all_users_with_vibe()
+
+    logger.info(f"Found {len(users)} users to migrate")
+
+    success_count = 0
+    error_count = 0
+
+    for i, uid in enumerate(users):
+        try:
+            if await migrate_user(uid, dry_run):
+                success_count += 1
+            else:
+                error_count += 1
+
+            if (i + 1) % 100 == 0:
+                logger.info(f"Progress: {i + 1}/{len(users)}")
+
+        except Exception as e:
+            logger.error(f"User {uid}: Unexpected error - {e}")
+            error_count += 1
+
+    logger.info(f"Migration completed: {success_count} success, {error_count} errors")
+
+
+async def main():
+    """CLI entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Migrate Vibe data to v2.0 structure")
+    parser.add_argument("--dry-run", action="store_true", default=True,
+                       help="Preview changes without writing (default: True)")
+    parser.add_argument("--execute", action="store_true",
+                       help="Actually execute the migration")
+    parser.add_argument("--user-id", type=str, default=None,
+                       help="Migrate a specific user only")
+    args = parser.parse_args()
+
+    dry_run = not args.execute
+    user_id = UUID(args.user_id) if args.user_id else None
+
+    if not dry_run:
+        logger.warning("EXECUTING MIGRATION - This will modify data!")
+        await asyncio.sleep(2)
+
+    await run_migration(dry_run=dry_run, user_id=user_id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

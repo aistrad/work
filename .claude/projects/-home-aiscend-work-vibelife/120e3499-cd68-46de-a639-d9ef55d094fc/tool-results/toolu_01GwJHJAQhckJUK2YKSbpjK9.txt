@@ -1,0 +1,306 @@
+     1→"""
+     2→ProactiveEngine - 主动推送系统核心引擎
+     3→
+     4→职责:
+     5→1. 加载 Skill 级提醒定义 (reminders.yaml)
+     6→2. 协调触发检测、内容生成、推送投递
+     7→3. 管理数据源 (unified_profiles)
+     8→
+     9→设计原则:
+    10→- Skill 级定义: 每个 Skill 在 reminders.yaml 定义自己的提醒类型
+    11→- 数据源统一: unified_profiles 是唯一真源
+    12→- 智能化: 基于 life_context 个性化内容 + 事件触发
+    13→"""
+    14→
+    15→import logging
+    16→import yaml
+    17→from dataclasses import dataclass, field
+    18→from datetime import datetime, date, timedelta
+    19→from enum import Enum
+    20→from pathlib import Path
+    21→from typing import List, Dict, Any, Optional
+    22→from uuid import UUID
+    23→
+    24→import pytz
+    25→
+    26→from stores.db import get_connection
+    27→from stores.unified_profile_repo import UnifiedProfileRepository
+    28→from services.reminder.notification import NotificationService
+    29→
+    30→logger = logging.getLogger(__name__)
+    31→
+    32→
+    33→class ReminderPriority(str, Enum):
+    34→    LOW = "low"
+    35→    MEDIUM = "medium"
+    36→    HIGH = "high"
+    37→    URGENT = "urgent"
+    38→
+    39→
+    40→@dataclass
+    41→class ReminderTask:
+    42→    """提醒任务"""
+    43→    user_id: UUID
+    44→    skill_id: str
+    45→    reminder_type: str
+    46→    priority: ReminderPriority = ReminderPriority.MEDIUM
+    47→    trigger_event: Optional[str] = None
+    48→    trigger_date: Optional[date] = None
+    49→    metadata: Dict[str, Any] = field(default_factory=dict)
+    50→
+    51→
+    52→@dataclass
+    53→class ReminderContent:
+    54→    """提醒内容"""
+    55→    title: str
+    56→    body: str
+    57→    data: Dict[str, Any] = field(default_factory=dict)
+    58→    card_type: Optional[str] = None
+    59→
+    60→
+    61→class ProactiveEngine:
+    62→    """主动推送引擎"""
+    63→
+    64→    # 默认推送时间 (用户本地时间)
+    65→    DEFAULT_PUSH_HOUR = 4
+    66→
+    67→    def __init__(self):
+    68→        self._skill_configs: Dict[str, Dict] = {}
+    69→        self._trigger_detector = None
+    70→        self._content_generator = None
+    71→        self._notification_service = NotificationService()
+    72→        self._load_skill_configs()
+    73→
+    74→    def _load_skill_configs(self):
+    75→        """加载所有 Skill 的 reminders.yaml"""
+    76→        skills_dir = Path(__file__).parent.parent.parent / "skills"
+    77→
+    78→        for skill_dir in skills_dir.iterdir():
+    79→            if skill_dir.is_dir():
+    80→                reminders_file = skill_dir / "reminders.yaml"
+    81→                if reminders_file.exists():
+    82→                    try:
+    83→                        with open(reminders_file, encoding="utf-8") as f:
+    84→                            config = yaml.safe_load(f)
+    85→                            if config and "skill_id" in config:
+    86→                                self._skill_configs[config["skill_id"]] = config
+    87→                                logger.info(f"Loaded reminders config for skill: {config['skill_id']}")
+    88→                    except Exception as e:
+    89→                        logger.error(f"Failed to load {reminders_file}: {e}")
+    90→
+    91→        logger.info(f"Loaded {len(self._skill_configs)} skill reminder configs")
+    92→
+    93→    @property
+    94→    def trigger_detector(self):
+    95→        """延迟加载 TriggerDetector"""
+    96→        if self._trigger_detector is None:
+    97→            from .trigger_detector import TriggerDetector
+    98→            self._trigger_detector = TriggerDetector()
+    99→        return self._trigger_detector
+   100→
+   101→    @property
+   102→    def content_generator(self):
+   103→        """延迟加载 ContentGenerator"""
+   104→        if self._content_generator is None:
+   105→            from .content_generator import ContentGenerator
+   106→            self._content_generator = ContentGenerator()
+   107→        return self._content_generator
+   108→
+   109→    async def run_scheduled_scan(self) -> List[ReminderTask]:
+   110→        """
+   111→        定时扫描入口 (由 Worker 调用)
+   112→
+   113→        流程:
+   114→        1. 获取当前时段应该推送的用户
+   115→        2. 检测每个用户的触发条件
+   116→        3. 生成提醒任务
+   117→        """
+   118→        tasks = []
+   119→
+   120→        # 获取当前时段的用户
+   121→        users = await self._get_users_for_current_hour()
+   122→        logger.info(f"Found {len(users)} users for current hour")
+   123→
+   124→        for user in users:
+   125→            try:
+   126→                user_tasks = await self._detect_user_triggers(user)
+   127→                tasks.extend(user_tasks)
+   128→            except Exception as e:
+   129→                logger.error(f"Failed to detect triggers for user {user.get('user_id')}: {e}")
+   130→
+   131→        logger.info(f"Generated {len(tasks)} reminder tasks")
+   132→        return tasks
+   133→
+   134→    async def process_tasks(self, tasks: List[ReminderTask]) -> int:
+   135→        """
+   136→        处理提醒任务
+   137→
+   138→        流程:
+   139→        1. 生成个性化内容
+   140→        2. 投递到推送渠道
+   141→        3. 记录到数据库
+   142→        """
+   143→        success_count = 0
+   144→
+   145→        for task in tasks:
+   146→            try:
+   147→                # 获取用户 Profile
+   148→                profile = await UnifiedProfileRepository.get_profile(task.user_id)
+   149→                if not profile:
+   150→                    logger.warning(f"Profile not found for user {task.user_id}")
+   151→                    continue
+   152→
+   153→                # 获取 Skill 配置
+   154→                skill_config = self._skill_configs.get(task.skill_id, {})
+   155→                reminder_config = self._get_reminder_config(skill_config, task.reminder_type)
+   156→
+   157→                # 生成内容
+   158→                content = await self.content_generator.generate(
+   159→                    task=task,
+   160→                    profile=profile,
+   161→                    config=reminder_config,
+   162→                )
+   163→
+   164→                # 投递 (保存到数据库)
+   165→                await self._notification_service.send_notification(
+   166→                    user_id=task.user_id,
+   167→                    notification_type=task.reminder_type,
+   168→                    title=content.title,
+   169→                    content=content.data,
+   170→                    trigger_date=task.trigger_date or date.today(),
+   171→                )
+   172→
+   173→                success_count += 1
+   174→                logger.debug(f"Processed task: {task.skill_id}/{task.reminder_type} for user {task.user_id}")
+   175→
+   176→            except Exception as e:
+   177→                logger.error(f"Failed to process task {task}: {e}")
+   178→
+   179→        logger.info(f"Successfully processed {success_count}/{len(tasks)} tasks")
+   180→        return success_count
+   181→
+   182→    async def run_once(self) -> int:
+   183→        """执行一次完整的扫描和处理"""
+   184→        tasks = await self.run_scheduled_scan()
+   185→        if tasks:
+   186→            return await self.process_tasks(tasks)
+   187→        return 0
+   188→
+   189→    async def _get_users_for_current_hour(self) -> List[Dict[str, Any]]:
+   190→        """获取当前时段应该推送的用户"""
+   191→        now_utc = datetime.now(pytz.UTC)
+   192→        target_hour = self.DEFAULT_PUSH_HOUR
+   193→
+   194→        # 找出当前时刻为目标时间的时区偏移
+   195→        valid_offsets = []
+   196→        for offset in range(-12, 15):
+   197→            tz_time = now_utc + timedelta(hours=offset)
+   198→            if tz_time.hour == target_hour:
+   199→                valid_offsets.append(offset)
+   200→
+   201→        if not valid_offsets:
+   202→            return []
+   203→
+   204→        # 查询付费用户 (使用 unified_profiles)
+   205→        query = """
+   206→            SELECT u.id as user_id, up.profile
+   207→            FROM vibe_users u
+   208→            JOIN unified_profiles up ON up.user_id = u.id
+   209→            WHERE u.subscription_status = 'active'
+   210→        """
+   211→
+   212→        users = []
+   213→        try:
+   214→            async with get_connection() as conn:
+   215→                rows = await conn.fetch(query)
+   216→
+   217→            for row in rows:
+   218→                profile = row["profile"] if isinstance(row["profile"], dict) else {}
+   219→                tz_name = profile.get("preferences", {}).get("timezone", "Asia/Shanghai")
+   220→
+   221→                try:
+   222→                    tz = pytz.timezone(tz_name)
+   223→                    user_time = now_utc.astimezone(tz)
+   224→                    if user_time.hour == target_hour:
+   225→                        users.append({
+   226→                            "user_id": row["user_id"],
+   227→                            "profile": profile,
+   228→                            "timezone": tz_name,
+   229→                        })
+   230→                except Exception:
+   231→                    # 默认使用 Asia/Shanghai (UTC+8)
+   232→                    if 8 in valid_offsets:
+   233→                        users.append({
+   234→                            "user_id": row["user_id"],
+   235→                            "profile": profile,
+   236→                            "timezone": "Asia/Shanghai",
+   237→                        })
+   238→        except Exception as e:
+   239→            logger.error(f"Failed to get users: {e}")
+   240→
+   241→        return users
+   242→
+   243→    async def _detect_user_triggers(self, user: Dict[str, Any]) -> List[ReminderTask]:
+   244→        """检测用户的所有触发条件"""
+   245→        tasks = []
+   246→        user_id = user["user_id"]
+   247→        profile = user["profile"]
+   248→
+   249→        # 遍历所有 Skill 配置
+   250→        for skill_id, config in self._skill_configs.items():
+   251→            for reminder in config.get("reminder_types", []):
+   252→                trigger_config = reminder.get("trigger", {})
+   253→
+   254→                try:
+   255→                    # 检测触发条件
+   256→                    should_trigger, event_info = await self.trigger_detector.should_trigger(
+   257→                        trigger_config=trigger_config,
+   258→                        profile=profile,
+   259→                        skill_id=skill_id,
+   260→                    )
+   261→
+   262→                    if should_trigger:
+   263→                        tasks.append(ReminderTask(
+   264→                            user_id=user_id,
+   265→                            skill_id=skill_id,
+   266→                            reminder_type=reminder["id"],
+   267→                            priority=ReminderPriority(reminder.get("priority", "medium")),
+   268→                            trigger_event=event_info.get("event_name") if event_info else None,
+   269→                            trigger_date=event_info.get("event_date") if event_info else date.today(),
+   270→                            metadata={"config": reminder, "event_info": event_info},
+   271→                        ))
+   272→                except Exception as e:
+   273→                    logger.error(f"Failed to check trigger {reminder.get('id')} for user {user_id}: {e}")
+   274→
+   275→        return tasks
+   276→
+   277→    def _get_reminder_config(self, skill_config: Dict, reminder_type: str) -> Dict:
+   278→        """获取特定提醒类型的配置"""
+   279→        for reminder in skill_config.get("reminder_types", []):
+   280→            if reminder["id"] == reminder_type:
+   281→                return reminder
+   282→        return {}
+   283→
+   284→    def get_skill_configs(self) -> Dict[str, Dict]:
+   285→        """获取所有 Skill 配置 (用于调试)"""
+   286→        return self._skill_configs
+   287→
+   288→
+   289→# ═══════════════════════════════════════════════════════════════════════════
+   290→# Singleton
+   291→# ═══════════════════════════════════════════════════════════════════════════
+   292→
+   293→_engine: Optional[ProactiveEngine] = None
+   294→
+   295→
+   296→def get_proactive_engine() -> ProactiveEngine:
+   297→    """获取单例 ProactiveEngine"""
+   298→    global _engine
+   299→    if _engine is None:
+   300→        _engine = ProactiveEngine()
+   301→    return _engine
+   302→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

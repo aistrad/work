@@ -1,0 +1,809 @@
+# VibeLife 用户数据沉淀与 Context 机制深度研究
+
+## 研究背景
+
+基于对以下文档的深度研究：
+- MENTIS OS part1.md / part2.md - 原始设计理念
+- VIBE DIARY idea v1.md - Vibe Diary 概念
+- vibelife spec v2.0.md / v2.1.md - 当前产品规范
+
+---
+
+## 核心洞察：从 Mentis 到 VibeLife 的演进
+
+### MENTIS OS 的核心理念 (复杂版)
+
+```
+用户输入 (Stream)
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     复杂的提取管道                               │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. 情绪识别 (8种主情绪 + 12种次情绪)                            │
+│ 2. 行为匹配 (NLU → Auto Checkin)                                │
+│ 3. 能量计算 (energy_score 0-100)                                │
+│ 4. 动量系统 (momentum + streak)                                 │
+│ 5. 运势计算 (八字日运 + 紫微流日)                               │
+│ 6. Agent 主动干预 (4类触发器)                                   │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               大量结构化存储                                     │
+├─────────────────────────────────────────────────────────────────┤
+│ • emotion_history (情绪历史)                                    │
+│ • behavior_checkins (行为打卡)                                  │
+│ • momentum_log (动量日志)                                       │
+│ • energy_snapshots (能量快照)                                   │
+│ • fortune_cache (运势缓存)                                      │
+│ • pattern_insights (模式洞察)                                   │
+│ • ... 十几张表                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**问题**: 过度工程化，维护成本高，用户价值不明显
+
+### VibeLife v2.1 的简化方向
+
+```
+用户对话
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  Vibe Engine (LLM 驱动)                         │
+├─────────────────────────────────────────────────────────────────┤
+│ • 情绪感知 (规则 + LLM)                                         │
+│ • Skill 路由 (意图识别)                                         │
+│ • 知识检索 (RAG)                                                │
+│ • Insight 生成 (4种类型)                                        │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               核心存储 (已实现)                                  │
+├─────────────────────────────────────────────────────────────────┤
+│ • vibe_users (用户基础信息)                                     │
+│ • skill_profiles (技能档案)                                     │
+│ • skill_conversations (对话)                                    │
+│ • skill_messages (消息)                                         │
+│ • skill_insights (洞察)                                         │
+│ • knowledge_chunks (知识库)                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**问题**: Insight Layer 触发规则过于简单，缺少用户画像积累
+
+---
+
+## 极简设计方案：让 LLM 做脏活
+
+### 设计原则
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║                        极简设计三原则                                          ║
+║                                                                               ║
+║   ─────────────────────────────────────────────────────────────────────────   ║
+║                                                                               ║
+║   1. 存储文本，而非结构                                                       ║
+║      ─────────────────────────────────                                        ║
+║      • 不要预定义复杂的数据结构                                               ║
+║      • 存储原始对话 + LLM 生成的自然语言摘要                                  ║
+║      • 查询时让 LLM 实时理解和提取                                            ║
+║                                                                               ║
+║   2. Context = 对话历史 + 用户画像摘要 + 相关知识                              ║
+║      ─────────────────────────────────────────────────                        ║
+║      • 对话历史: 最近 N 条消息                                                ║
+║      • 用户画像摘要: 一段 LLM 生成的自然语言描述                              ║
+║      • 相关知识: RAG 检索的知识片段                                           ║
+║                                                                               ║
+║   3. 用 Agent 做定期任务，而非实时计算                                        ║
+║      ─────────────────────────────────────                                    ║
+║      • 不要在每条消息后做复杂计算                                             ║
+║      • 用后台 Agent 定期更新用户画像                                          ║
+║      • 用 Cron Job 生成周期性洞察                                             ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### 核心创新：User Portrait (用户画像摘要)
+
+**不要这样做** (传统方式):
+```sql
+-- 复杂的结构化存储
+CREATE TABLE user_emotions (id, user_id, emotion, intensity, timestamp);
+CREATE TABLE user_topics (id, user_id, topic, frequency, last_mention);
+CREATE TABLE user_patterns (id, user_id, pattern_type, evidence, confidence);
+CREATE TABLE user_preferences (id, user_id, key, value);
+-- ... 更多表
+```
+
+**应该这样做** (极简方式):
+```sql
+-- 一张表，一个 JSONB 字段
+CREATE TABLE user_portraits (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES vibe_users(id),
+    skill_id VARCHAR(50),
+
+    -- 核心: LLM 生成的自然语言画像
+    portrait_text TEXT NOT NULL,
+
+    -- 元数据
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
+    based_on_messages INT,  -- 基于多少条消息生成
+    version INT DEFAULT 1,
+
+    UNIQUE(user_id, skill_id)
+);
+```
+
+**portrait_text 示例**:
+```
+关于这位用户，我了解到：
+
+【基本特征】
+- 1990年3月15日出生，甲木日主，偏印格
+- 性格特点：思考型，追求完美，有时过度分析
+- 沟通风格：喜欢深度交流，不喜欢泛泛而谈
+
+【近期状态】
+- 最近两周主要话题：工作压力、职业方向迷茫
+- 情绪基调：略显焦虑，但在积极寻求改变
+- 提到3次"差一点点"，可能与偏印运有关
+
+【重要洞察】
+- 决策模式：容易犹豫，倾向于过度准备
+- 发现了一个规律：周末情绪普遍比工作日好
+- 上次聊到家庭时，语气明显变柔和
+
+【互动偏好】
+- 喜欢我给出具体的行动建议
+- 不喜欢过于笼统的安慰
+- 对命理解释接受度高，但不想听"算命"
+
+【当前关注】
+- 正在考虑跳槽，但担心时机不对
+- 提到过想学习冥想，还没开始
+```
+
+### 数据流设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│                      极简数据流设计                                          │
+│                                                                             │
+│   ═══════════════════════════════════════════════════════════════════════   │
+│                                                                             │
+│   实时流程 (每条消息)                                                       │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   用户消息                                                                  │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Context Assembly (实时)                                            │   │
+│   │  ─────────────────────────────────────────────────────────────────  │   │
+│   │  1. 读取 user_portraits.portrait_text (1次数据库查询)               │   │
+│   │  2. 读取最近 6 条 skill_messages (1次数据库查询)                    │   │
+│   │  3. RAG 检索相关知识 (1次向量查询)                                  │   │
+│   │                                                                     │   │
+│   │  总共: 3 次查询，毫秒级                                             │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  LLM System Prompt 构建                                             │   │
+│   │  ─────────────────────────────────────────────────────────────────  │   │
+│   │                                                                     │   │
+│   │  你是 Vibe，一个温暖的命理分析师...                                 │   │
+│   │                                                                     │   │
+│   │  ## 关于这位用户                                                    │   │
+│   │  {portrait_text}                                                    │   │
+│   │                                                                     │   │
+│   │  ## 相关知识                                                        │   │
+│   │  {rag_context}                                                      │   │
+│   │                                                                     │   │
+│   │  ## 最近对话                                                        │   │
+│   │  {recent_messages}                                                  │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  LLM 生成响应                                                       │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  保存消息 (实时)                                                    │   │
+│   │  ─────────────────────────────────────────────────────────────────  │   │
+│   │  • 保存用户消息到 skill_messages                                    │   │
+│   │  • 保存助手响应到 skill_messages                                    │   │
+│   │  • 不做其他任何计算                                                 │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ═══════════════════════════════════════════════════════════════════════   │
+│                                                                             │
+│   后台流程 (定期执行)                                                       │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   Portrait Agent (每天/每10条消息触发)                                      │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  1. 读取用户最近 50 条消息                                          │   │
+│   │  2. 读取当前 portrait_text (如果存在)                               │   │
+│   │  3. 让 LLM 生成/更新用户画像                                        │   │
+│   │  4. 保存新的 portrait_text                                          │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   Insight Agent (对话结束后触发)                                            │
+│       │                                                                     │
+│       ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  1. 读取用户画像 + 本次对话内容                                     │   │
+│   │  2. 让 LLM 判断是否值得生成洞察                                     │   │
+│   │  3. 如果值得，生成洞察并保存到 skill_insights                       │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Portrait Agent 提示词设计
+
+```python
+PORTRAIT_UPDATE_PROMPT = """
+你是一个用户画像分析专家。请基于以下信息，为这位用户生成或更新画像摘要。
+
+## 当前画像 (如果存在)
+{current_portrait or "这是新用户，还没有画像"}
+
+## 用户基础信息
+- 出生日期: {birth_datetime}
+- 八字: {bazi_chart}
+- 使用技能: {skill_id}
+
+## 最近 {message_count} 条对话
+{recent_messages}
+
+## 任务
+请生成一份自然语言的用户画像，包括:
+
+1. 【基本特征】- 性格特点、沟通风格
+2. 【近期状态】- 最近的主要话题、情绪基调
+3. 【重要洞察】- 发现的模式、规律
+4. 【互动偏好】- 喜欢什么样的回应方式
+5. 【当前关注】- 正在思考或处理的事情
+
+要求:
+- 用第三人称描述
+- 具体而非笼统
+- 如果是更新，保留重要的历史信息，更新过时的信息
+- 控制在 500 字以内
+- 只输出画像内容，不要其他解释
+"""
+```
+
+### Insight 判断提示词设计
+
+```python
+INSIGHT_CHECK_PROMPT = """
+你是一个洞察判断专家。请基于以下信息，判断是否应该生成洞察。
+
+## 用户画像
+{portrait_text}
+
+## 本次对话
+{conversation}
+
+## 最近生成的洞察 (避免重复)
+{recent_insights}
+
+## 任务
+判断本次对话是否包含值得记录的洞察。
+
+洞察类型:
+1. DISCOVERY - 首次发现用户的新特征或模式
+2. PATTERN - 发现重复出现的规律 (需要至少出现3次)
+3. GROWTH - 发现用户的积极变化或突破
+4. TIMING - 发现与当前运势相关的时机建议
+
+请返回 JSON:
+{
+  "should_generate": true/false,
+  "reason": "为什么值得/不值得生成",
+  "insight_type": "DISCOVERY/PATTERN/GROWTH/TIMING/null",
+  "insight_title": "洞察标题 (如果生成)",
+  "insight_content": "洞察内容 (如果生成)"
+}
+
+注意:
+- 不要为了生成而生成，只有真正有价值的才生成
+- 避免与最近的洞察重复
+- 洞察应该具体、可行动
+"""
+```
+
+### 数据库 Schema (极简版)
+
+```sql
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 极简版 User Insight 沉淀 Schema
+-- 核心理念: 存储文本，让 LLM 做理解
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- 用户画像表 (核心)
+CREATE TABLE user_portraits (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES vibe_users(id) ON DELETE CASCADE,
+    skill_id VARCHAR(50) NOT NULL,
+
+    -- 核心: LLM 生成的自然语言画像
+    portrait_text TEXT NOT NULL,
+
+    -- 元数据
+    based_on_messages INT DEFAULT 0,  -- 基于多少条消息生成
+    last_message_id UUID,             -- 最后处理的消息ID
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
+    version INT DEFAULT 1,
+
+    UNIQUE(user_id, skill_id)
+);
+
+-- 画像历史表 (可选，用于追踪演变)
+CREATE TABLE user_portrait_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES vibe_users(id) ON DELETE CASCADE,
+    skill_id VARCHAR(50) NOT NULL,
+    portrait_text TEXT NOT NULL,
+    version INT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_portraits_user_skill ON user_portraits(user_id, skill_id);
+CREATE INDEX idx_portrait_history_user ON user_portrait_history(user_id, created_at DESC);
+```
+
+### 实现代码 (极简版)
+
+```python
+# ═══════════════════════════════════════════════════════════════════════════
+# portrait_service.py - 用户画像服务
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PortraitService:
+    """
+    极简用户画像服务
+    核心思想: 让 LLM 做理解和提取，我们只负责存储和调度
+    """
+
+    # 触发条件
+    UPDATE_INTERVAL_MESSAGES = 10  # 每 10 条消息更新一次
+
+    @staticmethod
+    async def get_portrait(user_id: UUID, skill_id: str) -> Optional[str]:
+        """获取用户画像文本"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT portrait_text FROM user_portraits
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill_id
+            )
+            return row["portrait_text"] if row else None
+
+    @staticmethod
+    async def should_update(user_id: UUID, skill_id: str) -> bool:
+        """检查是否应该更新画像"""
+        async with get_connection() as conn:
+            # 获取当前画像信息
+            portrait = await conn.fetchrow(
+                """
+                SELECT based_on_messages, last_message_id
+                FROM user_portraits
+                WHERE user_id = $1 AND skill_id = $2
+                """,
+                user_id, skill_id
+            )
+
+            # 新用户，需要生成
+            if not portrait:
+                return True
+
+            # 计算新消息数量
+            new_messages = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM skill_messages sm
+                JOIN skill_conversations sc ON sm.conversation_id = sc.id
+                WHERE sc.user_id = $1 AND sc.skill_id = $2
+                  AND (sm.id > $3 OR $3 IS NULL)
+                """,
+                user_id, skill_id, portrait["last_message_id"]
+            )
+
+            return new_messages >= PortraitService.UPDATE_INTERVAL_MESSAGES
+
+    @staticmethod
+    async def update_portrait(
+        user_id: UUID,
+        skill_id: str,
+        llm_orchestrator
+    ) -> str:
+        """更新用户画像 (后台任务)"""
+
+        # 1. 获取当前画像
+        current_portrait = await PortraitService.get_portrait(user_id, skill_id)
+
+        # 2. 获取用户基础信息
+        async with get_connection() as conn:
+            user = await conn.fetchrow(
+                "SELECT * FROM vibe_users WHERE id = $1", user_id
+            )
+            profile = await conn.fetchrow(
+                """SELECT profile_data FROM skill_profiles
+                   WHERE user_id = $1 AND skill_id = $2""",
+                user_id, skill_id
+            )
+
+        # 3. 获取最近消息
+        messages = await SkillRepository.get_recent_messages(
+            user_id, skill_id, limit=50
+        )
+
+        # 4. 构建提示词
+        prompt = PORTRAIT_UPDATE_PROMPT.format(
+            current_portrait=current_portrait or "这是新用户，还没有画像",
+            birth_datetime=user["birth_datetime"],
+            bazi_chart=profile["profile_data"].get("bazi", {}) if profile else {},
+            skill_id=skill_id,
+            message_count=len(messages),
+            recent_messages=format_messages(messages)
+        )
+
+        # 5. 调用 LLM
+        response = await llm_orchestrator.chat(
+            [LLMMessage(role="user", content=prompt)],
+            temperature=0.3,
+            max_tokens=1000
+        )
+
+        new_portrait = response.content
+
+        # 6. 保存画像
+        last_msg_id = messages[0]["id"] if messages else None
+
+        async with get_connection() as conn:
+            # 保存历史
+            if current_portrait:
+                await conn.execute(
+                    """
+                    INSERT INTO user_portrait_history (user_id, skill_id, portrait_text, version)
+                    SELECT user_id, skill_id, portrait_text, version
+                    FROM user_portraits WHERE user_id = $1 AND skill_id = $2
+                    """,
+                    user_id, skill_id
+                )
+
+            # 更新/插入新画像
+            await conn.execute(
+                """
+                INSERT INTO user_portraits (user_id, skill_id, portrait_text, based_on_messages, last_message_id, version)
+                VALUES ($1, $2, $3, $4, $5, 1)
+                ON CONFLICT (user_id, skill_id)
+                DO UPDATE SET
+                    portrait_text = $3,
+                    based_on_messages = user_portraits.based_on_messages + $4,
+                    last_message_id = $5,
+                    version = user_portraits.version + 1,
+                    generated_at = NOW()
+                """,
+                user_id, skill_id, new_portrait, len(messages), last_msg_id
+            )
+
+        return new_portrait
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# insight_service.py - 洞察服务 (简化版)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InsightService:
+    """
+    极简洞察服务
+    核心思想: 让 LLM 判断是否值得生成洞察，而非复杂的规则引擎
+    """
+
+    @staticmethod
+    async def maybe_generate_insight(
+        user_id: UUID,
+        skill_id: str,
+        conversation_id: UUID,
+        llm_orchestrator
+    ) -> Optional[dict]:
+        """在对话结束后调用，判断是否生成洞察"""
+
+        # 1. 获取用户画像
+        portrait = await PortraitService.get_portrait(user_id, skill_id)
+        if not portrait:
+            return None
+
+        # 2. 获取本次对话
+        conversation = await SkillRepository.get_messages(
+            conversation_id, limit=20
+        )
+
+        # 3. 获取最近洞察 (避免重复)
+        recent_insights = await SkillRepository.get_user_insights(
+            user_id, skill_id, limit=5
+        )
+
+        # 4. 让 LLM 判断
+        prompt = INSIGHT_CHECK_PROMPT.format(
+            portrait_text=portrait,
+            conversation=format_messages(conversation),
+            recent_insights=format_insights(recent_insights)
+        )
+
+        response = await llm_orchestrator.chat(
+            [LLMMessage(role="user", content=prompt)],
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        try:
+            result = json.loads(response.content)
+        except:
+            return None
+
+        # 5. 如果判断应该生成，保存洞察
+        if result.get("should_generate"):
+            insight = await SkillRepository.create_insight(
+                user_id=user_id,
+                skill_id=skill_id,
+                insight_type=result["insight_type"].lower(),
+                title=result["insight_title"],
+                content=result["insight_content"],
+                confidence=0.8,
+                conversation_id=conversation_id
+            )
+            return insight
+
+        return None
+```
+
+### AgentRuntime 集成 (简化版)
+
+```python
+# runtime.py 修改
+
+class AgentRuntime:
+
+    @classmethod
+    async def process_message(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        message: str,
+        conversation_id: Optional[UUID] = None
+    ) -> AgentResponse:
+        """极简消息处理流程"""
+
+        # ───────────────────────────────────────────────────────────
+        # 1. Context Assembly (3次查询)
+        # ───────────────────────────────────────────────────────────
+
+        # 1.1 获取用户画像 (1次查询)
+        portrait = await PortraitService.get_portrait(user_id, skill_id)
+
+        # 1.2 获取对话历史 (1次查询)
+        history = await SkillRepository.get_messages(conversation_id, limit=6)
+
+        # 1.3 知识检索 (1次向量查询)
+        knowledge = await RetrievalService.get_context_for_query(message, skill_id)
+
+        # ───────────────────────────────────────────────────────────
+        # 2. 构建 System Prompt
+        # ───────────────────────────────────────────────────────────
+
+        system_prompt = f"""
+你是 Vibe，一个温暖的命理分析师...
+
+## 关于这位用户
+{portrait or "这是新用户，还没有足够的了解"}
+
+## 相关知识
+{knowledge}
+"""
+
+        # ───────────────────────────────────────────────────────────
+        # 3. LLM 生成
+        # ───────────────────────────────────────────────────────────
+
+        messages = build_messages(system_prompt, history, message)
+        response = await LLMOrchestrator.chat(messages)
+
+        # ───────────────────────────────────────────────────────────
+        # 4. 保存消息 (同步，必须)
+        # ───────────────────────────────────────────────────────────
+
+        await SkillRepository.add_message(conversation_id, "user", message)
+        await SkillRepository.add_message(conversation_id, "assistant", response.content)
+
+        # ───────────────────────────────────────────────────────────
+        # 5. 后台任务 (异步，不阻塞)
+        # ───────────────────────────────────────────────────────────
+
+        # 检查是否需要更新画像
+        asyncio.create_task(
+            cls._maybe_update_portrait(user_id, skill_id)
+        )
+
+        return AgentResponse(content=response.content, ...)
+
+    @staticmethod
+    async def _maybe_update_portrait(user_id: UUID, skill_id: str):
+        """后台检查并更新画像"""
+        try:
+            if await PortraitService.should_update(user_id, skill_id):
+                await PortraitService.update_portrait(
+                    user_id, skill_id, LLMOrchestrator
+                )
+        except Exception as e:
+            print(f"Portrait update failed: {e}")
+
+    @classmethod
+    async def on_conversation_end(
+        cls,
+        user_id: UUID,
+        skill_id: str,
+        conversation_id: UUID
+    ):
+        """对话结束时调用"""
+
+        # 尝试生成洞察
+        await InsightService.maybe_generate_insight(
+            user_id, skill_id, conversation_id, LLMOrchestrator
+        )
+```
+
+---
+
+## 与原方案对比
+
+### 原方案 (复杂版)
+
+```
+需要的表:
+├── user_topic_mentions (话题追踪)
+├── user_emotion_history (情绪历史)
+├── topic_dictionary (话题词典)
+└── ... 更多
+
+需要的模块:
+├── TopicExtractor (话题提取器)
+├── EmotionTracker (情绪追踪器)
+├── PatternDetector (模式检测器)
+└── 增强版 InsightGenerator
+
+实时计算:
+├── 话题提取
+├── 情绪分析
+├── 首次提及检测
+├── 模式匹配
+└── 各种触发规则
+
+工作量: 5-7 天
+```
+
+### 极简方案
+
+```
+需要的表:
+└── user_portraits (用户画像) - 1张表
+
+需要的模块:
+├── PortraitService (画像服务) - ~100行
+└── InsightService (简化版) - ~50行
+
+实时计算:
+└── 无 (所有理解工作交给 LLM)
+
+后台任务:
+├── 画像更新 (每10条消息)
+└── 洞察判断 (对话结束后)
+
+工作量: 1-2 天
+```
+
+---
+
+## 实现计划
+
+### Phase 1: 数据库 (0.5 天)
+- [ ] 创建 `user_portraits` 表
+- [ ] 创建 `user_portrait_history` 表 (可选)
+
+### Phase 2: 核心服务 (1 天)
+- [ ] 实现 `PortraitService`
+  - [ ] `get_portrait()` - 获取画像
+  - [ ] `should_update()` - 判断是否更新
+  - [ ] `update_portrait()` - 更新画像
+- [ ] 简化 `InsightService`
+  - [ ] `maybe_generate_insight()` - LLM 驱动的洞察判断
+
+### Phase 3: 集成 (0.5 天)
+- [ ] 修改 `AgentRuntime`
+  - [ ] Context Assembly 使用画像
+  - [ ] 后台触发画像更新
+  - [ ] 对话结束触发洞察判断
+
+### 关键修改文件
+
+| 文件 | 修改类型 | 说明 |
+|------|---------|------|
+| `migrations/002_user_portraits.sql` | 新增 | 画像表 |
+| `apps/api/services/vibe_engine/portrait_service.py` | 新增 | 画像服务 |
+| `apps/api/services/vibe_engine/insight_generator.py` | 修改 | 简化为 LLM 驱动 |
+| `apps/api/services/agent/runtime.py` | 修改 | 集成画像 |
+
+---
+
+## 总结
+
+### 核心理念
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║   传统方式: 人类设计规则，代码执行规则                                         ║
+║   ─────────────────────────────────────────────────────────────────────────   ║
+║   • 预定义数据结构                                                            ║
+║   • 编写复杂的提取规则                                                        ║
+║   • 维护规则和边界条件                                                        ║
+║   • 规则僵化，难以适应变化                                                    ║
+║                                                                               ║
+║   ═══════════════════════════════════════════════════════════════════════     ║
+║                                                                               ║
+║   极简方式: 存储文本，LLM 做理解                                              ║
+║   ─────────────────────────────────────────────────────────────────────────   ║
+║   • 存储原始对话 + LLM 生成的摘要                                             ║
+║   • 让 LLM 实时理解和提取                                                     ║
+║   • 提示词即规则，易于迭代                                                    ║
+║   • 灵活适应各种情况                                                          ║
+║                                                                               ║
+║   ═══════════════════════════════════════════════════════════════════════     ║
+║                                                                               ║
+║   "不要用代码解决 LLM 能解决的问题"                                           ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### 优势
+
+1. **代码量减少 80%+** - 从 5-7 天 → 1-2 天
+2. **维护成本低** - 改提示词比改代码容易
+3. **更智能** - LLM 理解能力 > 规则匹配
+4. **更灵活** - 适应各种边界情况
+5. **更快迭代** - A/B 测试不同提示词
+
+### 成本考虑
+
+- 画像更新: 每 10 条消息调用 1 次 LLM (~$0.01)
+- 洞察判断: 每次对话结束调用 1 次 LLM (~$0.005)
+- 总计: 用户每天 $0.02-0.05 的 LLM 成本
+
+vs 复杂方案:
+- 开发成本: 节省 4-5 天开发时间
+- 维护成本: 无需维护复杂的规则引擎
+
+**结论**: LLM 成本 << 开发维护成本
+
+---
+
+*本文档为 VibeLife 用户数据沉淀机制的极简设计方案，核心思想是"让 LLM 做脏活"。*

@@ -1,0 +1,272 @@
+"""
+VibeLife Stripe Service
+Stripe 支付集成服务
+"""
+
+import os
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel
+from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Stripe 配置
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
+
+
+class PaymentStatus(str, Enum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    REFUNDED = "refunded"
+
+
+class CheckoutSession(BaseModel):
+    """Stripe Checkout Session"""
+    session_id: str
+    url: str
+    status: str
+    customer_id: Optional[str] = None
+    subscription_id: Optional[str] = None
+
+
+class PaymentIntent(BaseModel):
+    """支付意图"""
+    intent_id: str
+    amount: int
+    currency: str
+    status: PaymentStatus
+
+
+class StripeService:
+    """Stripe 支付服务"""
+
+    def __init__(self):
+        self.api_key = STRIPE_SECRET_KEY
+        self._stripe = None
+
+    @property
+    def stripe(self):
+        """延迟加载 Stripe 模块"""
+        if self._stripe is None:
+            try:
+                import stripe
+                stripe.api_key = self.api_key
+                self._stripe = stripe
+            except ImportError:
+                logger.warning("Stripe module not installed")
+                return None
+        return self._stripe
+
+    async def create_customer(
+        self,
+        user_id: str,
+        email: str,
+        name: Optional[str] = None
+    ) -> Optional[str]:
+        """创建 Stripe 客户"""
+        if not self.stripe:
+            return None
+
+        try:
+            customer = self.stripe.Customer.create(
+                email=email,
+                name=name,
+                metadata={"user_id": user_id}
+            )
+            return customer.id
+        except Exception as e:
+            logger.error(f"Failed to create Stripe customer: {e}")
+            return None
+
+    async def create_checkout_session(
+        self,
+        user_id: str,
+        price_id: str,
+        success_url: str,
+        cancel_url: str,
+        customer_id: Optional[str] = None
+    ) -> Optional[CheckoutSession]:
+        """创建 Checkout Session"""
+        if not self.stripe:
+            return None
+
+        try:
+            session_params = {
+                "mode": "subscription",
+                "payment_method_types": ["card", "alipay", "wechat_pay"],
+                "line_items": [{"price": price_id, "quantity": 1}],
+                "success_url": success_url,
+                "cancel_url": cancel_url,
+                "metadata": {"user_id": user_id},
+                "payment_method_options": {
+                    "wechat_pay": {"client": "web"}
+                }
+            }
+
+            if customer_id:
+                session_params["customer"] = customer_id
+
+            session = self.stripe.checkout.Session.create(**session_params)
+
+            return CheckoutSession(
+                session_id=session.id,
+                url=session.url,
+                status=session.status,
+                customer_id=session.customer,
+                subscription_id=session.subscription
+            )
+        except Exception as e:
+            logger.error(f"Failed to create checkout session: {e}")
+            return None
+
+    async def create_billing_portal_session(
+        self,
+        customer_id: str,
+        return_url: str
+    ) -> Optional[str]:
+        """创建账单门户 Session（用于管理订阅）"""
+        if not self.stripe:
+            return None
+
+        try:
+            session = self.stripe.billing_portal.Session.create(
+                customer=customer_id,
+                return_url=return_url
+            )
+            return session.url
+        except Exception as e:
+            logger.error(f"Failed to create billing portal session: {e}")
+            return None
+
+    async def get_subscription(self, subscription_id: str) -> Optional[dict]:
+        """获取订阅信息"""
+        if not self.stripe:
+            return None
+
+        try:
+            subscription = self.stripe.Subscription.retrieve(subscription_id)
+            return {
+                "id": subscription.id,
+                "status": subscription.status,
+                "current_period_start": datetime.fromtimestamp(subscription.current_period_start),
+                "current_period_end": datetime.fromtimestamp(subscription.current_period_end),
+                "cancel_at_period_end": subscription.cancel_at_period_end,
+                "canceled_at": datetime.fromtimestamp(subscription.canceled_at) if subscription.canceled_at else None,
+                "plan": {
+                    "id": subscription.items.data[0].price.id,
+                    "product": subscription.items.data[0].price.product,
+                    "amount": subscription.items.data[0].price.unit_amount,
+                    "currency": subscription.items.data[0].price.currency,
+                    "interval": subscription.items.data[0].price.recurring.interval
+                }
+            }
+        except Exception as e:
+            logger.error(f"Failed to get subscription: {e}")
+            return None
+
+    async def cancel_subscription(
+        self,
+        subscription_id: str,
+        cancel_immediately: bool = False
+    ) -> bool:
+        """取消订阅"""
+        if not self.stripe:
+            return False
+
+        try:
+            if cancel_immediately:
+                self.stripe.Subscription.delete(subscription_id)
+            else:
+                self.stripe.Subscription.modify(
+                    subscription_id,
+                    cancel_at_period_end=True
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel subscription: {e}")
+            return False
+
+    async def reactivate_subscription(self, subscription_id: str) -> bool:
+        """重新激活订阅（取消"周期结束后取消"）"""
+        if not self.stripe:
+            return False
+
+        try:
+            self.stripe.Subscription.modify(
+                subscription_id,
+                cancel_at_period_end=False
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reactivate subscription: {e}")
+            return False
+
+    def verify_webhook_signature(
+        self,
+        payload: bytes,
+        signature: str
+    ) -> Optional[dict]:
+        """验证 Webhook 签名"""
+        if not self.stripe:
+            return None
+
+        try:
+            event = self.stripe.Webhook.construct_event(
+                payload,
+                signature,
+                STRIPE_WEBHOOK_SECRET
+            )
+            return {
+                "type": event.type,
+                "data": event.data.object
+            }
+        except Exception as e:
+            logger.error(f"Webhook signature verification failed: {e}")
+            return None
+
+    async def get_product_prices(self, product_id: str) -> list[dict]:
+        """获取产品的所有价格"""
+        if not self.stripe:
+            return []
+
+        try:
+            prices = self.stripe.Price.list(product=product_id, active=True)
+            return [
+                {
+                    "id": price.id,
+                    "amount": price.unit_amount,
+                    "currency": price.currency,
+                    "interval": price.recurring.interval if price.recurring else None,
+                    "interval_count": price.recurring.interval_count if price.recurring else None
+                }
+                for price in prices.data
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get product prices: {e}")
+            return []
+
+
+# 预定义的 Stripe Price IDs（需要在 Stripe Dashboard 中创建）
+STRIPE_PRICE_IDS = {
+    # 八字单站订阅
+    "bazi_monthly": "price_bazi_monthly_29",
+    "bazi_yearly": "price_bazi_yearly_199",
+
+    # 星座单站订阅
+    "zodiac_monthly": "price_zodiac_monthly_29",
+    "zodiac_yearly": "price_zodiac_yearly_199",
+
+    # MBTI 单站订阅
+    "mbti_monthly": "price_mbti_monthly_29",
+    "mbti_yearly": "price_mbti_yearly_199",
+
+    # VibeLife 全站订阅
+    "vibelife_all_monthly": "price_vibelife_monthly_69",
+    "vibelife_all_yearly": "price_vibelife_yearly_499",
+}

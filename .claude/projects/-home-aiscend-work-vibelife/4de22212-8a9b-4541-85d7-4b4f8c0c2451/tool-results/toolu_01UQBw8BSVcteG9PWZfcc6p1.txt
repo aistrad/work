@@ -1,0 +1,166 @@
+     1→"""
+     2→Notification Service - Store and query user notifications
+     3→
+     4→v2.0 更新：移除对旧 scheduler.py 的依赖，支持新的 ProactiveEngine
+     5→"""
+     6→import json
+     7→import logging
+     8→from datetime import date, datetime
+     9→from typing import List, Dict, Any, Optional
+    10→from uuid import UUID
+    11→
+    12→# asyncpg is optional in test environments. Avoid hard import failure.
+    13→try:  # pragma: no cover
+    14→    import asyncpg  # type: ignore
+    15→except Exception:  # pragma: no cover
+    16→    asyncpg = None  # type: ignore
+    17→
+    18→from stores.db import get_connection, fetchrow, fetch, execute
+    19→
+    20→logger = logging.getLogger(__name__)
+    21→
+    22→
+    23→from typing import TYPE_CHECKING
+    24→
+    25→
+    26→class NotificationService:
+    27→    """Store and query user notifications"""
+    28→
+    29→    if TYPE_CHECKING:
+    30→        from asyncpg import Pool as _Pool  # for type-checkers only
+    31→
+    32→    def __init__(self, pool=None):
+    33→        self._pool = pool
+    34→
+    35→    async def save(
+    36→        self,
+    37→        user_id: UUID,
+    38→        notification_type: str,
+    39→        title: str,
+    40→        content: Dict[str, Any],
+    41→        trigger_date: date = None,
+    42→    ) -> bool:
+    43→        """Save a notification"""
+    44→        if trigger_date is None:
+    45→            trigger_date = date.today()
+    46→
+    47→        query = """
+    48→            INSERT INTO user_notifications (user_id, type, title, content, trigger_date)
+    49→            VALUES ($1, $2, $3, $4, $5)
+    50→            ON CONFLICT (user_id, type, trigger_date) DO UPDATE
+    51→            SET title = $3, content = $4, created_at = NOW()
+    52→            RETURNING id
+    53→        """
+    54→        try:
+    55→            async with get_connection() as conn:
+    56→                result = await conn.fetchval(
+    57→                    query, user_id, notification_type, title, json.dumps(content), trigger_date
+    58→                )
+    59→                return result is not None
+    60→        except Exception as e:
+    61→            logger.error(f"Failed to save notification: {e}")
+    62→            return False
+    63→
+    64→    async def send_notification(
+    65→        self,
+    66→        user_id: UUID,
+    67→        notification_type: str,
+    68→        title: str,
+    69→        content: Any,
+    70→        trigger_date: date = None,
+    71→    ) -> bool:
+    72→        """
+    73→        Send notification (save to DB for web app)
+    74→
+    75→        Args:
+    76→            user_id: 用户 ID
+    77→            notification_type: 通知类型 (daily_fortune, dayun_transition, etc.)
+    78→            title: 通知标题
+    79→            content: 通知内容 (可以是 str 或 dict)
+    80→            trigger_date: 触发日期
+    81→        """
+    82→        # 处理 content 格式
+    83→        if isinstance(content, str):
+    84→            content_dict = {"body": content}
+    85→        elif isinstance(content, dict):
+    86→            content_dict = content
+    87→        else:
+    88→            content_dict = {"body": str(content)}
+    89→
+    90→        return await self.save(
+    91→            user_id=user_id,
+    92→            notification_type=notification_type,
+    93→            title=title,
+    94→            content=content_dict,
+    95→            trigger_date=trigger_date,
+    96→        )
+    97→
+    98→    async def get_unread(self, user_id: UUID, limit: int = 20) -> List[Dict[str, Any]]:
+    99→        """Get unread notifications for a user"""
+   100→        query = """
+   101→            SELECT id, type, title, content, trigger_date, created_at
+   102→            FROM user_notifications
+   103→            WHERE user_id = $1 AND is_read = false
+   104→            ORDER BY created_at DESC
+   105→            LIMIT $2
+   106→        """
+   107→        rows = await fetch(query, user_id, limit)
+   108→        return [self._row_to_dict(row) for row in rows]
+   109→
+   110→    async def get_all(self, user_id: UUID, limit: int = 50) -> List[Dict[str, Any]]:
+   111→        """Get all notifications for a user"""
+   112→        query = """
+   113→            SELECT id, type, title, content, trigger_date, is_read, read_at, created_at
+   114→            FROM user_notifications
+   115→            WHERE user_id = $1
+   116→            ORDER BY created_at DESC
+   117→            LIMIT $2
+   118→        """
+   119→        rows = await fetch(query, user_id, limit)
+   120→        return [self._row_to_dict(row) for row in rows]
+   121→
+   122→    async def mark_read(self, notification_id: UUID) -> bool:
+   123→        """Mark a notification as read"""
+   124→        query = """
+   125→            UPDATE user_notifications
+   126→            SET is_read = true, read_at = NOW()
+   127→            WHERE id = $1
+   128→        """
+   129→        try:
+   130→            result = await execute(query, notification_id)
+   131→            return "UPDATE" in result
+   132→        except Exception as e:
+   133→            logger.error(f"Failed to mark notification read: {e}")
+   134→            return False
+   135→
+   136→    async def get_today_daily(self, user_id: UUID) -> Optional[Dict[str, Any]]:
+   137→        """Get today's daily fortune notification"""
+   138→        query = """
+   139→            SELECT id, type, title, content, trigger_date, is_read, created_at
+   140→            FROM user_notifications
+   141→            WHERE user_id = $1 AND type = 'daily' AND trigger_date = $2
+   142→        """
+   143→        row = await fetchrow(query, user_id, date.today())
+   144→        return self._row_to_dict(row) if row else None
+   145→
+   146→    def _row_to_dict(self, row) -> Dict[str, Any]:
+   147→        """Convert DB row to dict"""
+   148→        content = row["content"]
+   149→        if isinstance(content, str):
+   150→            content = json.loads(content)
+   151→
+   152→        return {
+   153→            "id": str(row["id"]),
+   154→            "type": row["type"],
+   155→            "title": row["title"],
+   156→            "content": content,
+   157→            "trigger_date": str(row["trigger_date"]),
+   158→            "is_read": row.get("is_read", False),
+   159→            "read_at": row["read_at"].isoformat() if row.get("read_at") else None,
+   160→            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+   161→        }
+   162→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,234 @@
+"""
+Tool Schema v6 - 统一工具定义系统
+
+从 YAML 文件加载工具定义，自动生成：
+- Python OpenAI 格式工具定义
+- TypeScript 类型定义（可选）
+"""
+import yaml
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
+
+SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+
+
+@dataclass
+class ToolParam:
+    """工具参数"""
+    name: str
+    type: str
+    required: bool = False
+    description: str = ""
+    default: Any = None
+    enum: Optional[List[str]] = None
+
+
+@dataclass
+class ToolDef:
+    """工具定义"""
+    name: str
+    description: str
+    tool_type: str  # collect, compute, display, search
+    parameters: List[ToolParam] = field(default_factory=list)
+    card_type: Optional[str] = None
+    card_props: Optional[Dict] = None
+    when_to_call: Optional[str] = None
+    implementation: Optional[str] = None
+    skill_id: Optional[str] = None  # 所属 Skill ID
+
+    def to_openai_format(self) -> Dict[str, Any]:
+        """转换为 OpenAI 工具格式"""
+        properties = {}
+        required = []
+
+        for param in self.parameters:
+            prop = {"type": param.type, "description": param.description}
+            if param.enum:
+                prop["enum"] = param.enum
+            if param.default is not None:
+                prop["default"] = param.default
+            properties[param.name] = prop
+            if param.required:
+                required.append(param.name)
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                }
+            },
+            "_metadata": {
+                "tool_type": self.tool_type,
+                "card_type": self.card_type,
+                "when_to_call": self.when_to_call
+            }
+        }
+
+
+def _parse_yaml_tool(tool_data: Dict, tool_type: str) -> ToolDef:
+    """解析 YAML 工具定义"""
+    params = []
+    for p in tool_data.get("parameters", []):
+        params.append(ToolParam(
+            name=p["name"],
+            type=p.get("type", "string"),
+            required=p.get("required", False),
+            description=p.get("description", ""),
+            default=p.get("default"),
+            enum=p.get("enum")
+        ))
+
+    return ToolDef(
+        name=tool_data["name"],
+        description=tool_data.get("description", ""),
+        tool_type=tool_type,
+        parameters=params,
+        card_type=tool_data.get("card_type"),
+        card_props=tool_data.get("card_props"),
+        when_to_call=tool_data.get("when_to_call"),
+        implementation=tool_data.get("implementation")
+    )
+
+
+@lru_cache(maxsize=16)
+def load_skill_tools(skill_id: str) -> List[ToolDef]:
+    """从 YAML 加载 Skill 工具定义"""
+    tools_file = SKILLS_DIR / skill_id / "tools" / "tools.yaml"
+    if not tools_file.exists():
+        logger.warning(f"Tools file not found: {tools_file}")
+        return []
+
+    try:
+        with open(tools_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        tools = []
+        for tool_type in ["collect", "compute", "display", "search"]:
+            for tool_data in data.get(tool_type, []):
+                tools.append(_parse_yaml_tool(tool_data, tool_type))
+
+        logger.info(f"Loaded {len(tools)} tools for skill: {skill_id}")
+        return tools
+    except Exception as e:
+        logger.error(f"Failed to load tools for {skill_id}: {e}")
+        return []
+
+
+def get_skill_tools_openai(skill_id: str) -> List[Dict[str, Any]]:
+    """获取 Skill 工具的 OpenAI 格式"""
+    tools = load_skill_tools(skill_id)
+    return [t.to_openai_format() for t in tools]
+
+
+# 全局工具定义（不从 YAML 加载）
+GLOBAL_TOOLS = [
+    ToolDef(
+        name="search_db",
+        description="从数据库检索知识或案例。table='knowledge_chunks' 检索专业知识，table='cases' 检索参考案例。",
+        tool_type="search",
+        parameters=[
+            ToolParam("table", "string", True, "要查询的表", enum=["knowledge_chunks", "cases"]),
+            ToolParam("query", "string", True, "检索查询词"),
+            ToolParam("filters", "object", False, "可选过滤条件"),
+            ToolParam("top_k", "integer", False, "返回结果数量", default=5)
+        ]
+    ),
+    ToolDef(
+        name="ask_user_question",
+        description="主动向用户提问以获取更多信息。用于澄清意图、让用户选择或收集必要信息。",
+        tool_type="collect",
+        parameters=[
+            ToolParam("question", "string", True, "要问用户的问题"),
+            ToolParam("options", "array", False, "可选的选项列表（最多4个）")
+        ],
+        card_type="question_card"
+    ),
+    ToolDef(
+        name="show_skill_services",
+        description="展示当前 Skill 的服务目录。用户主动进入 Skill 或询问有什么服务时调用。",
+        tool_type="display",
+        parameters=[
+            ToolParam("skill_id", "string", True, "Skill ID (bazi/zodiac/tarot/career)")
+        ],
+        card_type="skill_services"
+    ),
+    ToolDef(
+        name="recommend_service",
+        description="根据对话上下文，向用户推荐相关的升级服务。完成基础服务后检测到用户需要更深入分析时调用。",
+        tool_type="display",
+        parameters=[
+            ToolParam("scenario_id", "string", True, "推荐的场景 ID"),
+            ToolParam("reason", "string", True, "推荐理由"),
+            ToolParam("highlights", "array", False, "服务亮点（2-3个）")
+        ],
+        card_type="service_recommendation"
+    ),
+    ToolDef(
+        name="request_info",
+        description="向用户请求信息。需要收集出生信息或其他必要信息时调用。",
+        tool_type="collect",
+        parameters=[
+            ToolParam("info_type", "string", True, "信息类型", enum=["birth", "context", "goals", "concerns"]),
+            ToolParam("question", "string", False, "自定义问题")
+        ],
+        card_type="collect_form"
+    ),
+    ToolDef(
+        name="show_insight",
+        description="展示洞察卡片。需要突出关键发现或建议时调用。",
+        tool_type="display",
+        parameters=[
+            ToolParam("insight_type", "string", True, "洞察类型", enum=["career", "relationship", "fortune", "health", "general"]),
+            ToolParam("title", "string", True, "洞察标题"),
+            ToolParam("content", "string", True, "洞察内容")
+        ],
+        card_type="insight_card"
+    ),
+    ToolDef(
+        name="show_report",
+        description="展示完整报告。用户想查看详细分析报告时调用。",
+        tool_type="display",
+        parameters=[
+            ToolParam("report_type", "string", False, "报告类型", default="lite", enum=["lite", "full"])
+        ],
+        card_type="report_card"
+    )
+]
+
+
+def get_global_tools_openai() -> List[Dict[str, Any]]:
+    """获取全局工具的 OpenAI 格式"""
+    return [t.to_openai_format() for t in GLOBAL_TOOLS]
+
+
+def get_all_tools_for_skill(skill_id: str) -> List[Dict[str, Any]]:
+    """获取 Skill 的所有工具（全局 + Skill 专属）"""
+    tools = get_global_tools_openai()
+    tools.extend(get_skill_tools_openai(skill_id))
+    return tools
+
+
+def get_tool_card_type(tool_name: str, skill_id: Optional[str] = None) -> Optional[str]:
+    """获取工具对应的卡片类型"""
+    # 先查全局工具
+    for tool in GLOBAL_TOOLS:
+        if tool.name == tool_name:
+            return tool.card_type
+
+    # 再查 Skill 工具
+    if skill_id:
+        for tool in load_skill_tools(skill_id):
+            if tool.name == tool_name:
+                return tool.card_type
+
+    return None

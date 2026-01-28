@@ -1,0 +1,506 @@
+"""
+TriggerEvaluator Unit Tests
+
+TDD: Tests written first, then implementation.
+
+Test categories:
+1. Static condition evaluation (exists, !exists, ==, !=, >, <, >=, <=, contains)
+2. Placeholder preprocessing ({today}, {now})
+3. Cron matching with timezone
+4. Event-based detection (birthday, solar_term)
+5. LLM fallback for complex conditions
+6. Idempotent key generation
+"""
+
+import pytest
+from datetime import datetime, date, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+import time_machine
+
+
+class TestStaticConditionEvaluation:
+    """Test static condition evaluation (no LLM needed)"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.fixture
+    def profile_with_birth_info(self):
+        return {
+            "vibe": {
+                "profile": {
+                    "birth_info": {
+                        "date": "1990-05-15",
+                        "time": "10:30",
+                        "location": "Beijing"
+                    }
+                },
+                "goals": [
+                    {"name": "Learn Python", "status": "active"}
+                ],
+                "state": {
+                    "emotion": "calm",
+                    "focus": ["career", "health"]
+                }
+            },
+            "lifecoach": {
+                "progress": {
+                    "last_checkin_date": "2026-01-25",
+                    "streak_days": 7
+                }
+            },
+            "skills": {
+                "bazi": {
+                    "daily_fortune": {
+                        "score": 75
+                    }
+                }
+            }
+        }
+
+    def test_exists_operator_returns_true_when_data_exists(self, evaluator, profile_with_birth_info):
+        """exists operator should return True when path has data"""
+        condition = {
+            "description": "用户已设定八字信息",
+            "data_path": "vibe.profile.birth_info",
+            "operator": "exists"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_exists_operator_returns_false_when_data_missing(self, evaluator, profile_with_birth_info):
+        """exists operator should return False when path has no data"""
+        condition = {
+            "description": "用户设定了X数据",
+            "data_path": "vibe.profile.nonexistent",
+            "operator": "exists"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is False
+
+    def test_not_exists_operator(self, evaluator, profile_with_birth_info):
+        """!exists operator should return True when path has no data"""
+        condition = {
+            "data_path": "vibe.profile.nonexistent",
+            "operator": "!exists"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_equals_operator_string(self, evaluator, profile_with_birth_info):
+        """== operator should work with strings"""
+        condition = {
+            "data_path": "vibe.state.emotion",
+            "operator": "==",
+            "value": "calm"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_not_equals_operator(self, evaluator, profile_with_birth_info):
+        """!= operator should work correctly"""
+        condition = {
+            "data_path": "lifecoach.progress.last_checkin_date",
+            "operator": "!=",
+            "value": "2026-01-26"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_greater_than_operator(self, evaluator, profile_with_birth_info):
+        """< operator should work with numbers"""
+        condition = {
+            "data_path": "skills.bazi.daily_fortune.score",
+            "operator": "<",
+            "value": 80
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_greater_than_or_equal_operator(self, evaluator, profile_with_birth_info):
+        """>= operator should work with numbers"""
+        condition = {
+            "data_path": "lifecoach.progress.streak_days",
+            "operator": ">=",
+            "value": 7
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+    def test_contains_operator(self, evaluator, profile_with_birth_info):
+        """contains operator should check substring"""
+        condition = {
+            "data_path": "vibe.profile.birth_info.location",
+            "operator": "contains",
+            "value": "Bei"
+        }
+        result = evaluator._static_eval(condition, profile_with_birth_info)
+        assert result is True
+
+
+class TestPlaceholderPreprocessing:
+    """Test placeholder replacement in conditions"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @time_machine.travel("2026-01-26 10:00:00", tick=False)
+    def test_today_placeholder_replaced(self, evaluator):
+        """{today} should be replaced with current date"""
+        condition = {
+            "data_path": "lifecoach.progress.last_checkin_date",
+            "operator": "!=",
+            "value": "{today}"
+        }
+        processed = evaluator._preprocess_condition(condition)
+        assert processed["value"] == "2026-01-26"
+
+    @time_machine.travel("2026-01-26 10:30:45", tick=False)
+    def test_now_placeholder_replaced(self, evaluator):
+        """{now} should be replaced with current datetime"""
+        condition = {
+            "data_path": "some.path",
+            "operator": "==",
+            "value": "{now}"
+        }
+        processed = evaluator._preprocess_condition(condition)
+        assert "2026-01-26" in processed["value"]
+
+
+class TestCronMatching:
+    """Test cron schedule matching with timezone"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    def test_cron_matches_at_scheduled_time(self, evaluator):
+        """Cron should match when current time matches schedule"""
+        schedule = "0 8 * * *"  # 8:00 AM every day in user timezone
+        matched, bucket_key = evaluator._evaluate_cron(schedule, "Asia/Shanghai")
+        # At 00:00 UTC = 08:00 Asia/Shanghai
+        assert matched is True
+        assert bucket_key is not None
+
+    @time_machine.travel("2026-01-26 01:00:00+00:00", tick=False)
+    def test_cron_does_not_match_outside_window(self, evaluator):
+        """Cron should not match outside the time window"""
+        schedule = "0 8 * * *"  # 8:00 AM every day
+        matched, bucket_key = evaluator._evaluate_cron(schedule, "Asia/Shanghai")
+        # At 01:00 UTC = 09:00 Asia/Shanghai
+        assert matched is False
+
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    def test_cron_returns_bucket_key_for_idempotency(self, evaluator):
+        """Cron should return bucket_key for idempotent deduplication"""
+        schedule = "0 8 * * *"
+        matched, bucket_key = evaluator._evaluate_cron(schedule, "Asia/Shanghai")
+        # At 00:00:30 UTC = 08:00:30 Asia/Shanghai, prev match is 08:00
+        assert bucket_key == "2026-01-26T08:00"
+
+    def test_invalid_cron_returns_false(self, evaluator):
+        """Invalid cron expression should return False"""
+        matched, bucket_key = evaluator._evaluate_cron("invalid cron", "Asia/Shanghai")
+        assert matched is False
+        assert bucket_key is None
+
+
+class TestConditionClassification:
+    """Test classification of static vs complex conditions"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    def test_condition_with_data_path_and_static_operator_is_static(self, evaluator):
+        """Conditions with data_path and static operator are static"""
+        condition = {
+            "data_path": "vibe.profile.birth_info",
+            "operator": "exists"
+        }
+        assert evaluator._is_static_condition(condition) is True
+
+    def test_condition_without_data_path_is_complex(self, evaluator):
+        """Conditions without data_path require LLM"""
+        condition = {
+            "description": "用户连续3天情绪低落且未进行冥想"
+        }
+        assert evaluator._is_static_condition(condition) is False
+
+    def test_condition_with_non_static_operator_is_complex(self, evaluator):
+        """Conditions with non-static operators require LLM"""
+        condition = {
+            "data_path": "some.path",
+            "operator": "semantic_match"
+        }
+        assert evaluator._is_static_condition(condition) is False
+
+
+class TestEventBasedDetection:
+    """Test event-based trigger detection"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @time_machine.travel("2026-05-08", tick=False)
+    def test_birthday_detected_7_days_before(self, evaluator):
+        """Birthday should be detected 7 days before"""
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {
+                        "date": "1990-05-15"
+                    }
+                }
+            }
+        }
+        triggered, event_info, idempotent_key = evaluator._detect_birthday(profile, [7, 0])
+        assert triggered is True
+        assert event_info["event_type"] == "birthday"
+        assert event_info["days_until"] == 7
+
+    @time_machine.travel("2026-05-15", tick=False)
+    def test_birthday_detected_on_day(self, evaluator):
+        """Birthday should be detected on the day"""
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {
+                        "date": "1990-05-15"
+                    }
+                }
+            }
+        }
+        triggered, event_info, idempotent_key = evaluator._detect_birthday(profile, [7, 0])
+        assert triggered is True
+        assert event_info["days_until"] == 0
+
+    @time_machine.travel("2026-05-10", tick=False)
+    def test_birthday_not_detected_outside_advance_days(self, evaluator):
+        """Birthday should not be detected outside advance_days"""
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {
+                        "date": "1990-05-15"
+                    }
+                }
+            }
+        }
+        triggered, event_info, idempotent_key = evaluator._detect_birthday(profile, [7, 0])
+        assert triggered is False
+
+    def test_birthday_not_detected_without_birth_info(self, evaluator):
+        """Birthday should not be detected without birth_info"""
+        profile = {"vibe": {"profile": {}}}
+        triggered, event_info, idempotent_key = evaluator._detect_birthday(profile, [7, 0])
+        assert triggered is False
+
+
+class TestNestedValueAccess:
+    """Test nested dictionary value access"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    def test_get_nested_value_success(self, evaluator):
+        """Should get deeply nested values"""
+        data = {"a": {"b": {"c": "value"}}}
+        result = evaluator._get_nested_value(data, "a.b.c")
+        assert result == "value"
+
+    def test_get_nested_value_missing_path(self, evaluator):
+        """Should return None for missing path"""
+        data = {"a": {"b": {}}}
+        result = evaluator._get_nested_value(data, "a.b.c")
+        assert result is None
+
+    def test_get_nested_value_non_dict(self, evaluator):
+        """Should handle non-dict intermediate values"""
+        data = {"a": "string"}
+        result = evaluator._get_nested_value(data, "a.b.c")
+        assert result is None
+
+
+class TestEvaluateConditions:
+    """Test the main condition evaluation flow"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.mark.asyncio
+    async def test_all_static_conditions_pass(self, evaluator):
+        """All static conditions passing should return True"""
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {"date": "1990-05-15"}
+                }
+            }
+        }
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"}
+        ]
+        result = await evaluator._evaluate_conditions(conditions, profile)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_one_static_condition_fails_short_circuits(self, evaluator):
+        """Failing static condition should short-circuit"""
+        profile = {"vibe": {"profile": {}}}
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"},
+            {"description": "Complex condition that should not be evaluated"}
+        ]
+        result = await evaluator._evaluate_conditions(conditions, profile)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_empty_conditions_return_true(self, evaluator):
+        """Empty conditions should return True"""
+        result = await evaluator._evaluate_conditions([], {})
+        assert result is True
+
+
+class TestTimeBasedTrigger:
+    """Test time-based trigger evaluation"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_time_based_trigger_with_matching_cron(self, evaluator):
+        """Time-based trigger should fire when cron matches"""
+        trigger_config = {
+            "type": "time_based",
+            "schedule": "0 8 * * *"
+        }
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {"date": "1990-05-15"}
+                }
+            }
+        }
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"}
+        ]
+
+        triggered, event_info, bucket_key = await evaluator.evaluate(
+            trigger_config=trigger_config,
+            profile=profile,
+            conditions=conditions,
+            user_timezone="Asia/Shanghai"
+        )
+
+        assert triggered is True
+        assert bucket_key is not None
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26 00:00:30+00:00", tick=False)
+    async def test_time_based_trigger_fails_when_conditions_not_met(self, evaluator):
+        """Time-based trigger should not fire when conditions fail"""
+        trigger_config = {
+            "type": "time_based",
+            "schedule": "0 8 * * *"
+        }
+        profile = {"vibe": {"profile": {}}}
+        conditions = [
+            {"data_path": "vibe.profile.birth_info", "operator": "exists"}
+        ]
+
+        triggered, event_info, bucket_key = await evaluator.evaluate(
+            trigger_config=trigger_config,
+            profile=profile,
+            conditions=conditions,
+            user_timezone="Asia/Shanghai"
+        )
+
+        assert triggered is False
+
+
+class TestEventBasedTrigger:
+    """Test event-based trigger evaluation"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-05-15", tick=False)
+    async def test_event_based_birthday_trigger(self, evaluator):
+        """Event-based birthday trigger should fire on birthday"""
+        trigger_config = {
+            "type": "event_based",
+            "event": "birthday",
+            "advance_days": [7, 0]
+        }
+        profile = {
+            "vibe": {
+                "profile": {
+                    "birth_info": {"date": "1990-05-15"}
+                }
+            }
+        }
+
+        triggered, event_info, idempotent_key = await evaluator.evaluate(
+            trigger_config=trigger_config,
+            profile=profile,
+            user_timezone="Asia/Shanghai"
+        )
+
+        assert triggered is True
+        assert event_info["event_type"] == "birthday"
+
+
+class TestDataConditionTrigger:
+    """Test data_condition trigger type"""
+
+    @pytest.fixture
+    def evaluator(self):
+        from services.proactive.trigger_evaluator import TriggerEvaluator
+        return TriggerEvaluator()
+
+    @pytest.mark.asyncio
+    @time_machine.travel("2026-01-26", tick=False)
+    async def test_data_condition_trigger(self, evaluator):
+        """Data condition trigger should evaluate conditions only"""
+        trigger_config = {
+            "type": "data_condition"
+        }
+        profile = {
+            "lifecoach": {
+                "north_star": {"vision": "Become a better person"},
+                "progress": {"last_checkin_date": "2026-01-25"}
+            }
+        }
+        conditions = [
+            {"data_path": "lifecoach.north_star.vision", "operator": "exists"},
+            {"data_path": "lifecoach.progress.last_checkin_date", "operator": "!=", "value": "{today}"}
+        ]
+
+        triggered, event_info, bucket_key = await evaluator.evaluate(
+            trigger_config=trigger_config,
+            profile=profile,
+            conditions=conditions,
+            user_timezone="Asia/Shanghai"
+        )
+
+        assert triggered is True

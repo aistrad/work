@@ -1,0 +1,563 @@
+# VibeLife 复杂组合指令工具设计 v2
+
+> **目标**: 让用户能完成 "年目标拆解 + 每日计划 + 持续监督" 等复杂指令
+> **基于**: 4 表核心数据架构 (vibe_users / unified_profiles / user_data_store / user_triggers)
+
+---
+
+## 1. 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          工具分层架构 v2                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Core Skill (基础层)
+├── 原子化工具
+│   ├── 数据工具
+│   │   ├── read_user_data      # 读取用户内容数据
+│   │   ├── write_user_data     # 写入用户内容数据
+│   │   ├── query_user_data     # 查询用户内容数据
+│   │   └── delete_user_data    # 删除用户内容数据
+│   │
+│   ├── 触发器工具
+│   │   ├── create_trigger      # 创建触发器 (提醒/条件/定时)
+│   │   ├── list_triggers       # 列出触发器
+│   │   ├── pause_trigger       # 暂停触发器
+│   │   └── cancel_trigger      # 取消触发器
+│   │
+│   └── 展示工具
+│       ├── show_goal_tree      # 展示目标树
+│       ├── show_daily_plan     # 展示今日计划
+│       └── show_checkin_form   # 展示打卡表单
+│
+└── 子技能 (组合层) - 在 scenarios/ 中定义
+    ├── goal_tracking           # 目标追踪
+    ├── relationship_calc       # 关系计算
+    └── time_window             # 时间窗口推荐
+```
+
+---
+
+## 2. 数据模型映射
+
+### 工具与数据表关系
+
+| 工具类别 | 操作表 | 说明 |
+|---------|--------|------|
+| 数据工具 | user_data_store | 用户的内容数据 (目标/计划/打卡) |
+| 触发器工具 | user_triggers | 主动服务触发器 |
+| Profile 相关 | unified_profiles | 由专用服务处理，不暴露为工具 |
+| 计费相关 | vibe_users + usage_events | 由系统自动处理 |
+
+### 虚拟文件系统
+
+```
+/users/{user_id}/
+├── goals/
+│   └── 2026/
+│       ├── year                # 年度目标
+│       ├── q1                  # 季度目标
+│       └── months/01           # 月度目标
+├── plans/
+│   └── daily/2026-01-18        # 每日计划
+├── checkins/
+│   └── 2026-01-18              # 每日打卡
+└── reflections/
+    └── week_01                 # 周复盘
+```
+
+---
+
+## 3. 原子工具设计
+
+### 3.1 数据工具
+
+#### read_user_data
+
+```yaml
+name: read_user_data
+description: 读取用户数据
+parameters:
+  path:
+    type: string
+    description: 虚拟路径，如 "goals/2026/year"
+    required: true
+returns:
+  status: success | not_found | error
+  path: string
+  data: object | null
+```
+
+#### write_user_data
+
+```yaml
+name: write_user_data
+description: 写入用户数据（创建或更新）
+parameters:
+  path:
+    type: string
+    description: 虚拟路径
+    required: true
+  content:
+    type: object
+    description: JSON 内容
+    required: true
+  data_type:
+    type: string
+    description: 数据类型（可选，默认从路径推断）
+    enum: [goals, plans, checkins, reflections, docs]
+returns:
+  status: success | error
+  path: string
+  version: integer
+```
+
+#### query_user_data
+
+```yaml
+name: query_user_data
+description: 查询用户数据
+parameters:
+  data_type:
+    type: string
+    description: 数据类型过滤
+  path_prefix:
+    type: string
+    description: 路径前缀，如 "goals/2026"
+  filters:
+    type: object
+    description: JSONB 过滤条件
+  limit:
+    type: integer
+    default: 20
+returns:
+  status: success | error
+  count: integer
+  results: array
+```
+
+### 3.2 触发器工具
+
+#### create_trigger
+
+```yaml
+name: create_trigger
+description: 创建触发器（提醒/条件/定时任务）
+parameters:
+  trigger_type:
+    type: string
+    enum: [reminder, condition, schedule]
+    required: true
+  title:
+    type: string
+    required: true
+  description:
+    type: string
+  action:
+    type: object
+    description: 触发后执行的动作
+    required: true
+  # 定时类参数
+  schedule:
+    type: string
+    description: 调度表达式 (HH:MM 或 cron)
+  schedule_type:
+    type: string
+    enum: [once, daily, weekly, cron]
+  # 条件类参数
+  condition:
+    type: object
+    description: 触发条件规则
+  # 关联
+  source_path:
+    type: string
+    description: 关联的 user_data_store 路径
+returns:
+  status: success | error
+  trigger: object
+```
+
+**action 类型**:
+
+| action.type | 说明 | 示例 |
+|-------------|------|------|
+| proactive_message | 推送消息 | 每日计划提醒 |
+| generate_content | 生成内容 | 周报自动生成 |
+| celebration | 庆祝动画 | 连续打卡里程碑 |
+| data_update | 更新数据 | 自动归档过期目标 |
+
+#### list_triggers
+
+```yaml
+name: list_triggers
+description: 列出用户触发器
+parameters:
+  trigger_type:
+    type: string
+    description: 类型过滤
+  status:
+    type: string
+    default: active
+    enum: [active, paused, completed, all]
+returns:
+  status: success | error
+  count: integer
+  triggers: array
+```
+
+#### cancel_trigger
+
+```yaml
+name: cancel_trigger
+description: 取消触发器
+parameters:
+  trigger_id:
+    type: string
+    required: true
+returns:
+  status: success | not_found
+```
+
+### 3.3 展示工具
+
+| 工具 | 卡片类型 | 数据来源 |
+|------|----------|----------|
+| show_goal_tree | goal_tree | query goals/* |
+| show_daily_plan | daily_plan | read plans/daily/{date} |
+| show_checkin_form | checkin_form | read plans/daily/{date} + checkins/{date} |
+| show_trigger_list | trigger_list | list_triggers |
+
+---
+
+## 4. 子技能设计
+
+### 4.1 goal_tracking (目标追踪)
+
+**触发词**: 目标, 计划, 任务, 监督我, 打卡
+
+**工具组合流程**:
+
+```
+用户: "这是我的年目标，帮我拆解"
+    ↓
+1. write_user_data(path="goals/2026/year", content={...})
+   → 存储年度目标
+    ↓
+2. LLM 智能分解目标
+   → 生成季度/月度目标结构
+    ↓
+3. write_user_data(path="goals/2026/q1", content={...})
+   write_user_data(path="goals/2026/months/01", content={...})
+   → 存储分解后的子目标
+    ↓
+4. create_trigger(
+     trigger_type="reminder",
+     title="每日目标回顾",
+     schedule="08:00",
+     schedule_type="daily",
+     action={type: "proactive_message", template: "daily_goal_review"},
+     source_path="goals/2026/year"
+   )
+   → 设置每日提醒
+    ↓
+5. create_trigger(
+     trigger_type="condition",
+     title="打卡里程碑",
+     condition={type: "streak", rule: {streak_days: {$gte: 7}}},
+     action={type: "celebration", template: "streak_milestone"}
+   )
+   → 设置条件触发
+    ↓
+6. show_goal_tree(root_goal_path="goals/2026/year")
+   → 展示目标树卡片
+```
+
+**场景 scenarios/goal_tracking.md**:
+
+```markdown
+---
+id: goal_tracking
+triggers:
+  - 目标
+  - 计划
+  - 任务
+  - 监督
+  - 打卡
+tools:
+  - read_user_data
+  - write_user_data
+  - query_user_data
+  - create_trigger
+  - show_goal_tree
+  - show_daily_plan
+  - show_checkin_form
+---
+
+# 目标追踪场景
+
+## SOP 流程
+
+### P1: 目标收集
+收集用户的目标内容，询问：
+- 具体目标是什么？
+- 期望达成时间？
+- 为什么这个目标重要？
+
+### P2: 智能分解
+使用 SMART 原则将年度目标分解为：
+- 季度里程碑
+- 月度任务
+- 每周行动项
+
+### P3: 建立追踪
+- 存储目标数据
+- 设置每日提醒
+- 设置里程碑触发
+
+### P4: 持续监督
+- 每日计划生成
+- 打卡复盘
+- 进度可视化
+```
+
+### 4.2 relationship_calc (关系计算)
+
+**触发词**: 合盘, 关系分析, 缘分, 匹配度
+
+**工具组合**:
+
+```
+用户: "帮我分析和伴侣的关系"
+    ↓
+1. 读取用户 Profile (unified_profiles)
+   → 获取用户命理数据
+    ↓
+2. request_info(info_type="partner_birth")
+   → 收集对方信息
+    ↓
+3. 计算合盘 (Bazi/Zodiac Services)
+   → 八字合婚 + 星座合盘
+    ↓
+4. write_user_data(
+     path="relationships/partner_analysis",
+     content={...}
+   )
+   → 保存分析结果
+    ↓
+5. show_relationship(relationship_type="romantic")
+   → 展示关系分析卡片
+```
+
+### 4.3 time_window (时间窗口)
+
+**触发词**: 最佳时间, 什么时候适合, 择日
+
+**工具组合**:
+
+```
+用户: "最近什么时候适合谈薪资？"
+    ↓
+1. 读取用户 Profile
+   → 获取八字 + 星盘
+    ↓
+2. query_user_data(path_prefix="goals/*")
+   → 了解用户近期目标
+    ↓
+3. 计算最佳时间窗口
+   → 结合流年流月 + 行星运势
+    ↓
+4. 展示推荐时间
+   → 时间窗口卡片
+```
+
+---
+
+## 5. 触发器配置示例
+
+### 5.1 系统默认触发器 (reminders.yaml)
+
+这些在用户激活目标追踪时自动创建：
+
+```yaml
+system_triggers:
+  - id: daily_plan_reminder
+    trigger_type: reminder
+    title: 今日计划
+    schedule: "08:00"
+    schedule_type: daily
+    action:
+      type: proactive_message
+      template: daily_plan
+      params:
+        include_fortune: true
+
+  - id: daily_checkin_reminder
+    trigger_type: reminder
+    title: 每日打卡
+    schedule: "21:00"
+    schedule_type: daily
+    action:
+      type: proactive_message
+      template: checkin_reminder
+
+  - id: weekly_reflection
+    trigger_type: schedule
+    title: 周复盘
+    schedule: "0 20 * * 0"  # 每周日晚8点
+    schedule_type: cron
+    action:
+      type: generate_content
+      template: weekly_reflection
+      params:
+        output_path: "reflections/week_{week_number}"
+```
+
+### 5.2 条件触发器
+
+```yaml
+condition_triggers:
+  - id: streak_7_days
+    trigger_type: condition
+    title: 连续打卡 7 天
+    condition:
+      type: streak
+      check_path: "checkins/*"
+      rule:
+        streak_days: { "$gte": 7 }
+    action:
+      type: celebration
+      template: streak_milestone
+      params:
+        milestone: 7
+        badge: "一周坚持"
+
+  - id: goal_deadline_warning
+    trigger_type: condition
+    title: 目标即将到期
+    condition:
+      type: deadline
+      check_path: "goals/*/items/*"
+      rule:
+        days_until_deadline: { "$lte": 7 }
+    action:
+      type: proactive_message
+      template: deadline_warning
+```
+
+---
+
+## 6. 数据读写流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         数据读写流程 (Data CRUD Flow)                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌─────────────────────┐
+                              │      Tool Call      │
+                              │  (from LLM Agent)   │
+                              └──────────┬──────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+        ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+        │  read_user_data   │ │  write_user_data  │ │  create_trigger   │
+        │    (handlers.py)  │ │    (handlers.py)  │ │    (handlers.py)  │
+        └─────────┬─────────┘ └─────────┬─────────┘ └─────────┬─────────┘
+                  │                     │                     │
+                  ▼                     ▼                     ▼
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                       Services Layer                             │
+        │  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐   │
+        │  │ UserDataService │ │ UserDataService │ │ TriggerService  │   │
+        │  │     .read()     │ │    .write()     │ │    .create()    │   │
+        │  └────────┬────────┘ └────────┬────────┘ └────────┬────────┘   │
+        └───────────┼───────────────────┼───────────────────┼────────────┘
+                    │                   │                   │
+                    └───────────────────┼───────────────────┘
+                                        │
+                                        ▼
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                        PostgreSQL                                │
+        ├─────────────────────────────────────────────────────────────────┤
+        │                                                                  │
+        │   ┌─────────────────────────────────────────────────────────┐   │
+        │   │              user_data_store                             │   │
+        │   ├─────────────────────────────────────────────────────────┤   │
+        │   │ id | user_id | data_type | data_path | content | ver   │   │
+        │   │────┼─────────┼───────────┼───────────┼─────────┼────────│   │
+        │   │ .. │ abc-123 │ goals     │ goals/... │ {...}   │ 1     │   │
+        │   │ .. │ abc-123 │ plans     │ plans/... │ {...}   │ 2     │   │
+        │   │ .. │ abc-123 │ checkins  │ check/... │ {...}   │ 1     │   │
+        │   └─────────────────────────────────────────────────────────┘   │
+        │                                                                  │
+        │   ┌─────────────────────────────────────────────────────────┐   │
+        │   │              user_triggers                               │   │
+        │   ├─────────────────────────────────────────────────────────┤   │
+        │   │ id | user_id | type    | title | schedule | condition   │   │
+        │   │────┼─────────┼─────────┼───────┼──────────┼─────────────│   │
+        │   │ .. │ abc-123 │reminder │ 打卡  │ 21:00    │ null        │   │
+        │   │ .. │ abc-123 │condition│ 7天   │ null     │ {streak...} │   │
+        │   └─────────────────────────────────────────────────────────┘   │
+        │                                                                  │
+        └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. 前端卡片映射
+
+| 工具返回 cardType | 前端组件 | 数据来源 |
+|-------------------|----------|----------|
+| goal_tree | GoalTreeCard | query goals/* |
+| daily_plan | DailyPlanCard | read plans/daily/* |
+| checkin_form | CheckinFormCard | plans + checkins |
+| trigger_list | TriggerListCard | list_triggers |
+| celebration | CelebrationModal | 触发器触发时 |
+
+---
+
+## 8. 实现阶段
+
+| 阶段 | 内容 | 产出 |
+|------|------|------|
+| **P1** | 数据工具 | user_data_store CRUD 完成 |
+| **P2** | 触发器工具 | user_triggers 表 + TriggerService |
+| **P3** | goal_tracking 子技能 | 目标分解、每日计划生成 |
+| **P4** | ProactiveEngine 升级 | 支持 condition 触发器 |
+| **P5** | 前端卡片 | goal_tree, daily_plan, checkin 卡片 |
+| **P6** | 扩展子技能 | relationship, time_window |
+
+---
+
+## 9. 文件清单
+
+### 需新建/更新
+
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| `apps/api/stores/migrations/008_user_triggers.sql` | 新建 | 创建 user_triggers 表 |
+| `apps/api/skills/core/services/trigger.py` | 新建 | TriggerService |
+| `apps/api/skills/core/tools/handlers.py` | 更新 | 添加触发器工具处理器 |
+| `apps/api/skills/core/tools/tools.yaml` | 更新 | 添加触发器工具定义 |
+| `apps/api/workers/trigger_executor.py` | 新建 | 触发器执行 Worker |
+| `apps/api/services/proactive/engine.py` | 更新 | 支持条件触发 |
+
+### 需删除
+
+| 文件 | 原因 |
+|------|------|
+| `apps/api/skills/core/services/reminder.py` | 升级为 trigger.py |
+| `apps/api/stores/skill_profiles*.py` | 合并到 unified_profiles |
+
+---
+
+## 10. 注意事项
+
+1. **数据隔离**: 所有工具必须检查 user_id，确保用户只能访问自己的数据
+2. **配额检查**: write/create 操作前需检查用户配额
+3. **版本冲突**: write_user_data 使用乐观锁，冲突时返回错误让 LLM 重试
+4. **触发器限制**: 每用户最多 50 个活跃触发器
+5. **条件评估**: 条件触发器由 Worker 定期扫描，非实时触发

@@ -1,0 +1,232 @@
+"""
+Conversation Store - SSOT: PostgreSQL
+
+Stores conversation history and job index in database.
+Replaces file-based storage for horizontal scalability.
+
+Tables used:
+- job_index: Maps job_id to user_id
+- conversation_messages: Stores all conversation messages
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from stores.fortune_db import fetchall, fetchone, execute
+
+logger = get_logger(__name__)
+
+# Feature flag: Use DB or fallback to file
+USE_DB_STORE = os.getenv("FORTUNE_USE_DB_STORE", "true").lower() in ("true", "1", "yes")
+
+# Legacy file-based paths (fallback only)
+BASE_DIR = os.path.join("user")
+JOB_INDEX_PATH = os.path.join(BASE_DIR, "job_index.json")
+
+
+# ============================================================================
+# Database Implementation
+# ============================================================================
+
+
+def _db_save_job_index(job_id: int, user_id: int) -> None:
+    """Save job-user mapping to database."""
+    execute(
+        """
+        INSERT INTO job_index (job_id, user_id)
+        VALUES (%s, %s)
+        ON CONFLICT (job_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        """,
+        (job_id, user_id),
+    )
+
+
+def _db_find_user_by_job(job_id: int) -> Optional[int]:
+    """Find user_id by job_id from database."""
+    row = fetchone(
+        "SELECT user_id FROM job_index WHERE job_id = %s",
+        (job_id,),
+    )
+    return row["user_id"] if row else None
+
+
+def _db_append_message(
+    user_id: int,
+    job_id: str,
+    role: str,
+    content: str,
+    model: Optional[str] = None,
+    doc_url: Optional[str] = None,
+) -> None:
+    """Append a message to conversation in database."""
+    execute(
+        """
+        INSERT INTO conversation_messages (user_id, job_id, role, content, model, doc_url)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (user_id, str(job_id), role, content, model, doc_url),
+    )
+
+
+def _db_get_messages(user_id: int, job_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Get conversation messages from database."""
+    rows = fetchall(
+        """
+        SELECT role, content, model, doc_url, created_at
+        FROM conversation_messages
+        WHERE user_id = %s AND job_id = %s
+        ORDER BY created_at ASC
+        LIMIT %s
+        """,
+        (user_id, str(job_id), limit),
+    )
+    return [
+        {
+            "role": r["role"],
+            "content": r["content"],
+            "model": r.get("model"),
+            "doc_url": r.get("doc_url"),
+            "ts": r["created_at"].isoformat() if r.get("created_at") else None,
+        }
+        for r in rows
+    ]
+
+
+# ============================================================================
+# Legacy File Implementation (Fallback)
+# ============================================================================
+
+
+def _ensure_user_dirs(user_id: int) -> str:
+    user_dir = os.path.join(BASE_DIR, str(user_id))
+    conv_dir = os.path.join(user_dir, "conversations")
+    os.makedirs(conv_dir, exist_ok=True)
+    return conv_dir
+
+
+def _read_json(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_json(path: str, data: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _file_save_job_index(job_id: int, user_id: int) -> None:
+    idx = _read_json(JOB_INDEX_PATH) or {}
+    idx[str(job_id)] = {"user_id": user_id, "saved_at": datetime.utcnow().isoformat()}
+    os.makedirs(BASE_DIR, exist_ok=True)
+    _write_json(JOB_INDEX_PATH, idx)
+
+
+def _file_find_user_by_job(job_id: int) -> Optional[int]:
+    idx = _read_json(JOB_INDEX_PATH) or {}
+    entry = idx.get(str(job_id))
+    if isinstance(entry, dict):
+        uid = entry.get("user_id")
+        try:
+            return int(uid) if uid is not None else None
+        except Exception:
+            return None
+    if isinstance(entry, int):
+        return entry
+    return None
+
+
+def _file_append_prompt(user_id: int, job_id: int | str, prompt: str, model: str) -> None:
+    conv_dir = _ensure_user_dirs(user_id)
+    path = os.path.join(conv_dir, f"{str(job_id)}.jsonl")
+    rec = {
+        "ts": datetime.utcnow().isoformat(),
+        "role": "user",
+        "model": model,
+        "content": prompt,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _file_append_output(user_id: int, job_id: int | str, text: str, url: Optional[str] = None) -> None:
+    conv_dir = _ensure_user_dirs(user_id)
+    path = os.path.join(conv_dir, f"{str(job_id)}.jsonl")
+    rec: Dict[str, Any] = {
+        "ts": datetime.utcnow().isoformat(),
+        "role": "assistant",
+        "content": text,
+    }
+    if url:
+        rec["doc_url"] = url
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ============================================================================
+# Public API (Auto-switch between DB and file)
+# ============================================================================
+
+
+def save_job_index(job_id: int, user_id: int) -> None:
+    """Save job-user mapping."""
+    if USE_DB_STORE:
+        try:
+            _db_save_job_index(job_id, user_id)
+            return
+        except Exception as e:
+            logger.warning(f"DB save_job_index failed, falling back to file: {e}")
+    _file_save_job_index(job_id, user_id)
+
+
+def find_user_by_job(job_id: int) -> Optional[int]:
+    """Find user_id by job_id."""
+    if USE_DB_STORE:
+        try:
+            result = _db_find_user_by_job(job_id)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning(f"DB find_user_by_job failed, falling back to file: {e}")
+    return _file_find_user_by_job(job_id)
+
+
+def append_prompt(user_id: int, job_id: int | str, prompt: str, model: str) -> None:
+    """Append user prompt to conversation."""
+    if USE_DB_STORE:
+        try:
+            _db_append_message(user_id, str(job_id), "user", prompt, model)
+            return
+        except Exception as e:
+            logger.warning(f"DB append_prompt failed, falling back to file: {e}")
+    _file_append_prompt(user_id, job_id, prompt, model)
+
+
+def append_output(user_id: int, job_id: int | str, text: str, url: Optional[str] = None) -> None:
+    """Append assistant output to conversation."""
+    if USE_DB_STORE:
+        try:
+            _db_append_message(user_id, str(job_id), "assistant", text, doc_url=url)
+            return
+        except Exception as e:
+            logger.warning(f"DB append_output failed, falling back to file: {e}")
+    _file_append_output(user_id, job_id, text, url)
+
+
+def get_conversation(user_id: int, job_id: int | str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Get conversation messages (DB only, new function)."""
+    if USE_DB_STORE:
+        try:
+            return _db_get_messages(user_id, str(job_id), limit)
+        except Exception as e:
+            logger.warning(f"DB get_conversation failed: {e}")
+    return []

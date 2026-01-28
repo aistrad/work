@@ -1,0 +1,208 @@
+"""
+Reflection API Routes - 复盘模块 API
+
+基于 os_design_claude_mvp v1.md §4.5 设计：
+- POST /api/reflection/create    创建复盘
+- GET  /api/reflection/list      获取复盘列表
+- GET  /api/reflection/latest    获取最新复盘（按类型）
+- GET  /api/reflection/prompt    获取复盘引导问题（根据类型）
+- GET  /api/reflection/context   获取复盘上下文
+- GET  /api/reflection/should-prompt  检查是否应该提示复盘
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from services import reflection_service
+
+
+router = APIRouter(prefix="/api/reflection", tags=["reflection"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+class CreateReflectionRequest(BaseModel):
+    type: str = Field(..., pattern="^(daily|weekly|monthly|checkpoint)$")
+    period_start: str = Field(..., pattern="^\\d{4}-\\d{2}-\\d{2}$")
+    period_end: str = Field(..., pattern="^\\d{4}-\\d{2}-\\d{2}$")
+    related_goal_id: Optional[str] = Field(None)
+    facts: Optional[Dict[str, Any]] = Field(None)
+    decision_review: Optional[Dict[str, Any]] = Field(None)
+    four_questions: Optional[Dict[str, Any]] = Field(None)
+    upgrades: Optional[Dict[str, Any]] = Field(None)
+    next_focus: Optional[str] = Field(None)
+
+
+@router.post("/create")
+def create_reflection(req: CreateReflectionRequest, request: Request):
+    """创建复盘记录"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    try:
+        period_start = date.fromisoformat(req.period_start)
+        period_end = date.fromisoformat(req.period_end)
+    except ValueError:
+        return _err(400, "invalid_date", "Invalid date format")
+
+    if period_start > period_end:
+        return _err(400, "invalid_period", "period_start must be <= period_end")
+
+    try:
+        reflection = reflection_service.create_reflection(
+            user_id=user_id,
+            reflection_type=req.type,
+            period_start=period_start,
+            period_end=period_end,
+            related_goal_id=req.related_goal_id,
+            facts=req.facts,
+            decision_review=req.decision_review,
+            four_questions=req.four_questions,
+            upgrades=req.upgrades,
+            next_focus=req.next_focus,
+        )
+        return _ok({"reflection": _serialize_reflection(reflection)})
+    except ValueError as e:
+        return _err(400, "invalid_request", str(e))
+
+
+@router.get("/list")
+def list_reflections(
+    request: Request,
+    type: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """获取用户复盘列表"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    reflections = reflection_service.list_reflections(
+        user_id=user_id,
+        reflection_type=type,
+        limit=min(limit, 100),
+        offset=offset,
+    )
+    return _ok({"reflections": [_serialize_reflection(r) for r in reflections]})
+
+
+@router.get("/latest")
+def get_latest_reflection(
+    request: Request,
+    type: str = "daily",
+):
+    """获取用户最新的某类型复盘"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    if type not in ("daily", "weekly", "monthly", "checkpoint"):
+        return _err(400, "invalid_type", "Invalid reflection type")
+
+    reflection = reflection_service.get_latest_reflection(user_id, type)
+    if not reflection:
+        return _ok({"reflection": None})
+
+    return _ok({"reflection": _serialize_reflection(reflection)})
+
+
+@router.get("/prompt")
+def get_reflection_prompt(
+    request: Request,
+    type: str = "daily",
+):
+    """获取复盘引导问题"""
+    require_auth(request)
+
+    if type not in ("daily", "weekly", "monthly", "checkpoint"):
+        return _err(400, "invalid_type", "Invalid reflection type")
+
+    prompt = reflection_service.get_reflection_prompt(type)
+    return _ok({"prompt": prompt})
+
+
+@router.get("/context")
+def get_reflection_context(
+    request: Request,
+    type: str = "daily",
+):
+    """获取复盘上下文信息"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    if type not in ("daily", "weekly", "monthly", "checkpoint"):
+        return _err(400, "invalid_type", "Invalid reflection type")
+
+    context = reflection_service.get_reflection_context(user_id, type)
+    return _ok({"context": context})
+
+
+@router.get("/should-prompt")
+def should_prompt_reflection(request: Request):
+    """检查是否应该提示用户进行复盘"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    result = reflection_service.should_prompt_reflection(user_id)
+    return _ok({"should_prompt": result is not None, "prompt": result})
+
+
+@router.get("/stats")
+def get_reflection_stats(
+    request: Request,
+    days: int = 30,
+):
+    """获取用户复盘统计"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    stats = reflection_service.get_reflection_stats(user_id, days=min(days, 365))
+    return _ok({"stats": stats})
+
+
+def _serialize_reflection(reflection: Dict[str, Any]) -> Dict[str, Any]:
+    """序列化复盘对象为JSON友好格式"""
+    if not reflection:
+        return {}
+
+    import json
+
+    result = {}
+    for key, value in reflection.items():
+        if key in ("reflection_id",):
+            result[key] = int(value) if value else None
+        elif key in ("goal_id", "related_goal_id"):
+            result[key] = str(value) if value else None
+        elif key in ("created_at", "period_start", "period_end", "reflection_date"):
+            if value:
+                result[key] = value.isoformat() if hasattr(value, "isoformat") else str(value)
+            else:
+                result[key] = None
+        elif key in ("facts", "decision_review", "four_questions", "upgrades", "input", "output_card"):
+            if isinstance(value, str):
+                try:
+                    result[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    result[key] = value
+            else:
+                result[key] = value
+        else:
+            result[key] = value
+
+    return result

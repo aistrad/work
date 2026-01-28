@@ -1,0 +1,1105 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from string import Template
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import APIRouter, Request, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from common.a2ui import validate_a2ui
+from services import chat_service
+from services import glm_client
+from services import bazi_facts
+from services import kb_service
+from services import agent_service_client
+from services import soul_os
+from services.chat_backend_config import default_chat_backend
+from services.yunshi_service import yunshi_service, build_daily_yunshi_a2ui, build_annual_yunshi_a2ui
+from stores import fortune_db
+
+
+router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+class ChatSendRequest(BaseModel):
+    session_id: Optional[str] = Field(None)
+    text: str = Field(..., min_length=1)
+
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+SYSTEM_PROMPT_TEMPLATE = Template("""你是 Fortune AI 的对话 Agent，角色是积极心理学教练（Performance Coach）。
+
+【产品定位】
+人生导航 / 陪伴 / 提升。系统和交互保持“有效而极简”。
+
+【你的优先级（不可逆）】
+Coach > Teaching Assistant > Customer Support > Sales
+
+【硬性规则（必须遵守）】
+1) 禁止恐吓、羞辱、宿命论断言；负面信息必须紧接“你可以做什么”的行动处方。
+2) 禁止自行计算八字事实；只能基于提供的 facts + evidence 输出。
+3) 每次输出必须包含：结论(conclusion) + 依据(why) + ≤3条处方(prescriptions) + 承诺邀请(commitment_ask)。
+4) 时间窗口默认只给干预窗口（intervention）；forecast 只能条件句+低置信度。
+5) 输出必须是 A2UI JSON，且第一组件必须是 markdown_text。
+6) 必须给出可点击 actions（start_task / schedule_task / open_panel / opt_out）。
+
+【语言风格 persona_style】
+standard：清晰、中性、专业
+warm：共情、支持性（默认）
+roast：轻毒舌但不羞辱、不对人格做负面定性
+
+【输入（系统已注入）】
+persona_style: $persona_style
+user_context: $user_context_json
+facts: $facts_json
+evidence: $evidence_json
+
+【输出（必须严格仅输出 JSON）】
+返回 A2UI JSON，结构：
+- meta.summary：一句话摘要
+- ui_components[0]：markdown_text（必须，包含：结论要点/依据/处方/时间窗口/边界/承诺邀请）
+- ui_components[1]：action_buttons（必须，按钮结构：{label, action:{type, ...}}）
+
+严格按以下字段名输出（不要用 content/actions/action_type/payload 等变体；不要代码块；不要额外文本）：
+{
+  "meta": {"summary": "..."},
+  "ui_components": [
+    {"type":"markdown_text","title":"教练回复","data":"...markdown..."},
+    {"type":"action_buttons","title":"下一步","data":[
+      {"label":"开始（2-5分钟）","action":{"type":"start_task","task_id":"..."}},
+      {"label":"加入今日计划","action":{"type":"schedule_task","task_id":"..."}},
+      {"label":"打开功能区","action":{"type":"open_panel","panel":"bento"}},
+      {"label":"先不需要","action":{"type":"opt_out"}}
+    ]}
+  ]
+}
+""")
+
+SYSTEM_PROMPT_STREAM_TEMPLATE = Template("""你是 Fortune AI 的对话 Agent，角色是积极心理学教练（Performance Coach）。
+
+【产品定位】
+人生导航 / 陪伴 / 提升。系统和交互保持“有效而极简”。
+
+【你的优先级（不可逆）】
+Coach > Teaching Assistant > Customer Support > Sales
+
+【硬性规则（必须遵守）】
+1) 禁止恐吓、羞辱、宿命论断言；负面信息必须紧接“你可以做什么”的行动处方。
+2) 禁止自行计算八字事实；只能基于提供的 facts + evidence 输出。
+3) 每次输出必须包含：结论(conclusion) + 依据(why) + ≤3条处方(prescriptions) + 承诺邀请(commitment_ask)。
+4) 每条处方必须包含 if_then：如果____→那么____；并优先给 2–5 分钟可启动版本。
+5) 只输出 Markdown 文本，不要 JSON/代码块/额外说明。
+
+【语言风格 persona_style】
+standard：清晰、中性、专业
+warm：共情、支持性（默认）
+roast：轻毒舌但不羞辱、不对人格做负面定性
+
+【输入（系统已注入）】
+persona_style: $persona_style
+user_context: $user_context_json
+facts: $facts_json
+evidence: $evidence_json
+
+【输出（Markdown）】
+用如下结构输出（标题可省略但必须包含“处方”一节）：
+
+结论：...
+依据：...
+处方：
+1) ...（包含 if_then）
+2) ...（包含 if_then）
+3) ...（包含 if_then）
+承诺邀请：...（一句话，邀请用户选择一个处方开始）
+""")
+
+
+def _load_user_context(user_id: int) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    profile = fortune_db.fetch_one(
+        "SELECT name, gender, birthday_local, tz_offset_hours, location FROM fortune_user WHERE user_id=%s AND deleted_at IS NULL",
+        (int(user_id),),
+    ) or {}
+    prefs = fortune_db.fetch_one(
+        "SELECT persona_style, push_enabled, push_time, quiet_hours_start, quiet_hours_end, chat_backend FROM fortune_user_preferences WHERE user_id=%s",
+        (int(user_id),),
+    ) or {}
+    snap = fortune_db.fetch_one(
+        "SELECT facts, facts_hash, compute_version FROM fortune_bazi_snapshot WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+        (int(user_id),),
+    ) or {}
+    return profile, prefs, snap
+
+
+def _write_agent_run_log(
+    user_id: int,
+    session_id: Optional[str],
+    agent_name: str,
+    prompt_version: str,
+    facts_hash: Optional[str],
+    input_data: Dict[str, Any],
+    output_data: Dict[str, Any],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    latency_ms: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Write audit log to fortune_agent_run table.
+
+    REQ: REQ-AGENT-006 (Audit)
+    """
+    try:
+        fortune_db.execute(
+            """
+            INSERT INTO fortune_agent_run (
+                user_id, session_id, agent_name, prompt_version, facts_hash,
+                input, output, tool_calls, usage, latency_ms, error, created_at
+            ) VALUES (%s, %s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, now())
+            """,
+            [
+                user_id,
+                session_id if session_id else None,
+                agent_name,
+                prompt_version,
+                facts_hash,
+                json.dumps(input_data, ensure_ascii=False, default=str),
+                json.dumps(output_data, ensure_ascii=False, default=str),
+                json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+                json.dumps(usage, ensure_ascii=False) if usage else None,
+                latency_ms,
+                error,
+            ],
+        )
+    except Exception as e:
+        # Log but don't fail the request
+        import logging
+        logging.getLogger(__name__).warning("Failed to write agent run log: %s", str(e))
+
+
+def _a2ui_from_text(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    obj = glm_client.extract_json_object(raw)
+    if isinstance(obj, dict):
+        norm = _normalize_a2ui(obj)
+        if isinstance(norm, dict):
+            try:
+                validate_a2ui(norm)
+                return norm
+            except Exception:
+                pass
+    # Fallback: wrap as markdown_text A2UI
+    summary = raw.splitlines()[0].strip()[:120] if raw else "输出"
+    return {
+        "meta": {"summary": summary},
+        "ui_components": [
+            {"type": "markdown_text", "title": "输出", "data": raw or "（空）"},
+            {"type": "action_buttons", "title": "下一步", "data": []},
+        ],
+    }
+
+
+def _normalize_action(action: Dict[str, Any]) -> Dict[str, Any]:
+    a = dict(action or {})
+    # common variants
+    if a.get("type") == "open_panel" and "panel" not in a and "panel_id" in a:
+        a["panel"] = a.get("panel_id")
+    return a
+
+
+def _normalize_action_button(btn: Any) -> Dict[str, Any]:
+    if not isinstance(btn, dict):
+        return {"label": str(btn), "action": {"type": "opt_out"}}
+    label = str(btn.get("label") or btn.get("text") or "下一步")
+    action = btn.get("action")
+    if isinstance(action, dict):
+        a = _normalize_action(action)
+        if not a.get("type"):
+            a["type"] = "opt_out"
+        return {"label": label, "action": a}
+    action_type = btn.get("action_type") or btn.get("type") or "opt_out"
+    payload = btn.get("payload") if isinstance(btn.get("payload"), dict) else {}
+    a = {"type": str(action_type)}
+    a.update(payload)
+    return {"label": label, "action": _normalize_action(a)}
+
+
+def _normalize_a2ui(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+    meta = obj.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+
+    comps = obj.get("ui_components")
+    if not isinstance(comps, list):
+        # tolerate alternative root key
+        comps = obj.get("components") if isinstance(obj.get("components"), list) else []
+
+    out_comps: List[Dict[str, Any]] = []
+    for c in comps:
+        if not isinstance(c, dict):
+            continue
+        t = str(c.get("type") or "").strip()
+        if not t:
+            continue
+        title = str(c.get("title") or ("教练回复" if t == "markdown_text" else "下一步" if t == "action_buttons" else "组件"))
+        data = c.get("data")
+        if data is None and "content" in c:
+            data = c.get("content")
+        if t == "action_buttons":
+            if data is None and "actions" in c:
+                data = c.get("actions")
+            if isinstance(data, list):
+                data = [_normalize_action_button(b) for b in data]
+            else:
+                data = []
+        if t == "markdown_text" and not isinstance(data, str):
+            data = "" if data is None else str(data)
+        out_comps.append({"type": t, "title": title, "data": data})
+
+    if not out_comps:
+        return None
+    # Ensure markdown_text is first component for renderer compatibility.
+    for i, c in enumerate(out_comps):
+        if c.get("type") == "markdown_text":
+            if i != 0:
+                out_comps.insert(0, out_comps.pop(i))
+            break
+
+    meta_out = dict(meta)
+    if not isinstance(meta_out.get("summary"), str):
+        meta_out["summary"] = str(meta_out.get("summary") or "")
+    return {"meta": meta_out, "ui_components": out_comps}
+
+
+_PRES_LINE_RE = re.compile(r"^\s*\d+[\.\)]\s*(.+?)\s*$")
+_BULLET_LINE_RE = re.compile(r"^\s*[-*]\s*(.+?)\s*$")
+_MD_INLINE_RE = re.compile(r"[*_`]+")
+
+# =============================================================================
+# Intent Detection for Yunshi
+# =============================================================================
+
+YUNSHI_DAILY_KEYWORDS = [
+    "今日运势", "今天运势", "今天的运势", "今日的运势",
+    "今日运气", "今天运气", "今天如何", "今天怎么样",
+    "今日吉凶", "今天吉凶", "运势如何", "运势怎么样",
+    "每日运势", "日运",
+]
+
+YUNSHI_ANNUAL_KEYWORDS = [
+    "流年", "今年运势", "年运势", "今年运气", "明年运势",
+    "年度运势", "今年如何", "今年怎么样", "年运",
+]
+
+def detect_yunshi_intent(text: str) -> Optional[str]:
+    """
+    检测用户消息是否为运势查询意图
+
+    Returns:
+        - "daily": 今日运势查询
+        - "annual": 流年运势查询
+        - None: 非运势查询
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    for kw in YUNSHI_DAILY_KEYWORDS:
+        if kw in t:
+            return "daily"
+
+    for kw in YUNSHI_ANNUAL_KEYWORDS:
+        if kw in t:
+            return "annual"
+
+    return None
+
+
+def handle_yunshi_intent(
+    user_id: int,
+    session_id: str,
+    intent: str,
+    user_text: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    处理运势查询意图，返回 A2UI 格式响应
+
+    Returns:
+        - Dict with a2ui, suggested_tasks, backend if handled
+        - None if should fall through to LLM
+    """
+    try:
+        from datetime import date, datetime
+
+        if intent == "daily":
+            yunshi = yunshi_service.compute_daily_yunshi(user_id, target_date=date.today())
+            a2ui = build_daily_yunshi_a2ui(yunshi)
+
+            # 提取处方作为任务
+            suggested_tasks = []
+            for p in yunshi.prescriptions[:2]:
+                from stores import fortune_db
+                row = fortune_db.execute_returning_one(
+                    """
+                    INSERT INTO fortune_commitment (user_id, session_id, source, commitment_type, title, details, status, yunshi_snapshot_id)
+                    VALUES (%s, %s, 'yunshi', 'start_task', %s, '{}'::jsonb, 'suggested', NULL)
+                    RETURNING task_id
+                    """,
+                    (int(user_id), session_id, p.content[:200]),
+                )
+                if row and row.get("task_id"):
+                    suggested_tasks.append({"task_id": str(row["task_id"]), "title": p.content})
+
+            # 确保 action_buttons 包含任务
+            if a2ui.get("ui_components"):
+                for comp in a2ui["ui_components"]:
+                    if comp.get("type") == "action_buttons":
+                        buttons = []
+                        for t in suggested_tasks[:2]:
+                            buttons.append({
+                                "label": f"开始：{t['title'][:12]}...",
+                                "action": {"type": "start_task", "task_id": t["task_id"]},
+                            })
+                        buttons.append({"label": "查看详细运势", "action": {"type": "open_panel", "panel": "yunshi"}})
+                        buttons.append({"label": "先不需要", "action": {"type": "opt_out"}})
+                        comp["data"] = buttons
+                        break
+
+            md = yunshi.summary
+            return {
+                "a2ui": a2ui,
+                "content": md,
+                "suggested_tasks": suggested_tasks,
+                "backend": "yunshi",
+            }
+
+        elif intent == "annual":
+            target_year = datetime.now().year
+            yunshi = yunshi_service.compute_annual_yunshi(user_id, target_year=target_year)
+            a2ui = build_annual_yunshi_a2ui(yunshi)
+
+            # 流年不生成即时任务
+            suggested_tasks = []
+
+            md = yunshi.summary
+            return {
+                "a2ui": a2ui,
+                "content": md,
+                "suggested_tasks": suggested_tasks,
+                "backend": "yunshi",
+            }
+
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Yunshi intent handling failed: {e}")
+        return None
+
+    return None
+
+
+def _strip_md(text: str) -> str:
+    s = _MD_INLINE_RE.sub("", text or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _short_label(text: str, max_len: int = 14) -> str:
+    s = _strip_md(text)
+    s = re.sub(r"^\d+[\.\)]\s*", "", s).strip()
+    if len(s) > max_len:
+        s = s[: max_len - 3].rstrip() + "..."
+    return s or "行动"
+
+
+def _extract_prescriptions(md: str) -> List[str]:
+    lines = [ln.strip() for ln in (md or "").splitlines() if ln.strip()]
+    start: Optional[int] = None
+    for i, ln in enumerate(lines):
+        if "处方" in ln and not _PRES_LINE_RE.match(ln):
+            start = i + 1
+            break
+    if start is None:
+        return []
+    out: List[str] = []
+    for ln in lines[start:]:
+        if ln.startswith("#"):
+            break
+        m = _PRES_LINE_RE.match(ln) or _BULLET_LINE_RE.match(ln)
+        if m:
+            item = _strip_md(m.group(1))
+            if item:
+                out.append(item)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _insert_suggested_tasks(user_id: int, session_id: str, prescriptions: List[str]) -> List[Dict[str, Any]]:
+    tasks: List[Dict[str, Any]] = []
+    for p in prescriptions[:3]:
+        title = _strip_md(p) or "行动"
+        row = fortune_db.execute_returning_one(
+            """
+            INSERT INTO fortune_commitment (user_id, session_id, source, commitment_type, title, details, status)
+            VALUES (%s, %s, 'chat', 'start_task', %s, '{}'::jsonb, 'suggested')
+            RETURNING task_id
+            """,
+            (int(user_id), session_id, title[:200]),
+        )
+        if row and row.get("task_id"):
+            tasks.append({"task_id": str(row["task_id"]), "title": title})
+    return tasks
+
+
+def _ensure_action_buttons(a2ui: Dict[str, Any], suggested_tasks: List[Dict[str, Any]]) -> None:
+    buttons = []
+    for t in suggested_tasks[:2]:
+        title = _short_label(str(t.get("title") or ""))
+        buttons.append({"label": f"开始：{title}", "action": {"type": "start_task", "task_id": str(t["task_id"])}})
+    if suggested_tasks:
+        buttons.append({"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": str(suggested_tasks[0]["task_id"])}})
+    buttons.append({"label": "打开功能区", "action": {"type": "open_panel", "panel": "bento"}})
+    buttons.append({"label": "先不需要", "action": {"type": "opt_out"}})
+
+    comps = a2ui.get("ui_components")
+    if not isinstance(comps, list):
+        a2ui["ui_components"] = comps = []
+
+    for c in comps:
+        if isinstance(c, dict) and c.get("type") == "action_buttons":
+            c["data"] = buttons
+            return
+
+    comps.append({"type": "action_buttons", "title": "下一步", "data": buttons})
+
+
+def _assistant_markdown(a2ui: Dict[str, Any]) -> str:
+    comps = a2ui.get("ui_components") or []
+    if isinstance(comps, list) and comps:
+        first = comps[0] if isinstance(comps[0], dict) else None
+        if first and isinstance(first.get("data"), str):
+            return first["data"]
+    return json.dumps(a2ui, ensure_ascii=False)
+
+
+@router.post("/send")
+def chat_send(req: ChatSendRequest, request: Request):
+    """
+    Send a chat message and get AI response.
+
+    Supports two backends based on user preference:
+    - fastapi: Direct LLM call (default, current implementation)
+    - agent_service: Vercel AI SDK orchestration (future)
+
+    Also writes audit log to fortune_agent_run for compliance.
+    """
+    import time as time_module
+
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    session_id = (req.session_id or "").strip()
+    if session_id and not _UUID_RE.match(session_id):
+        return _err(400, "invalid_request", "invalid_session_id")
+
+    if not session_id:
+        s = chat_service.create_session(user_id, title="")
+        session_id = s["session_id"]
+    else:
+        if not chat_service.get_session(user_id, session_id):
+            return _err(404, "not_found", "session_not_found")
+
+    user_text = req.text.strip()
+    if not user_text:
+        return _err(400, "invalid_request", "empty_text")
+
+    model_name = (os.getenv("FORTUNE_AI_GLM_MODEL") or "glm-4.7").strip()
+
+    # Save user message
+    chat_service.append_message(session_id=session_id, user_id=user_id, role="user", content=user_text, model=model_name)
+    chat_service.set_title_if_empty(session_id, user_text[:24])
+
+    profile, prefs, snap = _load_user_context(user_id)
+    if not snap or not snap.get("facts") or not snap.get("facts_hash"):
+        snap = bazi_facts.ensure_snapshot_for_user(user_id)
+
+    # 使用 soul_os 获取完整上下文
+    full_context = soul_os.get_full_context_for_chat(user_id, user_text)
+
+    # 反依赖检查
+    anti_dep = full_context.get("anti_dependency", {})
+    if anti_dep.get("should_intervene"):
+        # 返回反依赖干预消息
+        intervention_msg = anti_dep.get("intervention_message", "")
+        a2ui = {
+            "meta": {"summary": "让我们先行动起来"},
+            "ui_components": [
+                {"type": "markdown_text", "title": "教练提醒", "data": intervention_msg},
+                {"type": "action_buttons", "title": "下一步", "data": [
+                    {"label": "好的，我去做", "action": {"type": "opt_out"}},
+                    {"label": "打开任务", "action": {"type": "open_panel", "panel": "tasks"}},
+                ]},
+            ],
+        }
+        chat_service.append_message(
+            session_id=session_id,
+            user_id=user_id,
+            role="assistant",
+            content=intervention_msg,
+            a2ui=a2ui,
+            model="anti_dependency",
+        )
+        return _ok({
+            "session_id": session_id,
+            "assistant_message": {"role": "assistant", "a2ui": a2ui},
+            "suggested_tasks": [],
+            "backend": "anti_dependency",
+            "intervention_type": anti_dep.get("intervention_type", ""),
+        })
+
+    # ==========================================================================
+    # 运势意图检测 - 优先于 LLM 调用
+    # ==========================================================================
+    yunshi_intent = detect_yunshi_intent(user_text)
+    if yunshi_intent:
+        yunshi_response = handle_yunshi_intent(user_id, session_id, yunshi_intent, user_text)
+        if yunshi_response:
+            a2ui = yunshi_response["a2ui"]
+            md = yunshi_response.get("content", "")
+            suggested_tasks = yunshi_response.get("suggested_tasks", [])
+
+            chat_service.append_message(
+                session_id=session_id,
+                user_id=user_id,
+                role="assistant",
+                content=md,
+                a2ui=a2ui,
+                model="yunshi",
+            )
+
+            return _ok({
+                "session_id": session_id,
+                "assistant_message": {"role": "assistant", "a2ui": a2ui},
+                "suggested_tasks": suggested_tasks,
+                "backend": "yunshi",
+            })
+
+    # Check chat backend preference
+    chat_backend = str(prefs.get("chat_backend") or default_chat_backend())
+    start_time = time_module.time()
+    persona_style = full_context.get("persona_style", "warm")
+    facts_obj = snap.get("facts") or {}
+    facts_hash = str(snap.get("facts_hash") or "")
+
+    if chat_backend == "agent_service":
+        # Try Agent Service backend
+        try:
+            # Build messages for agent service
+            hist = chat_service.get_recent_messages_for_llm(user_id, session_id, limit=10)
+            agent_messages = [{"role": m.get("role", "user"), "content": str(m.get("content") or "")} for m in hist]
+
+            agent_response = agent_service_client.call_agent_service_sync(
+                user_id=user_id,
+                session_id=session_id,
+                messages=agent_messages,
+                user_context={"profile": profile, "preferences": prefs},
+                facts=facts_obj,
+                persona_style=persona_style,
+            )
+
+            # Process response
+            a2ui = agent_response.a2ui or _a2ui_from_text(agent_response.text)
+            md = _assistant_markdown(a2ui)
+            prescriptions = _extract_prescriptions(md)
+            suggested_tasks = _insert_suggested_tasks(user_id, session_id, prescriptions)
+            _ensure_action_buttons(a2ui, suggested_tasks)
+
+            chat_service.append_message(
+                session_id=session_id,
+                user_id=user_id,
+                role="assistant",
+                content=md,
+                a2ui=a2ui,
+                model="agent_service",
+            )
+
+            # Write audit log
+            latency_ms = int((time_module.time() - start_time) * 1000)
+            _write_agent_run_log(
+                user_id=user_id,
+                session_id=session_id,
+                agent_name="coach",
+                prompt_version="agent_service",
+                facts_hash=facts_hash,
+                input_data={"user_text": user_text, "backend": "agent_service"},
+                output_data={"a2ui_summary": a2ui.get("meta", {}).get("summary", ""), "suggested_tasks": len(suggested_tasks)},
+                latency_ms=latency_ms,
+            )
+
+            return _ok(
+                {
+                    "session_id": session_id,
+                    "assistant_message": {"role": "assistant", "a2ui": a2ui},
+                    "suggested_tasks": suggested_tasks,
+                    "backend": "agent_service",
+                }
+            )
+
+        except agent_service_client.AgentServiceUnavailable:
+            # Fall back to FastAPI if agent service unavailable
+            pass
+        except agent_service_client.AgentServiceError as e:
+            # Log error and fall back
+            latency_ms = int((time_module.time() - start_time) * 1000)
+            _write_agent_run_log(
+                user_id=user_id,
+                session_id=session_id,
+                agent_name="coach",
+                prompt_version="agent_service",
+                facts_hash=facts_hash,
+                input_data={"user_text": user_text, "backend": "agent_service"},
+                output_data={},
+                latency_ms=latency_ms,
+                error=str(e),
+            )
+            # Fall back to FastAPI
+            pass
+
+    # === FastAPI Direct LLM Implementation ===
+    # 使用 soul_os 构建的 system prompt 和 evidence
+    user_context = full_context.get("user_context", {})
+    evidence = full_context.get("evidence", {})
+
+    user_context_json = json.dumps(user_context, ensure_ascii=False, default=str)
+    facts_json = json.dumps(facts_obj, ensure_ascii=False)
+    evidence_json = json.dumps(evidence, ensure_ascii=False)
+
+    # 使用 soul_os 生成的 system prompt
+    system = full_context.get("system_prompt", "")
+    if not system:
+        system = SYSTEM_PROMPT_TEMPLATE.safe_substitute(
+            persona_style=persona_style,
+            user_context_json=user_context_json,
+            facts_json=facts_json,
+            evidence_json=evidence_json,
+        )
+
+    # 从 evidence 中提取 kb_refs 用于审计
+    kb_refs = evidence.get("kb_refs", [])
+
+    # Build LLM messages from DB (last 10 turns)
+    hist = chat_service.get_recent_messages_for_llm(user_id, session_id, limit=10)
+    llm_messages = [{"role": "system", "content": system}]
+    for m in hist:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        llm_messages.append({"role": role, "content": str(m.get("content") or "")})
+
+    error_msg = None
+    try:
+        raw_text, raw = glm_client.call_chat_completions(messages=llm_messages)
+    except glm_client.GlmError as e:
+        error_msg = str(e)
+        # Write audit log for failed request
+        latency_ms = int((time_module.time() - start_time) * 1000)
+        _write_agent_run_log(
+            user_id=user_id,
+            session_id=session_id,
+            agent_name="coach",
+            prompt_version="v1.0",
+            facts_hash=facts_hash,
+            input_data={"user_text": user_text, "kb_refs": kb_refs},
+            output_data={},
+            latency_ms=latency_ms,
+            error=error_msg,
+        )
+        return _err(500, "glm_error", error_msg)
+
+    a2ui = _a2ui_from_text(raw_text)
+    md = _assistant_markdown(a2ui)
+    prescriptions = _extract_prescriptions(md)
+    suggested_tasks = _insert_suggested_tasks(user_id, session_id, prescriptions)
+    _ensure_action_buttons(a2ui, suggested_tasks)
+
+    usage = raw.get("usage") if isinstance(raw, dict) else {}
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0) if isinstance(usage, dict) else 0
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0) if isinstance(usage, dict) else 0
+
+    chat_service.append_message(
+        session_id=session_id,
+        user_id=user_id,
+        role="assistant",
+        content=md,
+        a2ui=a2ui,
+        model=str(raw.get("model") or model_name),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+    # Write audit log for successful request
+    latency_ms = int((time_module.time() - start_time) * 1000)
+    _write_agent_run_log(
+        user_id=user_id,
+        session_id=session_id,
+        agent_name="coach",
+        prompt_version="v1.0",
+        facts_hash=facts_hash,
+        input_data={"user_text": user_text, "kb_refs": kb_refs},
+        output_data={"a2ui_summary": a2ui.get("meta", {}).get("summary", ""), "suggested_tasks": len(suggested_tasks)},
+        usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
+        latency_ms=latency_ms,
+    )
+
+    return _ok(
+        {
+            "session_id": session_id,
+            "assistant_message": {"role": "assistant", "a2ui": a2ui},
+            "suggested_tasks": suggested_tasks,
+            "backend": "fastapi",
+        }
+    )
+
+
+def _sse_json(obj: Any) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+@router.get("/stream")
+def chat_stream(
+    request: Request,
+    message: str = Query(..., min_length=1, description="User message"),
+    session_id: Optional[str] = Query(None, description="Existing session id"),
+):
+    """
+    Stream chat response via Server-Sent Events (SSE).
+
+    Frontend protocol:
+    - data: {"type":"delta","delta":"..."}  (0..n)
+    - data: {"type":"final","data":{...}}   (1)
+    - data: [DONE]
+    """
+    import time as time_module
+
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    sid = (session_id or "").strip()
+    if sid and not _UUID_RE.match(sid):
+        return _err(400, "invalid_request", "invalid_session_id")
+
+    if not sid:
+        s = chat_service.create_session(user_id, title="")
+        sid = s["session_id"]
+    else:
+        if not chat_service.get_session(user_id, sid):
+            return _err(404, "not_found", "session_not_found")
+
+    user_text = (message or "").strip()
+    if not user_text:
+        return _err(400, "invalid_request", "empty_text")
+
+    model_name = (os.getenv("FORTUNE_AI_GLM_MODEL") or "glm-4.7").strip()
+
+    # Save user message
+    chat_service.append_message(session_id=sid, user_id=user_id, role="user", content=user_text, model=model_name)
+    chat_service.set_title_if_empty(sid, user_text[:24])
+
+    profile, prefs, snap = _load_user_context(user_id)
+    if not snap or not snap.get("facts") or not snap.get("facts_hash"):
+        snap = bazi_facts.ensure_snapshot_for_user(user_id)
+
+    # Use soul_os to get context + anti-dependency check
+    full_context = soul_os.get_full_context_for_chat(user_id, user_text)
+    anti_dep = full_context.get("anti_dependency", {})
+
+    def gen():
+        start_time = time_module.time()
+        facts_obj = snap.get("facts") or {}
+        facts_hash = str(snap.get("facts_hash") or "")
+        persona_style = full_context.get("persona_style", "warm")
+
+        # Anti-dependency intervention: return immediately
+        if anti_dep.get("should_intervene"):
+            intervention_msg = str(anti_dep.get("intervention_message", "") or "")
+            a2ui = {
+                "meta": {"summary": "让我们先行动起来"},
+                "ui_components": [
+                    {"type": "markdown_text", "title": "教练提醒", "data": intervention_msg},
+                    {"type": "action_buttons", "title": "下一步", "data": [
+                        {"label": "好的，我去做", "action": {"type": "opt_out"}},
+                        {"label": "打开任务", "action": {"type": "open_panel", "panel": "tasks"}},
+                    ]},
+                ],
+            }
+            chat_service.append_message(
+                session_id=sid,
+                user_id=user_id,
+                role="assistant",
+                content=intervention_msg,
+                a2ui=a2ui,
+                model="anti_dependency",
+            )
+            yield _sse_json({"type": "delta", "delta": intervention_msg})
+            yield _sse_json(
+                {
+                    "type": "final",
+                    "data": {
+                        "session_id": sid,
+                        "assistant_message": {"role": "assistant", "a2ui": a2ui},
+                        "suggested_tasks": [],
+                        "backend": "anti_dependency",
+                        "intervention_type": str(anti_dep.get("intervention_type") or ""),
+                    },
+                }
+            )
+            yield "data: [DONE]\n\n"
+            return
+
+        # ==========================================================================
+        # 运势意图检测 - 优先于 LLM 调用
+        # ==========================================================================
+        yunshi_intent = detect_yunshi_intent(user_text)
+        if yunshi_intent:
+            yunshi_response = handle_yunshi_intent(user_id, sid, yunshi_intent, user_text)
+            if yunshi_response:
+                a2ui = yunshi_response["a2ui"]
+                md = yunshi_response.get("content", "")
+                suggested_tasks = yunshi_response.get("suggested_tasks", [])
+
+                chat_service.append_message(
+                    session_id=sid,
+                    user_id=user_id,
+                    role="assistant",
+                    content=md,
+                    a2ui=a2ui,
+                    model="yunshi",
+                )
+
+                yield _sse_json({"type": "delta", "delta": md})
+                yield _sse_json(
+                    {
+                        "type": "final",
+                        "data": {
+                            "session_id": sid,
+                            "assistant_message": {"role": "assistant", "a2ui": a2ui},
+                            "suggested_tasks": suggested_tasks,
+                            "backend": "yunshi",
+                        },
+                    }
+                )
+                yield "data: [DONE]\n\n"
+                return
+
+        # Determine backend preference
+        preferred_backend = str(prefs.get("chat_backend") or default_chat_backend())
+        yield _sse_json({"type": "meta", "session_id": sid, "backend": preferred_backend})
+
+        # Build history (last 10 turns)
+        hist = chat_service.get_recent_messages_for_llm(user_id, sid, limit=10)
+        base_messages = [{"role": m.get("role", "user"), "content": str(m.get("content") or "")} for m in hist]
+
+        # Context payload for agent service (if used)
+        agent_context: Dict[str, Any] = {
+            "user": {"profile": profile, "preferences": prefs},
+            "facts": facts_obj,
+            "persona_style": persona_style,
+            "output_format": "markdown",
+        }
+
+        full_text_parts: List[str] = []
+        backend_used = preferred_backend
+        tool_calls: Optional[List[Dict[str, Any]]] = None
+
+        # Stream from agent_service when selected and available
+        if preferred_backend == "agent_service":
+            try:
+                import httpx
+                if not agent_service_client.is_agent_service_configured():
+                    raise agent_service_client.AgentServiceUnavailable("Agent service not configured")
+
+                payload = {
+                    "user_id": user_id,
+                    "session_id": sid,
+                    "messages": [{"role": m.get("role", "user"), "content": str(m.get("content") or "")} for m in hist],
+                    "stream": True,
+                    "context": agent_context,
+                }
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {agent_service_client.AGENT_SERVICE_TOKEN}",
+                }
+
+                with httpx.Client(timeout=agent_service_client.AGENT_SERVICE_TIMEOUT) as client:
+                    with client.stream("POST", f"{agent_service_client.AGENT_SERVICE_URL}/api/chat", json=payload, headers=headers) as resp:
+                        if resp.status_code == 503:
+                            raise agent_service_client.AgentServiceUnavailable("Agent service temporarily unavailable")
+                        if resp.status_code != 200:
+                            raise agent_service_client.AgentServiceError(f"Agent service error: {resp.status_code}")
+
+                        for raw_line in resp.iter_lines():
+                            line = (raw_line or "").strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if not data:
+                                continue
+                            try:
+                                evt = json.loads(data)
+                            except Exception:
+                                continue
+                            if not isinstance(evt, dict):
+                                continue
+                            if evt.get("type") == "text" and isinstance(evt.get("content"), str):
+                                delta = str(evt.get("content") or "")
+                                if delta:
+                                    full_text_parts.append(delta)
+                                    yield _sse_json({"type": "delta", "delta": delta})
+                            if evt.get("type") == "done":
+                                if isinstance(evt.get("text"), str) and evt.get("text"):
+                                    full_text_parts = [str(evt.get("text") or "")]
+                                if isinstance(evt.get("tool_calls"), list):
+                                    tool_calls = evt.get("tool_calls")
+                                break
+            except Exception:
+                backend_used = "fastapi"
+
+        # Stream from direct LLM (fastapi)
+        if backend_used != "agent_service":
+            user_context = full_context.get("user_context", {})
+            evidence = full_context.get("evidence", {})
+            kb_refs = evidence.get("kb_refs", [])
+
+            user_context_json = json.dumps(user_context, ensure_ascii=False, default=str)
+            facts_json = json.dumps(facts_obj, ensure_ascii=False)
+            evidence_json = json.dumps(evidence, ensure_ascii=False)
+
+            system_stream = SYSTEM_PROMPT_STREAM_TEMPLATE.safe_substitute(
+                persona_style=persona_style,
+                user_context_json=user_context_json,
+                facts_json=facts_json,
+                evidence_json=evidence_json,
+            )
+
+            llm_messages = [{"role": "system", "content": system_stream}]
+            for m in hist:
+                role = "assistant" if m.get("role") == "assistant" else "user"
+                llm_messages.append({"role": role, "content": str(m.get("content") or "")})
+
+            try:
+                got_any = False
+                for delta in glm_client.stream_chat_completions(messages=llm_messages):
+                    if delta:
+                        got_any = True
+                        full_text_parts.append(delta)
+                        yield _sse_json({"type": "delta", "delta": delta})
+                if not got_any:
+                    # Provider may not support streaming; fall back to non-streaming and simulate deltas.
+                    raw_text, _raw = glm_client.call_chat_completions(messages=llm_messages)
+                    raw_text = str(raw_text or "")
+                    for i in range(0, len(raw_text), 48):
+                        chunk = raw_text[i : i + 48]
+                        if chunk:
+                            full_text_parts.append(chunk)
+                            yield _sse_json({"type": "delta", "delta": chunk})
+            except glm_client.GlmError as e:
+                # Try a non-streaming fallback before failing.
+                try:
+                    raw_text, _raw = glm_client.call_chat_completions(messages=llm_messages)
+                    raw_text = str(raw_text or "")
+                    for i in range(0, len(raw_text), 48):
+                        chunk = raw_text[i : i + 48]
+                        if chunk:
+                            full_text_parts.append(chunk)
+                            yield _sse_json({"type": "delta", "delta": chunk})
+                except glm_client.GlmError:
+                    err = str(e)
+                    latency_ms = int((time_module.time() - start_time) * 1000)
+                    _write_agent_run_log(
+                        user_id=user_id,
+                        session_id=sid,
+                        agent_name="coach",
+                        prompt_version="v1.0-stream",
+                        facts_hash=facts_hash,
+                        input_data={"user_text": user_text, "kb_refs": kb_refs, "backend": "fastapi"},
+                        output_data={},
+                        latency_ms=latency_ms,
+                        error=err,
+                    )
+                    yield _sse_json({"type": "error", "error": err})
+                    yield "data: [DONE]\n\n"
+                    return
+
+        full_text = "".join(full_text_parts).strip()
+        a2ui = _a2ui_from_text(full_text)
+        md = _assistant_markdown(a2ui)
+        prescriptions = _extract_prescriptions(md)
+        suggested_tasks = _insert_suggested_tasks(user_id, sid, prescriptions)
+        _ensure_action_buttons(a2ui, suggested_tasks)
+
+        chat_service.append_message(
+            session_id=sid,
+            user_id=user_id,
+            role="assistant",
+            content=md,
+            a2ui=a2ui,
+            model=("agent_service" if backend_used == "agent_service" else model_name),
+        )
+
+        latency_ms = int((time_module.time() - start_time) * 1000)
+        _write_agent_run_log(
+            user_id=user_id,
+            session_id=sid,
+            agent_name="coach",
+            prompt_version=("agent_service-stream" if backend_used == "agent_service" else "v1.0-stream"),
+            facts_hash=facts_hash,
+            input_data={"user_text": user_text, "backend": backend_used},
+            output_data={"a2ui_summary": a2ui.get("meta", {}).get("summary", ""), "suggested_tasks": len(suggested_tasks)},
+            tool_calls=tool_calls,
+            latency_ms=latency_ms,
+        )
+
+        yield _sse_json(
+            {
+                "type": "final",
+                "data": {
+                    "session_id": sid,
+                    "assistant_message": {"role": "assistant", "a2ui": a2ui},
+                    "suggested_tasks": suggested_tasks,
+                    "backend": backend_used,
+                },
+            }
+        )
+        yield "data: [DONE]\n\n"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+@router.post("/ask")
+def chat_ask_alias(req: ChatSendRequest, request: Request):
+    # Backward-compatible alias for /api/chat/send
+    return chat_send(req, request)

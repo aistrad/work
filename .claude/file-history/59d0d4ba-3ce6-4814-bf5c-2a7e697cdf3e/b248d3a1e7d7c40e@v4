@@ -1,0 +1,1244 @@
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function getCookie(name) {
+  const m = document.cookie.match(new RegExp("(?:^|; )" + name.replace(/[-.]/g, "\\$&") + "=([^;]*)"));
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+function csrfHeaders() {
+  const csrf = getCookie("fortune_csrf");
+  return csrf ? { "X-CSRF-Token": csrf } : {};
+}
+
+async function apiJson(url, opts = {}) {
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok !== true) {
+    const msg = data?.error?.message || data?.detail || "server_error";
+    throw new Error(msg);
+  }
+  return data?.data ?? {};
+}
+
+function md(src) {
+  let raw = String(src || "");
+  const codeBlocks = [];
+  raw = raw.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+    codeBlocks.push({ lang: String(lang || ""), code: String(code || "") });
+    return token;
+  });
+
+  let s = raw;
+  s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // links
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // headings / quote / lists
+  s = s.replace(/^###\s+(.*)$/gm, "<h3>$1</h3>")
+    .replace(/^##\s+(.*)$/gm, "<h2>$1</h2>")
+    .replace(/^#\s+(.*)$/gm, "<h1>$1</h1>")
+    .replace(/^>\s?(.*)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/^\s*[-*]\s+(.*)$/gm, "<li>$1</li>")
+    .replace(/^\s*\d+\.\s+(.*)$/gm, "<li>$1</li>");
+  s = s.replace(/(?:<li>[\s\S]*?<\/li>\s*)+/g, (m) => "<ul>" + m.replace(/\n/g, "") + "</ul>");
+  // emphasis / inline code
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  s = s.replace(/\n\n+/g, "<br/><br/>").replace(/\n/g, "<br/>");
+
+  // restore code blocks
+  for (let i = 0; i < codeBlocks.length; i++) {
+    const token = `__CODE_BLOCK_${i}__`;
+    const b = codeBlocks[i];
+    const lang = escapeHtml(b.lang || "");
+    const code = escapeHtml(b.code || "");
+    const html = `<pre class="md-code"><code${lang ? ` class="language-${lang}"` : ""}>${code}</code></pre>`;
+    s = s.replace(token, html);
+  }
+
+  return s;
+}
+
+function pushMsg(role, html, extraClass) {
+  const div = document.createElement("div");
+  const baseRole = role === "user" ? "user" : "bot";
+  div.className = `msg msg-${baseRole}` + (extraClass ? ` ${extraClass}` : "");
+  if (baseRole === "user") {
+    div.innerHTML = `<div class="msg__bubble">${html}</div>`;
+  } else {
+    div.innerHTML = `<div class="msg__icon">✦</div><div class="msg__content">${html}</div>`;
+  }
+  $("#thread")?.appendChild(div);
+  div.scrollIntoView({ behavior: "smooth", block: "end" });
+  return div;
+}
+
+function setMsgContent(div, html) {
+  const el = div.querySelector(".msg__content") || div.querySelector(".msg__bubble") || div;
+  el.innerHTML = html;
+}
+
+// ========== Result Card System (replaces Viewer) ==========
+// 工具结果卡片 - 直接内联到聊天流中
+const resultCards = new Map(); // taskId -> DOM element
+
+function pushResultCard(taskId, title, html, type = "result") {
+  // type: "progress" | "result" | "error"
+  const existingCard = resultCards.get(taskId);
+
+  if (existingCard) {
+    // Update existing card
+    const titleEl = existingCard.querySelector(".result-card__title");
+    const contentEl = existingCard.querySelector(".result-card__content");
+    if (titleEl) titleEl.textContent = title;
+    if (contentEl) {
+      contentEl.innerHTML = html;
+      wireActions(contentEl);
+    }
+    existingCard.className = `msg msg-bot result-card result-card--${type}`;
+    existingCard.scrollIntoView({ behavior: "smooth", block: "end" });
+    return existingCard;
+  }
+
+  // Create new card
+  const div = document.createElement("div");
+  div.className = `msg msg-bot result-card result-card--${type}`;
+  div.setAttribute("data-task-id", taskId);
+  div.innerHTML = `
+    <div class="msg__icon result-card__icon">◆</div>
+    <div class="msg__content result-card__body">
+      <div class="result-card__header">
+        <span class="result-card__title">${escapeHtml(title)}</span>
+        <div class="result-card__actions">
+          <button class="ui-btn ui-btn-ghost result-card__copy" title="复制">📋</button>
+          <button class="ui-btn ui-btn-ghost result-card__dismiss" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="result-card__content">${html}</div>
+    </div>
+  `;
+
+  // Bind actions
+  div.querySelector(".result-card__copy")?.addEventListener("click", async () => {
+    const content = div.querySelector(".result-card__content")?.innerText || "";
+    try {
+      await navigator.clipboard.writeText(content);
+      const btn = div.querySelector(".result-card__copy");
+      if (btn) { btn.textContent = "✓"; setTimeout(() => btn.textContent = "📋", 1500); }
+    } catch (_e) {}
+  });
+
+  div.querySelector(".result-card__dismiss")?.addEventListener("click", () => {
+    div.classList.add("result-card--dismissed");
+    setTimeout(() => {
+      div.remove();
+      resultCards.delete(taskId);
+    }, 300);
+  });
+
+  wireActions(div.querySelector(".result-card__content"));
+  $("#thread")?.appendChild(div);
+  div.scrollIntoView({ behavior: "smooth", block: "end" });
+  resultCards.set(taskId, div);
+  return div;
+}
+
+function updateResultCard(taskId, title, html, type) {
+  return pushResultCard(taskId, title, html, type);
+}
+
+function removeResultCard(taskId) {
+  const card = resultCards.get(taskId);
+  if (card) {
+    card.classList.add("result-card--dismissed");
+    setTimeout(() => {
+      card.remove();
+      resultCards.delete(taskId);
+    }, 300);
+  }
+}
+
+// Legacy setViewer functions - now redirect to Result Card system
+let _currentViewerTaskId = null;
+
+function setViewer(title, html) {
+  if (!_currentViewerTaskId) {
+    _currentViewerTaskId = "viewer_" + Date.now();
+  }
+  pushResultCard(_currentViewerTaskId, title, html, "result");
+}
+
+function setViewerMarkdown(title, markdownText) {
+  setViewer(title, md(markdownText || ""));
+}
+
+function setViewerA2UI(title, a2ui) {
+  const rendered = renderA2UI(a2ui || {});
+  setViewer(title, rendered.html || "（无内容）");
+}
+
+function resetViewer() {
+  // No-op in new system - cards persist in chat
+  _currentViewerTaskId = null;
+}
+
+// ========== Progress Bar Utilities ==========
+function setViewerProgress(title, steps, currentStep, message) {
+  if (!_currentViewerTaskId) {
+    _currentViewerTaskId = "viewer_" + Date.now();
+  }
+  const percent = steps > 0 ? Math.round((currentStep / steps) * 100) : 0;
+  const stepsHtml = Array.from({ length: steps }, (_, i) => {
+    const isCompleted = i < currentStep;
+    const isCurrent = i === currentStep;
+    return `<div class="ui-step ${isCompleted ? "completed" : ""} ${isCurrent ? "current" : ""}">${i + 1}</div>`;
+  }).join("");
+
+  const html = `
+    <div class="ui-progress-wrapper">
+      <div class="ui-progress">
+        <div class="ui-progress__bar" style="width:${percent}%"></div>
+      </div>
+      <div class="ui-steps">${stepsHtml}</div>
+      <div class="ui-task__meta" style="margin-top:8px">${escapeHtml(message || `步骤 ${currentStep}/${steps}`)}</div>
+    </div>
+  `;
+  pushResultCard(_currentViewerTaskId, title, html, currentStep >= steps ? "result" : "progress");
+}
+
+function setViewerIndeterminate(title, message) {
+  if (!_currentViewerTaskId) {
+    _currentViewerTaskId = "viewer_" + Date.now();
+  }
+  const html = `
+    <div class="ui-progress-wrapper">
+      <div class="ui-progress ui-progress--indeterminate">
+        <div class="ui-progress__bar"></div>
+      </div>
+      <div class="ui-task__meta" style="margin-top:8px">${escapeHtml(message || "处理中...")}</div>
+    </div>
+  `;
+  pushResultCard(_currentViewerTaskId, title, html, "progress");
+}
+
+// Start new task (resets viewer task id)
+function startNewTask() {
+  _currentViewerTaskId = "task_" + Date.now();
+  return _currentViewerTaskId;
+}
+
+function openDrawer() {
+  const drawer = $("#session-drawer");
+  if (!drawer) return;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+}
+
+function closeDrawer() {
+  const drawer = $("#session-drawer");
+  if (!drawer) return;
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+}
+
+function setActiveTab(panelId) {
+  $$(".ui-tab").forEach((b) => b.classList.remove("ui-tab--active"));
+  const btn = $(`[data-panel="${panelId}"]`);
+  if (btn) btn.classList.add("ui-tab--active");
+  $$(".ui-panel").forEach((p) => (p.style.display = "none"));
+  const panel = $("#" + panelId);
+  if (panel) panel.style.display = "block";
+}
+
+function openBento() {
+  setActiveTab("panel-bento");
+  document.body.classList.add("show-bento");
+}
+
+function openTools() {
+  setActiveTab("panel-tools");
+  document.body.classList.add("show-bento");
+}
+
+function openSettings() {
+  setActiveTab("panel-settings");
+  document.body.classList.add("show-bento");
+}
+
+function closeBento() {
+  document.body.classList.remove("show-bento", "show-bento-peek");
+  if (typeof bottomSheet !== "undefined" && bottomSheet.currentState) {
+    bottomSheet.currentState = "closed";
+  }
+}
+
+function renderA2UI(a2ui) {
+  const comps = a2ui?.ui_components || [];
+  const first = comps.find((c) => c && c.type === "markdown_text") || comps[0] || {};
+  const mdText = typeof first?.data === "string" ? first.data : "";
+  let html = md(mdText || "");
+
+  const actComp = comps.find((c) => c && c.type === "action_buttons");
+  if (actComp && Array.isArray(actComp.data) && actComp.data.length) {
+    const btns = actComp.data
+      .map((b, i) => {
+        const label = escapeHtml(b.label || `Action ${i + 1}`);
+        const act = escapeHtml(JSON.stringify(b.action || {}));
+        return `<button class="ui-btn ui-btn-ghost a2ui-btn" data-action="${act}">${label}</button>`;
+      })
+      .join(" ");
+    html += `<div class="actions" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">${btns}</div>`;
+  }
+  return { mdText, html };
+}
+
+async function runAction(action) {
+  if (!action || typeof action !== "object") return;
+  if ((action.type === "start_task" || action.type === "schedule_task") && action.task_id) {
+    await apiJson("/api/bento/commitment/accept", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ task_id: action.task_id, commitment_type: action.type }),
+    });
+    await loadActions();
+    return;
+  }
+  if (action.type === "done_task" && action.task_id) {
+    await apiJson("/api/bento/commitment/done", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ task_id: action.task_id }),
+    });
+    await loadActions();
+    return;
+  }
+  if (action.type === "open_panel") {
+    const panel = action.panel || "bento";
+    if (panel === "settings") openSettings();
+    else if (panel === "tools") openTools();
+    else openBento();
+    return;
+  }
+  if (action.type === "opt_out") {
+    pushMsg("bot", "好的，先不打扰。");
+  }
+}
+
+function wireActions(container) {
+  container?.querySelectorAll(".a2ui-btn")?.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        const action = JSON.parse(btn.getAttribute("data-action") || "{}");
+        await runAction(action);
+        btn.textContent = "已处理";
+        btn.disabled = true;
+      } catch (err) {
+        pushMsg("bot", "动作执行失败：" + String(err?.message || err));
+      }
+    });
+  });
+}
+
+const chatState = {
+  sessionId: null,
+};
+
+let userProfile = null;
+let userPreferences = null;
+
+async function loadSessions() {
+  const list = $("#session-list");
+  if (!list) return;
+  list.innerHTML = "";
+  const q = ($("#session-search")?.value || "").trim();
+  let data;
+  try {
+    data = await apiJson(`/api/session/list?limit=60`);
+  } catch (_e) {
+    return;
+  }
+  const sessions = (data.sessions || []).filter((s) => {
+    if (!q) return true;
+    const t = (s.title || "") + " " + (s.preview || "");
+    return t.toLowerCase().includes(q.toLowerCase());
+  });
+  sessions.forEach((s) => {
+    const item = document.createElement("div");
+    item.className = "ui-session-item";
+    item.innerHTML = `<div class="title">${escapeHtml(s.title || "新对话")}</div><div class="sub">${escapeHtml(
+      (s.preview || "").slice(0, 120)
+    )}</div>`;
+    item.addEventListener("click", async () => {
+      try {
+        await loadSession(String(s.session_id));
+        closeDrawer();
+      } catch (err) {
+        pushMsg("bot", "加载会话失败：" + String(err?.message || err));
+      }
+    });
+    list.appendChild(item);
+  });
+}
+
+async function loadSession(sessionId) {
+  const data = await apiJson(`/api/session/${encodeURIComponent(sessionId)}?limit=200`);
+  const msgs = data.messages || [];
+  $("#thread").innerHTML = "";
+  chatState.sessionId = sessionId;
+  msgs.forEach((m) => {
+    if (m.role === "user") {
+      pushMsg("user", escapeHtml(m.content || ""));
+      return;
+    }
+    const a2ui = m.a2ui;
+    if (a2ui && a2ui.ui_components) {
+      const rendered = renderA2UI(a2ui);
+      const div = pushMsg("bot", rendered.html, "card");
+      wireActions(div);
+    } else {
+      pushMsg("bot", md(m.content || ""), "card");
+    }
+  });
+}
+
+async function sendChat(text) {
+  const q = (text || "").trim();
+  if (!q) return;
+  pushMsg("user", escapeHtml(q));
+  $("#ask-text").value = "";
+  const skel = pushMsg("bot", "&nbsp;", "skel");
+  try {
+    const data = await apiJson("/api/chat/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ session_id: chatState.sessionId, text: q }),
+    });
+    if (data.session_id) chatState.sessionId = data.session_id;
+    const a2ui = data?.assistant_message?.a2ui;
+    const rendered = renderA2UI(a2ui);
+    skel.classList.remove("skel");
+    skel.classList.add("card");
+    setMsgContent(skel, rendered.html || "（无内容）");
+    wireActions(skel);
+    await loadSessions();
+  } catch (err) {
+    skel.classList.remove("skel");
+    setMsgContent(skel, "请求失败：" + escapeHtml(String(err?.message || err)));
+  }
+}
+
+async function loadToday() {
+  const box = $("#today-content");
+  if (!box) return;
+  box.innerHTML = "加载中…";
+  try {
+    const data = await apiJson("/api/bento/today");
+    const a2ui = data.a2ui || {};
+    const rendered = renderA2UI(a2ui);
+    box.innerHTML = rendered.html;
+    wireActions(box);
+  } catch (err) {
+    box.innerHTML = "加载失败：" + escapeHtml(String(err?.message || err));
+  }
+}
+
+async function loadActions() {
+  const box = $("#actions-content");
+  if (!box) return;
+  box.innerHTML = "加载中…";
+  try {
+    const data = await apiJson("/api/bento/actions");
+    const tasks = data.tasks || [];
+    if (!tasks.length) {
+      box.innerHTML = `<div class="ui-task__meta">暂无任务。你可以先从「今日指引」开始。</div>`;
+      return;
+    }
+    box.innerHTML = tasks
+      .map((t) => {
+        const title = escapeHtml(t.title || "");
+        const status = escapeHtml(t.status || "");
+        const id = escapeHtml(t.task_id || "");
+        const btns = [];
+        if (status === "suggested") {
+          btns.push(`<button class="ui-btn ui-btn-ghost mini" data-act='${escapeHtml(
+            JSON.stringify({ type: "start_task", task_id: t.task_id })
+          )}'>开始</button>`);
+          btns.push(`<button class="ui-btn ui-btn-ghost mini" data-act='${escapeHtml(
+            JSON.stringify({ type: "schedule_task", task_id: t.task_id })
+          )}'>加入今日</button>`);
+        }
+        if (status === "active") {
+          btns.push(`<button class="ui-btn ui-btn-ghost mini" data-act='${escapeHtml(
+            JSON.stringify({ type: "done_task", task_id: t.task_id })
+          )}'>完成</button>`);
+        }
+        return `<div class="ui-task"><div><div>${title}</div><div class="ui-task__meta">${status} · ${id.slice(
+          0,
+          8
+        )}</div></div><div style="display:flex;gap:6px;flex-wrap:wrap">${btns.join("")}</div></div>`;
+      })
+      .join("");
+    box.querySelectorAll("button[data-act]")?.forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const act = JSON.parse(btn.getAttribute("data-act") || "{}");
+        await runAction(act);
+        btn.textContent = "已处理";
+        btn.disabled = true;
+      });
+    });
+  } catch (err) {
+    box.innerHTML = "加载失败：" + escapeHtml(String(err?.message || err));
+  }
+}
+
+async function loadPlan() {
+  const box = $("#plan-content");
+  if (!box) return;
+  box.innerHTML = "加载中…";
+  try {
+    const data = await apiJson("/api/plan/active");
+    const enrollment = data.enrollment;
+    if (!enrollment) {
+      const list = await apiJson("/api/plan/list");
+      const plans = list.plans || [];
+      box.innerHTML =
+        `<div class="ui-task__meta">还没有加入计划。选一个最小可坚持的：</div>` +
+        plans
+          .map(
+            (p) =>
+              `<div class="ui-task"><div><div><strong>${escapeHtml(p.name)}</strong></div><div class="ui-task__meta">${escapeHtml(
+                p.theory
+              )} · ${escapeHtml(String(p.duration_days))} 天</div></div><div><button class="ui-btn ui-btn-ghost mini" data-plan="${escapeHtml(
+                p.plan_id
+              )}">加入</button></div></div>`
+          )
+          .join("");
+      box.querySelectorAll("button[data-plan]")?.forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const pid = btn.getAttribute("data-plan");
+          await apiJson("/api/plan/join", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...csrfHeaders() },
+            body: JSON.stringify({ plan_id: pid }),
+          });
+          await loadPlan();
+          await loadToday();
+        });
+      });
+      return;
+    }
+    const today = data.today || {};
+    const day = today.day || {};
+    const dayNo = today.day_no || enrollment.current_day || 1;
+    box.innerHTML = `<div><strong>${escapeHtml(enrollment.name || "")}</strong> · Day ${escapeHtml(String(dayNo))}</div>
+      <div class="ui-task__meta" style="margin-top:6px">${escapeHtml(day.title || "")}</div>
+      <div style="margin-top:10px">${md(day.instruction || "")}</div>
+      <div class="actions" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="ui-btn ui-btn-ghost" id="plan-done">我完成了</button>
+      </div>`;
+    $("#plan-done")?.addEventListener("click", async () => {
+      await apiJson("/api/plan/record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...csrfHeaders() },
+        body: JSON.stringify({ enrollment_id: enrollment.enrollment_id, day_no: dayNo, completed: true, note: "" }),
+      });
+      pushMsg("bot", "已记录完成 ✅", "card");
+      await loadPlan();
+      await loadActions();
+    });
+  } catch (err) {
+    box.innerHTML = "加载失败：" + escapeHtml(String(err?.message || err));
+  }
+}
+
+function openReader(title, html) {
+  // reader panel removed; reuse viewer
+  setViewer(title || "结果", html || "");
+}
+
+async function pollPush() {
+  try {
+    if (document.visibilityState !== "visible") return;
+    const data = await apiJson("/api/push/inbox?limit=3");
+    const events = data.events || [];
+    for (const ev of events) {
+      const payload = ev.payload || {};
+      const a2ui = payload.a2ui;
+      if (a2ui && a2ui.ui_components) {
+        const rendered = renderA2UI(a2ui);
+        const div = pushMsg("bot", rendered.html, "card");
+        wireActions(div);
+      } else {
+        pushMsg("bot", `提醒：${escapeHtml(JSON.stringify(payload).slice(0, 240))}`, "card");
+      }
+    }
+  } catch (_e) {}
+}
+
+async function initAuthAndProfile() {
+  const me = await apiJson("/api/auth/me");
+  const profileData = await apiJson("/api/user/profile");
+  const profile = profileData.profile || {};
+  const prefs = profileData.preferences || {};
+  userProfile = profile;
+  userPreferences = prefs;
+
+  const b = String(profile.birthday_local || "");
+  const [birthDate, birthTime] = b.includes(" ") ? b.split(" ") : [b, ""];
+  $("#pill-name").textContent = profile.name || me.name || "—";
+  $("#pill-birth").textContent = birthDate ? (birthTime ? `${birthDate} ${birthTime}` : birthDate) : "—";
+  $("#pill-loc").textContent = profile.location?.name || "—";
+
+  const persona = prefs.persona_style || me.persona_style || "warm";
+  $("#persona-style").value = persona;
+  $("#prefs-form select[name=\"persona_style\"]").value = persona;
+  $("#prefs-form select[name=\"push_enabled\"]").value = String(prefs.push_enabled ?? true);
+  $("#prefs-form input[name=\"push_time\"]").value = prefs.push_time || "08:00:00";
+  $("#prefs-form input[name=\"quiet_hours_start\"]").value = prefs.quiet_hours_start || "22:00:00";
+  $("#prefs-form input[name=\"quiet_hours_end\"]").value = prefs.quiet_hours_end || "07:00:00";
+}
+
+function isoToBirthdayLocal(iso) {
+  const s = String(iso || "").trim();
+  if (!s.includes("T")) return null;
+  const [d, t0] = s.split("T");
+  const t = t0.replace(/Z$/, "").replace(/[+-].*$/, "");
+  const parts = t.split(":");
+  const hh = parts[0] || "00";
+  const mm = parts[1] || "00";
+  const ss = parts[2] || "00";
+  return `${d} ${hh}:${mm}:${ss}`;
+}
+
+async function rectifyStream(reqPayload) {
+  const res = await fetch("/api/rectify/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify(reqPayload),
+  });
+  if (!res.ok || !res.body) throw new Error("rectify_failed");
+  const reader = res.body.getReader();
+  const dec = new TextDecoder("utf-8");
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const part of parts) {
+      const line = part.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      const js = line.slice(5).trim();
+      if (!js) continue;
+      let msg;
+      try {
+        msg = JSON.parse(js);
+      } catch (_e) {
+        continue;
+      }
+      if (msg.type === "progress" || msg.type === "coarse" || msg.type === "refine") {
+        setViewer("出生校准", `<div class="ui-task__meta">校准进行中：${escapeHtml(String(msg.stage || msg.type || ""))}…</div>`);
+      }
+      if (msg.type === "done") {
+        const bestLocal = msg.best_local_time || msg.best?.local_time || msg.best?.local_time || "";
+        const bLocal = isoToBirthdayLocal(bestLocal);
+        setViewer(
+          "出生校准",
+          `<strong>校准完成</strong><br/>建议本地时间：<code>${escapeHtml(String(bestLocal || ""))}</code>${
+            bLocal ? `<div class="actions" style="margin-top:10px"><button class="ui-btn ui-btn-primary" id="btn-apply-rectify">采纳到 Profile</button></div>` : ""
+          }`
+        );
+        $("#btn-apply-rectify")?.addEventListener("click", async () => {
+          if (!userProfile) return;
+          const payload = {
+            name: userProfile.name,
+            gender: userProfile.gender,
+            birthday_local: bLocal,
+            tz_offset_hours: userProfile.tz_offset_hours,
+            location: userProfile.location,
+          };
+          await apiJson("/api/user/profile", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", ...csrfHeaders() },
+            body: JSON.stringify(payload),
+          });
+          userProfile = { ...userProfile, birthday_local: bLocal };
+          $("#pill-birth").textContent = bLocal;
+          setViewer("出生校准", `<strong>已采纳</strong><div class="ui-task__meta">Profile 已更新，并重算八字 facts ✅</div>`);
+        });
+      }
+      if (msg.type === "error") {
+        setViewer("出生校准", `校准失败：${escapeHtml(String(msg.detail || "rectify_failed"))}`);
+      }
+    }
+  }
+}
+
+// Wiring
+$("#session-drawer-open")?.addEventListener("click", () => {
+  openDrawer();
+  loadSessions();
+});
+$("#session-drawer-close")?.addEventListener("click", closeDrawer);
+$("#session-drawer-overlay")?.addEventListener("click", closeDrawer);
+$("#session-search")?.addEventListener("input", loadSessions);
+$("#session-new")?.addEventListener("click", async () => {
+  $("#thread").innerHTML = "";
+  chatState.sessionId = null;
+  closeDrawer();
+  await loadSessions();
+  $("#ask-text")?.focus();
+});
+
+$$(".ui-tab")?.forEach((btn) =>
+  btn.addEventListener("click", () => {
+    setActiveTab(btn.dataset.panel);
+  })
+);
+
+$("#open-bento")?.addEventListener("click", openBento);
+$("#open-settings")?.addEventListener("click", openSettings);
+
+// 关闭功能区按钮
+$("#close-bento")?.addEventListener("click", closeBento);
+
+// 点击遮罩层关闭功能区（移动端）
+document.addEventListener("click", (e) => {
+  if (window.innerWidth > 1080) return;
+  const target = e.target;
+  // 如果点击的是遮罩层（::before 伪元素区域），关闭功能区
+  if (document.body.classList.contains("show-bento") || document.body.classList.contains("show-bento-peek")) {
+    const workbench = $(".ui-workbench");
+    if (workbench && !workbench.contains(target) && target !== $("#open-bento")) {
+      closeBento();
+    }
+  }
+});
+
+$("#logout")?.addEventListener("click", async () => {
+  await apiJson("/api/auth/logout", { method: "POST", headers: { ...csrfHeaders() } }).catch(() => {});
+  location.href = "/login";
+});
+
+$("#logout-all")?.addEventListener("click", async () => {
+  await apiJson("/api/auth/logout-all", { method: "POST", headers: { ...csrfHeaders() } });
+  location.href = "/login";
+});
+
+$("#delete-account")?.addEventListener("click", async () => {
+  const password = prompt("请输入密码以确认注销：") || "";
+  if (!password.trim()) return;
+  await apiJson("/api/auth/account", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify({ password }),
+  });
+  location.href = "/login";
+});
+
+$("#password-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  await apiJson("/api/auth/password", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify({ old_password: fd.get("old_password") || "", new_password: fd.get("new_password") || "" }),
+  });
+  alert("密码已更新，请重新登录。");
+  location.href = "/login";
+});
+
+$("#prefs-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  await apiJson("/api/user/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify({
+      persona_style: fd.get("persona_style"),
+      push_enabled: String(fd.get("push_enabled")) === "true",
+      push_time: fd.get("push_time"),
+      quiet_hours_start: fd.get("quiet_hours_start"),
+      quiet_hours_end: fd.get("quiet_hours_end"),
+    }),
+  });
+  $("#persona-style").value = String(fd.get("persona_style") || "warm");
+  alert("已保存");
+});
+
+$("#persona-style")?.addEventListener("change", async (e) => {
+  const style = e.target.value;
+  await apiJson("/api/user/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...csrfHeaders() },
+    body: JSON.stringify({ persona_style: style }),
+  });
+  $("#prefs-form select[name=\"persona_style\"]").value = style;
+});
+
+// ask-form submit handler moved to bottom after sendChatWithLoading is defined
+
+$("#reload-today")?.addEventListener("click", loadToday);
+$("#reload-actions")?.addEventListener("click", loadActions);
+$("#reload-plan")?.addEventListener("click", loadPlan);
+
+$("#checkin-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  startNewTask(); // Reset task id for new result card
+  const fd = new FormData(e.target);
+  try {
+    const data = await apiJson("/api/bento/checkin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({
+        mood: fd.get("mood") || "",
+        intensity: Number(fd.get("intensity") || 0),
+        note: fd.get("note") || "",
+      }),
+    });
+    const a2ui = data.a2ui || {};
+    setViewerA2UI("情绪打卡", a2ui);
+    e.target.reset();
+    await loadActions();
+  } catch (err) {
+    setViewer("情绪打卡", "打卡失败：" + escapeHtml(String(err?.message || err)));
+  }
+});
+
+$("#decision-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const question = String(fd.get("question") || "").trim();
+  const options = String(fd.get("options") || "").trim();
+  const msg = `请你用 Decision Brief 帮我把问题变成可执行实验（人生导航/陪伴/提升）。\\n\\n【问题】\\n${question}\\n\\n【选项】\\n${options}\\n\\n请输出：Options/Constraints/Risks/Next Experiment，并给≤3条行动处方+承诺邀请。`;
+  await sendChat(msg);
+  openBento();
+});
+
+$("#script-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const scene = String(fd.get("scene") || "");
+  const target = String(fd.get("target") || "");
+  const goal = String(fd.get("goal") || "");
+  const msg = `请以积极心理学/Performance Coach 风格，帮我生成可复制的话术模板。\\n\\n【场景】${scene}\\n【对象】${target}\\n【目标】${goal}\\n\\n要求：先共情→再给结构→给三段式话术（开场/表达/请求或边界）→给一个最小承诺动作。`;
+  await sendChat(msg);
+  openBento();
+});
+
+$("#report-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  startNewTask(); // Reset task id for new result card
+  const fd = new FormData(e.target);
+  const backend = String(fd.get("backend") || "cli");
+  const model = String(fd.get("model") || "standard");
+  const system_prompt = String(fd.get("system_prompt") || "");
+  setViewerProgress("八字深度报告", 4, 1, `提交请求 (backend=${backend})...`);
+  try {
+    const data = await apiJson("/api/report/bazi/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ backend, model, system_prompt }),
+    });
+    const jobId = data.job_id;
+    const usedBackend = data.backend || backend;
+    setViewerProgress("八字深度报告", 4, 2, `任务 #${jobId} 排队中...`);
+
+    let pollCount = 0;
+    const poll = async () => {
+      const j = await apiJson(`/api/report/bazi/${encodeURIComponent(jobId)}?backend=${encodeURIComponent(usedBackend)}`);
+      if (j.status === "processing") {
+        pollCount++;
+        const step = Math.min(3, 2 + Math.floor(pollCount / 3));
+        const messages = ["分析命盘...", "计算大运流年...", "生成报告内容..."];
+        setViewerProgress("八字深度报告", 4, step, messages[step - 2] || "处理中...");
+        setTimeout(poll, 1500);
+        return;
+      }
+      if (j.status === "completed") {
+        setViewerProgress("八字深度报告", 4, 4, "完成！");
+        setTimeout(() => {
+          const a2ui = j.a2ui || j.a2ui_data;
+          if (a2ui?.ui_components?.length) {
+            setViewerA2UI(`报告 #${jobId}`, a2ui);
+          } else {
+            setViewerMarkdown(`报告 #${jobId}`, String(j.content || ""));
+          }
+        }, 500);
+        return;
+      }
+      setViewer("八字深度报告", `任务 #${escapeHtml(String(jobId))} 异常：${escapeHtml(String(j.message || j.error || "unknown"))}`);
+    };
+    poll();
+  } catch (err) {
+    setViewer("八字深度报告", "提交失败：" + escapeHtml(String(err?.message || err)));
+  }
+});
+
+$("#rectify-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  startNewTask(); // Reset task id for new result card
+  if (!userProfile) {
+    setViewer("出生校准", "未加载到 Profile，请刷新页面。");
+    return;
+  }
+  const fd = new FormData(e.target);
+  const eventsStr = String(fd.get("events") || "");
+  const window_start = String(fd.get("window_start") || "00:00:00");
+  const window_end = String(fd.get("window_end") || "23:59:59");
+
+  const b = String(userProfile.birthday_local || "");
+  const birthDate = b.includes(" ") ? b.split(" ")[0] : b;
+  const lines = eventsStr.split("\n").map((l) => l.trim()).filter(Boolean);
+  const events = lines.map((line) => {
+    const [type, date, impact] = line.split(",");
+    const o = { type: (type || "").trim(), date: (date || "").trim() };
+    if (impact) o.impact = impact.trim();
+    return o;
+  });
+
+  const reqPayload = {
+    name: userProfile.name || "—",
+    birthday: birthDate || "1990-01-01",
+    window_start,
+    window_end,
+    tz_offset_hours: userProfile.tz_offset_hours || 8,
+    latitude: userProfile.location?.latitude,
+    longitude: userProfile.location?.longitude,
+    events,
+    debug: false,
+  };
+
+  setViewerIndeterminate("出生校准", "正在分析事件与命盘...");
+  try {
+    await rectifyStream(reqPayload);
+  } catch (err) {
+    setViewer("出生校准", "校准失败：" + escapeHtml(String(err?.message || err)));
+  }
+});
+
+$("#tieban-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  startNewTask(); // Reset task id for new result card
+  if (!userProfile) {
+    setViewer("铁板神算", "未加载到 Profile，请刷新页面。");
+    return;
+  }
+  const fd = new FormData(e.target);
+  const known_facts = Object.fromEntries(fd.entries());
+
+  const b = String(userProfile.birthday_local || "");
+  const [birthDate, birthTimeRaw] = b.includes(" ") ? b.split(" ") : [b, ""];
+  const birthTime = birthTimeRaw || "00:00:00";
+
+  const initReq = {
+    name: userProfile.name || "—",
+    gender: userProfile.gender || "男",
+    date: birthDate || "1990-01-01",
+    time: birthTime,
+    tz_offset_hours: userProfile.tz_offset_hours || 8,
+    location_name: userProfile.location?.name,
+    longitude: userProfile.location?.longitude,
+    latitude: userProfile.location?.latitude,
+    known_facts,
+    ruleset_names: ["ppx_v6"],
+  };
+
+  setViewerProgress("铁板神算", 3, 1, "正在生成命书候选...");
+  try {
+    const res = await fetch("/api/tieban/init", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(initReq) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail || "tieban_init_failed");
+    if ((data.candidates || []).length) {
+      setViewerProgress("铁板神算", 3, 2, "已生成候选，请确认...");
+      const first = data.candidates[0];
+      setTimeout(() => {
+        setViewer(
+          "铁板神算",
+          `<strong>命书候选</strong><br/>base=${escapeHtml(String(first.base))} ke=${escapeHtml(String(first.ke))}（预览）<div class="actions" style="margin-top:10px"><button class="ui-btn ui-btn-primary" id="btn-tieban-lock">锁定该候选</button></div>`
+        );
+        $("#btn-tieban-lock")?.addEventListener("click", async () => {
+          setViewerProgress("铁板神算", 3, 3, "正在锁定命书...");
+          try {
+            const r = await fetch("/api/tieban/select", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ run_id: data.run_id, candidate_id: first.candidate_id, state_version: data.state_version }),
+            });
+            const j = await r.json();
+            if (!r.ok) throw new Error(j?.detail || "tieban_select_failed");
+            if (j.status === "LOCKED" && j.report) {
+              const sum = (j.report.sections?.[0]?.content || "").toString();
+              setViewer(
+                "铁板神算",
+                `<strong>已锁定</strong> · base=${escapeHtml(String(j.report.locked_base))} ke=${escapeHtml(String(j.report.true_ke))}<div class="ui-task__meta">context=${escapeHtml(
+                  String(j.report.locked_context_id)
+                )}</div><div style="margin-top:6px;">${md(sum.slice(0, 360))}…</div>`
+              );
+            } else {
+              setViewer("铁板神算", "锁定成功。");
+            }
+          } catch (err) {
+            setViewer("铁板神算", "锁定失败：" + escapeHtml(String(err?.message || err)));
+          }
+        });
+      }, 400);
+    } else {
+      setViewer("铁板神算", "未找到合适候选，请补充事实后重试。");
+    }
+  } catch (err) {
+    setViewer("铁板神算", "生成失败：" + escapeHtml(String(err?.message || err)));
+  }
+});
+
+// REMOVED: viewer buttons no longer exist - results are inline in chat
+
+// ========== Card Collapse/Expand Toggle ==========
+function initCardToggles() {
+  $$(".ui-card__toggle").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const card = btn.closest(".ui-card");
+      if (!card) return;
+      card.classList.toggle("collapsed");
+      // Update aria-expanded
+      const isExpanded = !card.classList.contains("collapsed");
+      btn.setAttribute("aria-expanded", String(isExpanded));
+    });
+  });
+}
+
+// ========== Send Button Loading State ==========
+function setSendLoading(loading) {
+  const btn = $("#ask-btn");
+  if (!btn) return;
+  if (loading) {
+    btn.classList.add("loading");
+    btn.disabled = true;
+  } else {
+    btn.classList.remove("loading");
+    btn.disabled = false;
+  }
+}
+
+// ========== Mobile Bottom Sheet Gestures ==========
+const bottomSheet = {
+  el: null,
+  startY: 0,
+  startTranslate: 0,
+  currentTranslate: 0,
+  isDragging: false,
+  velocity: 0,
+  lastY: 0,
+  lastTime: 0,
+  states: ["closed", "peek", "open"],
+  currentState: "closed",
+
+  init() {
+    this.el = $(".ui-workbench");
+    if (!this.el || window.innerWidth > 1080) return;
+
+    // Add drag handle touch events
+    const handle = this.el.querySelector("::before") || this.el;
+    this.el.addEventListener("touchstart", this.onTouchStart.bind(this), { passive: true });
+    this.el.addEventListener("touchmove", this.onTouchMove.bind(this), { passive: false });
+    this.el.addEventListener("touchend", this.onTouchEnd.bind(this), { passive: true });
+
+    // Backdrop click to close
+    const backdrop = $(".ui-backdrop");
+    if (backdrop) {
+      backdrop.addEventListener("click", () => this.setState("closed"));
+    }
+  },
+
+  onTouchStart(e) {
+    if (window.innerWidth > 1080) return;
+    const touch = e.touches[0];
+    // Only allow drag from top 60px area (handle area)
+    const rect = this.el.getBoundingClientRect();
+    if (touch.clientY - rect.top > 60) return;
+
+    this.isDragging = true;
+    this.startY = touch.clientY;
+    this.lastY = touch.clientY;
+    this.lastTime = Date.now();
+    this.el.style.transition = "none";
+
+    // Calculate current translate from state
+    const viewportHeight = window.innerHeight;
+    if (this.currentState === "open") {
+      this.startTranslate = 0;
+    } else if (this.currentState === "peek") {
+      this.startTranslate = viewportHeight - 200;
+    } else {
+      this.startTranslate = viewportHeight;
+    }
+    this.currentTranslate = this.startTranslate;
+  },
+
+  onTouchMove(e) {
+    if (!this.isDragging || window.innerWidth > 1080) return;
+    const touch = e.touches[0];
+    const deltaY = touch.clientY - this.startY;
+    const now = Date.now();
+    const dt = now - this.lastTime;
+
+    // Calculate velocity
+    if (dt > 0) {
+      this.velocity = (touch.clientY - this.lastY) / dt;
+    }
+    this.lastY = touch.clientY;
+    this.lastTime = now;
+
+    // Calculate new translate
+    const viewportHeight = window.innerHeight;
+    this.currentTranslate = Math.max(0, Math.min(viewportHeight, this.startTranslate + deltaY));
+
+    // Apply transform
+    this.el.style.transform = `translateY(${this.currentTranslate}px)`;
+
+    // Prevent scroll when dragging
+    e.preventDefault();
+  },
+
+  onTouchEnd() {
+    if (!this.isDragging || window.innerWidth > 1080) return;
+    this.isDragging = false;
+    this.el.style.transition = "";
+
+    const viewportHeight = window.innerHeight;
+    const threshold = viewportHeight * 0.3;
+    const peekPosition = viewportHeight - 200;
+
+    // Velocity-based decision
+    if (Math.abs(this.velocity) > 0.5) {
+      // Fast swipe
+      if (this.velocity > 0) {
+        // Swipe down
+        if (this.currentTranslate > peekPosition * 0.5) {
+          this.setState("closed");
+        } else {
+          this.setState("peek");
+        }
+      } else {
+        // Swipe up
+        if (this.currentTranslate < peekPosition) {
+          this.setState("open");
+        } else {
+          this.setState("peek");
+        }
+      }
+    } else {
+      // Position-based decision
+      if (this.currentTranslate < threshold) {
+        this.setState("open");
+      } else if (this.currentTranslate < viewportHeight - 100) {
+        this.setState("peek");
+      } else {
+        this.setState("closed");
+      }
+    }
+  },
+
+  setState(state) {
+    this.currentState = state;
+    this.el.style.transform = "";
+
+    document.body.classList.remove("show-bento", "show-bento-peek");
+
+    if (state === "open") {
+      document.body.classList.add("show-bento");
+    } else if (state === "peek") {
+      document.body.classList.add("show-bento-peek");
+    }
+  },
+};
+
+// Override openBento for mobile peek support
+const _originalOpenBento = openBento;
+function openBentoMobile() {
+  if (window.innerWidth <= 1080 && bottomSheet.currentState === "closed") {
+    bottomSheet.setState("open");
+  } else {
+    _originalOpenBento();
+  }
+}
+
+// ========== Enhanced Send Chat with Loading State ==========
+const _originalSendChat = sendChat;
+async function sendChatWithLoading(text) {
+  const q = (text || "").trim();
+  if (!q) return;
+
+  setSendLoading(true);
+  pushMsg("user", escapeHtml(q));
+  $("#ask-text").value = "";
+  const skel = pushMsg("bot", "&nbsp;", "skel");
+
+  try {
+    const data = await apiJson("/api/chat/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ session_id: chatState.sessionId, text: q }),
+    });
+    if (data.session_id) chatState.sessionId = data.session_id;
+    const a2ui = data?.assistant_message?.a2ui;
+    const rendered = renderA2UI(a2ui);
+    skel.classList.remove("skel");
+    skel.classList.add("card");
+    setMsgContent(skel, rendered.html || "（无内容）");
+    wireActions(skel);
+    await loadSessions();
+  } catch (err) {
+    skel.classList.remove("skel");
+    setMsgContent(skel, "请求失败：" + escapeHtml(String(err?.message || err)));
+  } finally {
+    setSendLoading(false);
+  }
+}
+
+// Init
+(async () => {
+  try {
+    await initAuthAndProfile();
+  } catch (_e) {
+    location.href = "/login";
+    return;
+  }
+  await Promise.all([loadSessions(), loadToday(), loadActions(), loadPlan()]);
+
+  // Initialize card toggles
+  initCardToggles();
+
+  // Initialize mobile bottom sheet gestures
+  bottomSheet.init();
+
+  // Re-init on window resize
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 1080) {
+      bottomSheet.setState("closed");
+    }
+  });
+
+  setInterval(pollPush, 60 * 1000);
+  pollPush();
+})();
+
+// Send form with loading state
+$("#ask-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  sendChatWithLoading($("#ask-text")?.value || "");
+});

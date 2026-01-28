@@ -1,0 +1,808 @@
+"""
+Dashboard API 路由
+
+Zone B Dashboard = 6 Tabs:
+1. 概览 (Overview): State Score + PERMA + 今日任务
+2. 状态 (Status): L0 事实 + L1 图式
+3. 趋势 (Trends): 历史数据 + 事件标记
+4. 任务 (Tasks): Commitment 管理
+5. 关系 (Relations): 关系页
+6. 探索 (Explore): Mystic + 课程
+
+参考：/home/aiscend/work/fortune_ai/docs/os/os_design_claude_mvp.md
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from services import soul_os
+from stores import fortune_db
+
+
+router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+# =============================================================================
+# Request Models
+# =============================================================================
+
+class TaskAcceptRequest(BaseModel):
+    task_id: str = Field(..., min_length=36, max_length=36)
+    commitment_type: Optional[str] = Field(None, description="start_task|schedule_task")
+
+
+class TaskDoneRequest(BaseModel):
+    task_id: str = Field(..., min_length=36, max_length=36)
+    note: str = Field("", max_length=500)
+
+
+class CheckinRequest(BaseModel):
+    mood: str = Field(..., min_length=1, max_length=50)
+    intensity: int = Field(..., ge=0, le=10)
+    note: str = Field("", max_length=1000)
+
+
+# =============================================================================
+# Tab 1: 概览 (Overview)
+# =============================================================================
+
+@router.get("/overview")
+def get_overview(request: Request):
+    """
+    概览 Tab 数据
+
+    返回：
+    - insight: 一句话洞察
+    - state_score: 状态分数 + 三信号分解 + 补救动作
+    - perma: PERMA 五维快照
+    - today_tasks: 今日任务（≤3条）
+    - risk_alerts: 风险提示
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # State Score
+    state_score = soul_os.calculate_state_score(user_id)
+
+    # L1 Schema (PERMA)
+    l1 = soul_os.get_l1_schema(user_id)
+    perma_data = l1.perma.to_dict()
+
+    # 今日任务
+    tasks = soul_os.list_commitments(user_id, status=["suggested", "active"], limit=3)
+
+    # 反依赖检查
+    anti_dep = soul_os.check_anti_dependency(user_id)
+    risk_alerts = []
+    if anti_dep.should_intervene:
+        risk_alerts.append({
+            "type": anti_dep.intervention_type,
+            "message": anti_dep.intervention_message,
+        })
+
+    # 生成洞察
+    score = state_score.score
+    if score >= 70:
+        insight = "今天状态不错，保持这个节奏！"
+    elif score >= 50:
+        insight = "状态还行，做一个小任务可以让你感觉更好。"
+    elif score >= 30:
+        insight = "今天需要一点自我关怀，先做一个最小行动。"
+    else:
+        insight = "今天可能有点累，先照顾好自己。"
+
+    return _ok({
+        "insight": insight,
+        "state_score": state_score.to_dict(),
+        "perma": {
+            "positive_emotion": perma_data["positive_emotion"],
+            "engagement": perma_data["engagement"],
+            "relationships": perma_data["relationships"],
+            "meaning": perma_data["meaning"],
+            "accomplishment": perma_data["accomplishment"],
+        },
+        "today_tasks": [
+            {
+                "task_id": t["task_id"],
+                "title": t["title"],
+                "status": t["status"],
+                "commitment_type": t.get("commitment_type", "start_task"),
+            }
+            for t in tasks
+        ],
+        "risk_alerts": risk_alerts,
+    })
+
+
+# =============================================================================
+# Tab 2: 状态 (Status)
+# =============================================================================
+
+@router.get("/status")
+def get_status(request: Request):
+    """
+    状态 Tab 数据
+
+    返回：
+    - l0_facts: 八字事实 + 心理学翻译
+    - l1_schema: PERMA 快照 + 认知图式 + 优势
+    - state_score: 当前分数
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # L0 Facts
+    l0 = soul_os.get_l0_facts(user_id)
+    facts = l0.get("facts", {})
+    translations = soul_os.translate_bazi_to_psychology(facts)
+
+    # 提取日主信息
+    bazi = facts.get("bazi", {})
+    day_master = bazi.get("day_master", {})
+    strength = bazi.get("strength", {})
+
+    # L1 Schema
+    l1 = soul_os.get_l1_schema(user_id)
+
+    # State Score
+    state_score = soul_os.calculate_state_score(user_id)
+
+    return _ok({
+        "l0_facts": {
+            "day_master": day_master.get("gan", ""),
+            "day_master_element": day_master.get("element", ""),
+            "strength": strength.get("level", "neutral"),
+            "strength_score": strength.get("score", 0),
+            "translations": translations,
+            "facts_hash": l0.get("facts_hash", ""),
+        },
+        "l1_schema": l1.to_dict(),
+        "state_score": state_score.to_dict(),
+    })
+
+
+# =============================================================================
+# Tab 3: 趋势 (Trends)
+# =============================================================================
+
+@router.get("/trends")
+def get_trends(request: Request, days: int = 7):
+    """
+    趋势 Tab 数据
+
+    返回：
+    - state_score_history: 历史分数
+    - events: 关键事件（任务完成、打卡等）
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    days = max(1, min(30, int(days)))
+    window_start = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # 获取打卡历史计算每日分数
+    checkins = fortune_db.fetch_all(
+        """
+        SELECT DATE(created_at) as date, AVG(intensity) as avg_intensity
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at >= %s
+        GROUP BY DATE(created_at)
+        ORDER BY date
+        """,
+        (user_id, window_start),
+    ) or []
+
+    # 获取任务完成历史
+    done_by_date = fortune_db.fetch_all(
+        """
+        SELECT DATE(done_at) as date, COUNT(*) as cnt
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+        GROUP BY DATE(done_at)
+        """,
+        (user_id, window_start),
+    ) or []
+    done_map = {str(r["date"]): r["cnt"] for r in done_by_date}
+
+    # 构建历史分数（简化版）
+    score_history = []
+    for c in checkins:
+        date_str = str(c["date"])
+        intensity = float(c.get("avg_intensity") or 5)
+        emotion_signal = max(0, (10 - intensity)) * 4
+        action_signal = min(done_map.get(date_str, 0) * 10, 40)
+        score = int(emotion_signal + action_signal + 10)  # 简化 streak
+        score_history.append({
+            "date": date_str,
+            "score": score,
+        })
+
+    # 获取事件列表
+    events = []
+
+    # 任务完成事件
+    done_tasks = fortune_db.fetch_all(
+        """
+        SELECT task_id, title, done_at
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+        ORDER BY done_at DESC
+        LIMIT 20
+        """,
+        (user_id, window_start),
+    ) or []
+    for t in done_tasks:
+        events.append({
+            "date": str(t["done_at"].date()) if t.get("done_at") else "",
+            "type": "commitment_done",
+            "title": f"完成了：{t.get('title', '')}",
+        })
+
+    # 打卡事件
+    recent_checkins = fortune_db.fetch_all(
+        """
+        SELECT mood, intensity, created_at
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 10
+        """,
+        (user_id, window_start),
+    ) or []
+    for c in recent_checkins:
+        events.append({
+            "date": str(c["created_at"].date()) if c.get("created_at") else "",
+            "type": "checkin",
+            "title": f"情绪打卡：{c.get('mood', '')}（{c.get('intensity', 0)}/10）",
+        })
+
+    # 按日期排序
+    events.sort(key=lambda x: x["date"], reverse=True)
+
+    return _ok({
+        "state_score_history": score_history,
+        "events": events[:20],
+    })
+
+
+# =============================================================================
+# Tab 4: 任务 (Tasks)
+# =============================================================================
+
+@router.get("/tasks")
+def get_tasks(request: Request):
+    """
+    任务 Tab 数据
+
+    返回：
+    - active: 进行中的任务
+    - suggested: 建议任务
+    - completed_recent: 最近完成的任务
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    active = soul_os.list_commitments(user_id, status=["active"], limit=10)
+    suggested = soul_os.list_commitments(user_id, status=["suggested"], limit=10)
+    completed = soul_os.list_commitments(user_id, status=["done"], limit=5)
+
+    return _ok({
+        "active": active,
+        "suggested": suggested,
+        "completed_recent": completed,
+    })
+
+
+@router.post("/task/accept")
+def accept_task(req: TaskAcceptRequest, request: Request):
+    """接受任务"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    task_id = (req.task_id or "").strip()
+
+    if not _UUID_RE.match(task_id):
+        return _err(400, "invalid_request", "invalid_task_id")
+
+    ctype = (req.commitment_type or "").strip() if req.commitment_type else None
+    if ctype is not None and ctype not in ("start_task", "schedule_task"):
+        return _err(400, "invalid_request", "invalid_commitment_type")
+
+    # 计算 due_at
+    due_at = None
+    if ctype == "schedule_task":
+        prefs = fortune_db.fetch_one(
+            "SELECT push_timezone FROM fortune_user_preferences WHERE user_id=%s",
+            (user_id,),
+        ) or {}
+        tz_name = str(prefs.get("push_timezone") or "Asia/Shanghai")
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Shanghai")
+        now_local = datetime.now(tz)
+        end_local = datetime.combine(now_local.date(), time(23, 0, 0), tzinfo=tz)
+        due_at = end_local.astimezone(timezone.utc)
+
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_commitment
+        SET
+          status = 'active',
+          accepted_at = COALESCE(accepted_at, now()),
+          commitment_type = COALESCE(%s, commitment_type),
+          due_at = COALESCE(%s, due_at)
+        WHERE task_id=%s AND user_id=%s AND status IN ('suggested','active')
+        RETURNING task_id, status, accepted_at
+        """,
+        (ctype, due_at, task_id, user_id),
+    )
+
+    if not row:
+        return _err(404, "not_found", "task_not_found")
+
+    return _ok({
+        "task_id": str(row["task_id"]),
+        "status": str(row["status"]),
+        "accepted_at": str(row.get("accepted_at") or ""),
+    })
+
+
+@router.post("/task/done")
+def complete_task(req: TaskDoneRequest, request: Request):
+    """
+    完成任务
+
+    实现完整反馈回路：
+    1. 更新任务状态
+    2. 奖励 Aura 积分
+    3. 更新 growth_streak
+    4. 返回新的 State Score
+    """
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    task_id = (req.task_id or "").strip()
+
+    if not _UUID_RE.match(task_id):
+        return _err(400, "invalid_request", "invalid_task_id")
+
+    # 使用 soul_os 完成任务
+    result = soul_os.complete_commitment(user_id, task_id, note=req.note)
+
+    if not result.get("success"):
+        return _err(404, "not_found", result.get("message", "task_not_found"))
+
+    # 奖励 Aura
+    aura_earned = 0
+    try:
+        from services import currency_service
+        from models.currency import CurrencyType, LedgerCategory
+
+        entry = currency_service.add_currency(
+            user_id=user_id,
+            currency_type=CurrencyType.AURA,
+            amount=10,
+            category=LedgerCategory.EARN,
+            reason="commitment_complete",
+            ref_type="commitment",
+            ref_id=task_id,
+            description="完成任务奖励",
+        )
+        aura_earned = entry.amount
+    except Exception:
+        pass
+
+    # 更新 streak
+    new_streak = 0
+    try:
+        from services import twin_service
+        new_streak = twin_service.increment_growth_streak(user_id)
+    except Exception:
+        pass
+
+    return _ok({
+        "task_id": task_id,
+        "status": "done",
+        "state_score": result.get("state_score", {}),
+        "rewards": {
+            "aura_earned": aura_earned,
+            "new_streak": new_streak,
+        },
+        "message": result.get("message", ""),
+    })
+
+
+@router.post("/task/skip")
+def skip_task(req: TaskDoneRequest, request: Request):
+    """跳过任务"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+    task_id = (req.task_id or "").strip()
+
+    if not _UUID_RE.match(task_id):
+        return _err(400, "invalid_request", "invalid_task_id")
+
+    row = fortune_db.execute_returning_one(
+        """
+        UPDATE fortune_commitment
+        SET status = 'skipped', done_at = now()
+        WHERE task_id=%s AND user_id=%s AND status IN ('suggested','active')
+        RETURNING task_id, status
+        """,
+        (task_id, user_id),
+    )
+
+    if not row:
+        return _err(404, "not_found", "task_not_found")
+
+    return _ok({
+        "task_id": str(row["task_id"]),
+        "status": "skipped",
+    })
+
+
+# =============================================================================
+# 情绪打卡 (Check-in)
+# =============================================================================
+
+@router.post("/checkin")
+def checkin(req: CheckinRequest, request: Request):
+    """
+    情绪打卡
+
+    返回 JITAI 推荐动作 + A2UI 格式
+    """
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    # 使用 soul_os 创建打卡
+    data = soul_os.create_checkin_with_jitai(
+        user_id,
+        mood=req.mood,
+        intensity=int(req.intensity),
+        note=req.note,
+    )
+
+    # 构建 A2UI 响应
+    md = f"### 情绪打卡\n- 情绪：{req.mood}（{int(req.intensity)}/10）\n\n### 推荐动作\n- {data['recommended_action']}\n\n你愿意现在开始吗？"
+    a2ui = {
+        "meta": {"summary": f"情绪打卡：{req.mood}"},
+        "ui_components": [
+            {"type": "markdown_text", "title": "情绪打卡", "data": md},
+            {
+                "type": "action_buttons",
+                "title": "下一步",
+                "data": [
+                    {"label": "开始这个动作", "action": {"type": "start_task", "task_id": data["task_id"]}},
+                    {"label": "加入今日计划", "action": {"type": "schedule_task", "task_id": data["task_id"]}},
+                    {"label": "先不需要", "action": {"type": "opt_out"}},
+                ],
+            },
+        ],
+    }
+
+    # 返回新的 State Score
+    state_score = soul_os.calculate_state_score(user_id)
+
+    return _ok({
+        "task_id": data["task_id"],
+        "recommended_action": data["recommended_action"],
+        "a2ui": a2ui,
+        "state_score": state_score.to_dict(),
+    })
+
+
+# =============================================================================
+# Tab 5: 关系 (Relations) - MVP 简化版
+# =============================================================================
+
+@router.get("/relations")
+def get_relations(request: Request):
+    """
+    关系 Tab 数据（MVP 简化版）
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # MVP: 返回空列表，后续实现
+    return _ok({
+        "relations": [],
+        "social_features": [
+            {"id": "energy_tip", "name": "能量打赏", "enabled": False},
+            {"id": "luck_chain", "name": "好运接龙", "enabled": False},
+            {"id": "vent_chain", "name": "吐槽接龙", "enabled": False},
+        ],
+    })
+
+
+# =============================================================================
+# Tab 6: 探索 (Explore) - MVP 简化版
+# =============================================================================
+
+@router.get("/explore")
+def get_explore(request: Request):
+    """
+    探索 Tab 数据（MVP 简化版）
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # MVP: 返回入口列表
+    return _ok({
+        "mystic_entries": [
+            {"id": "bazi_report", "name": "八字深度报告", "description": "30页专业分析"},
+            {"id": "star_chart", "name": "星盘解读", "description": "西方占星视角"},
+            {"id": "tarot", "name": "塔罗占卜", "description": "即时问答"},
+        ],
+        "courses": [],
+        "artifacts": [],
+    })
+
+
+# =============================================================================
+# K-line API (人生K线)
+# =============================================================================
+
+@router.get("/kline")
+def get_kline(request: Request, days: int = 30, interval: str = "day"):
+    """
+    K线数据 API
+
+    参数：
+    - days: 获取天数 (1-90)
+    - interval: 时间间隔 (day | week | month)
+
+    返回：
+    - data: K线数据列表 [{date, open, high, low, close, volume, trend, drivers}]
+    - summary: 统计摘要
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    days = max(1, min(90, int(days)))
+    window_start = datetime.now(timezone.utc) - timedelta(days=days)
+
+    if interval not in ("day", "week", "month"):
+        interval = "day"
+
+    # 尝试从K线表获取已计算的数据
+    kline_data = fortune_db.fetch_all(
+        """
+        SELECT date, open_score, high_score, low_score, close_score,
+               volume, emotion_avg, action_count, drivers
+        FROM fortune_kline_daily
+        WHERE user_id = %s AND date >= %s
+        ORDER BY date
+        """,
+        (user_id, window_start.date()),
+    ) or []
+
+    # 如果没有预计算数据，实时计算
+    if not kline_data:
+        kline_data = _calculate_kline_from_events(user_id, window_start, days)
+
+    # 构建响应数据
+    data = []
+    for k in kline_data:
+        open_score = float(k.get("open_score") or 50)
+        high_score = float(k.get("high_score") or open_score)
+        low_score = float(k.get("low_score") or open_score)
+        close_score = float(k.get("close_score") or open_score)
+
+        # 计算趋势
+        if close_score > open_score:
+            trend = "up"
+            color = "#22c55e"  # 绿色涨
+        elif close_score < open_score:
+            trend = "down"
+            color = "#ef4444"  # 红色跌
+        else:
+            trend = "neutral"
+            color = "#f59e0b"  # 橙色横盘
+
+        data.append({
+            "date": str(k["date"]),
+            "open": round(open_score, 1),
+            "high": round(high_score, 1),
+            "low": round(low_score, 1),
+            "close": round(close_score, 1),
+            "volume": int(k.get("volume") or k.get("action_count") or 0),
+            "trend": trend,
+            "color": color,
+            "drivers": k.get("drivers") or [],
+        })
+
+    # 聚合按周或月
+    if interval == "week":
+        data = _aggregate_kline(data, "week")
+    elif interval == "month":
+        data = _aggregate_kline(data, "month")
+
+    # 计算统计摘要
+    if data:
+        avg_score = sum(d["close"] for d in data) / len(data)
+        max_score = max(d["high"] for d in data)
+        min_score = min(d["low"] for d in data)
+        up_days = sum(1 for d in data if d["trend"] == "up")
+        down_days = sum(1 for d in data if d["trend"] == "down")
+    else:
+        avg_score = max_score = min_score = 50
+        up_days = down_days = 0
+
+    return _ok({
+        "data": data,
+        "interval": interval,
+        "summary": {
+            "avg_score": round(avg_score, 1),
+            "max_score": round(max_score, 1),
+            "min_score": round(min_score, 1),
+            "up_days": up_days,
+            "down_days": down_days,
+            "total_days": len(data),
+        },
+    })
+
+
+def _calculate_kline_from_events(user_id: int, window_start: datetime, days: int) -> List[Dict]:
+    """从事件数据实时计算K线OHLC"""
+    # 获取每日打卡数据
+    checkins_by_date = fortune_db.fetch_all(
+        """
+        SELECT DATE(created_at) as date,
+               MIN(intensity) as min_intensity,
+               MAX(intensity) as max_intensity,
+               AVG(intensity) as avg_intensity,
+               COUNT(*) as cnt
+        FROM fortune_checkin
+        WHERE user_id = %s AND created_at >= %s
+        GROUP BY DATE(created_at)
+        ORDER BY date
+        """,
+        (user_id, window_start),
+    ) or []
+
+    # 获取每日任务完成数
+    tasks_by_date = fortune_db.fetch_all(
+        """
+        SELECT DATE(done_at) as date, COUNT(*) as cnt
+        FROM fortune_commitment
+        WHERE user_id = %s AND status = 'done' AND done_at >= %s
+        GROUP BY DATE(done_at)
+        """,
+        (user_id, window_start),
+    ) or []
+    task_map = {str(r["date"]): r["cnt"] for r in tasks_by_date}
+
+    # 构建日期范围
+    result = []
+    current_date = window_start.date()
+    end_date = datetime.now(timezone.utc).date()
+
+    checkin_map = {str(c["date"]): c for c in checkins_by_date}
+
+    prev_close = 50.0  # 默认起始分数
+
+    while current_date <= end_date:
+        date_str = str(current_date)
+        c = checkin_map.get(date_str)
+        task_cnt = task_map.get(date_str, 0)
+
+        if c:
+            # 有打卡数据
+            avg_intensity = float(c.get("avg_intensity") or 5)
+            min_intensity = float(c.get("min_intensity") or avg_intensity)
+            max_intensity = float(c.get("max_intensity") or avg_intensity)
+
+            # 将情绪强度转换为分数 (intensity越低越好)
+            # intensity 0-10 映射到 score 100-0
+            base_score = max(0, 100 - avg_intensity * 10)
+
+            # 行动分数加成
+            action_bonus = min(task_cnt * 5, 20)
+
+            open_score = prev_close
+            close_score = min(100, base_score + action_bonus)
+            high_score = max(open_score, close_score, 100 - min_intensity * 10 + action_bonus)
+            low_score = min(open_score, close_score, 100 - max_intensity * 10)
+
+            drivers = []
+            if task_cnt > 0:
+                drivers.append(f"完成{task_cnt}个任务")
+            if c.get("cnt", 0) > 1:
+                drivers.append(f"{c['cnt']}次打卡")
+
+            result.append({
+                "date": current_date,
+                "open_score": round(open_score, 1),
+                "high_score": round(high_score, 1),
+                "low_score": round(low_score, 1),
+                "close_score": round(close_score, 1),
+                "volume": c.get("cnt", 0) + task_cnt,
+                "action_count": task_cnt,
+                "emotion_avg": round(avg_intensity, 1),
+                "drivers": drivers,
+            })
+            prev_close = close_score
+        else:
+            # 无数据日，保持前一天收盘
+            if task_cnt > 0:
+                action_bonus = min(task_cnt * 5, 20)
+                close_score = min(100, prev_close + action_bonus)
+                result.append({
+                    "date": current_date,
+                    "open_score": round(prev_close, 1),
+                    "high_score": round(close_score, 1),
+                    "low_score": round(prev_close, 1),
+                    "close_score": round(close_score, 1),
+                    "volume": task_cnt,
+                    "action_count": task_cnt,
+                    "drivers": [f"完成{task_cnt}个任务"],
+                })
+                prev_close = close_score
+
+        current_date += timedelta(days=1)
+
+    return result
+
+
+def _aggregate_kline(data: List[Dict], interval: str) -> List[Dict]:
+    """聚合K线数据到周/月"""
+    if not data:
+        return []
+
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+
+    for d in data:
+        date_str = d["date"]
+        if interval == "week":
+            # ISO周
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            key = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+        else:  # month
+            key = date_str[:7]  # YYYY-MM
+        groups[key].append(d)
+
+    result = []
+    for key in sorted(groups.keys()):
+        items = groups[key]
+        result.append({
+            "date": key,
+            "open": items[0]["open"],
+            "high": max(item["high"] for item in items),
+            "low": min(item["low"] for item in items),
+            "close": items[-1]["close"],
+            "volume": sum(item["volume"] for item in items),
+            "trend": "up" if items[-1]["close"] > items[0]["open"] else ("down" if items[-1]["close"] < items[0]["open"] else "neutral"),
+            "color": "#22c55e" if items[-1]["close"] > items[0]["open"] else ("#ef4444" if items[-1]["close"] < items[0]["open"] else "#f59e0b"),
+            "drivers": [],
+        })
+
+    return result

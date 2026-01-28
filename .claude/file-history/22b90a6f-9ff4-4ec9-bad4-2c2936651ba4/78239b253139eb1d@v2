@@ -1,0 +1,238 @@
+"""
+Knowledge Builder API Routes
+
+REST API endpoints for knowledge building pipeline.
+"""
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional, List
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class BuildRequest(BaseModel):
+    skill_id: str
+    stages: str = "all"  # all, 0, 1-3, 4a, 4b, 5, 6
+    limit: int = 100
+
+
+class BuildResponse(BaseModel):
+    status: str
+    message: str
+    task_id: Optional[str] = None
+
+
+class CaseExtractRequest(BaseModel):
+    skill_id: str
+    limit: int = 100
+
+
+class QualityCheckRequest(BaseModel):
+    skill_id: str
+    save_report: bool = True
+
+
+class QualityReportResponse(BaseModel):
+    skill_id: str
+    overall_score: float
+    coverage_score: float
+    distribution_score: float
+    retrieval_score: float
+    warnings: List[str]
+    recommendations: List[str]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Background Task Storage
+# ─────────────────────────────────────────────────────────────────
+
+_build_tasks = {}
+
+
+async def _run_build_pipeline(task_id: str, skill_id: str, stages: str, limit: int):
+    """Background task for running build pipeline"""
+    from scripts.build_knowledge import KnowledgeBuilder
+
+    try:
+        _build_tasks[task_id] = {"status": "running", "skill_id": skill_id}
+
+        builder = KnowledgeBuilder(skill_id)
+
+        if stages == "all":
+            results = await builder.run_all()
+        else:
+            results = {}
+            stage_list = [s.strip() for s in stages.split(",")]
+
+            for stage in stage_list:
+                if stage == "0":
+                    results["stage_0"] = await builder.run_stage_0()
+                elif stage in ("1", "2", "3", "1-3"):
+                    results["stages_1_3"] = await builder.run_stages_1_2_3()
+                elif stage == "4a":
+                    results["stage_4a"] = await builder.run_stage_4a(limit)
+                elif stage == "4b":
+                    results["stage_4b"] = await builder.run_stage_4b(limit)
+                elif stage == "5":
+                    results["stage_5"] = await builder.run_stage_5(interactive=False)
+                elif stage == "6":
+                    results["stage_6"] = await builder.run_stage_6()
+
+        _build_tasks[task_id] = {
+            "status": "completed",
+            "skill_id": skill_id,
+            "results": results,
+        }
+
+    except Exception as e:
+        logger.error(f"Build pipeline failed: {e}")
+        _build_tasks[task_id] = {
+            "status": "failed",
+            "skill_id": skill_id,
+            "error": str(e),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/build", response_model=BuildResponse)
+async def start_build(request: BuildRequest, background_tasks: BackgroundTasks):
+    """
+    Start knowledge building pipeline.
+
+    Runs in background and returns task ID for status checking.
+    """
+    import uuid
+
+    task_id = f"build_{request.skill_id}_{uuid.uuid4().hex[:8]}"
+
+    background_tasks.add_task(
+        _run_build_pipeline,
+        task_id,
+        request.skill_id,
+        request.stages,
+        request.limit,
+    )
+
+    return BuildResponse(
+        status="started",
+        message=f"Build pipeline started for {request.skill_id}",
+        task_id=task_id,
+    )
+
+
+@router.get("/build/{task_id}")
+async def get_build_status(task_id: str):
+    """Get status of a build task"""
+    if task_id not in _build_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return _build_tasks[task_id]
+
+
+@router.post("/cases/extract")
+async def extract_cases(request: CaseExtractRequest):
+    """
+    Extract cases from knowledge chunks.
+    """
+    from workers.case_extractor import CaseExtractor
+    from stores.db import get_connection
+
+    async with get_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, chunk_text as content
+            FROM knowledge_chunks
+            WHERE skill_id = $1
+            LIMIT $2
+            """,
+            request.skill_id,
+            request.limit,
+        )
+        chunks = [dict(row) for row in rows]
+
+    if not chunks:
+        return {"status": "no_chunks", "extracted": 0, "saved": 0}
+
+    extractor = CaseExtractor()
+    cases = await extractor.extract_from_chunks(chunks, request.skill_id)
+    saved = await extractor.save_cases(cases)
+
+    return {
+        "status": "completed",
+        "extracted": len(cases),
+        "saved": saved,
+    }
+
+
+@router.post("/quality/check", response_model=QualityReportResponse)
+async def run_quality_check(request: QualityCheckRequest):
+    """
+    Run quality check and generate report.
+    """
+    from workers.quality_checker import QualityChecker
+
+    checker = QualityChecker()
+    report = await checker.generate_report(request.skill_id)
+
+    if request.save_report:
+        await checker.save_report(report)
+
+    return QualityReportResponse(
+        skill_id=report.skill_id,
+        overall_score=report.overall_score,
+        coverage_score=report.coverage.coverage_score,
+        distribution_score=report.distribution.balance_score,
+        retrieval_score=report.retrieval.retrieval_score,
+        warnings=report.warnings,
+        recommendations=report.recommendations,
+    )
+
+
+@router.get("/stats/{skill_id}")
+async def get_skill_stats(skill_id: str):
+    """
+    Get statistics for a skill's knowledge base.
+    """
+    from stores.db import get_connection
+    from pathlib import Path
+
+    async with get_connection() as conn:
+        # Chunk stats
+        chunk_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM knowledge_chunks WHERE skill_id = $1",
+            skill_id,
+        )
+
+        # Case stats (approved only)
+        case_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM cases WHERE skill_id = $1 AND status = 'approved'",
+            skill_id,
+        )
+
+        # Pending cases
+        pending_cases = await conn.fetchval(
+            "SELECT COUNT(*) FROM cases WHERE skill_id = $1 AND status = 'pending'",
+            skill_id,
+        )
+
+    # Scenario stats from file system
+    scenarios_dir = Path(__file__).parent.parent / "skills" / skill_id / "scenarios"
+    scenario_count = len(list(scenarios_dir.glob("*.md"))) if scenarios_dir.exists() else 0
+
+    return {
+        "skill_id": skill_id,
+        "chunks": chunk_count or 0,
+        "cases_approved": case_count or 0,
+        "cases_pending": pending_cases or 0,
+        "scenarios": scenario_count,
+    }

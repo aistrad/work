@@ -1,0 +1,997 @@
+# VibeProfile - 用户画像核心数据层
+
+> Version: 1.0 | 2026-01-19
+> 定位: VibeLife 系统的核心用户画像、数据、Context 管理中心
+
+---
+
+## 1. 概述
+
+### 1.1 定位
+
+VibeProfile 是 VibeLife 系统的 **核心数据层**，负责：
+- 统一管理用户画像数据
+- 提供标准化的数据访问接口
+- 支撑 Proactive Engine、CoreAgent、Skill 系统的数据需求
+- 与用户数据空间整合打通
+
+### 1.2 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **Single Source of Truth** | 所有用户画像数据统一存储在 VibeProfile |
+| **Data-Centric** | VibeProfile 是数据层，不包含业务逻辑 |
+| **Schema Evolution** | 基于 unified_profiles 扩展，保持向后兼容 |
+| **Performance First** | Hot/Warm/Cold 分层存储，优化读写性能 |
+| **Privacy Aware** | 摘要透明，用户可查看 AI 对自己的认知摘要 |
+
+### 1.3 核心能力
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           VibeProfile 核心能力                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  数据存储                                                                    │
+│  ════════                                                                    │
+│  • 用户身份信息 (birth_info, identity)                                       │
+│  • 用户状态 (state, emotion, focus)                                          │
+│  • 偏好设置 (preferences)                                                    │
+│  • Skill 数据 (skill_data)                                                   │
+│  • 洞察积累 (insights)                                                       │
+│  • 事件时间线 (timeline)                                                     │
+│                                                                              │
+│  数据访问                                                                    │
+│  ════════                                                                    │
+│  • 标准化读取接口 (get_*)                                                    │
+│  • 局部更新接口 (update_*)                                                   │
+│  • 批量查询接口 (query_*, batch_*)                                           │
+│  • 缓存管理 (ProfileCache)                                                   │
+│                                                                              │
+│  Proactive 支持                                                              │
+│  ══════════════                                                              │
+│  • 被动数据源: 响应 ProactiveEngine 的查询                                   │
+│  • 主动通知者: 关键状态变化时触发事件                                         │
+│  • 预计算模式: 维护 proactive_state 供快速查询                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 数据架构
+
+### 2.1 整体结构
+
+基于现有 `unified_profiles` 表扩展，采用 **Hot/Warm/Cold 三层存储**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        VibeProfile 数据架构                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Hot Layer (实时数据) - unified_profiles.profile JSONB               │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │                                                                     │    │
+│  │ identity: 身份信息                                                   │    │
+│  │ ├── birth_info: {date, time, place, timezone, gender}               │    │
+│  │ ├── bazi_chart: {四柱八字完整数据}                                   │    │
+│  │ └── zodiac_chart: {星盘完整数据}                                     │    │
+│  │                                                                     │    │
+│  │ state: 当前状态                                                      │    │
+│  │ ├── emotion: {current, baseline, last_updated}                      │    │
+│  │ ├── focus: {topics: [], intensity, since}                           │    │
+│  │ ├── life_stage: {stage, sub_stage, since}                           │    │
+│  │ └── energy_level: {level, trend, factors}                           │    │
+│  │                                                                     │    │
+│  │ preferences: 偏好设置                                                │    │
+│  │ ├── voice_mode: "warm" | "professional" | "playful"                 │    │
+│  │ ├── language: "zh-CN"                                               │    │
+│  │ ├── push_enabled: true                                              │    │
+│  │ └── privacy_level: "summary" | "full" | "minimal"                   │    │
+│  │                                                                     │    │
+│  │ skill_data: Skill 计算数据                                           │    │
+│  │ ├── bazi: {chart, features, daymaster, current_dayun...}            │    │
+│  │ ├── zodiac: {chart, planets, houses, current_transits...}           │    │
+│  │ ├── tarot: {last_reading, card_history...}                          │    │
+│  │ └── career: {assessment, goals...}                                  │    │
+│  │                                                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Warm Layer (中频更新) - unified_profiles.profile JSONB              │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │                                                                     │    │
+│  │ extracted: 从对话抽取的信息                                          │    │
+│  │ ├── facts: [{fact, source, confidence, timestamp}]                  │    │
+│  │ ├── concerns: [{topic, intensity, first_mentioned, last_mentioned}] │    │
+│  │ ├── goals: [{goal, status, deadline, progress}]                     │    │
+│  │ └── relationships: [{name, relation, sentiment, notes}]             │    │
+│  │                                                                     │    │
+│  │ life_context: 生活上下文                                             │    │
+│  │ ├── occupation: {title, industry, company_size}                     │    │
+│  │ ├── relationships: {status, family_structure}                       │    │
+│  │ ├── health: {physical, mental, concerns}                            │    │
+│  │ └── finance: {level, concerns, goals}                               │    │
+│  │                                                                     │    │
+│  │ proactive_state: 推送就绪状态 (预计算)                               │    │
+│  │ ├── pending_triggers: [{trigger_id, skill_id, ready_at}]            │    │
+│  │ ├── cooldowns: {trigger_id: last_sent_at}                           │    │
+│  │ └── suppressed: [{trigger_id, until, reason}]                       │    │
+│  │                                                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Cold Layer (低频更新) - 独立表存储                                   │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │                                                                     │    │
+│  │ vibe_profile_insights (洞察积累)                                     │    │
+│  │ ├── discovery: 首次发现的特征                                        │    │
+│  │ ├── pattern: 重复出现的规律                                          │    │
+│  │ ├── timing: 时机相关建议                                             │    │
+│  │ └── growth: 成长变化观察                                             │    │
+│  │                                                                     │    │
+│  │ vibe_profile_timeline (时间线事件)                                   │    │
+│  │ ├── 大运交接、流年更替                                               │    │
+│  │ ├── 重要对话里程碑                                                   │    │
+│  │ ├── 用户主动标记的重要事件                                           │    │
+│  │ └── AI 观察到的转变点                                                │    │
+│  │                                                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 数据库表结构
+
+#### 主表: unified_profiles (扩展)
+
+```sql
+-- 现有表，保持不变
+CREATE TABLE unified_profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id)
+);
+
+-- 新增索引 (支持 Proactive 查询)
+CREATE INDEX idx_profiles_proactive_pending
+    ON unified_profiles USING GIN ((profile -> 'proactive_state' -> 'pending_triggers'));
+CREATE INDEX idx_profiles_state_emotion
+    ON unified_profiles USING GIN ((profile -> 'state' -> 'emotion'));
+CREATE INDEX idx_profiles_skill_data
+    ON unified_profiles USING GIN ((profile -> 'skill_data'));
+```
+
+#### 新增表: vibe_profile_insights (Cold Layer)
+
+```sql
+CREATE TABLE vibe_profile_insights (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    insight_type VARCHAR(50) NOT NULL,  -- discovery | pattern | timing | growth
+    skill_id VARCHAR(50),               -- 关联的 Skill，NULL 表示跨 Skill
+    category VARCHAR(100) NOT NULL,     -- 洞察分类
+    content TEXT NOT NULL,              -- 洞察内容
+    confidence FLOAT DEFAULT 0.5,       -- 置信度 0-1
+    evidence JSONB DEFAULT '[]',        -- 证据列表
+    first_observed_at TIMESTAMPTZ,      -- 首次观察时间
+    last_confirmed_at TIMESTAMPTZ,      -- 最近确认时间
+    observation_count INT DEFAULT 1,    -- 观察次数
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_insights_user_type ON vibe_profile_insights(user_id, insight_type);
+CREATE INDEX idx_insights_skill ON vibe_profile_insights(user_id, skill_id);
+```
+
+#### 新增表: vibe_profile_timeline (Cold Layer)
+
+```sql
+CREATE TABLE vibe_profile_timeline (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+    event_type VARCHAR(50) NOT NULL,    -- dayun_change | liunian_change | milestone | observation | user_marked
+    event_date DATE NOT NULL,
+    skill_id VARCHAR(50),               -- 关联的 Skill
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    importance VARCHAR(20) DEFAULT 'normal',  -- low | normal | high | critical
+    data JSONB DEFAULT '{}',            -- 事件详细数据
+    source VARCHAR(50) NOT NULL,        -- system | ai | user
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_timeline_user_date ON vibe_profile_timeline(user_id, event_date DESC);
+CREATE INDEX idx_timeline_type ON vibe_profile_timeline(user_id, event_type);
+```
+
+### 2.3 Profile JSONB Schema
+
+```yaml
+# unified_profiles.profile 完整 Schema
+profile:
+  # === Hot Layer ===
+  identity:
+    birth_info:
+      date: "1990-05-15"
+      time: "14:30"
+      place: "北京"
+      timezone: "Asia/Shanghai"
+      gender: "male"
+      calendar_type: "solar"  # solar | lunar
+    bazi_chart:
+      year: { gan: "庚", zhi: "午" }
+      month: { gan: "辛", zhi: "巳" }
+      day: { gan: "甲", zhi: "子" }
+      hour: { gan: "辛", zhi: "未" }
+      # ... 完整八字数据
+    zodiac_chart:
+      sun: { sign: "Taurus", degree: 24.5, house: 10 }
+      moon: { sign: "Cancer", degree: 12.3, house: 12 }
+      # ... 完整星盘数据
+
+  state:
+    emotion:
+      current: "neutral"        # anxious | sad | neutral | content | excited
+      baseline: "content"       # 情绪基线
+      intensity: 0.3            # 0-1
+      last_updated: "2026-01-19T10:00:00Z"
+    focus:
+      topics: ["career", "relationship"]
+      primary: "career"
+      intensity: 0.7
+      since: "2026-01-15"
+    life_stage:
+      stage: "career_growth"    # 人生阶段
+      sub_stage: "seeking_promotion"
+      since: "2025-10-01"
+    energy_level:
+      level: 0.6                # 0-1
+      trend: "stable"           # rising | stable | declining
+      factors: ["sleep_quality", "work_pressure"]
+
+  preferences:
+    voice_mode: "warm"
+    language: "zh-CN"
+    push_enabled: true
+    push_time_preference: "morning"  # morning | afternoon | evening
+    privacy_level: "summary"
+
+  skill_data:
+    bazi:
+      chart: { ... }
+      features:
+        daymaster: "甲木"
+        strength: "身弱"
+        pattern: "正官格"
+      current_dayun:
+        gan: "壬"
+        zhi: "申"
+        start_year: 2023
+        end_year: 2033
+      current_liunian:
+        year: 2026
+        gan: "丙"
+        zhi: "午"
+      computed_at: "2026-01-19T00:00:00Z"
+    zodiac:
+      chart: { ... }
+      current_transits:
+        saturn: { sign: "Pisces", house: 8, aspects: [...] }
+        # ...
+      computed_at: "2026-01-19T00:00:00Z"
+    # ... 其他 Skill
+
+  # === Warm Layer ===
+  extracted:
+    facts:
+      - fact: "在互联网公司工作"
+        source: "conversation:abc123"
+        confidence: 0.9
+        timestamp: "2026-01-10T15:30:00Z"
+    concerns:
+      - topic: "升职"
+        intensity: 0.8
+        first_mentioned: "2026-01-05"
+        last_mentioned: "2026-01-19"
+        mentions_count: 5
+    goals:
+      - goal: "年底前升职"
+        status: "active"
+        deadline: "2026-12-31"
+        progress: 0.3
+    relationships:
+      - name: "老板"
+        relation: "superior"
+        sentiment: "neutral"
+        notes: "关系一般，沟通较少"
+
+  life_context:
+    occupation:
+      title: "产品经理"
+      industry: "互联网"
+      company_size: "large"
+      years_in_role: 3
+    relationships:
+      status: "single"
+      family_structure: "父母健在"
+    health:
+      physical: "good"
+      mental: "moderate_stress"
+      concerns: ["睡眠质量"]
+    finance:
+      level: "middle"
+      concerns: []
+      goals: ["买房"]
+
+  proactive_state:
+    pending_triggers:
+      - trigger_id: "bazi_daily_fortune"
+        skill_id: "bazi"
+        ready_at: "2026-01-20T04:00:00Z"
+        priority: "medium"
+    cooldowns:
+      "bazi_fortune_alert": "2026-01-15T04:00:00Z"
+    suppressed:
+      - trigger_id: "zodiac_mercury_retrograde"
+        until: "2026-02-01"
+        reason: "user_dismissed"
+    last_scanned_at: "2026-01-19T04:00:00Z"
+
+  # === Metadata ===
+  _meta:
+    version: "1.0"
+    last_full_update: "2026-01-19T10:00:00Z"
+    data_completeness:
+      identity: 1.0
+      state: 0.8
+      life_context: 0.6
+```
+
+---
+
+## 3. 数据访问层
+
+### 3.1 VibeProfileRepository
+
+```python
+# services/profile/vibe_profile_repo.py
+
+class VibeProfileRepository:
+    """
+    VibeProfile 数据访问层
+
+    设计原则:
+    - 所有读写通过此类，禁止直接操作数据库
+    - 支持细粒度的局部更新
+    - 内置缓存管理
+    - 变更时触发事件通知
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Hot Layer - Identity
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_identity(user_id: UUID) -> Dict[str, Any]:
+        """获取用户身份信息"""
+        pass
+
+    @staticmethod
+    async def update_birth_info(user_id: UUID, birth_info: Dict) -> None:
+        """更新出生信息 (触发 Skill 数据重算)"""
+        pass
+
+    @staticmethod
+    async def update_skill_chart(user_id: UUID, skill: str, chart: Dict) -> None:
+        """更新 Skill 计算的命盘/星图"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Hot Layer - State
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_state(user_id: UUID) -> Dict[str, Any]:
+        """获取用户当前状态"""
+        pass
+
+    @staticmethod
+    async def update_emotion(user_id: UUID, emotion: str, intensity: float) -> None:
+        """更新情绪状态 (可能触发 Proactive)"""
+        pass
+
+    @staticmethod
+    async def update_focus(user_id: UUID, topics: List[str], primary: str) -> None:
+        """更新关注焦点"""
+        pass
+
+    @staticmethod
+    async def update_life_stage(user_id: UUID, stage: str, sub_stage: str = None) -> None:
+        """更新人生阶段"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Hot Layer - Skill Data
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_skill_data(user_id: UUID, skill: str) -> Dict[str, Any]:
+        """获取指定 Skill 的数据"""
+        pass
+
+    @staticmethod
+    async def get_all_skill_data(user_id: UUID) -> Dict[str, Any]:
+        """获取所有 Skill 数据"""
+        pass
+
+    @staticmethod
+    async def update_skill_data(user_id: UUID, skill: str, data: Dict) -> None:
+        """更新 Skill 数据"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Warm Layer - Extracted
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_extracted(user_id: UUID) -> Dict[str, Any]:
+        """获取抽取的用户信息"""
+        pass
+
+    @staticmethod
+    async def add_fact(user_id: UUID, fact: str, source: str, confidence: float) -> None:
+        """添加新发现的事实"""
+        pass
+
+    @staticmethod
+    async def update_concern(user_id: UUID, topic: str, intensity: float) -> None:
+        """更新用户关注点"""
+        pass
+
+    @staticmethod
+    async def upsert_goal(user_id: UUID, goal: str, status: str, progress: float = None) -> None:
+        """更新或插入目标"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Warm Layer - Life Context
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_life_context(user_id: UUID) -> Dict[str, Any]:
+        """获取生活上下文"""
+        pass
+
+    @staticmethod
+    async def update_life_context(user_id: UUID, updates: Dict) -> None:
+        """更新生活上下文 (深度合并)"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Warm Layer - Proactive State
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_proactive_state(user_id: UUID) -> Dict[str, Any]:
+        """获取推送就绪状态"""
+        pass
+
+    @staticmethod
+    async def add_pending_trigger(user_id: UUID, trigger: Dict) -> None:
+        """添加待触发的推送"""
+        pass
+
+    @staticmethod
+    async def mark_trigger_sent(user_id: UUID, trigger_id: str) -> None:
+        """标记推送已发送 (更新 cooldown)"""
+        pass
+
+    @staticmethod
+    async def suppress_trigger(user_id: UUID, trigger_id: str, until: datetime, reason: str) -> None:
+        """抑制推送"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Cold Layer - Insights
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_insights(
+        user_id: UUID,
+        insight_type: str = None,
+        skill_id: str = None,
+        limit: int = 20
+    ) -> List[Dict]:
+        """获取用户洞察"""
+        pass
+
+    @staticmethod
+    async def add_insight(
+        user_id: UUID,
+        insight_type: str,  # discovery | pattern | timing | growth
+        category: str,
+        content: str,
+        skill_id: str = None,
+        confidence: float = 0.5,
+        evidence: List[str] = None
+    ) -> UUID:
+        """添加新洞察"""
+        pass
+
+    @staticmethod
+    async def confirm_insight(user_id: UUID, insight_id: UUID) -> None:
+        """确认洞察 (增加观察次数，更新确认时间)"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Cold Layer - Timeline
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_timeline(
+        user_id: UUID,
+        start_date: date = None,
+        end_date: date = None,
+        event_types: List[str] = None,
+        limit: int = 50
+    ) -> List[Dict]:
+        """获取时间线事件"""
+        pass
+
+    @staticmethod
+    async def add_timeline_event(
+        user_id: UUID,
+        event_type: str,
+        event_date: date,
+        title: str,
+        description: str = None,
+        skill_id: str = None,
+        importance: str = "normal",
+        data: Dict = None,
+        source: str = "system"
+    ) -> UUID:
+        """添加时间线事件"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Batch Operations (for Proactive)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def query_users_by_state(
+        emotion: str = None,
+        focus_topic: str = None,
+        life_stage: str = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """按状态查询用户 (Proactive 使用)"""
+        pass
+
+    @staticmethod
+    async def query_users_with_pending_triggers(
+        before: datetime = None,
+        skill_id: str = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """查询有待触发推送的用户"""
+        pass
+
+    @staticmethod
+    async def batch_update_proactive_state(updates: List[Dict]) -> int:
+        """批量更新推送状态"""
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Summary (for Privacy)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_profile_summary(user_id: UUID) -> Dict[str, Any]:
+        """
+        获取用户画像摘要 (用于用户查看 AI 的认知)
+
+        返回:
+        {
+            "identity": "1990年出生，八字甲木日主，星座金牛座",
+            "personality": "理性务实，有责任感，注重细节",
+            "current_state": "近期关注职业发展，情绪状态稳定",
+            "key_insights": ["适合稳扎稳打", "贵人运在今年下半年"],
+            "goals": ["年底升职"],
+            "data_completeness": 0.75
+        }
+        """
+        pass
+```
+
+### 3.2 事件通知机制
+
+```python
+# services/profile/vibe_profile_events.py
+
+class VibeProfileEvents:
+    """
+    VibeProfile 变更事件通知
+
+    当关键数据发生变化时，通知相关模块
+    """
+
+    # 事件类型
+    BIRTH_INFO_UPDATED = "vibe_profile.birth_info_updated"
+    EMOTION_CHANGED = "vibe_profile.emotion_changed"
+    STATE_CHANGED = "vibe_profile.state_changed"
+    INSIGHT_ADDED = "vibe_profile.insight_added"
+    GOAL_UPDATED = "vibe_profile.goal_updated"
+
+    @staticmethod
+    async def emit(event_type: str, user_id: UUID, data: Dict = None):
+        """
+        发送事件
+
+        监听者:
+        - ProactiveEngine: 监听状态变化，可能触发推送
+        - CoreAgent: 监听洞察添加，更新对话上下文
+        - Skill Services: 监听出生信息更新，重新计算命盘
+        """
+        pass
+
+    @staticmethod
+    def on(event_type: str, handler: Callable):
+        """注册事件处理器"""
+        pass
+```
+
+---
+
+## 4. Proactive 集成
+
+### 4.1 三种集成模式
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VibeProfile + Proactive 集成                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  模式 1: 被动数据源                                                          │
+│  ════════════════════                                                        │
+│                                                                              │
+│  ProactiveEngine                      VibeProfile                            │
+│       │                                    │                                 │
+│       │  query_users_with_pending_triggers │                                 │
+│       │ ────────────────────────────────► │                                 │
+│       │                                    │                                 │
+│       │  get_proactive_state(user_id)      │                                 │
+│       │ ────────────────────────────────► │                                 │
+│       │                                    │                                 │
+│       │  get_skill_data(user_id, skill)    │                                 │
+│       │ ────────────────────────────────► │                                 │
+│                                                                              │
+│  ────────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  模式 2: 主动通知者                                                          │
+│  ════════════════════                                                        │
+│                                                                              │
+│  VibeProfile                          ProactiveEngine                        │
+│       │                                    │                                 │
+│       │  update_emotion("anxious", 0.8)    │                                 │
+│       │ ◄────────────────────────────────  │ (CoreAgent 更新)               │
+│       │                                    │                                 │
+│       │  emit(EMOTION_CHANGED, data)       │                                 │
+│       │ ────────────────────────────────► │                                 │
+│       │                                    │                                 │
+│       │                                    │ 检测到情绪变化                   │
+│       │                                    │ 触发 mindfulness 推送           │
+│                                                                              │
+│  ────────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  模式 3: 预计算模式                                                          │
+│  ════════════════════                                                        │
+│                                                                              │
+│  定时任务 (每小时)                                                            │
+│       │                                                                      │
+│       │  1. 扫描所有用户的 skill_data                                        │
+│       │  2. 检测触发条件 (大运交接、流年变化、运势低分等)                     │
+│       │  3. 更新 proactive_state.pending_triggers                            │
+│       │                                                                      │
+│  ProactiveEngine (每分钟)                                                     │
+│       │                                                                      │
+│       │  query_users_with_pending_triggers(before=now)                       │
+│       │  └─ 直接获取需要推送的用户，无需重复计算                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 proactive_state 结构设计
+
+```python
+proactive_state = {
+    # 待触发的推送
+    "pending_triggers": [
+        {
+            "trigger_id": "bazi_daily_fortune",
+            "skill_id": "bazi",
+            "ready_at": "2026-01-20T04:00:00Z",  # 预计触发时间
+            "priority": "medium",
+            "reason": "daily_schedule",  # 触发原因
+            "data": {}  # 触发时可能需要的数据
+        },
+        {
+            "trigger_id": "zodiac_saturn_transit",
+            "skill_id": "zodiac",
+            "ready_at": "2026-01-20T04:00:00Z",
+            "priority": "high",
+            "reason": "transit_event",
+            "data": {"aspect": "square", "natal_planet": "sun"}
+        }
+    ],
+
+    # 冷却中的推送 (防止重复发送)
+    "cooldowns": {
+        "bazi_daily_fortune": "2026-01-19T04:00:00Z",  # 上次发送时间
+        "bazi_fortune_alert": "2026-01-15T04:00:00Z"
+    },
+
+    # 被抑制的推送 (用户关闭或临时屏蔽)
+    "suppressed": [
+        {
+            "trigger_id": "zodiac_mercury_retrograde",
+            "until": "2026-02-01",
+            "reason": "user_dismissed"
+        }
+    ],
+
+    # 元数据
+    "last_scanned_at": "2026-01-19T04:00:00Z",
+    "next_scan_at": "2026-01-19T05:00:00Z"
+}
+```
+
+---
+
+## 5. Skill 融合规则
+
+### 5.1 融合层次
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Skill 融合规则                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Core Layer (始终融合)                                                       │
+│  ═══════════════════════                                                     │
+│                                                                              │
+│  core ◄─────────────────────────────────────────────────────────────────┐   │
+│    │                                                                     │   │
+│    │ 从所有 Skill 聚合洞察                                               │   │
+│    │                                                                     │   │
+│    ├─── lifecoach (人生教练)                                             │   │
+│    │    • 整合 bazi/zodiac 的时运分析                                    │   │
+│    │    • 结合 career 的职业建议                                         │   │
+│    │                                                                     │   │
+│    └─── mindfulness (正念导师)                                           │   │
+│         • 感知 state.emotion 变化                                        │   │
+│         • 响应用户情绪状态                                                │   │
+│                                                                              │
+│  ────────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  Professional Layer (独立运作)                                               │
+│  ═══════════════════════════════                                             │
+│                                                                              │
+│  bazi ──────────────────┐                                                   │
+│                         │ 各自独立计算和存储                                 │
+│  zodiac ────────────────┤ 不直接互相调用数据                                │
+│                         │                                                   │
+│  tarot ─────────────────┤ 只通过 VibeProfile 共享                           │
+│                         │ birth_info 等基础信息                             │
+│  career ────────────────┤                                                   │
+│                         │                                                   │
+│  jungastro ─────────────┘                                                   │
+│                                                                              │
+│  ────────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  数据流向                                                                    │
+│  ════════                                                                    │
+│                                                                              │
+│  Professional Skill                  VibeProfile                             │
+│       │                                    │                                 │
+│       │  write: skill_data.{skill}         │                                 │
+│       │ ────────────────────────────────► │                                 │
+│       │                                    │                                 │
+│       │  read: identity.birth_info         │                                 │
+│       │ ◄──────────────────────────────── │                                 │
+│       │                                    │                                 │
+│       │  read: state (可选)                │                                 │
+│       │ ◄──────────────────────────────── │                                 │
+│                                                                              │
+│  Core/Default Skill                  VibeProfile                             │
+│       │                                    │                                 │
+│       │  read: 所有数据                     │                                 │
+│       │ ◄──────────────────────────────── │                                 │
+│       │                                    │                                 │
+│       │  write: state, extracted, insights │                                 │
+│       │ ────────────────────────────────► │                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 访问权限矩阵
+
+| Skill | 可读取 | 可写入 |
+|-------|--------|--------|
+| core | 全部 | state, extracted, insights |
+| lifecoach | 全部 | state, extracted, insights, goals |
+| mindfulness | 全部 | state.emotion, insights |
+| bazi | identity, state | skill_data.bazi |
+| zodiac | identity, state | skill_data.zodiac |
+| tarot | identity, state | skill_data.tarot |
+| career | identity, state, extracted | skill_data.career |
+| jungastro | identity, state, skill_data.zodiac | skill_data.jungastro |
+
+---
+
+## 6. 用户隐私与透明度
+
+### 6.1 摘要透明设计
+
+用户可在设置页面查看 AI 对自己的认知摘要，但不展示原始数据。
+
+```typescript
+// 用户可见的 Profile 摘要
+interface ProfileSummary {
+  // 身份认知
+  identity: string;  // "1990年出生，八字甲木日主，金牛座"
+
+  // 性格认知
+  personality: {
+    traits: string[];     // ["理性务实", "有责任感", "注重细节"]
+    strengths: string[];  // ["执行力强", "善于规划"]
+    challenges: string[]; // ["有时过于追求完美", "不善表达情感"]
+  };
+
+  // 当前状态
+  currentState: {
+    focus: string;        // "近期主要关注职业发展"
+    emotion: string;      // "情绪状态稳定"
+    lifeStage: string;    // "处于职业上升期"
+  };
+
+  // 关键洞察
+  keyInsights: string[];  // ["适合稳扎稳打", "贵人运在今年下半年"]
+
+  // 目标
+  goals: string[];        // ["年底前升职"]
+
+  // 数据完整度
+  dataCompleteness: number;  // 0.75
+
+  // 元数据
+  lastUpdated: string;
+}
+```
+
+### 6.2 用户控制选项
+
+```yaml
+# 用户隐私设置
+privacy_settings:
+  # 显示级别
+  summary_visibility: "detailed"  # minimal | summary | detailed
+
+  # 数据收集
+  collect_emotions: true
+  collect_life_context: true
+
+  # 推送控制
+  proactive_enabled: true
+  proactive_frequency: "normal"  # minimal | normal | frequent
+```
+
+---
+
+## 7. 迁移计划
+
+### Phase 1: Schema 扩展 (1 天)
+
+- [ ] 扩展 unified_profiles.profile 的 JSONB 结构
+- [ ] 创建 vibe_profile_insights 表
+- [ ] 创建 vibe_profile_timeline 表
+- [ ] 添加必要的索引
+
+### Phase 2: Repository 重构 (2 天)
+
+- [ ] 创建 VibeProfileRepository 类
+- [ ] 迁移 UnifiedProfileRepository 的方法
+- [ ] 添加 Proactive 相关的查询方法
+- [ ] 实现事件通知机制
+
+### Phase 3: Proactive 集成 (1 天)
+
+- [ ] 实现 proactive_state 管理
+- [ ] 修改 ProactiveEngine 使用新接口
+- [ ] 添加预计算任务
+
+### Phase 4: CoreAgent 集成 (1 天)
+
+- [ ] 修改 CoreAgent 从 VibeProfile 读取数据
+- [ ] 实现状态更新逻辑
+- [ ] 集成洞察写入
+
+### Phase 5: 用户界面 (1 天)
+
+- [ ] 实现 Profile Summary API
+- [ ] 在设置页面展示 AI 认知摘要
+- [ ] 添加隐私设置控制
+
+---
+
+## 8. API 接口
+
+### 8.1 内部 API (Python)
+
+```python
+# 获取完整 Profile
+profile = await VibeProfileRepository.get_profile(user_id)
+
+# 获取 Skill 数据
+bazi_data = await VibeProfileRepository.get_skill_data(user_id, "bazi")
+
+# 更新情绪状态 (会触发事件)
+await VibeProfileRepository.update_emotion(user_id, "anxious", 0.8)
+
+# 添加洞察
+await VibeProfileRepository.add_insight(
+    user_id=user_id,
+    insight_type="pattern",
+    category="emotion",
+    content="用户在工作压力大时容易焦虑",
+    confidence=0.8,
+    evidence=["conv:abc123", "conv:def456"]
+)
+
+# 查询待推送用户
+users = await VibeProfileRepository.query_users_with_pending_triggers(
+    before=datetime.now(),
+    skill_id="bazi"
+)
+```
+
+### 8.2 HTTP API (供前端)
+
+```
+GET  /api/v1/profile/summary          # 获取 Profile 摘要 (用户可见)
+GET  /api/v1/profile/insights         # 获取洞察列表
+GET  /api/v1/profile/timeline         # 获取时间线
+PUT  /api/v1/profile/privacy          # 更新隐私设置
+```
+
+---
+
+## 附录
+
+### A. 与现有模块的集成点
+
+| 模块 | 读取 | 写入 |
+|------|------|------|
+| CoreAgent | identity, state, skill_data, extracted | state, extracted |
+| ProactiveEngine | proactive_state, skill_data | proactive_state |
+| Skill Services | identity | skill_data |
+| ContentGenerator | 全部 | - |
+| TriggerDetector | skill_data, state | - |
+
+### B. 性能优化建议
+
+1. **JSONB 索引**: 对高频查询的字段建立 GIN 索引
+2. **缓存策略**: Hot Layer 数据缓存 5 分钟
+3. **批量操作**: Proactive 扫描使用批量查询
+4. **冷热分离**: Insights/Timeline 独立表避免主表膨胀
+
+### C. 版本历史
+
+- **v1.0** (2026-01-19): 初始设计

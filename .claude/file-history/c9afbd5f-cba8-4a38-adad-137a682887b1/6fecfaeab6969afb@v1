@@ -1,0 +1,577 @@
+#!/usr/bin/env python
+"""
+Vibe v2.0 Code Review Fixes - E2E 测试
+
+测试最新修复：
+- P0: vibe.goals 写入位置修复（应写到 vibe.goals，而非 vibe.profile.goals）
+- P1: merge 参数支持
+- P1: 读取空值统一返回 None
+- P1: Timeline 批量追加优化
+
+Usage:
+    python scripts/test_vibe_v2_fixes.py
+"""
+
+import asyncio
+import json
+import logging
+import sys
+import uuid
+from datetime import datetime, timezone
+from typing import Dict, Any, List
+from uuid import UUID
+
+# Setup path
+sys.path.insert(0, '/home/aiscend/work/vibelife/apps/api')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test Utilities
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestContext:
+    """模拟 ToolContext"""
+    def __init__(self, user_id: str, skill_id: str = "core"):
+        self.user_id = user_id
+        self.skill_id = skill_id
+        self.scenario_id = None
+        self.profile = {}
+
+
+async def call_save(user_id: str, path: str, data: Any, merge: bool = True) -> Dict[str, Any]:
+    """调用 save 工具"""
+    from skills.core.tools.handlers import execute_save
+    ctx = TestContext(user_id)
+    return await execute_save({"path": path, "data": data, "merge": merge}, ctx)
+
+
+async def call_read(user_id: str, path: str) -> Dict[str, Any]:
+    """调用 read 工具"""
+    from skills.core.tools.handlers import execute_read
+    ctx = TestContext(user_id)
+    return await execute_read({"path": path}, ctx)
+
+
+async def get_raw_profile(user_id: str) -> Dict[str, Any]:
+    """直接读取数据库中的 profile"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+    return await UnifiedProfileRepository.get_profile(UUID(user_id)) or {}
+
+
+def assert_success(result: Dict, message: str = ""):
+    """断言操作成功"""
+    if result.get("status") == "error":
+        raise AssertionError(f"Expected success but got error: {result.get('error')} {message}")
+    return True
+
+
+def assert_equal(actual, expected, message: str = ""):
+    """断言相等"""
+    if actual != expected:
+        raise AssertionError(f"Expected {expected}, got {actual}. {message}")
+    return True
+
+
+def assert_is_none(actual, message: str = ""):
+    """断言为 None"""
+    if actual is not None:
+        raise AssertionError(f"Expected None, got {actual}. {message}")
+    return True
+
+
+def assert_not_none(actual, message: str = ""):
+    """断言不为 None"""
+    if actual is None:
+        raise AssertionError(f"Expected not None. {message}")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P0 测试：Goals 写入位置修复
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_p0_goals_write_location(user_id: str):
+    """
+    P0 验证: vibe.goals 应写入顶层 vibe.goals，而非 vibe.profile.goals
+
+    Bug 描述：之前 save vibe.goals 会调用 update_vibe_profile({"goals": ...})
+    导致 goals 写入到 vibe.profile.goals，而非顶层 vibe.goals
+    """
+    logger.info("=" * 60)
+    logger.info("P0 测试: Goals 写入位置修复")
+    logger.info("=" * 60)
+
+    # 清空现有 goals
+    from stores.db import execute
+    await execute(
+        """UPDATE unified_profiles
+           SET profile = jsonb_set(
+               jsonb_set(
+                   COALESCE(profile, '{}'::jsonb),
+                   '{vibe}',
+                   COALESCE(profile -> 'vibe', '{}'::jsonb) - 'goals'
+               ),
+               '{vibe, profile}',
+               COALESCE(profile -> 'vibe' -> 'profile', '{}'::jsonb) - 'goals'
+           )
+           WHERE user_id = $1""",
+        UUID(user_id)
+    )
+    logger.info("  已清空现有 goals")
+
+    # 保存 goals
+    goals = [
+        {"title": "P0测试目标A", "status": "active"},
+        {"title": "P0测试目标B", "status": "active"},
+    ]
+    result = await call_save(user_id, "vibe.goals", goals)
+    assert_success(result, "保存 goals 失败")
+    logger.info(f"  ✓ 保存 goals: {result}")
+
+    # 直接读取数据库验证存储位置
+    raw_profile = await get_raw_profile(user_id)
+    vibe = raw_profile.get("vibe", {})
+
+    # 检查顶层 vibe.goals
+    top_level_goals = vibe.get("goals", [])
+    logger.info(f"  vibe.goals (顶层): {top_level_goals}")
+
+    # 检查 vibe.profile.goals（不应该有）
+    profile_goals = vibe.get("profile", {}).get("goals", [])
+    logger.info(f"  vibe.profile.goals (不应存在): {profile_goals}")
+
+    # 验证
+    assert_equal(len(top_level_goals), 2, "顶层 vibe.goals 应有 2 个目标")
+    assert_equal(len(profile_goals), 0, "vibe.profile.goals 应为空")
+
+    # 通过 read 工具验证
+    read_result = await call_read(user_id, "vibe.goals")
+    assert_success(read_result)
+    assert_equal(read_result.get("count"), 2, "read vibe.goals 应返回 2 个目标")
+    logger.info(f"  ✓ read vibe.goals 返回: {read_result.get('count')} 个目标")
+
+    logger.info("  ✅ P0 Goals 写入位置修复验证通过")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 测试：merge 参数支持
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_p1_merge_parameter_state(user_id: str):
+    """
+    P1 验证: vibe.state.* 的 merge 参数
+
+    - merge=True (默认): 深度合并
+    - merge=False: 直接覆盖
+    """
+    logger.info("=" * 60)
+    logger.info("P1 测试: vibe.state.* merge 参数")
+    logger.info("=" * 60)
+
+    # 先设置初始状态
+    initial_data = {"key1": "value1", "key2": "value2", "nested": {"a": 1, "b": 2}}
+    result = await call_save(user_id, "vibe.state.test_merge", initial_data, merge=False)
+    assert_success(result)
+    logger.info(f"  ✓ 设置初始状态: {initial_data}")
+
+    # 测试 merge=True（默认）
+    merge_data = {"key2": "updated", "key3": "new", "nested": {"b": 3, "c": 4}}
+    result = await call_save(user_id, "vibe.state.test_merge", merge_data, merge=True)
+    assert_success(result)
+    logger.info(f"  ✓ merge=True 更新: {merge_data}")
+
+    # 验证合并结果
+    read_result = await call_read(user_id, "vibe.state.test_merge")
+    merged = read_result.get("data", {})
+    logger.info(f"  合并结果: {merged}")
+
+    # 应该保留 key1，更新 key2，新增 key3
+    assert_equal(merged.get("key1"), "value1", "key1 应保留")
+    assert_equal(merged.get("key2"), "updated", "key2 应被更新")
+    assert_equal(merged.get("key3"), "new", "key3 应被新增")
+    # nested 应该深度合并
+    nested = merged.get("nested", {})
+    assert_equal(nested.get("a"), 1, "nested.a 应保留")
+    assert_equal(nested.get("b"), 3, "nested.b 应被更新")
+    assert_equal(nested.get("c"), 4, "nested.c 应被新增")
+    logger.info("  ✓ merge=True 深度合并验证通过")
+
+    # 测试 merge=False（覆盖）
+    overwrite_data = {"only_key": "only_value"}
+    result = await call_save(user_id, "vibe.state.test_merge", overwrite_data, merge=False)
+    assert_success(result)
+    logger.info(f"  ✓ merge=False 覆盖: {overwrite_data}")
+
+    # 验证覆盖结果
+    read_result = await call_read(user_id, "vibe.state.test_merge")
+    overwritten = read_result.get("data", {})
+    logger.info(f"  覆盖结果: {overwritten}")
+
+    assert_equal(overwritten, overwrite_data, "merge=False 应完全覆盖")
+    logger.info("  ✓ merge=False 覆盖验证通过")
+
+    logger.info("  ✅ P1 vibe.state.* merge 参数验证通过")
+    return True
+
+
+async def test_p1_merge_parameter_profile(user_id: str):
+    """
+    P1 验证: vibe.profile.* 的 merge 参数
+
+    - merge=True (默认): 深度合并
+    - merge=False: 直接覆盖
+    """
+    logger.info("=" * 60)
+    logger.info("P1 测试: vibe.profile.* merge 参数")
+    logger.info("=" * 60)
+
+    # 先设置初始数据
+    initial_data = {"field1": "a", "field2": "b", "sub": {"x": 1, "y": 2}}
+    result = await call_save(user_id, "vibe.profile.test_merge", initial_data, merge=False)
+    assert_success(result)
+    logger.info(f"  ✓ 设置初始数据: {initial_data}")
+
+    # 测试 merge=True（默认）
+    merge_data = {"field2": "updated", "field3": "new"}
+    result = await call_save(user_id, "vibe.profile.test_merge", merge_data, merge=True)
+    assert_success(result)
+    logger.info(f"  ✓ merge=True 更新: {merge_data}")
+
+    # 验证合并结果
+    read_result = await call_read(user_id, "vibe.profile.test_merge")
+    merged = read_result.get("data", {})
+    logger.info(f"  合并结果: {merged}")
+
+    # profile 默认 merge=True，应保留未更新的字段
+    assert_equal(merged.get("field1"), "a", "field1 应保留")
+    assert_equal(merged.get("field2"), "updated", "field2 应被更新")
+    assert_equal(merged.get("field3"), "new", "field3 应被新增")
+    logger.info("  ✓ merge=True 验证通过")
+
+    # 测试 merge=False（覆盖）
+    overwrite_data = {"only_field": "only"}
+    result = await call_save(user_id, "vibe.profile.test_merge", overwrite_data, merge=False)
+    assert_success(result)
+    logger.info(f"  ✓ merge=False 覆盖: {overwrite_data}")
+
+    # 验证覆盖结果
+    read_result = await call_read(user_id, "vibe.profile.test_merge")
+    overwritten = read_result.get("data", {})
+    logger.info(f"  覆盖结果: {overwritten}")
+
+    assert_equal(overwritten, overwrite_data, "merge=False 应完全覆盖")
+    logger.info("  ✓ merge=False 验证通过")
+
+    logger.info("  ✅ P1 vibe.profile.* merge 参数验证通过")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 测试：读取空值统一返回 None
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_p1_empty_value_consistency(user_id: str):
+    """
+    P1 验证: 读取不存在的嵌套路径应返回 None（而非 {}）
+
+    vibe.profile.xxx 和 vibe.state.xxx 的行为应一致
+    """
+    logger.info("=" * 60)
+    logger.info("P1 测试: 空值返回一致性")
+    logger.info("=" * 60)
+
+    # 读取不存在的 profile 路径
+    result1 = await call_read(user_id, "vibe.profile.nonexistent_path")
+    data1 = result1.get("data")
+    logger.info(f"  vibe.profile.nonexistent_path 返回: {data1} (类型: {type(data1).__name__})")
+    assert_is_none(data1, "vibe.profile.nonexistent_path 应返回 None")
+    logger.info("  ✓ vibe.profile.nonexistent_path 返回 None")
+
+    # 读取不存在的 state 路径
+    result2 = await call_read(user_id, "vibe.state.nonexistent_path")
+    data2 = result2.get("data")
+    logger.info(f"  vibe.state.nonexistent_path 返回: {data2} (类型: {type(data2).__name__})")
+    assert_is_none(data2, "vibe.state.nonexistent_path 应返回 None")
+    logger.info("  ✓ vibe.state.nonexistent_path 返回 None")
+
+    # 读取深层不存在路径
+    result3 = await call_read(user_id, "vibe.profile.deep.nested.nonexistent")
+    data3 = result3.get("data")
+    logger.info(f"  vibe.profile.deep.nested.nonexistent 返回: {data3}")
+    assert_is_none(data3, "深层不存在路径应返回 None")
+    logger.info("  ✓ 深层不存在路径返回 None")
+
+    logger.info("  ✅ P1 空值返回一致性验证通过")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 测试：Timeline 批量追加优化
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_p1_timeline_batch_append(user_id: str):
+    """
+    P1 验证: Timeline 批量追加（单次 DB 写入）
+
+    之前：list 传入时逐条写库，多次 IO
+    现在：合并后单次写入
+    """
+    logger.info("=" * 60)
+    logger.info("P1 测试: Timeline 批量追加优化")
+    logger.info("=" * 60)
+
+    # 读取当前 timeline 数量
+    read_before = await call_read(user_id, "vibe.timeline")
+    count_before = read_before.get("count", 0)
+    logger.info(f"  当前 timeline 条数: {count_before}")
+
+    # 批量追加多个事件
+    events = [
+        {"date": "2026-01-26", "type": "test", "event": f"批量测试事件 {i}"}
+        for i in range(10)
+    ]
+
+    import time
+    start_time = time.time()
+    result = await call_save(user_id, "vibe.timeline", events)
+    elapsed = time.time() - start_time
+
+    assert_success(result, "批量追加失败")
+    logger.info(f"  ✓ 批量追加 10 个事件，耗时: {elapsed:.3f}s")
+
+    # 验证数量
+    read_after = await call_read(user_id, "vibe.timeline")
+    count_after = read_after.get("count", 0)
+    assert_equal(count_after, count_before + 10, f"应增加 10 条")
+    logger.info(f"  ✓ timeline 条数: {count_before} → {count_after}")
+
+    # 验证顺序（最新在前）
+    timeline = read_after.get("data", [])
+    if len(timeline) >= 10:
+        # 检查最新的 10 条是我们刚加的
+        latest_10 = timeline[:10]
+        for i, event in enumerate(latest_10):
+            expected_idx = 9 - i  # 逆序
+            expected_event = f"批量测试事件 {expected_idx}"
+            assert_equal(event.get("event"), expected_event, f"事件顺序错误: 期望 {expected_event}")
+        logger.info("  ✓ 事件顺序正确（最新在前）")
+
+    logger.info("  ✅ P1 Timeline 批量追加验证通过")
+    return True
+
+
+async def test_p1_timeline_batch_concurrent(user_id: str):
+    """
+    P1 验证: 并发批量追加不丢数据
+    """
+    logger.info("=" * 60)
+    logger.info("P1 测试: 并发批量追加")
+    logger.info("=" * 60)
+
+    # 读取当前数量
+    read_before = await call_read(user_id, "vibe.timeline")
+    count_before = read_before.get("count", 0)
+    logger.info(f"  当前 timeline 条数: {count_before}")
+
+    # 并发发起 5 个批量追加请求，每个追加 3 条
+    async def batch_append(batch_id: int):
+        events = [
+            {"date": "2026-01-26", "type": "concurrent", "event": f"并发批次{batch_id}-事件{i}"}
+            for i in range(3)
+        ]
+        return await call_save(user_id, "vibe.timeline", events)
+
+    results = await asyncio.gather(*[batch_append(i) for i in range(5)])
+
+    # 检查所有都成功
+    for i, r in enumerate(results):
+        assert_success(r, f"批次 {i} 失败")
+    logger.info(f"  ✓ 5 个并发批量追加全部成功")
+
+    # 验证总数
+    read_after = await call_read(user_id, "vibe.timeline")
+    count_after = read_after.get("count", 0)
+    expected = count_before + 15  # 5 批次 × 3 条
+    assert_equal(count_after, expected, f"应有 {expected} 条")
+    logger.info(f"  ✓ timeline 条数: {count_before} → {count_after} (增加 15 条)")
+
+    logger.info("  ✅ P1 并发批量追加验证通过")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 综合验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_comprehensive_vibe_operations(user_id: str):
+    """
+    综合测试: 模拟真实对话场景
+    """
+    logger.info("=" * 60)
+    logger.info("综合测试: 模拟真实对话场景")
+    logger.info("=" * 60)
+
+    # 1. 用户分享背景
+    logger.info("  [对话] 用户: 我是一名产品经理，最近在考虑职业转型")
+    await call_save(user_id, "vibe.profile.context.occupation", "产品经理")
+    await call_save(user_id, "vibe.state.focus", ["职业转型"])
+    logger.info("  ✓ 保存职业和关注点")
+
+    # 2. 用户设定目标
+    logger.info("  [对话] 用户: 我想转型做技术管理")
+    await call_save(user_id, "vibe.goals", [
+        {"title": "转型技术管理", "status": "active", "category": "career"}
+    ])
+    logger.info("  ✓ 保存目标")
+
+    # 3. 用户表达情绪
+    logger.info("  [对话] 用户: 感觉有点迷茫，不知道从哪开始")
+    await call_save(user_id, "vibe.state.emotion", "confused")
+    await call_save(user_id, "vibe.state.energy", "medium")
+    logger.info("  ✓ 保存情绪状态")
+
+    # 4. 系统识别用户特质
+    logger.info("  [系统] 识别用户特质: 分析型、目标导向")
+    await call_save(user_id, "vibe.profile.identity.traits", ["analytical", "goal-oriented"])
+    logger.info("  ✓ 保存特质")
+
+    # 5. 记录重要事件
+    logger.info("  [对话] 用户: 今天和前辈聊了转型的事")
+    await call_save(user_id, "vibe.timeline", {
+        "date": "2026-01-26",
+        "type": "conversation",
+        "event": "与前辈讨论职业转型"
+    })
+    logger.info("  ✓ 记录事件")
+
+    # 6. 更新目标状态
+    logger.info("  [对话] 用户: 决定先学习技术基础知识")
+    await call_save(user_id, "vibe.goals", [
+        {"title": "转型技术管理", "status": "in_progress", "next_step": "学习技术基础"}
+    ])
+    logger.info("  ✓ 更新目标状态")
+
+    # 验证完整 vibe 数据
+    vibe_result = await call_read(user_id, "vibe")
+    vibe = vibe_result.get("data", {})
+
+    logger.info("  === 最终 Vibe 数据 ===")
+    logger.info(f"  profile.context.occupation: {vibe.get('profile', {}).get('context', {}).get('occupation')}")
+    logger.info(f"  profile.identity.traits: {vibe.get('profile', {}).get('identity', {}).get('traits')}")
+    logger.info(f"  state.emotion: {vibe.get('state', {}).get('emotion')}")
+    logger.info(f"  state.focus: {vibe.get('state', {}).get('focus')}")
+    logger.info(f"  goals count: {len(vibe.get('goals', []))}")
+    logger.info(f"  timeline count: {len(vibe.get('timeline', []))}")
+
+    # 验证目标更新
+    goals = vibe.get("goals", [])
+    career_goal = next((g for g in goals if g.get("title") == "转型技术管理"), None)
+    assert_not_none(career_goal, "应找到转型目标")
+    assert_equal(career_goal.get("status"), "in_progress", "目标状态应更新")
+    assert_equal(career_goal.get("next_step"), "学习技术基础", "目标 next_step 应更新")
+    logger.info("  ✓ 目标 merge 更新验证通过")
+
+    logger.info("  ✅ 综合测试通过")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def cleanup_test_user(user_id: str):
+    """清理测试用户的 vibe 数据"""
+    from stores.db import execute
+    await execute(
+        """UPDATE unified_profiles
+           SET profile = profile - 'vibe'
+           WHERE user_id = $1""",
+        UUID(user_id)
+    )
+    logger.info(f"已清理测试用户 {user_id} 的 vibe 数据")
+
+
+async def create_test_user() -> str:
+    """创建测试用户"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    test_user_id = uuid.uuid4()
+    await UnifiedProfileRepository.create_profile(test_user_id, {
+        "identity": {"birth_info": {}},
+        "skills": {},
+        "vibe": {},
+    })
+    logger.info(f"创建测试用户: {test_user_id}")
+    return str(test_user_id)
+
+
+async def run_all_tests():
+    """运行所有测试"""
+    logger.info("=" * 70)
+    logger.info("Vibe v2.0 Code Review Fixes - E2E 测试")
+    logger.info("=" * 70)
+
+    # 创建测试用户
+    test_user_id = await create_test_user()
+
+    passed = 0
+    failed = 0
+    errors = []
+
+    tests = [
+        ("P0: Goals 写入位置", test_p0_goals_write_location),
+        ("P1: merge 参数 (state)", test_p1_merge_parameter_state),
+        ("P1: merge 参数 (profile)", test_p1_merge_parameter_profile),
+        ("P1: 空值返回一致性", test_p1_empty_value_consistency),
+        ("P1: Timeline 批量追加", test_p1_timeline_batch_append),
+        ("P1: 并发批量追加", test_p1_timeline_batch_concurrent),
+        ("综合: 真实对话场景", test_comprehensive_vibe_operations),
+    ]
+
+    for name, test_func in tests:
+        try:
+            await test_func(test_user_id)
+            passed += 1
+            logger.info(f"✅ {name} 通过")
+        except Exception as e:
+            failed += 1
+            errors.append((name, str(e)))
+            logger.error(f"❌ {name} 失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 清理测试用户
+    await cleanup_test_user(test_user_id)
+
+    # 汇总
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("测试汇总")
+    logger.info("=" * 70)
+    logger.info(f"通过: {passed}/{len(tests)}")
+    logger.info(f"失败: {failed}/{len(tests)}")
+
+    if errors:
+        logger.info("")
+        logger.info("失败详情:")
+        for name, error in errors:
+            logger.info(f"  - {name}: {error}")
+
+    return failed == 0
+
+
+async def main():
+    """入口"""
+    success = await run_all_tests()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

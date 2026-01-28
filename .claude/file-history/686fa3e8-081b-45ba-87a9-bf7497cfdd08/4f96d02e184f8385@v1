@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, Optional
+
+from fastapi import HTTPException, Request
+
+from services import auth_service
+from services.security import sha256_hex
+
+
+# =============================================================================
+# Service Token for Internal API Trust Boundary
+# =============================================================================
+
+# Service token for internal API calls (Next.js → FastAPI)
+# Must be set in both environments and kept secret
+INTERNAL_SERVICE_TOKEN = os.getenv("FORTUNE_INTERNAL_SERVICE_TOKEN", "")
+
+# Allowed internal IPs (fallback when token not configured)
+INTERNAL_ALLOWED_IPS = {"127.0.0.1", "::1", "localhost"}
+
+
+def require_internal_auth(request: Request) -> Dict[str, Any]:
+    """
+    Verify internal API call is authorized.
+
+    Trust boundary: Internal APIs should only be called by server-side code
+    (Next.js API routes), never directly from browser.
+
+    Verification order:
+    1. X-Service-Token header (preferred, required in production)
+    2. IP whitelist (fallback for local dev)
+    3. Session cookie (for user context extraction)
+    """
+    # 1. Check service token (primary mechanism)
+    token = (request.headers.get("X-Service-Token") or "").strip()
+    if INTERNAL_SERVICE_TOKEN:
+        if not token:
+            raise HTTPException(
+                status_code=403,
+                detail="missing_service_token",
+            )
+        if token != INTERNAL_SERVICE_TOKEN:
+            raise HTTPException(
+                status_code=403,
+                detail="invalid_service_token",
+            )
+    else:
+        # Token not configured - check IP whitelist (dev mode only)
+        client_ip = get_client_ip(request)
+        if client_ip not in INTERNAL_ALLOWED_IPS:
+            raise HTTPException(
+                status_code=403,
+                detail="internal_api_access_denied",
+            )
+
+    # 2. Still require valid session for user context
+    auth = get_current_auth(request)
+    if not auth:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    return auth
+
+
+def get_client_ip(request: Request) -> str:
+    try:
+        return request.client.host if request.client else ""
+    except Exception:
+        return ""
+
+
+def get_user_agent(request: Request) -> str:
+    return (request.headers.get("user-agent") or "")[:500]
+
+
+def get_current_auth(request: Request) -> Optional[Dict[str, Any]]:
+    session_token = request.cookies.get("fortune_session") or ""
+    return auth_service.get_user_by_session_token(session_token)
+
+
+def require_auth(request: Request) -> Dict[str, Any]:
+    auth = get_current_auth(request)
+    if not auth:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return auth
+
+
+def require_csrf(request: Request, auth: Dict[str, Any]) -> None:
+    token = (request.headers.get("X-CSRF-Token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=403, detail="missing_csrf")
+    got = sha256_hex(token)
+    expected = str(auth.get("csrf_token_hash") or "")
+    if not expected or got != expected:
+        raise HTTPException(status_code=403, detail="invalid_csrf")
+

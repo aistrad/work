@@ -1,0 +1,248 @@
+# VibeLife 产品优化计划 - 第二轮
+
+> 基于代码审查 + 实际测试
+> 日期: 2026-01-22
+> 状态: 第一轮 P0-P2 已完成，寻找更多优化
+
+---
+
+## 执行摘要
+
+| 优先级 | 问题 | 影响 | 难度 |
+|-------|------|------|------|
+| **P3** | Token 刷新失败后无重定向 | 用户卡在错误状态 | 低 |
+| **P4** | 工具卡片缺少 ErrorBoundary | 单卡片崩溃影响整页 | 中 |
+| **P5** | Conversation 恢复缺少用户验证 | 安全漏洞 | 低 |
+| **P6** | 网络请求缺少重试机制 | 移动端体验差 | 中 |
+| **P7** | Profile 缓存击穿问题 | 并发请求性能差 | 中 |
+
+---
+
+## P3: Token 刷新失败后无重定向（高优先级）
+
+### 问题
+**文件**: `apps/web/src/lib/api.ts` (行 104-148)
+
+Token 刷新失败后调用 `clearTokens()` 但不通知用户，用户会看到 401 错误但不知道需要重新登录。
+
+### 修复方案
+```typescript
+// api.ts
+async function refreshAccessToken(): Promise<boolean> {
+  // ... 现有代码
+  if (!response.ok) {
+    clearTokens();
+    // 发送事件通知需要重新登录
+    window.dispatchEvent(new CustomEvent('auth:session-expired'));
+    return false;
+  }
+}
+
+// AuthProvider.tsx - 监听事件并重定向
+useEffect(() => {
+  const handler = () => {
+    toast.error('登录已过期，请重新登录');
+    router.push('/auth/login');
+  };
+  window.addEventListener('auth:session-expired', handler);
+  return () => window.removeEventListener('auth:session-expired', handler);
+}, []);
+```
+
+### 相关文件
+- `apps/web/src/lib/api.ts`
+- `apps/web/src/providers/AuthProvider.tsx`
+
+---
+
+## P4: 工具卡片缺少 ErrorBoundary（高优先级）
+
+### 问题
+**文件**: `apps/web/src/components/chat/ChatMessage.tsx` (行 290-298)
+
+`ToolCardRenderer` 使用 `Suspense` 但没有 `ErrorBoundary`。如果卡片渲染失败，整个消息区域崩溃。
+
+### 修复方案
+```typescript
+// 创建 ToolCardErrorBoundary.tsx
+class ToolCardErrorBoundary extends React.Component<Props, State> {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20">
+          <p className="text-sm text-red-400">卡片加载失败</p>
+          <button onClick={() => this.setState({ hasError: false })}>
+            重试
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ChatMessage.tsx 中使用
+<ToolCardErrorBoundary toolName={name}>
+  <Suspense fallback={<ToolLoadingFallback />}>
+    {CardRegistry.render(cardType, adaptedProps)}
+  </Suspense>
+</ToolCardErrorBoundary>
+```
+
+### 相关文件
+- `apps/web/src/components/chat/ChatMessage.tsx`
+- `apps/web/src/components/chat/ToolCardErrorBoundary.tsx` (新建)
+
+---
+
+## P5: Conversation 恢复缺少用户验证（安全问题）
+
+### 问题
+**文件**: `apps/api/routes/chat_v5.py` (行 255-269)
+
+从数据库恢复 skill 时未检查 conversation 是否属于当前用户，可能存在跨用户数据访问漏洞。
+
+### 修复方案
+```python
+# chat_v5.py
+if not active_skill:
+    try:
+        conv = await conversation_repo.get_conversation(conversation_id)
+        # 安全检查：验证 conversation 属于当前用户
+        if conv and str(conv.user_id) != str(user_id):
+            logger.warning(f"Conversation user mismatch: {conv.user_id} vs {user_id}")
+            conv = None  # 不恢复不属于当前用户的对话
+        if conv and conv.skill and conv.skill != "core":
+            active_skill = conv.skill
+    except Exception as e:
+        logger.warning(f"Failed to restore skill: {e}")
+```
+
+### 相关文件
+- `apps/api/routes/chat_v5.py`
+
+---
+
+## P6: 网络请求缺少重试机制（体验优化）
+
+### 问题
+**文件**: `apps/web/src/lib/api.ts` (行 84-122)
+
+`fetchAPI` 只尝试一次，没有指数退避重试机制。对于移动端不稳定网络环境会导致高失败率。
+
+### 修复方案
+```typescript
+// api.ts
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok || response.status < 500) {
+        return response;
+      }
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error as Error;
+    }
+
+    // 指数退避：200ms, 400ms, 800ms
+    if (attempt < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, 200 * Math.pow(2, attempt)));
+    }
+  }
+
+  throw lastError;
+}
+```
+
+### 相关文件
+- `apps/web/src/lib/api.ts`
+
+---
+
+## P7: Profile 缓存击穿问题（性能优化）
+
+### 问题
+**文件**: `apps/api/stores/profile_cache.py` (行 53-70)
+
+缓存过期时直接删除但不预热，多个并发请求可能同时触发缓存重载。
+
+### 修复方案
+```python
+# profile_cache.py - 实现 stale-while-revalidate
+async def get_by_key(self, key: str, allow_stale: bool = True) -> Optional[Dict]:
+    entry = self._cache.get(key)
+    if entry is None:
+        return None
+
+    if entry.is_expired:
+        if allow_stale:
+            # 返回过期数据，后台异步刷新
+            asyncio.create_task(self._revalidate_async(key))
+            return entry.data
+        else:
+            del self._cache[key]
+            return None
+
+    return entry.data
+```
+
+### 相关文件
+- `apps/api/stores/profile_cache.py`
+
+---
+
+## 其他发现（低优先级）
+
+| 问题 | 文件 | 说明 |
+|------|------|------|
+| 流式加载缺少 ARIA 标记 | ChatMessage.tsx | 影响无障碍用户 |
+| 移动端 TabBar 可能遮挡内容 | AppShell.tsx | 需要增加 padding |
+| 生产环境遗留 console.log | 多个文件 | 暴露内部实现 |
+| 硬编码中文字符串无 i18n | 多个文件 | 影响扩展性 |
+| Message 批量插入无事务 | message_repo.py | 可能部分保存 |
+
+---
+
+## 确认实施顺序
+
+1. **P5** (10分钟) → 安全漏洞先堵住
+2. **P4** (20分钟) → 防止卡片崩溃
+3. **P3** (15分钟) → Token 过期处理
+
+总计约 45 分钟
+
+---
+
+## 验证方法
+
+### P3 验证
+```bash
+# 1. 手动使过期的 token 失效
+# 2. 刷新页面
+# 3. 预期：自动重定向到登录页面
+```
+
+### P4 验证
+```bash
+# 1. 触发一个会导致卡片渲染错误的场景
+# 2. 预期：显示错误提示卡片，不影响其他消息
+```
+
+### P5 验证
+```bash
+# 1. 使用用户 A 的 conversation_id 用用户 B 的 token 请求
+# 2. 预期：不恢复 skill，创建新对话
+```

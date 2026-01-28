@@ -1,0 +1,350 @@
+     1→"""
+     2→Case Extractor - Stage 4a of Knowledge Building Pipeline
+     3→
+     4→Automatically extracts cases from knowledge chunks using LLM.
+     5→Supports multiple skills with skill-specific core_data and features schemas.
+     6→"""
+     7→import asyncio
+     8→import json
+     9→import logging
+    10→import uuid
+    11→from dataclasses import dataclass
+    12→from typing import Optional
+    13→from pathlib import Path
+    14→
+    15→logger = logging.getLogger(__name__)
+    16→
+    17→# Skill-specific schemas
+    18→SKILL_SCHEMAS = {
+    19→    "bazi": {
+    20→        "core_data": {
+    21→            "year": "年柱 (如: 甲子)",
+    22→            "month": "月柱",
+    23→            "day": "日柱",
+    24→            "hour": "时柱",
+    25→            "gender": "性别 (男/女)",
+    26→        },
+    27→        "features": {
+    28→            "daymaster": "日主 (如: 甲木)",
+    29→            "strength": "身强/身弱",
+    30→            "pattern": "格局 (如: 正官格)",
+    31→            "key_gods": "关键十神 (数组)",
+    32→        },
+    33→    },
+    34→    "zodiac": {
+    35→        "core_data": {
+    36→            "sun_sign": "太阳星座",
+    37→            "moon_sign": "月亮星座",
+    38→            "rising_sign": "上升星座",
+    39→            "birth_chart": "星盘配置摘要",
+    40→        },
+    41→        "features": {
+    42→            "dominant_element": "主导元素",
+    43→            "dominant_modality": "主导模式",
+    44→            "key_aspects": "关键相位",
+    45→            "stellium": "星群 (如有)",
+    46→        },
+    47→    },
+    48→    "tarot": {
+    49→        "core_data": {
+    50→            "spread_type": "牌阵类型",
+    51→            "cards": "抽到的牌 (数组)",
+    52→            "question": "问题类型",
+    53→        },
+    54→        "features": {
+    55→            "major_count": "大牌数量",
+    56→            "dominant_suit": "主导花色",
+    57→            "reversed_count": "逆位数量",
+    58→            "key_cards": "关键牌",
+    59→        },
+    60→    },
+    61→    "career": {
+    62→        "core_data": {
+    63→            "background": "职业背景",
+    64→            "current_role": "当前职位",
+    65→            "challenge": "面临挑战",
+    66→        },
+    67→        "features": {
+    68→            "industry": "行业",
+    69→            "career_stage": "职业阶段",
+    70→            "key_skills": "核心技能",
+    71→            "goals": "职业目标",
+    72→        },
+    73→    },
+    74→}
+    75→
+    76→EXTRACTION_PROMPT = """你是一个专业的案例提取专家。请从以下文本中识别并提取案例。
+    77→
+    78→## Skill类型: {skill_id}
+    79→
+    80→## 案例数据结构
+    81→core_data 字段说明:
+    82→{core_data_schema}
+    83→
+    84→features 字段说明:
+    85→{features_schema}
+    86→
+    87→## 待分析文本
+    88→{text}
+    89→
+    90→## 输出要求
+    91→如果文本中包含案例，请以JSON格式输出，包含以下字段:
+    92→- name: 案例名称/标题
+    93→- core_data: 核心数据 (按上述结构)
+    94→- features: 特征数据 (按上述结构)
+    95→- tags: 标签数组 (如: ["事业", "财运"])
+    96→- analysis: 分析内容 (JSON对象，包含 key_points 数组)
+    97→- conclusion: 结论 (JSON对象，包含 summary 和 advice)
+    98→- scenario_ids: 适用场景ID数组 (如: ["basic_reading", "career"])
+    99→
+   100→如果文本中没有案例，返回: {{"no_case": true}}
+   101→
+   102→请直接输出JSON，不要添加其他说明。
+   103→"""
+   104→
+   105→
+   106→@dataclass
+   107→class ExtractedCase:
+   108→    """Extracted case data"""
+   109→    name: str
+   110→    skill_id: str
+   111→    core_data: dict
+   112→    features: dict
+   113→    tags: list[str]
+   114→    analysis: dict
+   115→    conclusion: dict
+   116→    scenario_ids: list[str]
+   117→    source_chunk_id: Optional[str] = None
+   118→    authority: str = "medium"
+   119→
+   120→
+   121→class CaseExtractor:
+   122→    """
+   123→    Extracts cases from knowledge chunks using LLM.
+   124→    """
+   125→
+   126→    def __init__(self, llm_client=None):
+   127→        self.llm = llm_client
+   128→
+   129→    async def _call_llm(self, prompt: str) -> dict:
+   130→        """Call LLM with prompt"""
+   131→        from services.model_router import chat
+   132→        response = await chat(
+   133→            messages=[{"role": "user", "content": prompt}],
+   134→            capability="analysis",
+   135→        )
+   136→        return {"content": response.content}
+   137→
+   138→    def _get_schema_description(self, skill_id: str) -> tuple[str, str]:
+   139→        """Get schema descriptions for a skill"""
+   140→        schema = SKILL_SCHEMAS.get(skill_id, SKILL_SCHEMAS["bazi"])
+   141→
+   142→        core_desc = "\n".join(
+   143→            f"- {k}: {v}" for k, v in schema["core_data"].items()
+   144→        )
+   145→        features_desc = "\n".join(
+   146→            f"- {k}: {v}" for k, v in schema["features"].items()
+   147→        )
+   148→        return core_desc, features_desc
+   149→
+   150→    async def extract_from_chunk(
+   151→        self,
+   152→        chunk_text: str,
+   153→        skill_id: str,
+   154→        chunk_id: Optional[str] = None,
+   155→    ) -> list[ExtractedCase]:
+   156→        """
+   157→        Extract cases from a single chunk.
+   158→
+   159→        Args:
+   160→            chunk_text: The text content to analyze
+   161→            skill_id: The skill ID (bazi, zodiac, etc.)
+   162→            chunk_id: Optional source chunk ID
+   163→
+   164→        Returns:
+   165→            List of extracted cases (may be empty)
+   166→        """
+   167→        core_schema, features_schema = self._get_schema_description(skill_id)
+   168→
+   169→        prompt = EXTRACTION_PROMPT.format(
+   170→            skill_id=skill_id,
+   171→            core_data_schema=core_schema,
+   172→            features_schema=features_schema,
+   173→            text=chunk_text[:4000],  # Limit text length
+   174→        )
+   175→
+   176→        try:
+   177→            response = await self._call_llm(prompt)
+   178→
+   179→            # Parse JSON response
+   180→            content = response.get("content", "")
+   181→
+   182→            # Try to extract JSON from response
+   183→            if "```json" in content:
+   184→                content = content.split("```json")[1].split("```")[0]
+   185→            elif "```" in content:
+   186→                content = content.split("```")[1].split("```")[0]
+   187→
+   188→            data = json.loads(content.strip())
+   189→
+   190→            if data.get("no_case"):
+   191→                return []
+   192→
+   193→            # Handle single case or array
+   194→            cases_data = [data] if isinstance(data, dict) else data
+   195→
+   196→            cases = []
+   197→            for case_data in cases_data:
+   198→                if case_data.get("no_case"):
+   199→                    continue
+   200→
+   201→                case = ExtractedCase(
+   202→                    name=case_data.get("name", "未命名案例"),
+   203→                    skill_id=skill_id,
+   204→                    core_data=case_data.get("core_data", {}),
+   205→                    features=case_data.get("features", {}),
+   206→                    tags=case_data.get("tags", []),
+   207→                    analysis=case_data.get("analysis", {"key_points": []}),
+   208→                    conclusion=case_data.get("conclusion", {"summary": "", "advice": ""}),
+   209→                    scenario_ids=case_data.get("scenario_ids", ["basic_reading"]),
+   210→                    source_chunk_id=chunk_id,
+   211→                )
+   212→                cases.append(case)
+   213→
+   214→            return cases
+   215→
+   216→        except json.JSONDecodeError as e:
+   217→            logger.warning(f"Failed to parse case extraction response: {e}")
+   218→            return []
+   219→        except Exception as e:
+   220→            logger.error(f"Case extraction failed: {e}")
+   221→            return []
+   222→
+   223→    async def extract_from_chunks(
+   224→        self,
+   225→        chunks: list[dict],
+   226→        skill_id: str,
+   227→        batch_size: int = 5,
+   228→    ) -> list[ExtractedCase]:
+   229→        """
+   230→        Extract cases from multiple chunks.
+   231→
+   232→        Args:
+   233→            chunks: List of chunk dicts with 'id' and 'content' keys
+   234→            skill_id: The skill ID
+   235→            batch_size: Number of concurrent extractions
+   236→
+   237→        Returns:
+   238→            List of all extracted cases
+   239→        """
+   240→        all_cases = []
+   241→
+   242→        for i in range(0, len(chunks), batch_size):
+   243→            batch = chunks[i:i + batch_size]
+   244→
+   245→            tasks = [
+   246→                self.extract_from_chunk(
+   247→                    chunk.get("content", chunk.get("chunk_text", "")),
+   248→                    skill_id,
+   249→                    chunk.get("id"),
+   250→                )
+   251→                for chunk in batch
+   252→            ]
+   253→
+   254→            results = await asyncio.gather(*tasks, return_exceptions=True)
+   255→
+   256→            for result in results:
+   257→                if isinstance(result, list):
+   258→                    all_cases.extend(result)
+   259→                elif isinstance(result, Exception):
+   260→                    logger.error(f"Batch extraction error: {result}")
+   261→
+   262→        logger.info(f"Extracted {len(all_cases)} cases from {len(chunks)} chunks")
+   263→        return all_cases
+   264→
+   265→    async def save_cases(self, cases: list[ExtractedCase]) -> int:
+   266→        """
+   267→        Save extracted cases to database.
+   268→
+   269→        Returns:
+   270→            Number of cases saved
+   271→        """
+   272→        if not cases:
+   273→            return 0
+   274→
+   275→        from stores.db import get_connection
+   276→
+   277→        saved = 0
+   278→        async with get_connection() as conn:
+   279→            for case in cases:
+   280→                case_id = f"CASE_{case.skill_id}_{uuid.uuid4().hex[:8]}"
+   281→
+   282→                try:
+   283→                    await conn.execute(
+   284→                        """
+   285→                        INSERT INTO cases (
+   286→                            id, skill_id, scenario_ids, name,
+   287→                            core_data, features, tags,
+   288→                            analysis, conclusion, authority
+   289→                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+   290→                        ON CONFLICT (id) DO NOTHING
+   291→                        """,
+   292→                        case_id,
+   293→                        case.skill_id,
+   294→                        case.scenario_ids,
+   295→                        case.name,
+   296→                        json.dumps(case.core_data),
+   297→                        json.dumps(case.features),
+   298→                        case.tags,
+   299→                        json.dumps(case.analysis),
+   300→                        json.dumps(case.conclusion),
+   301→                        case.authority,
+   302→                    )
+   303→                    saved += 1
+   304→                except Exception as e:
+   305→                    logger.error(f"Failed to save case {case.name}: {e}")
+   306→
+   307→        logger.info(f"Saved {saved} cases to database")
+   308→        return saved
+   309→
+   310→
+   311→# CLI entry point
+   312→async def extract_cases_cli(skill_id: str, limit: int = 100):
+   313→    """CLI entry point for case extraction"""
+   314→    from stores.db import get_connection
+   315→
+   316→    # Fetch chunks that haven't been processed for cases
+   317→    async with get_connection() as conn:
+   318→        rows = await conn.fetch(
+   319→            """
+   320→            SELECT id, chunk_text as content
+   321→            FROM knowledge_chunks
+   322→            WHERE skill_id = $1
+   323→            AND chunk_type IN ('case', 'theory', 'rule')
+   324→            LIMIT $2
+   325→            """,
+   326→            skill_id,
+   327→            limit,
+   328→        )
+   329→        chunks = [dict(row) for row in rows]
+   330→
+   331→    if not chunks:
+   332→        logger.info(f"No chunks found for skill: {skill_id}")
+   333→        return
+   334→
+   335→    extractor = CaseExtractor()
+   336→    cases = await extractor.extract_from_chunks(chunks, skill_id)
+   337→    saved = await extractor.save_cases(cases)
+   338→
+   339→    print(f"Extracted {len(cases)} cases, saved {saved} to database")
+   340→
+   341→
+   342→if __name__ == "__main__":
+   343→    import sys
+   344→    skill = sys.argv[1] if len(sys.argv) > 1 else "bazi"
+   345→    asyncio.run(extract_cases_cli(skill))
+   346→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

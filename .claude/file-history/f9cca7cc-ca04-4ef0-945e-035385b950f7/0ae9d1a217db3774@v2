@@ -1,0 +1,363 @@
+"""
+Vibe 同步执行器 - v11
+
+配置驱动的 Skill → Vibe 同步
+
+职责：
+1. 加载 vibe_sync.yaml 配置
+2. 根据配置执行字段映射
+3. 处理特殊逻辑（archetype、traits transform）
+
+文档：docs/archive/v9/LLM_DRIVEN_ARCHITECTURE.md#15
+"""
+import yaml
+import logging
+from typing import Dict, Any, Optional, List
+from pathlib import Path
+from uuid import UUID
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+# 配置缓存
+_sync_config: Optional[Dict] = None
+
+
+def load_sync_config() -> Dict[str, Any]:
+    """加载 Vibe 同步配置（带缓存）"""
+    global _sync_config
+    if _sync_config is None:
+        config_path = Path(__file__).parent.parent.parent / "config" / "vibe_sync.yaml"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                _sync_config = yaml.safe_load(f)
+                logger.info(f"[VibeSyncLoaded from {config_path}")
+        except Exception as e:
+            logger.error(f"[VibeSync] Failed to load config: {e}")
+            _sync_config = {}
+    return _sync_config
+
+
+def reload_sync_config() -> None:
+    """重新加载配置（清除缓存）"""
+    global _sync_config
+    _sync_config = None
+    load_sync_config()
+    logger.info("[VibeSync] Config reloaded")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════
+
+
+def get_nested_value(data: Dict, path: str) -> Any:
+    """
+    从嵌套字典中获取值，支持点号路径
+
+    Example:
+        get_nested_value({"a": {"b": 1}}, "a.b") → 1
+    """
+    if not data or not path:
+        return None
+
+    keys = path.split(".")
+    value = data
+    for key in keys:
+        if isinstance(value, dict):
+            value = value.get(key)
+        else:
+            return None
+    return value
+
+
+def set_nested_value(data: Dict, path: str, value: Any) -> None:
+    """
+    设置嵌套字典的值，支持点号路径
+
+    Example:
+        data = {}
+        set_nested_value(data, "a.b.c", 1)
+        → {"a": {"b": {"c": 1}}}
+    """
+    if not path:
+        return
+
+    keys = path.split(".")
+    current = data
+    for key in keys[:-1]:
+        current = current.setdefault(key, {})
+    current[keys[-1]] = value
+
+
+# ═══════════════════════════════════════════════════════════════
+# Transform 函数
+# ═══════════════════════════════════════════════════════════════
+
+
+def transform_element_to_archetype(element: str, config: Dict) -> Dict[str, Any]:
+    """五行元素 → 人格原型"""
+    if not element:
+        return {}
+
+    mapping = config.get("mapping", {})
+    element_lower = element.lower()
+
+    if element_lower in mapping:
+        arch = mapping[element_lower]
+        return {
+            "primary": arch.get("primary"),
+            "source": "bazi",
+            "element": element_lower,
+        }
+    return {}
+
+
+def transform_sign_to_archetype(sign: str, config: Dict) -> Dict[str, Any]:
+    """星座 → 人格原型"""
+    if not sign:
+        return {}
+
+    mapping = config.get("mapping", {})
+    sign_lower = sign.lower()
+
+    if sign_lower in mapping:
+        arch = mapping[sign_lower]
+        return {
+            "primary": arch.get("primary"),
+            "source": "zodiac",
+            "sign": sign_lower,
+        }
+    return {}
+
+
+def extract_bazi_traits(day_master: Dict, config: Dict) -> List[Dict[str, Any]]:
+    """从八字日主提取特质"""
+    if not day_master:
+        return []
+
+    element = day_master.get("element", "").lower()
+    mapping = config.get("mapping", {})
+    intensity = config.get("intensity", 0.8)
+
+    if element in mapping:
+        traits = mapping[element].get("traits", [])
+        return [
+            {"trait": t, "intensity": intensity, "source": "bazi"}
+            for t in traits
+        ]
+    return []
+
+
+def extract_zodiac_traits(sun_sign: str, config: Dict) -> List[Dict[str, Any]]:
+    """从星座提取特质"""
+    if not sun_sign:
+        return []
+
+    sign_lower = sun_sign.lower()
+    mapping = config.get("mapping", {})
+    intensity = config.get("intensity", 0.7)
+
+    if sign_lower in mapping:
+        traits = mapping[sign_lower].get("traits", [])[:2]  # 取前两个
+        return [
+            {"trait": t, "intensity": intensity, "source": "zodiac"}
+            for t in traits
+        ]
+    return []
+
+
+def extract_first_goal_id(rocks: List[Dict]) -> Optional[str]:
+    """从列表中提取第一个 goal_id"""
+    if not rocks or not isinstance(rocks, list):
+        return None
+    first = rocks[0] if rocks else {}
+    return first.get("goal_id")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 主同步函数
+# ═══════════════════════════════════════════════════════════════
+
+
+async def sync_skill_to_vibe(
+    user_id: UUID,
+    skill_id: str,
+    skill_data: Dict[str, Any]
+) -> bool:
+    """
+    配置驱动的 Skill → Vibe 同步
+
+    Args:
+        user_id: 用户 ID
+        skill_id: Skill ID (bazi, zodiac, lifecoach, etc.)
+        skill_data: Skill 数据（刚保存的完整数据）
+
+    Returns:
+        bool: 是否执行了同步
+    """
+    config = load_sync_config()
+    if not config:
+        logger.warning("[VibeSync] No config loaded, skipping sync")
+        return False
+
+    synced = False
+
+    # 同步到 insight
+    insight_config = config.get("insight", {})
+    insight_updates = await _sync_to_insight(skill_id, skill_data, insight_config)
+    if insight_updates:
+        await _update_vibe_insight(user_id, insight_updates)
+        synced = True
+        logger.info(f"[VibeSync] Synced {skill_id} → vibe.insight for user {user_id}")
+
+    # 同步到 target
+    target_config = config.get("target", {})
+    target_updates = await _sync_to_target(skill_id, skill_data, target_config)
+    if target_updates:
+        await _update_vibe_target(user_id, target_updates)
+        synced = True
+        logger.info(f"[VibeSync] Synced {skill_id} → vibe.target for user {user_id}")
+
+    return synced
+
+
+async def _sync_to_insight(
+    skill_id: str,
+    skill_data: Dict,
+    insight_config: Dict
+) -> Dict[str, Any]:
+    """同步到 vibe.insight"""
+    updates = {}
+
+    # === Archetype 同步 ===
+    archetype_config = insight_config.get("essence", {}).get("archetype", {})
+    sources = archetype_config.get("sources", [])
+
+    for source in sources:
+        if source.get("skill") != skill_id:
+            continue
+
+        trigger_path = source.get("trigger")
+        trigger_value = get_nested_value(skill_data, trigger_path)
+        if not trigger_value:
+            continue
+
+        transform = source.get("transform")
+        if transform == "element_to_archetype":
+            # 从 day_master.element 获取元素
+            element = trigger_value.get("element") if isinstance(trigger_value, dict) else trigger_value
+            arch = transform_element_to_archetype(element, source)
+            if arch:
+                set_nested_value(updates, "essence.archetype", arch)
+                # 同时提取 traits
+                traits = extract_bazi_traits(trigger_value, source)
+                if traits:
+                    set_nested_value(updates, "essence.traits", traits)
+        elif transform == "sign_to_archetype":
+            arch = transform_sign_to_archetype(trigger_value, source)
+            if arch:
+                set_nested_value(updates, "essence.archetype", arch)
+                # 同时提取 traits
+                traits = extract_zodiac_traits(trigger_value, source)
+                if traits:
+                    existing_traits = get_nested_value(updates, "essence.traits") or []
+                    set_nested_value(updates, "essence.traits", existing_traits + traits)
+        elif transform == "direct":
+            path = source.get("path")
+            value = get_nested_value(skill_data, path)
+            if value:
+                set_nested_value(updates, "essence.archetype", value)
+
+    # === Chart Features 同步 ===
+    chart_features_config = insight_config.get("essence", {}).get("chart_features", {})
+    skill_chart_config = chart_features_config.get(skill_id, {})
+
+    if skill_chart_config:
+        trigger = skill_chart_config.get("trigger")
+        if get_nested_value(skill_data, trigger):
+            fields = skill_chart_config.get("fields", [])
+            for field in fields:
+                source_path = field.get("source")
+                dest_path = field.get("dest")
+                value = get_nested_value(skill_data, source_path)
+                if value is not None:
+                    set_nested_value(updates, f"essence.chart_features.{dest_path}", value)
+
+    return updates
+
+
+async def _sync_to_target(
+    skill_id: str,
+    skill_data: Dict,
+    target_config: Dict
+) -> Dict[str, Any]:
+    """同步到 vibe.target"""
+    updates = {}
+
+    for section, section_config in target_config.items():
+        if section_config.get("skill") != skill_id:
+            continue
+
+        trigger = section_config.get("trigger")
+        if not get_nested_value(skill_data, trigger):
+            continue
+
+        fields = section_config.get("fields", [])
+        for field in fields:
+            source_path = field.get("source")
+            dest_path = field.get("dest")
+            transform = field.get("transform", "direct")
+
+            value = get_nested_value(skill_data, source_path)
+            if value is None:
+                continue
+
+            # 应用 transform
+            if transform == "extract_first_goal_id":
+                value = extract_first_goal_id(value)
+            # direct: 不转换
+
+            if value is not None:
+                set_nested_value(updates, f"{section}.{dest_path}" if dest_path != section else section, value)
+
+    return updates
+
+
+async def _update_vibe_insight(user_id: UUID, updates: Dict) -> None:
+    """更新 vibe.insight（深度合并）"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    current_insight = await UnifiedProfileRepository.get_vibe_insight(user_id)
+    current_insight = current_insight or {}
+
+    # 深度合并
+    merged = _deep_merge(current_insight, updates)
+    merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    await UnifiedProfileRepository.update_vibe_insight(user_id, merged)
+
+
+async def _update_vibe_target(user_id: UUID, updates: Dict) -> None:
+    """更新 vibe.target（深度合并）"""
+    from stores.unified_profile_repo import UnifiedProfileRepository
+
+    current_target = await UnifiedProfileRepository.get_vibe_target(user_id)
+    current_target = current_target or {}
+
+    # 深度合并
+    merged = _deep_merge(current_target, updates)
+    merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    await UnifiedProfileRepository.update_vibe_target(user_id, merged)
+
+
+def _deep_merge(base: Dict, update: Dict) -> Dict:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result

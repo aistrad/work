@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+Goal-Anchored History 测试脚本
+
+测试场景：
+1. 基础功能：第一条消息 + 最近 N 条
+2. 短对话：消息数 < limit 时的行为
+3. 长对话：50+ 条消息后，第一条仍在
+4. 去重：第一条消息在最近 N 条中时不重复
+5. 空会话：无消息时返回空列表
+
+运行方式：
+    cd apps/api
+    python scripts/test_goal_anchored_history.py
+"""
+import asyncio
+import sys
+import os
+from uuid import uuid4
+from datetime import datetime, timedelta
+
+# 添加项目路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 加载 .env（真实数据库配置）
+from pathlib import Path
+env_file = Path(__file__).parent.parent.parent.parent / ".env"
+if env_file.exists():
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+# 强制使用真实数据库进行测试
+os.environ["VIBELIFE_ENV"] = "test"
+os.environ["VIBELIFE_TEST_DB_URL"] = os.environ.get("VIBELIFE_DB_URL", "")
+
+
+class TestResult:
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.errors = []
+
+    def add_pass(self, name: str):
+        self.passed += 1
+        print(f"  ✅ {name}")
+
+    def add_fail(self, name: str, expected, actual):
+        self.failed += 1
+        self.errors.append((name, expected, actual))
+        print(f"  ❌ {name}")
+        print(f"     Expected: {expected}")
+        print(f"     Actual:   {actual}")
+
+    def summary(self):
+        total = self.passed + self.failed
+        print(f"\n{'='*60}")
+        print(f"测试结果: {self.passed}/{total} 通过")
+        if self.errors:
+            print(f"\n失败的测试:")
+            for name, expected, actual in self.errors:
+                print(f"  - {name}")
+        print(f"{'='*60}")
+        return self.failed == 0
+
+
+async def create_test_conversation(conv_id):
+    """创建测试用的 conversation 记录"""
+    from stores import conversation_repo
+    await conversation_repo.create_conversation(
+        skill="core",  # 使用有效的 skill 值
+        user_id=None,
+        conversation_id=conv_id
+    )
+
+
+async def delete_test_conversation(conv_id):
+    """删除测试用的 conversation 记录"""
+    from stores.db import execute
+    await execute("DELETE FROM conversations WHERE id = $1", conv_id)
+
+
+async def test_basic_functionality():
+    """测试 1: 基础功能 - 第一条 + 最近 N 条"""
+    print("\n📋 测试 1: 基础功能")
+    result = TestResult()
+
+    from stores import message_repo
+    from stores.db import init_db
+
+    await init_db()
+
+    # 创建测试会话
+    conv_id = uuid4()
+
+    try:
+        # 先创建 conversation 记录（外键约束）
+        await create_test_conversation(conv_id)
+
+        # 创建 20 条消息
+        for i in range(20):
+            role = "user" if i % 2 == 0 else "assistant"
+            content = f"Message {i+1}: {'用户' if role == 'user' else '助手'}消息"
+            if i == 0:
+                content = "我想做人生规划，帮我设定一个北极星目标"  # 第一条是原始意图
+            await message_repo.create_message(conv_id, role, content)
+
+        # 测试 get_messages_anchored
+        messages = await message_repo.get_messages_anchored(conv_id, limit=5)
+
+        # 验证：应该有 6 条（第一条 + 最近 5 条）
+        if len(messages) == 6:
+            result.add_pass("消息数量正确 (6条)")
+        else:
+            result.add_fail("消息数量", 6, len(messages))
+
+        # 验证：第一条是原始意图
+        if "北极星" in messages[0]["content"]:
+            result.add_pass("第一条消息是原始意图")
+        else:
+            result.add_fail("第一条消息内容", "包含'北极星'", messages[0]["content"][:50])
+
+        # 验证：最后一条是最新消息
+        if "Message 20" in messages[-1]["content"]:
+            result.add_pass("最后一条是最新消息")
+        else:
+            result.add_fail("最后一条消息", "Message 20", messages[-1]["content"][:50])
+
+    finally:
+        # 清理测试数据
+        await message_repo.delete_conversation_messages(conv_id)
+        await delete_test_conversation(conv_id)
+
+    return result
+
+
+async def test_short_conversation():
+    """测试 2: 短对话 - 消息数 < limit"""
+    print("\n📋 测试 2: 短对话 (消息数 < limit)")
+    result = TestResult()
+
+    from stores import message_repo
+
+    conv_id = uuid4()
+
+    try:
+        # 先创建 conversation 记录
+        await create_test_conversation(conv_id)
+
+        # 只创建 3 条消息
+        await message_repo.create_message(conv_id, "user", "第一条：我的目标是什么")
+        await message_repo.create_message(conv_id, "assistant", "第二条：让我帮你分析")
+        await message_repo.create_message(conv_id, "user", "第三条：好的")
+
+        # 请求 limit=10
+        messages = await message_repo.get_messages_anchored(conv_id, limit=10)
+
+        # 验证：应该只有 3 条（不会重复）
+        if len(messages) == 3:
+            result.add_pass("短对话消息数正确 (3条)")
+        else:
+            result.add_fail("短对话消息数", 3, len(messages))
+
+        # 验证：顺序正确
+        if messages[0]["content"].startswith("第一条"):
+            result.add_pass("顺序正确")
+        else:
+            result.add_fail("消息顺序", "第一条开头", messages[0]["content"][:20])
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        await delete_test_conversation(conv_id)
+
+    return result
+
+
+async def test_deduplication():
+    """测试 3: 去重 - 第一条在最近 N 条中时不重复"""
+    print("\n📋 测试 3: 去重逻辑")
+    result = TestResult()
+
+    from stores import message_repo
+
+    conv_id = uuid4()
+
+    try:
+        # 先创建 conversation 记录
+        await create_test_conversation(conv_id)
+
+        # 创建 5 条消息，limit=10（第一条会在最近 10 条中）
+        for i in range(5):
+            await message_repo.create_message(conv_id, "user", f"消息 {i+1}")
+
+        messages = await message_repo.get_messages_anchored(conv_id, limit=10)
+
+        # 验证：应该只有 5 条（第一条不重复）
+        if len(messages) == 5:
+            result.add_pass("去重正确 (5条)")
+        else:
+            result.add_fail("去重后消息数", 5, len(messages))
+
+        # 验证：没有重复的消息
+        contents = [m["content"] for m in messages]
+        if len(contents) == len(set(contents)):
+            result.add_pass("无重复消息")
+        else:
+            result.add_fail("重复检查", "无重复", f"有重复: {contents}")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        await delete_test_conversation(conv_id)
+
+    return result
+
+
+async def test_empty_conversation():
+    """测试 4: 空会话"""
+    print("\n📋 测试 4: 空会话")
+    result = TestResult()
+
+    from stores import message_repo
+
+    conv_id = uuid4()  # 不存在的会话
+
+    messages = await message_repo.get_messages_anchored(conv_id, limit=10)
+
+    if len(messages) == 0:
+        result.add_pass("空会话返回空列表")
+    else:
+        result.add_fail("空会话结果", "[]", messages)
+
+    return result
+
+
+async def test_long_conversation_goal_retention():
+    """测试 5: 长对话目标保持 - 50+ 条消息后第一条仍在"""
+    print("\n📋 测试 5: 长对话目标保持 (50+ 条消息)")
+    result = TestResult()
+
+    from stores import message_repo
+
+    conv_id = uuid4()
+
+    try:
+        # 先创建 conversation 记录
+        await create_test_conversation(conv_id)
+
+        # 创建 60 条消息
+        original_goal = "我想成为独立开发者，实现财务自由和时间自由"
+        await message_repo.create_message(conv_id, "user", original_goal)
+
+        for i in range(59):
+            role = "assistant" if i % 2 == 0 else "user"
+            content = f"对话 {i+2}: {'分析中...' if role == 'assistant' else '继续'}"
+            await message_repo.create_message(conv_id, role, content)
+
+        # 请求 limit=14（共 15 条）
+        messages = await message_repo.get_messages_anchored(conv_id, limit=14)
+
+        # 验证：应该有 15 条
+        if len(messages) == 15:
+            result.add_pass("长对话消息数正确 (15条)")
+        else:
+            result.add_fail("长对话消息数", 15, len(messages))
+
+        # 验证：第一条是原始目标
+        if "独立开发者" in messages[0]["content"]:
+            result.add_pass("原始目标保留 ✨")
+        else:
+            result.add_fail("原始目标", "包含'独立开发者'", messages[0]["content"][:50])
+
+        # 验证：最后一条是最新的
+        if "对话 60" in messages[-1]["content"]:
+            result.add_pass("最新消息正确")
+        else:
+            result.add_fail("最新消息", "对话 60", messages[-1]["content"][:50])
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        await delete_test_conversation(conv_id)
+
+    return result
+
+
+async def test_chat_v5_integration():
+    """测试 6: Chat V5 路由集成"""
+    print("\n📋 测试 6: Chat V5 路由集成")
+    result = TestResult()
+
+    from stores import message_repo
+    from routes.chat_v5 import get_conversation_history
+
+    conv_id = uuid4()
+
+    try:
+        # 先创建 conversation 记录
+        await create_test_conversation(conv_id)
+
+        # 创建 30 条消息
+        await message_repo.create_message(conv_id, "user", "帮我算八字，我想知道今年运势")
+        for i in range(29):
+            role = "assistant" if i % 2 == 0 else "user"
+            await message_repo.create_message(conv_id, role, f"消息 {i+2}")
+
+        # Phase 1 (skill=None): 应该是 5 条
+        history_p1 = await get_conversation_history(conv_id, skill=None)
+        if len(history_p1) == 5:
+            result.add_pass("Phase 1: 5 条消息")
+        else:
+            result.add_fail("Phase 1 消息数", 5, len(history_p1))
+
+        # Phase 2 (skill='bazi'): 应该是 15 条
+        history_p2 = await get_conversation_history(conv_id, skill="bazi")
+        if len(history_p2) == 15:
+            result.add_pass("Phase 2: 15 条消息")
+        else:
+            result.add_fail("Phase 2 消息数", 15, len(history_p2))
+
+        # 验证两个 Phase 的第一条都是原始意图
+        if "八字" in history_p1[0]["content"] and "八字" in history_p2[0]["content"]:
+            result.add_pass("两个 Phase 都保留原始意图")
+        else:
+            result.add_fail("原始意图保留", "包含'八字'",
+                          f"P1: {history_p1[0]['content'][:30]}, P2: {history_p2[0]['content'][:30]}")
+
+    finally:
+        await message_repo.delete_conversation_messages(conv_id)
+        await delete_test_conversation(conv_id)
+
+    return result
+
+
+async def main():
+    print("=" * 60)
+    print("Goal-Anchored History 测试")
+    print("借鉴 Planning-with-Files 的 Attention Manipulation 原则")
+    print("=" * 60)
+
+    all_passed = True
+    total_passed = 0
+    total_failed = 0
+
+    tests = [
+        test_basic_functionality,
+        test_short_conversation,
+        test_deduplication,
+        test_empty_conversation,
+        test_long_conversation_goal_retention,
+        test_chat_v5_integration,
+    ]
+
+    for test in tests:
+        try:
+            result = await test()
+            total_passed += result.passed
+            total_failed += result.failed
+            if result.failed > 0:
+                all_passed = False
+        except Exception as e:
+            print(f"  💥 测试异常: {e}")
+            import traceback
+            traceback.print_exc()
+            all_passed = False
+            total_failed += 1
+
+    print("\n" + "=" * 60)
+    print(f"总计: {total_passed} 通过, {total_failed} 失败")
+    print("=" * 60)
+
+    if all_passed:
+        print("\n🎉 所有测试通过！Goal-Anchored History 工作正常。")
+    else:
+        print("\n⚠️  部分测试失败，请检查上面的错误信息。")
+
+    return all_passed
+
+
+if __name__ == "__main__":
+    success = asyncio.run(main())
+    sys.exit(0 if success else 1)

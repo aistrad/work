@@ -1,0 +1,573 @@
+     1→/**
+     2→ * Next.js API Route for Chat - AI SDK 6 UI Message Stream
+     3→ *
+     4→ * Proxies to Python backend and converts SSE events into AI SDK v6 UIMessageChunk format.
+     5→ *
+     6→ * Supported backend event types:
+     7→ * - chunk: Text content chunks (streaming)
+     8→ * - done: Conversation complete with metadata
+     9→ * - error: Error messages
+    10→ * - tool_call: Tool invocation requests (for Generative UI)
+    11→ * - tool_result: Tool execution results (for Generative UI)
+    12→ */
+    13→
+    14→import { NextRequest, NextResponse } from 'next/server';
+    15→import { createUIMessageStreamResponse, type UIMessageChunk } from 'ai';
+    16→
+    17→// 服务端使用内部地址直接访问后端 API
+    18→// VIBELIFE_API_INTERNAL 是服务端环境变量（非 NEXT_PUBLIC_）
+    19→const API_BASE = process.env.VIBELIFE_API_INTERNAL
+    20→  ? `${process.env.VIBELIFE_API_INTERNAL}/api/v1`
+    21→  : "http://127.0.0.1:8000/api/v1";
+    22→
+    23→export const runtime = 'edge';
+    24→
+    25→type JsonObject = Record<string, unknown>;
+    26→
+    27→function isRecord(value: unknown): value is JsonObject {
+    28→  return typeof value === 'object' && value !== null && !Array.isArray(value);
+    29→}
+    30→
+    31→function getString(value: unknown): string | undefined {
+    32→  return typeof value === 'string' && value.trim() ? value : undefined;
+    33→}
+    34→
+    35→function getNumber(value: unknown): number | undefined {
+    36→  if (typeof value === 'number' && Number.isFinite(value)) return value;
+    37→  if (typeof value === 'string') {
+    38→    const parsed = Number(value);
+    39→    return Number.isFinite(parsed) ? parsed : undefined;
+    40→  }
+    41→  return undefined;
+    42→}
+    43→
+    44→function isUuid(value: string): boolean {
+    45→  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    46→}
+    47→
+    48→function buildDefaultProfile(skill: string): JsonObject {
+    49→  const nowYear = new Date().getFullYear();
+    50→  return {
+    51→    basic: {
+    52→      birth_year: 1990,
+    53→      day_master_element: "wood",
+    54→      gender: "unknown",
+    55→      zodiac: skill === 'zodiac' ? 'Leo' : undefined,
+    56→      current_year: nowYear,
+    57→    },
+    58→    life_context: {},
+    59→  };
+    60→}
+    61→
+    62→async function fetchJson(url: string, init?: RequestInit) {
+    63→  const res = await fetch(url, init);
+    64→  const text = await res.text();
+    65→  if (!text) return { ok: res.ok, status: res.status, json: null as unknown };
+    66→  try {
+    67→    return { ok: res.ok, status: res.status, json: JSON.parse(text) as unknown };
+    68→  } catch {
+    69→    return { ok: res.ok, status: res.status, json: { raw: text } as unknown };
+    70→  }
+    71→}
+    72→
+    73→async function executeToolCall(options: {
+    74→  toolName: string;
+    75→  args: JsonObject;
+    76→  skill: string;
+    77→  voiceMode: string;
+    78→  authHeader: string | null;
+    79→  fallbackUserId: string;
+    80→}) {
+    81→  const { toolName, args, skill, voiceMode, authHeader, fallbackUserId } = options;
+    82→  const headers = {
+    83→    'Content-Type': 'application/json',
+    84→    ...(authHeader ? { Authorization: authHeader } : {}),
+    85→  };
+    86→
+    87→  const rawUserId =
+    88→    getString(args.userId) ||
+    89→    getString(args.user_id) ||
+    90→    getString(args.userID) ||
+    91→    fallbackUserId;
+    92→
+    93→  const userId = isUuid(rawUserId) ? rawUserId : fallbackUserId;
+    94→
+    95→  const profile = (isRecord(args.profile) ? args.profile : buildDefaultProfile(skill)) as JsonObject;
+    96→
+    97→  switch (toolName) {
+    98→    case 'show_bazi_kline': {
+    99→      const startYear = getNumber(args.startYear) ?? getNumber(args.start_year);
+   100→      const endYear = getNumber(args.endYear) ?? getNumber(args.end_year);
+   101→
+   102→      const { ok, json } = await fetchJson(`${API_BASE}/fortune/kline`, {
+   103→        method: 'POST',
+   104→        headers,
+   105→        body: JSON.stringify({
+   106→          user_id: userId,
+   107→          profile,
+   108→          ...(startYear ? { start_year: startYear } : {}),
+   109→          ...(endYear ? { end_year: endYear } : {}),
+   110→        }),
+   111→      });
+   112→
+   113→      if (!ok || !isRecord(json) || json.success !== true || !isRecord(json.data)) {
+   114→        const errorText = isRecord(json) ? getString(json.error) : undefined;
+   115→        throw new Error(errorText || 'K线数据获取失败');
+   116→      }
+   117→
+   118→      return json.data;
+   119→    }
+   120→
+   121→    case 'show_bazi_fortune': {
+   122→      const basic = isRecord(profile.basic) ? profile.basic : {};
+   123→      const birthYear = getNumber(basic.birth_year) ?? 1990;
+   124→      const dayMasterElement = getString(basic.day_master_element) ?? 'wood';
+   125→      const gender = getString(basic.gender) ?? 'unknown';
+   126→      const year = getNumber(args.year) ?? new Date().getFullYear();
+   127→
+   128→      const cyclesUrl = new URL(`${API_BASE}/fortune/cycles`);
+   129→      cyclesUrl.searchParams.set('birth_year', String(birthYear));
+   130→      cyclesUrl.searchParams.set('day_master_element', dayMasterElement);
+   131→      cyclesUrl.searchParams.set('gender', gender);
+   132→
+   133→      const cyclesRes = await fetchJson(cyclesUrl.toString(), { headers });
+   134→      const annualRes = await fetchJson(
+   135→        `${API_BASE}/fortune/annual/${year}?day_master_element=${encodeURIComponent(dayMasterElement)}`,
+   136→        { headers }
+   137→      );
+   138→
+   139→      const cycles =
+   140→        isRecord(cyclesRes.json) && cyclesRes.json.success === true && Array.isArray(cyclesRes.json.cycles)
+   141→          ? cyclesRes.json.cycles
+   142→          : [];
+   143→
+   144→      const annual =
+   145→        isRecord(annualRes.json) && annualRes.json.success === true && isRecord(annualRes.json.fortune)
+   146→          ? annualRes.json.fortune
+   147→          : null;
+   148→
+   149→      return {
+   150→        user_id: userId,
+   151→        profile,
+   152→        year,
+   153→        cycles,
+   154→        annual,
+   155→        voice_mode: voiceMode,
+   156→      };
+   157→    }
+   158→
+   159→    case 'show_report': {
+   160→      const normalizeReport = (report: JsonObject) => ({
+   161→        ...report,
+   162→        ...(report.created_at && !report.createdAt ? { createdAt: report.created_at } : {}),
+   163→        ...(report.is_paid !== undefined && report.isPaid === undefined ? { isPaid: report.is_paid } : {}),
+   164→        ...(report.report_type && !report.reportType ? { reportType: report.report_type } : {}),
+   165→      });
+   166→
+   167→      const reportId = getString(args.reportId) || getString(args.report_id);
+   168→
+   169→      if (reportId) {
+   170→        const { ok, json } = await fetchJson(`${API_BASE}/report/${reportId}`, { headers });
+   171→        if (ok && isRecord(json) && json.success === true) {
+   172→          const report = isRecord(json.report) ? json.report : isRecord(json) ? json : null;
+   173→          if (report) return normalizeReport(report);
+   174→        }
+   175→      }
+   176→
+   177→      // If we have auth, try to list reports using /users/me/profile -> /report/list
+   178→      if (authHeader) {
+   179→        const me = await fetchJson(`${API_BASE}/users/me/profile`, { headers });
+   180→        const meId = isRecord(me.json) ? getString(me.json.user_id) : undefined;
+   181→        if (meId) {
+   182→          const listUrl = new URL(`${API_BASE}/report/list`);
+   183→          listUrl.searchParams.set('user_id', meId);
+   184→          listUrl.searchParams.set('skill', skill);
+   185→          const list = await fetchJson(listUrl.toString(), { headers });
+   186→          const reports =
+   187→            isRecord(list.json) && list.json.success === true && Array.isArray(list.json.reports)
+   188→              ? list.json.reports
+   189→              : [];
+   190→          const first = reports[0];
+   191→          const firstId = isRecord(first) ? getString(first.id) : undefined;
+   192→          if (firstId) {
+   193→            const detail = await fetchJson(`${API_BASE}/report/${encodeURIComponent(firstId)}`, { headers });
+   194→            if (detail.ok && isRecord(detail.json) && detail.json.success === true) {
+   195→              const report = isRecord(detail.json.report) ? detail.json.report : isRecord(detail.json) ? detail.json : null;
+   196→              if (report) return normalizeReport(report);
+   197→            }
+   198→          }
+   199→        }
+   200→      }
+   201→
+   202→      // Fallback demo report
+   203→      return {
+   204→        id: 'demo',
+   205→        title: `${skill === 'zodiac' ? '星盘' : '八字'}报告（演示）`,
+   206→        createdAt: new Date().toISOString().slice(0, 10),
+   207→        prologue: '这是一个演示版报告卡片。完善个人信息后可生成真实报告。',
+   208→        isPaid: false,
+   209→      };
+   210→    }
+   211→
+   212→    case 'show_relationship': {
+   213→      const partnerInfo = isRecord(args.partnerInfo) ? args.partnerInfo : isRecord(args.partner_info) ? args.partner_info : null;
+   214→      const relationshipType =
+   215→        getString(args.relationshipType) || getString(args.relationship_type) || 'general';
+   216→
+   217→      const partnerProfile = partnerInfo
+   218→        ? { basic: partnerInfo, life_context: {} }
+   219→        : { basic: { zodiac: 'taurus' }, life_context: {} };
+   220→
+   221→      const { ok, json } = await fetchJson(`${API_BASE}/relationship/analyze`, {
+   222→        method: 'POST',
+   223→        headers,
+   224→        body: JSON.stringify({
+   225→          user_id: userId,
+   226→          user_profile: profile,
+   227→          partner_info: partnerProfile,
+   228→          relationship_type: relationshipType,
+   229→        }),
+   230→      });
+   231→
+   232→      if (!ok || !isRecord(json) || json.success !== true || !isRecord(json.analysis)) {
+   233→        const errorText = isRecord(json) ? getString(json.error) : undefined;
+   234→        throw new Error(errorText || '关系分析失败');
+   235→      }
+   236→
+   237→      const analysis = json.analysis;
+   238→      const score = getNumber(analysis.overall_score) ?? 85;
+   239→      return { score, ...analysis };
+   240→    }
+   241→
+   242→    case 'request_info': {
+   243→      const infoType = getString(args.infoType) || 'birth';
+   244→      const fields =
+   245→        infoType === 'birth'
+   246→          ? [
+   247→              { id: 'birthDate', label: '出生日期', type: 'date', placeholder: '' },
+   248→              { id: 'birthTime', label: '出生时间', type: 'time', placeholder: '' },
+   249→              { id: 'birthPlace', label: '出生地点', type: 'text', placeholder: '城市名' },
+   250→            ]
+   251→          : infoType === 'context'
+   252→            ? [{ id: 'situation', label: '当前情况', type: 'text', placeholder: '描述你目前面临的情况' }]
+   253→            : infoType === 'goals'
+   254→              ? [{ id: 'goals', label: '你的目标', type: 'text', placeholder: '你想达成什么' }]
+   255→              : [{ id: 'concerns', label: '你的困惑', type: 'text', placeholder: '最困扰你的是什么' }];
+   256→
+   257→      return {
+   258→        infoType,
+   259→        question: getString(args.question),
+   260→        fields,
+   261→      };
+   262→    }
+   263→
+   264→    case 'show_insight': {
+   265→      return {
+   266→        insights: [
+   267→          {
+   268→            id: `ins-${Date.now()}`,
+   269→            title: '关键洞察（演示）',
+   270→            content: '你做决定时更看重长期收益；本周适合把目标拆成更小的行动。',
+   271→          },
+   272→          {
+   273→            id: `ins-${Date.now()}-2`,
+   274→            title: '行动建议（演示）',
+   275→            content: '把「下一步」写成一句话，并在 25 分钟内启动第一小步。',
+   276→          },
+   277→        ],
+   278→      };
+   279→    }
+   280→
+   281→    case 'show_bazi_chart': {
+   282→      return {
+   283→        userId,
+   284→        birthInfo: { date: '1990-05-15', time: '08:00', gender: 'unknown' },
+   285→        fourPillars: {
+   286→          year: { stem: '庚', branch: '午' },
+   287→          month: { stem: '戊', branch: '子' },
+   288→          day: { stem: '甲', branch: '辰' },
+   289→          hour: { stem: '甲', branch: '寅' },
+   290→        },
+   291→        dayMaster: { element: 'wood', stem: '甲', description: '甲木日主，重视成长与原则。' },
+   292→        fiveElements: { wood: 3, fire: 2, earth: 2, metal: 1, water: 2 },
+   293→        tenGods: [],
+   294→        pattern: { name: '正印格', description: '偏向学习与积累。' },
+   295→      };
+   296→    }
+   297→
+   298→    case 'show_zodiac_chart': {
+   299→      return {
+   300→        userId,
+   301→        birthInfo: { date: '1990-05-15', time: '08:00', place: 'Shanghai' },
+   302→        sunSign: '金牛座',
+   303→        moonSign: '巨蟹座',
+   304→        risingSign: '处女座',
+   305→        planets: [
+   306→          { planet: 'Sun', sign: '金牛座', degree: 12, house: 9 },
+   307→          { planet: 'Moon', sign: '巨蟹座', degree: 3, house: 11 },
+   308→          { planet: 'Mercury', sign: '金牛座', degree: 25, house: 9 },
+   309→          { planet: 'Venus', sign: '双子座', degree: 5, house: 10 },
+   310→          { planet: 'Mars', sign: '狮子座', degree: 18, house: 12, retrograde: false },
+   311→        ],
+   312→        aspects: [],
+   313→        dominantElement: '土',
+   314→        dominantModality: '固定',
+   315→      };
+   316→    }
+   317→
+   318→    case 'show_zodiac_transit': {
+   319→      const date = getString(args.date) || new Date().toISOString().slice(0, 10);
+   320→      return {
+   321→        date,
+   322→        transits: [
+   323→          {
+   324→            planet: 'Mercury',
+   325→            sign: '摩羯座',
+   326→            aspect: '合相',
+   327→            natalPlanet: 'Sun',
+   328→            influence: 'neutral',
+   329→            description: '适合复盘与校对细节，沟通更重逻辑。',
+   330→            startDate: date,
+   331→            endDate: date,
+   332→            isActive: true,
+   333→          },
+   334→        ],
+   335→        majorEvents: [],
+   336→        overallEnergy: '稳中求进，适合做计划与结构化整理。',
+   337→        advice: '把复杂问题拆成 3 个可执行步骤，先完成最容易的一步。',
+   338→      };
+   339→    }
+   340→
+   341→    case 'show_zodiac_synastry': {
+   342→      return {
+   343→        person1: { name: '你', sunSign: '金牛座' },
+   344→        person2: { name: 'TA', sunSign: '狮子座' },
+   345→        overallScore: 82,
+   346→        categories: [
+   347→          { name: '沟通', score: 78, description: '表达方式不同但可互补。' },
+   348→          { name: '价值观', score: 84, description: '目标一致，节奏需协调。' },
+   349→          { name: '情绪', score: 80, description: '需要更多安全感的表达。' },
+   350→        ],
+   351→        strengths: ['踏实可靠', '愿意长期投入'],
+   352→        challenges: ['固执时容易僵持', '情绪表达风格不同'],
+   353→        advice: '明确边界与期待，用具体行动替代猜测。',
+   354→      };
+   355→    }
+   356→
+   357→    default: {
+   358→      return { ok: true, tool: toolName, args };
+   359→    }
+   360→  }
+   361→}
+   362→
+   363→export async function POST(req: NextRequest) {
+   364→  const body = await req.json();
+   365→  const { messages, skill, voice_mode, conversation_id } = body;
+   366→
+   367→  // Extract the latest user message
+   368→  const lastMessage = messages?.[messages.length - 1];
+   369→  const userMessage = typeof lastMessage === 'string'
+   370→    ? lastMessage
+   371→    : lastMessage?.content || lastMessage?.parts?.[0]?.text || body.message || '';
+   372→
+   373→  // Get auth token from header
+   374→  const authHeader = req.headers.get('authorization');
+   375→  const fallbackUserId = crypto.randomUUID();
+   376→
+   377→  // Prepare request to Python backend
+   378→  const chatRequest = {
+   379→    message: userMessage,
+   380→    skill: skill || 'bazi',
+   381→    voice_mode: voice_mode || 'warm',
+   382→    conversation_id: conversation_id,
+   383→  };
+   384→
+   385→  try {
+   386→    // Call Python backend SSE endpoint
+   387→    const response = await fetch(`${API_BASE}/chat/stream`, {
+   388→      method: 'POST',
+   389→      headers: {
+   390→        'Content-Type': 'application/json',
+   391→        ...(authHeader && { Authorization: authHeader }),
+   392→      },
+   393→      body: JSON.stringify(chatRequest),
+   394→      signal: req.signal,
+   395→    });
+   396→
+   397→    if (!response.ok || !response.body) {
+   398→      const errorText = await response.text().catch(() => 'Chat failed');
+   399→      const errorStream = new ReadableStream<UIMessageChunk>({
+   400→        start(controller) {
+   401→          controller.enqueue({ type: 'error', errorText: errorText || 'Chat failed' });
+   402→          controller.close();
+   403→        },
+   404→      });
+   405→      return createUIMessageStreamResponse({ stream: errorStream, status: response.status });
+   406→    }
+   407→
+   408→    const textPartId = `text-${Date.now()}`;
+   409→    const assistantMessageId = `msg-${Date.now()}`;
+   410→
+   411→    const stream = new ReadableStream<UIMessageChunk>({
+   412→      async start(controller) {
+   413→        const reader = response.body?.getReader();
+   414→        const decoder = new TextDecoder();
+   415→
+   416→        if (!reader) {
+   417→          controller.close();
+   418→          return;
+   419→        }
+   420→
+   421→        let buffer = '';
+   422→        let textStarted = false;
+   423→        let finished = false;
+   424→        let shouldStop = false;
+   425→        let currentTextPartId = textPartId;
+   426→
+   427→        // Initialize message + text part early so UI can stream instantly.
+   428→        controller.enqueue({ type: 'start', messageId: assistantMessageId });
+   429→        controller.enqueue({ type: 'text-start', id: currentTextPartId });
+   430→        textStarted = true;
+   431→
+   432→        try {
+   433→          while (true) {
+   434→            const { done, value } = await reader.read();
+   435→            if (done) break;
+   436→
+   437→            buffer += decoder.decode(value, { stream: true });
+   438→            const lines = buffer.split('\n');
+   439→            buffer = lines.pop() || '';
+   440→
+   441→            for (const line of lines) {
+   442→              if (line.startsWith('data: ')) {
+   443→                const dataStr = line.slice(6).trim();
+   444→                if (!dataStr) continue;
+   445→
+   446→                try {
+   447→                  const data = JSON.parse(dataStr);
+   448→
+   449→                  if (data.type === 'chunk') {
+   450→                    controller.enqueue({
+   451→                      type: 'text-delta',
+   452→                      id: currentTextPartId,
+   453→                      delta: String(data.content ?? ''),
+   454→                    });
+   455→                  } else if (data.type === 'tool_call') {
+   456→                    // AI SDK 6: Tool call event from backend
+   457→                    // Format: { type: 'tool_call', tool_name: string, tool_call_id: string, args: object }
+   458→                    if (textStarted) {
+   459→                      controller.enqueue({ type: 'text-end', id: currentTextPartId });
+   460→                      textStarted = false;
+   461→                    }
+   462→                    // Use tool-input-available for tool calls in AI SDK 6
+   463→                    const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
+   464→                    const toolName = String(data.tool_name || '');
+   465→                    const args = isRecord(data.args) ? (data.args as JsonObject) : {};
+   466→                    controller.enqueue({
+   467→                      type: 'tool-input-available',
+   468→                      toolCallId,
+   469→                      toolName,
+   470→                      input: args,
+   471→                    });
+   472→
+   473→                    // Execute tool on the server (Next route) and stream tool output for Generative UI.
+   474→                    try {
+   475→                      const output = await executeToolCall({
+   476→                        toolName,
+   477→                        args,
+   478→                        skill: chatRequest.skill,
+   479→                        voiceMode: chatRequest.voice_mode,
+   480→                        authHeader,
+   481→                        fallbackUserId,
+   482→                      });
+   483→                      controller.enqueue({
+   484→                        type: 'tool-output-available',
+   485→                        toolCallId,
+   486→                        output,
+   487→                      });
+   488→                    } catch (toolError) {
+   489→                      const errorText =
+   490→                        toolError instanceof Error ? toolError.message : 'Tool execution failed';
+   491→                      controller.enqueue({
+   492→                        type: 'tool-output-error',
+   493→                        toolCallId,
+   494→                        errorText,
+   495→                      });
+   496→                    }
+   497→                  } else if (data.type === 'tool_result') {
+   498→                    // AI SDK 6: Tool result event from backend
+   499→                    // Format: { type: 'tool_result', tool_call_id: string, result: any }
+   500→                    // Use tool-output-available for tool results in AI SDK 6
+   501→                    controller.enqueue({
+   502→                      type: 'tool-output-available',
+   503→                      toolCallId: data.tool_call_id,
+   504→                      output: data.result,
+   505→                    });
+   506→                  } else if (data.type === 'done') {
+   507→                    if (textStarted) {
+   508→                      controller.enqueue({ type: 'text-end', id: currentTextPartId });
+   509→                    }
+   510→                    controller.enqueue({
+   511→                      type: 'finish',
+   512→                      finishReason: 'stop',
+   513→                      messageMetadata: {
+   514→                        ...(data.conversation_id ? { conversation_id: data.conversation_id } : {}),
+   515→                        ...(data.skill ? { skill: data.skill } : {}),
+   516→                        ...(data.voice_mode ? { voice_mode: data.voice_mode } : {}),
+   517→                      },
+   518→                    });
+   519→                    finished = true;
+   520→                    shouldStop = true;
+   521→                    break;
+   522→                  } else if (data.type === 'error') {
+   523→                    controller.enqueue({
+   524→                      type: 'error',
+   525→                      errorText: String(data.message ?? 'Chat error'),
+   526→                    });
+   527→                    finished = true;
+   528→                    shouldStop = true;
+   529→                    break;
+   530→                  }
+   531→                } catch {
+   532→                  // Skip malformed JSON
+   533→                }
+   534→              }
+   535→            }
+   536→
+   537→            if (shouldStop) break;
+   538→          }
+   539→
+   540→          // If backend ended without a done marker, close gracefully.
+   541→          if (!finished) {
+   542→            if (textStarted) controller.enqueue({ type: 'text-end', id: currentTextPartId });
+   543→            controller.enqueue({ type: 'finish', finishReason: 'stop' });
+   544→          }
+   545→        } catch (error) {
+   546→          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+   547→          controller.enqueue({ type: 'error', errorText: errorMsg });
+   548→          finished = true;
+   549→        } finally {
+   550→          controller.close();
+   551→        }
+   552→      },
+   553→    });
+   554→
+   555→    return createUIMessageStreamResponse({ stream });
+   556→  } catch (error) {
+   557→    const errorStream = new ReadableStream<UIMessageChunk>({
+   558→      start(controller) {
+   559→        controller.enqueue({
+   560→          type: 'error',
+   561→          errorText: error instanceof Error ? error.message : 'Unknown error',
+   562→        });
+   563→        controller.close();
+   564→      },
+   565→    });
+   566→    return createUIMessageStreamResponse({ stream: errorStream, status: 500 });
+   567→  }
+   568→}
+   569→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,545 @@
+"""
+Chat Routes V5 - Unified chat endpoint with CoreAgent
+Based on: Claude Agent SDK style architecture
+
+Features:
+- Single /chat/stream endpoint
+- CoreAgent with LLM-based skill selection
+- Quota check at entry + usage recording
+- OpenAI compatible SSE format (works with AI SDK 4.x useChat)
+- 分阶段渐进式加载（Phase 1: Skill 选择, Phase 2: Skill 执行）
+- 历史消息从数据库获取（不依赖前端传入）
+- 协议流支持 (REFACTOR_PLAN.md Phase 3)
+
+v2.1 更新 (2026-01-20):
+- 添加协议流支持
+- 协议状态自动恢复
+- 协议进度 SSE 事件
+- 协议步骤自动推进
+
+v2.0 更新 (2026-01-20):
+- 删除前端传入 history 机制，改为数据库查询
+- 分阶段加载：Phase 1 不加载 profile，Phase 2 按需加载
+- use_skill 同轮重载上下文
+"""
+import json
+import logging
+import asyncio
+import time
+import yaml
+from pathlib import Path
+from typing import Optional, Dict
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from services.identity import get_optional_user, CurrentUser
+from services.agent import CoreAgent, AgentContext, QuotaTracker, create_agent, get_adapter, AgentEvent
+from stores.profile_cache import get_cached_profile_with_skill
+from stores import message_repo, conversation_repo
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+router = APIRouter(prefix="/chat/v5", tags=["Chat V5"])
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MessageItem(BaseModel):
+    """Single message in AI SDK format"""
+    role: str
+    content: str
+
+
+class ChatRequestV5(BaseModel):
+    """V5 Chat request - supports both simple and AI SDK format"""
+    message: Optional[str] = Field(None, description="User message (simple format)")
+    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK format, used for user message extraction only)")
+    conversation_id: Optional[UUID] = Field(None, description="Conversation ID")
+    skill: Optional[str] = Field(None, description="Skill ID (bazi/zodiac/career/tarot)")
+    voice_mode: Optional[str] = Field(None, description="Voice mode (warm/sarcastic)")
+
+    def get_user_message(self) -> str:
+        """Extract user message from either format"""
+        if self.message:
+            return self.message
+        if self.messages:
+            # Get the last user message from the array
+            for msg in reversed(self.messages):
+                if msg.role == "user":
+                    return msg.content
+        return ""
+
+    # 注意：get_history() 已删除，历史消息从数据库获取
+
+
+class GuestChatRequestV5(BaseModel):
+    """Guest chat request - supports both simple and AI SDK format"""
+    message: Optional[str] = Field(None, description="User message (simple format)")
+    messages: Optional[list[MessageItem]] = Field(None, description="Messages array (AI SDK format)")
+
+    def get_user_message(self) -> str:
+        """Extract user message from either format"""
+        if self.message:
+            return self.message
+        if self.messages:
+            for msg in reversed(self.messages):
+                if msg.role == "user":
+                    return msg.content
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_user_context(user_id: Optional[UUID], skill: Optional[str] = None) -> tuple:
+    """
+    Get user profile and skill data (分阶段加载)
+
+    Phase 1 (skill=None): 不加载 profile，返回空
+    Phase 2 (skill 有值): 按需加载当前 skill 需要的数据
+    """
+    if not user_id:
+        return {}, {}
+
+    if not skill:
+        # Phase 1: Skill 选择阶段，不需要 profile
+        return {}, {}
+
+    try:
+        # Phase 2: 只加载当前 skill 需要的数据
+        result = await get_cached_profile_with_skill(user_id, skill)
+        return result.get("profile", {}), result.get("skill_data", {})
+    except Exception as e:
+        logger.error(f"Failed to get user context: {e}")
+        return {}, {}
+
+
+async def get_conversation_history(conversation_id: Optional[UUID], skill: Optional[str] = None) -> list:
+    """
+    Get recent conversation history from database (分阶段加载)
+
+    Phase 1 (skill=None): 5 条历史，足够理解意图
+    Phase 2 (skill 有值): 10 条历史，深度分析需要更多上下文
+    """
+    if not conversation_id:
+        return []
+
+    # 根据阶段决定历史条数
+    limit = 5 if not skill else 10
+
+    try:
+        messages = await message_repo.get_messages_for_context(conversation_id, limit)
+        return messages
+    except Exception as e:
+        logger.error(f"Failed to get history: {e}")
+        return []
+
+
+async def ensure_conversation_exists(
+    conversation_id: UUID,
+    user_id: Optional[UUID],
+    skill: Optional[str] = None,
+    voice_mode: Optional[str] = None
+) -> None:
+    """Ensure conversation exists in database, create if not"""
+    try:
+        existing = await conversation_repo.get_conversation(conversation_id)
+        if not existing:
+            await conversation_repo.create_conversation(
+                skill=skill or "core",
+                user_id=user_id,
+                voice_mode=voice_mode or "warm",
+                conversation_id=conversation_id
+            )
+    except Exception as e:
+        logger.warning(f"Failed to ensure conversation: {e}")
+
+
+async def save_message(conversation_id: UUID, role: str, content: str) -> None:
+    """Save message to database"""
+    try:
+        await message_repo.create_message(
+            conversation_id=conversation_id,
+            role=role,
+            content=content
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save message: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Protocol Support - REFACTOR_PLAN.md Phase 3
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_protocol_config(protocol_id: str) -> dict:
+    """加载协议配置"""
+    config_path = Path(__file__).parent.parent / f"skills/lifecoach/protocols/{protocol_id}.yaml"
+    try:
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Failed to load protocol config {protocol_id}: {e}")
+        return {}
+
+
+def build_protocol_prompt(
+    protocol_config: dict,
+    step: int,
+    lifecoach_state: dict
+) -> str:
+    """构建协议驱动的 system prompt"""
+    total_steps = protocol_config.get("total_steps", 6)
+    steps = protocol_config.get("steps", [])
+
+    if step < 1 or step > total_steps:
+        return ""
+
+    step_config = steps[step - 1]  # 0-indexed
+
+    # 构建已收集数据的摘要
+    protocol_data = lifecoach_state.get("protocol", {}).get("data", {})
+    collected_data = "\n".join([
+        f"- 步骤 {k.replace('step_', '')}: {v.get('summary', '已完成')}"
+        for k, v in protocol_data.items()
+        if k.startswith("step_")
+    ])
+
+    prompt = f"""
+## 🎯 协议模式激活
+
+你正在执行 **{protocol_config.get('name', '')}** 协议。
+
+**进度**: 步骤 {step}/{total_steps}
+**阶段**: {step_config.get('phase', '')}
+**当前任务**: {step_config.get('name', '')}
+
+### 已收集的数据
+{collected_data or "尚未收集数据"}
+
+### 本步骤的问题
+{step_config.get('question', '')}
+
+### 回应指导
+{step_config.get('response_prompt', '')}
+
+### 重要原则
+1. **一次只问一个问题**，等用户回答
+2. 用户回答后，调用 `advance_protocol_step` 保存数据
+3. 保存完成后，**自动过渡到下一个问题**
+4. 保持对话自然，不要让用户感觉在填表单
+5. 不要跳出协议流程，除非用户明确要求
+
+---
+"""
+    return prompt
+
+
+async def get_protocol_state(user_id: UUID, skill: str) -> Optional[Dict]:
+    """获取当前协议状态"""
+    if skill != "lifecoach":
+        return None
+
+    try:
+        data = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+        protocol = data.get("protocol", {})
+
+        # 只返回进行中的协议
+        if protocol.get("id") and not protocol.get("completed"):
+            return protocol
+    except Exception as e:
+        logger.error(f"Failed to get protocol state: {e}")
+
+    return None
+
+
+async def emit_protocol_progress_event(
+    protocol_state: dict,
+    protocol_config: dict
+) -> AgentEvent:
+    """生成协议进度 SSE 事件"""
+    step = protocol_state.get("step", 1)
+    total_steps = protocol_config.get("total_steps", 6)
+    steps = protocol_config.get("steps", [])
+
+    step_config = steps[step - 1] if step <= len(steps) else {}
+
+    return AgentEvent(
+        type="protocol_progress",
+        data={
+            "protocol_id": protocol_state["id"],
+            "step": step,
+            "total_steps": total_steps,
+            "phase": step_config.get("phase", ""),
+            "progress": step / total_steps,
+            "step_name": step_config.get("name", ""),
+        }
+    )
+
+
+async def async_generator(items):
+    """辅助函数：将列表转换为异步生成器"""
+    for item in items:
+        yield item
+
+
+# ═════════════════════════════════���═════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/stream")
+async def chat_stream_v5(
+    request: ChatRequestV5,
+    req: Request,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """
+    V5 Chat endpoint with CoreAgent.
+
+    Features:
+    - CoreAgent decides skill via LLM (no keyword matching)
+    - Supports multi-skill fusion
+    - Quota check at entry
+    - Vercel AI SDK compatible SSE
+
+    Test mode:
+    - Add header `X-Test-Tier: paid` to simulate paid user
+    - Add header `X-Test-Tier: free` to simulate free user
+    """
+    user_id = current_user.user_id if current_user else None
+    user_tier = "free"
+
+    # Test mode: allow tier override via header
+    test_tier = req.headers.get("x-test-tier")
+    if test_tier and test_tier in ("free", "paid", "guest"):
+        user_tier = test_tier
+        logger.info(f"Test mode: using tier={test_tier}")
+    elif user_id:
+        from services.entitlement import EntitlementService
+        entitlements = await EntitlementService.get_entitlements(user_id)
+        user_tier = entitlements.get("tier", "free")
+
+    # [A] Entry quota check
+    quota_ok, quota_message = await QuotaTracker.check(
+        user_id=str(user_id) if user_id else "guest",
+        tier=user_tier
+    )
+
+    if not quota_ok:
+        return EventSourceResponse(_quota_exceeded_response(quota_message, user_tier))
+
+    conversation_id = request.conversation_id or uuid4()
+
+    async def generate():
+        try:
+            perf_start = time.time()
+            perf_log = {}
+
+            # [PERF T3] Get user context (分阶段加载)
+            # Phase 1: skill=None 时不加载 profile
+            # Phase 2: skill 有值时按需加载
+            t3_start = time.time()
+            profile, skill_data = await get_user_context(user_id, request.skill)
+            perf_log["T3_user_context_ms"] = int((time.time() - t3_start) * 1000)
+            perf_log["phase"] = "phase2" if request.skill else "phase1"
+
+            # Save user message first (needed for history query)
+            user_message = request.get_user_message()
+            if not user_message:
+                # AI SDK 4.x error format: 3:"error message"
+                yield f'3:{json.dumps("No user message provided")}\n'
+                yield f'd:{json.dumps({"finishReason": "error", "usage": {"promptTokens": 0, "completionTokens": 0}})}\n'
+                return
+
+            # [PERF T4] Ensure conversation exists before saving messages
+            t4_start = time.time()
+            await ensure_conversation_exists(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                skill=request.skill,
+                voice_mode=request.voice_mode
+            )
+            perf_log["T4_ensure_conv_ms"] = int((time.time() - t4_start) * 1000)
+
+            # [v8] 从 conversation 恢复 skill（如果前端没传）
+            active_skill = request.skill
+            if not active_skill:
+                try:
+                    conv = await conversation_repo.get_conversation(conversation_id)
+                    if conv and conv.skill and conv.skill != "core":
+                        active_skill = conv.skill
+                        # 恢复了 skill，需要重新加载 profile 和 skill_data
+                        profile, skill_data = await get_user_context(user_id, active_skill)
+                        perf_log["phase"] = "phase2"
+                        perf_log["skill_restored"] = active_skill
+                        logger.info(f"[v8] Restored skill from conversation: {active_skill}")
+                except Exception as e:
+                    logger.warning(f"[v8] Failed to restore skill: {e}")
+
+            # [Protocol] 恢复协议状态（REFACTOR_PLAN.md Phase 3）
+            protocol_state = None
+            protocol_config = None
+
+            if active_skill == "lifecoach" and user_id:
+                protocol_state = await get_protocol_state(user_id, active_skill)
+                if protocol_state:
+                    # 加载协议配置
+                    protocol_config = load_protocol_config(protocol_state["id"])
+                    logger.info(f"[Protocol] Restored: {protocol_state['id']} step {protocol_state.get('step', 1)}")
+                    perf_log["protocol_active"] = protocol_state["id"]
+
+            # [PERF T5] Save user message
+            t5_start = time.time()
+            await save_message(conversation_id, "user", user_message)
+            perf_log["T5_save_msg_ms"] = int((time.time() - t5_start) * 1000)
+
+            # [NEW] Get history from database (not from request)
+            t_history_start = time.time()
+            history = await get_conversation_history(conversation_id, active_skill)
+            perf_log["T_history_ms"] = int((time.time() - t_history_start) * 1000)
+            perf_log["history_count"] = len(history)
+
+            # Build agent context
+            context = AgentContext(
+                user_id=str(user_id) if user_id else "guest",
+                user_tier=user_tier,
+                profile=profile,
+                skill_data=skill_data,
+                history=history,  # 从数据库获取，不再依赖前端传入
+                skill=active_skill,  # v8: 可能从 conversation 恢复
+                voice_mode=request.voice_mode,
+                conversation_id=str(conversation_id)
+            )
+
+            # [Protocol] 注入协议 prompt（如果有）
+            if protocol_state and protocol_config:
+                lifecoach_data = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+                context.protocol_prompt = build_protocol_prompt(
+                    protocol_config=protocol_config,
+                    step=protocol_state.get("step", 1),
+                    lifecoach_state=lifecoach_data
+                )
+
+            # Create agent and adapter
+            agent = create_agent()
+            adapter = get_adapter("simple")
+
+            logger.info(f"[PERF] Pre-agent: {perf_log}")
+
+            # [PERF T6-T9] Stream through adapter (converts AgentEvent → AI SDK 4.x format)
+            t_agent_start = time.time()
+            first_token_time = None
+            full_content = ""
+            async for event in adapter.adapt(agent.run(user_message, context)):
+                # SimpleToolAdapter returns "0:\"text\"\n" format strings
+                if isinstance(event, str):
+                    # Record first token time
+                    if first_token_time is None and event.startswith('0:'):
+                        first_token_time = time.time()
+                        perf_log["TTFT_ms"] = int((first_token_time - t_agent_start) * 1000)
+                        logger.info(f"[PERF] First token: TTFT={perf_log['TTFT_ms']}ms")
+                    yield event
+                    # Extract actual content from AI SDK 4.x format: 0:"content"\n
+                    if event.startswith('0:'):
+                        try:
+                            content = json.loads(event[2:].rstrip('\n'))
+                            # Skip tool markers for saved content
+                            if not (isinstance(content, str) and content.startswith('[[TOOL:')):
+                                full_content += content
+                        except:
+                            pass
+                else:
+                    # Other adapters return dicts - convert to SSE string for StreamingResponse
+                    data_str = event.get("data", "") if isinstance(event, dict) else str(event)
+                    yield f"data: {data_str}\n\n"
+                    if '"delta"' in data_str and '"content"' in data_str:
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            full_content += delta.get("content", "")
+                        except:
+                            pass
+
+            # [PERF] Agent done
+            perf_log["agent_total_ms"] = int((time.time() - t_agent_start) * 1000)
+
+            # Save assistant message
+            if full_content:
+                await save_message(conversation_id, "assistant", full_content)
+
+            # [C] Record usage
+            await QuotaTracker.record(
+                user_id=str(user_id) if user_id else "guest",
+                usage=agent.usage
+            )
+
+            # [PERF] Total time
+            perf_log["total_ms"] = int((time.time() - perf_start) * 1000)
+            logger.info(f"[PERF] Complete: {perf_log}")
+
+        except Exception as e:
+            logger.error(f"Chat error: {e}", exc_info=True)
+            yield f"\n\n❌ Error: {str(e)}"
+
+    # 使用 StreamingResponse 输出 AI SDK 4.x data stream 格式
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "X-Vercel-AI-Data-Stream": "v1"  # AI SDK 4.x 必需的 header
+        }
+    )
+
+
+@router.post("/guest/stream")
+async def guest_chat_stream_v5(request: GuestChatRequestV5):
+    """
+    Guest chat endpoint (no auth, limited functionality).
+    """
+    async def generate():
+        try:
+            context = AgentContext(
+                user_id="guest",
+                user_tier="guest",
+                profile={},
+                skill_data={}
+            )
+
+            agent = create_agent(max_iterations=5)
+            adapter = get_adapter("text")
+
+            user_message = request.get_user_message()
+            if not user_message:
+                yield {"data": json.dumps({"type": "error", "errorText": "No user message provided"})}
+                return
+
+            # Stream through adapter
+            async for event in adapter.adapt(agent.run(user_message, context)):
+                yield event
+
+        except Exception as e:
+            logger.error(f"Guest chat error: {e}")
+            yield {"data": json.dumps({"type": "error", "errorText": str(e)})}
+
+    headers = {"x-vercel-ai-ui-message-stream": "v1"}
+    return EventSourceResponse(generate(), headers=headers)
+
+
+async def _quota_exceeded_response(message: str, tier: str):
+    """Generate quota exceeded SSE response"""
+    yield {
+        "event": "error",
+        "data": json.dumps({
+            "type": "quota_exceeded",
+            "message": message,
+            "tier": tier,
+            "upgrade_url": "/membership"
+        })
+    }

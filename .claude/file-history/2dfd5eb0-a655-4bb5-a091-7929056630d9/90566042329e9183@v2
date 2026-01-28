@@ -1,0 +1,279 @@
+"""
+Pairing Routes - Privacy-first synastry pairing API
+
+端点:
+- /pairing/code - 获取用户配对码
+- /pairing/request - 发起配对请求
+- /pairing/pending - 获取待处理请求
+- /pairing/accept - 接受配对请求
+- /pairing/reject - 拒绝配对请求
+- /pairing/link - 生成/获取邀请链接
+- /pairing/results - 获取合盘结果
+"""
+
+import os
+from typing import Optional, List
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, status, Depends, Query
+from pydantic import BaseModel
+
+from services.identity import get_current_user, get_optional_user, CurrentUser
+from services.pairing import PairingService
+
+router = APIRouter(prefix="/pairing", tags=["Pairing"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PairingRequestInput(BaseModel):
+    """发起配对请求的输入"""
+    target_vibe_id: str
+    relationship_type: str
+    message: Optional[str] = None
+
+
+class PairingAcceptInput(BaseModel):
+    """接受/拒绝配对请求的输入"""
+    request_id: str
+
+
+class InviteLinkInput(BaseModel):
+    """生成邀请链接的输入"""
+    relationship_type: str
+    message: Optional[str] = None
+
+
+class InviteAcceptInput(BaseModel):
+    """接受邀请链接的输入"""
+    token: str
+
+
+class DeleteResultInput(BaseModel):
+    """删除合盘结果的输入"""
+    partner_id: str
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pairing Code Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/code")
+async def get_pairing_code(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    获取用户的配对码 (Vibe ID)
+
+    直接返回用户的 Vibe ID，用于分享给他人进行合盘
+    """
+    vibe_id = await PairingService.get_user_vibe_id(current_user.user_id)
+    if not vibe_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+
+    return {
+        "vibe_id": vibe_id,
+        "message": "分享此配对码给对方，TA 可以向你发起合盘请求"
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Pairing Request Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/request")
+async def create_pairing_request(
+    request: PairingRequestInput,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    发起配对请求
+
+    向指定 Vibe ID 的用户发起合盘请求，需要对方同意才能计算合盘
+    """
+    try:
+        result = await PairingService.request_pairing(
+            requester_id=current_user.user_id,
+            target_vibe_id=request.target_vibe_id,
+            relationship_type=request.relationship_type,
+            message=request.message,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/pending")
+async def get_pending_requests(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    获取待处理的配对请求
+
+    返回发送给当前用户的待处理请求列表
+    """
+    requests = await PairingService.get_pending_requests(current_user.user_id)
+    return {
+        "requests": requests,
+        "count": len(requests)
+    }
+
+
+@router.post("/accept")
+async def accept_pairing_request(
+    request: PairingAcceptInput,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    接受配对请求
+
+    接受后自动计算合盘，结果保存到双方记录
+    """
+    try:
+        result = await PairingService.accept_pairing(
+            request_id=UUID(request.request_id),
+            user_id=current_user.user_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.post("/reject")
+async def reject_pairing_request(
+    request: PairingAcceptInput,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    拒绝配对请求
+    """
+    try:
+        result = await PairingService.reject_pairing(
+            request_id=UUID(request.request_id),
+            user_id=current_user.user_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Invite Link Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/link")
+async def create_invite_link(
+    request: InviteLinkInput,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    生成邀请链接
+
+    生成一次性邀请链接，可分享给未注册用户
+    """
+    # 获取基础 URL
+    base_url = os.getenv("VIBELIFE_BASE_URL", "https://vibelife.app")
+
+    try:
+        result = await PairingService.generate_invite_link(
+            creator_id=current_user.user_id,
+            relationship_type=request.relationship_type,
+            message=request.message,
+            base_url=base_url,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get("/link/{token}")
+async def get_invite_info(token: str):
+    """
+    获取邀请链接信息（公开端点）
+
+    无需登录即可查看邀请信息
+    """
+    result = await PairingService.get_invite_info(token)
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="邀请链接不存在"
+        )
+    return result
+
+
+@router.post("/link/{token}/accept")
+async def accept_invite_link(
+    token: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    接受邀请链接
+
+    需要登录，接受后自动计算合盘
+    """
+    try:
+        result = await PairingService.accept_invite(
+            token=token,
+            user_id=current_user.user_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Synastry Results Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/results")
+async def get_synastry_results(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    获取用户的所有合盘结果
+
+    返回隐私安全的合盘结果（不含原始出生数据）
+    """
+    results = await PairingService.get_synastry_results(current_user.user_id)
+    return {
+        "results": results,
+        "count": len(results)
+    }
+
+
+@router.delete("/results")
+async def delete_synastry_result(
+    request: DeleteResultInput,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    删除合盘结果
+
+    只能删除自己的记录，不影响对方的记录
+    """
+    try:
+        result = await PairingService.delete_synastry_result(
+            user_id=current_user.user_id,
+            partner_id=UUID(request.partner_id),
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )

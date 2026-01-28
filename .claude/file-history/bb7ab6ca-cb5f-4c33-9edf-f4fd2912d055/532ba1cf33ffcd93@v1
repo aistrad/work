@@ -1,0 +1,318 @@
+"""
+CoreAgent 集成测试
+测试 CoreAgent + SkillLoader + SOPEngine 的集成
+"""
+import pytest
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+from typing import AsyncGenerator
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from services.agent.core import CoreAgent, AgentContext, AgentEvent
+from services.agent.skill_loader import (
+    load_skill, build_system_prompt, build_runtime_context
+)
+from services.agent.sop_engine import SOPAction, check_sop_requirements
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Mock 数据
+# ═══════════════════════════════════════════════════════════════════════════
+
+MOCK_PROFILE_COMPLETE = {
+    "basic": {"name": "测试用户"},
+    "birth_info": {
+        "date": "1990-05-15",
+        "time": "14:30",
+        "location": "北京"
+    }
+}
+
+MOCK_PROFILE_NO_BIRTH = {
+    "basic": {"name": "测试用户"}
+}
+
+MOCK_BAZI_DATA = {
+    "bazi": {
+        "chart": {
+            "year": {"gan": "庚", "zhi": "午"},
+            "month": {"gan": "辛", "zhi": "巳"},
+            "day": {"gan": "甲", "zhi": "子"},
+            "hour": {"gan": "壬", "zhi": "申"}
+        }
+    }
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SkillLoader 集成测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSkillLoaderIntegration:
+    """测试 SkillLoader 与 CoreAgent 的集成"""
+
+    def test_core_skill_always_loaded(self):
+        """Core Skill 始终加载"""
+        prompt = build_system_prompt(["bazi"], include_core=True)
+        core_skill = load_skill("core")
+        if core_skill:
+            # System prompt 应该包含 core 的内容
+            assert len(prompt) > 0
+
+    def test_bazi_skill_activation(self):
+        """激活 bazi skill 时知识正确注入"""
+        prompt = build_system_prompt(["bazi"])
+        bazi_skill = load_skill("bazi")
+        if bazi_skill:
+            # 应该包含 bazi 的内容
+            assert len(prompt) > 0
+
+    def test_runtime_context_injection(self):
+        """运行时上下文注入"""
+        context = build_runtime_context("bazi", "身强用神财官", include_knowledge=True)
+        # 如果有匹配的规则，应该包含相关内容
+        assert isinstance(context, str)
+
+    def test_multi_skill_fusion(self):
+        """多 Skill 融合"""
+        prompt = build_system_prompt(["bazi", "zodiac"])
+        # 应该包含两个 skill 的内容
+        assert len(prompt) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SOPEngine 集成测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSOPEngineIntegration:
+    """测试 SOPEngine 与 CoreAgent 的集成"""
+
+    def test_sop_collect_triggers_form(self):
+        """P1 触发表单收集"""
+        action, context = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_NO_BIRTH,
+            skill_data={},
+            message="看看我的命盘"
+        )
+        assert action == SOPAction.NEED_INFO
+
+    def test_sop_compute_triggers_calc(self):
+        """P2 触发计算"""
+        action, context = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data={},
+            message="分析我的命盘"
+        )
+        assert action == SOPAction.NEED_COMPUTE
+
+    def test_sop_llm_free_after_p2(self):
+        """P2 后 LLM 自由"""
+        action, context = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            message="分析我的事业运"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CoreAgent Mock 测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCoreAgentWithMockLLM:
+    """使用 Mock LLM 测试 CoreAgent"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        """创建 Mock LLM"""
+        llm = MagicMock()
+
+        async def mock_stream(*args, **kwargs):
+            yield {"type": "content", "content": "这是测试回复"}
+            yield {"type": "done"}
+
+        llm.stream = mock_stream
+        return llm
+
+    @pytest.fixture
+    def agent(self, mock_llm):
+        """创建带 Mock LLM 的 Agent"""
+        return CoreAgent(llm=mock_llm, max_iterations=3)
+
+    def test_agent_context_creation(self):
+        """测试 AgentContext 创建"""
+        context = AgentContext(
+            user_id="test_user",
+            user_tier="paid",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            skill="bazi",
+            voice_mode="warm"
+        )
+        assert context.user_id == "test_user"
+        assert context.skill == "bazi"
+        assert context.profile == MOCK_PROFILE_COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_agent_run_basic(self, agent):
+        """测试 Agent 基本运行"""
+        context = AgentContext(
+            user_id="test_user",
+            user_tier="paid",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            skill="bazi"
+        )
+
+        events = []
+        async for event in agent.run("测试消息", context):
+            events.append(event)
+
+        # 应该有事件产生
+        assert len(events) > 0
+
+
+# ═══════════════════════════��═══════════════════════════════════════════════
+# 工具系统集成测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestToolSystemIntegration:
+    """测试工具系统集成"""
+
+    def test_tools_yaml_loading(self):
+        """YAML 工具加载"""
+        from services.agent.skill_loader import load_tools
+        tools = load_tools("bazi")
+        if tools:
+            assert hasattr(tools, "collect")
+            assert hasattr(tools, "compute")
+            assert hasattr(tools, "display")
+
+    def test_tools_openai_format(self):
+        """工具转换为 OpenAI 格式"""
+        from services.agent.skill_loader import load_tools
+        tools = load_tools("bazi")
+        if tools:
+            openai_tools = tools.to_openai_format()
+            assert isinstance(openai_tools, list)
+            for tool in openai_tools:
+                assert "type" in tool
+                assert "function" in tool
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SOP 流程集成测试
+# ═══════════════════════���═══════════════════════════════════════════════════
+
+class TestSOPFlowIntegration:
+    """测试完整 SOP 流程"""
+
+    def test_new_user_bazi_flow(self):
+        """新用户首次八字流程：P1 → P2 → P3-P6"""
+        # Step 1: 无出生信息，需要收集
+        action1, _ = check_sop_requirements(
+            skill_name="bazi",
+            profile={},
+            skill_data={},
+            message="看命盘"
+        )
+        assert action1 == SOPAction.NEED_INFO
+
+        # Step 2: 有出生信息，需要计算
+        action2, _ = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data={},
+            message="看命盘"
+        )
+        assert action2 == SOPAction.NEED_COMPUTE
+
+        # Step 3: 有命盘，交给 LLM
+        action3, _ = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            message="分析事业"
+        )
+        assert action3 == SOPAction.READY_FOR_LLM
+
+    def test_returning_user_bazi_flow(self):
+        """老用户再次八字流程：直接 P3-P6"""
+        action, context = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            message="看看我今年的运势"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+        assert context["has_chart"] is True
+
+    def test_synastry_missing_partner_flow(self):
+        """合盘缺对方信息流程"""
+        # zodiac 合盘需要双方信息
+        action, _ = check_sop_requirements(
+            skill_name="zodiac",
+            profile={},  # 无出生信息
+            skill_data={},
+            message="我和他合适吗"
+        )
+        assert action == SOPAction.NEED_INFO
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 边界情况测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestEdgeCases:
+    """测试边界情况"""
+
+    def test_unknown_skill_fallback(self):
+        """未知 Skill 降级处理"""
+        action, _ = check_sop_requirements(
+            skill_name="unknown_skill",
+            profile={},
+            skill_data={},
+            message="测试"
+        )
+        # 未知 skill 应该直接交给 LLM
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_empty_message(self):
+        """空消息处理"""
+        action, _ = check_sop_requirements(
+            skill_name="bazi",
+            profile=MOCK_PROFILE_COMPLETE,
+            skill_data=MOCK_BAZI_DATA,
+            message=""
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_career_skill_no_birth_required(self):
+        """Career Skill 不需要出生信息"""
+        action, _ = check_sop_requirements(
+            skill_name="career",
+            profile={},
+            skill_data={},
+            message="我适合什么工作"
+        )
+        assert action == SOPAction.READY_FOR_LLM
+
+    def test_tarot_skill_needs_compute(self):
+        """Tarot Skill 需要抽牌（计算）"""
+        action, _ = check_sop_requirements(
+            skill_name="tarot",
+            profile={},
+            skill_data={},
+            message="帮我抽一张牌"
+        )
+        assert action == SOPAction.NEED_COMPUTE
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

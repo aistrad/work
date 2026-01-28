@@ -1,0 +1,134 @@
+     1→from dataclasses import dataclass
+     2→from datetime import datetime, timedelta
+     3→from typing import Dict, Any, List, Tuple
+     4→import math
+     5→
+     6→from common.logging import get_logger
+     7→
+     8→logger = get_logger(__name__)
+     9→
+    10→
+    11→@dataclass
+    12→class PillarContext:
+    13→    id: str
+    14→    pillars: Dict[str, str]
+    15→
+    16→
+    17→def _compute_tst(dt_local: datetime, longitude: float, tz_offset_hours: float) -> datetime:
+    18→    l_meridian = 15 * tz_offset_hours
+    19→    delta_minutes = (longitude - l_meridian) * 4
+    20→    t_lmt = dt_local + timedelta(minutes=delta_minutes)
+    21→    doy = int(t_lmt.strftime("%j"))
+    22→    theta = 2 * math.pi * (doy - 81) / 365
+    23→    eot = 9.87 * math.sin(2 * theta) - 7.53 * math.cos(theta) - 1.5 * math.sin(theta)
+    24→    t_tst = t_lmt + timedelta(minutes=eot)
+    25→    return t_tst
+    26→
+    27→
+    28→def _pillars_from_datetime(dt_local: datetime) -> Dict[str, str]:
+    29→    from lunar_python import Solar
+    30→
+    31→    solar = Solar.fromYmdHms(dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute, dt_local.second)
+    32→    lunar = solar.getLunar()
+    33→    eight = lunar.getEightChar()
+    34→    return {
+    35→        "year": eight.getYear(),
+    36→        "month": eight.getMonth(),
+    37→        "day": eight.getDay(),
+    38→        "hour": eight.getTime(),
+    39→    }
+    40→
+    41→
+    42→def _nearest_solar_term(dt_local: datetime) -> Tuple[datetime, float]:
+    43→    from lunar_python import Solar
+    44→
+    45→    solar = Solar.fromYmdHms(dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute, dt_local.second)
+    46→    lunar = solar.getLunar()
+    47→    table = lunar.getJieQiTable()
+    48→    min_diff = None
+    49→    nearest = None
+    50→    for _, s in table.items():
+    51→        term_dt = datetime(s.getYear(), s.getMonth(), s.getDay(), s.getHour(), s.getMinute(), s.getSecond())
+    52→        diff = abs((dt_local - term_dt).total_seconds()) / 60.0
+    53→        if min_diff is None or diff < min_diff:
+    54→            min_diff = diff
+    55→            nearest = term_dt
+    56→    return nearest, float(min_diff or 0)
+    57→
+    58→
+    59→def _nearest_shichen_boundary(dt_local: datetime) -> Tuple[datetime, float]:
+    60→    # Boundaries at 23:00,1:00,3:00,...
+    61→    hour = dt_local.hour
+    62→    minute = dt_local.minute
+    63→    # compute current boundary hour candidates
+    64→    candidates = []
+    65→    for h in range(0, 24):
+    66→        if h % 2 == 1 or h == 23:
+    67→            candidates.append(h)
+    68→    # build candidate datetimes
+    69→    best_dt = None
+    70→    best_diff = None
+    71→    for h in candidates:
+    72→        cand = dt_local.replace(hour=h, minute=0, second=0, microsecond=0)
+    73→        # adjust day if 23 boundary when time is early morning
+    74→        if h == 23 and dt_local.hour < 12:
+    75→            cand -= timedelta(days=1)
+    76→        diff = abs((dt_local - cand).total_seconds()) / 60.0
+    77→        if best_diff is None or diff < best_diff:
+    78→            best_diff = diff
+    79→            best_dt = cand
+    80→    return best_dt, float(best_diff or 0)
+    81→
+    82→
+    83→def normalize_input(
+    84→    birth_local: datetime,
+    85→    tz_offset_hours: float,
+    86→    location: Dict[str, Any],
+    87→    ruleset: Dict[str, Any],
+    88→) -> Dict[str, Any]:
+    89→    longitude = float(location.get("longitude"))
+    90→    t_tst = _compute_tst(birth_local, longitude, tz_offset_hours)
+    91→
+    92→    boundary_minutes = float(ruleset["time"].get("boundary_window_minutes", 0))
+    93→    shichen_minutes = float(ruleset["time"].get("shichen_fuzzy_minutes", 0))
+    94→
+    95→    contexts: List[PillarContext] = []
+    96→    flags: List[str] = []
+    97→
+    98→    def add_context(dt: datetime, label: str) -> None:
+    99→        pillars = _pillars_from_datetime(dt)
+   100→        ctx = PillarContext(id=label, pillars=pillars)
+   101→        # avoid duplicates
+   102→        for existing in contexts:
+   103→            if existing.pillars == ctx.pillars:
+   104→                return
+   105→        contexts.append(ctx)
+   106→
+   107→    add_context(t_tst, "A")
+   108→
+   109→    term_dt, term_diff = _nearest_solar_term(t_tst)
+   110→    shichen_dt, shichen_diff = _nearest_shichen_boundary(t_tst)
+   111→
+   112→    if term_diff <= boundary_minutes:
+   113→        flags.append("SOLAR_TERM_EDGE")
+   114→        add_context(term_dt - timedelta(seconds=1), "B")
+   115→        add_context(term_dt + timedelta(seconds=1), "C")
+   116→
+   117→    if shichen_diff <= shichen_minutes:
+   118→        flags.append("SHICHEN_EDGE")
+   119→        add_context(shichen_dt - timedelta(seconds=1), "D")
+   120→        add_context(shichen_dt + timedelta(seconds=1), "E")
+   121→
+   122→    # If both boundaries, ensure combined contexts as well
+   123→    payload_contexts = [{"id": c.id, "pillars": c.pillars} for c in contexts]
+   124→
+   125→    return {
+   126→        "tst_time": t_tst.isoformat(),
+   127→        "boundary_flags": flags,
+   128→        "pillars_contexts": payload_contexts,
+   129→    }
+   130→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

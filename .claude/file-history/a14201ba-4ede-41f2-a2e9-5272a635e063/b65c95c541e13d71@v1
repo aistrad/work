@@ -1,0 +1,222 @@
+"""
+Goal API Routes - 目标设定模块 API
+
+基于 os_design_claude_mvp v1.md §3.5 设计：
+- POST /api/goal/create          创建目标
+- GET  /api/goal/list            获取用户目标列表
+- GET  /api/goal/{goal_id}       获取单个目标详情
+- PUT  /api/goal/{goal_id}       更新目标
+- POST /api/goal/{goal_id}/link  关联任务到目标
+- POST /api/goal/{goal_id}/checkpoint  记录检查点进展
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth, require_csrf
+from services import goal_service
+
+
+router = APIRouter(prefix="/api/goal", tags=["goal"])
+
+
+def _ok(data: Dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, "data": data or {}})
+
+
+def _err(status: int, code: str, message: str, detail: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": {"code": code, "message": message, "detail": detail or {}}},
+        status_code=status,
+    )
+
+
+class CreateGoalRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    type: str = Field(..., pattern="^(annual|quarterly|monthly|weekly)$")
+    parent_goal_id: Optional[str] = Field(None)
+    outcome_measure: Optional[str] = Field(None, max_length=500)
+    lead_measures: Optional[List[str]] = Field(None)
+    assumptions: Optional[List[str]] = Field(None)
+    dimension: Optional[str] = Field("mixed", pattern="^(cognition|time|capital|mixed)$")
+    checkpoints: Optional[List[Dict[str, Any]]] = Field(None)
+
+
+class UpdateGoalRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    outcome_measure: Optional[str] = Field(None, max_length=500)
+    lead_measures: Optional[List[str]] = Field(None)
+    assumptions: Optional[List[str]] = Field(None)
+    dimension: Optional[str] = Field(None, pattern="^(cognition|time|capital|mixed)$")
+    checkpoints: Optional[List[Dict[str, Any]]] = Field(None)
+    status: Optional[str] = Field(None, pattern="^(active|achieved|abandoned|revised)$")
+
+
+class LinkTaskRequest(BaseModel):
+    task_id: str = Field(..., min_length=1)
+
+
+class CheckpointRequest(BaseModel):
+    checkpoint_date: str = Field(..., pattern="^\\d{4}-\\d{2}-\\d{2}$")
+    description: str = Field(..., min_length=1, max_length=1000)
+    progress: Optional[str] = Field(None, pattern="^(pending|in_progress|completed|blocked)$")
+
+
+@router.post("/create")
+def create_goal(req: CreateGoalRequest, request: Request):
+    """创建新目标"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    try:
+        goal = goal_service.create_goal(
+            user_id=user_id,
+            title=req.title,
+            goal_type=req.type,
+            parent_goal_id=req.parent_goal_id,
+            outcome_measure=req.outcome_measure,
+            lead_measures=req.lead_measures,
+            assumptions=req.assumptions,
+            dimension=req.dimension or "mixed",
+            checkpoints=req.checkpoints,
+        )
+        return _ok({"goal": _serialize_goal(goal)})
+    except ValueError as e:
+        return _err(400, "invalid_request", str(e))
+
+
+@router.get("/list")
+def list_goals(
+    request: Request,
+    type: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """获取用户目标列表"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    goals = goal_service.list_goals(
+        user_id=user_id,
+        goal_type=type,
+        status=status,
+        limit=min(limit, 100),
+        offset=offset,
+    )
+    return _ok({"goals": [_serialize_goal(g) for g in goals]})
+
+
+@router.get("/active")
+def get_active_goals(request: Request):
+    """获取用户当前活跃目标"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    goals = goal_service.get_active_goals(user_id)
+    return _ok({"goals": [_serialize_goal(g) for g in goals]})
+
+
+@router.get("/{goal_id}")
+def get_goal(goal_id: str, request: Request):
+    """获取单个目标详情"""
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    goal = goal_service.get_goal(goal_id, user_id)
+    if not goal:
+        return _err(404, "not_found", "Goal not found")
+
+    progress = goal_service.get_goal_progress(goal_id, user_id)
+    return _ok({"goal": _serialize_goal(goal), "progress": progress})
+
+
+@router.put("/{goal_id}")
+def update_goal(goal_id: str, req: UpdateGoalRequest, request: Request):
+    """更新目标"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    goal = goal_service.update_goal(
+        goal_id=goal_id,
+        user_id=user_id,
+        title=req.title,
+        outcome_measure=req.outcome_measure,
+        lead_measures=req.lead_measures,
+        assumptions=req.assumptions,
+        dimension=req.dimension,
+        checkpoints=req.checkpoints,
+        status=req.status,
+    )
+    if not goal:
+        return _err(404, "not_found", "Goal not found")
+
+    return _ok({"goal": _serialize_goal(goal)})
+
+
+@router.post("/{goal_id}/link")
+def link_task_to_goal(goal_id: str, req: LinkTaskRequest, request: Request):
+    """关联任务到目标"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    success = goal_service.link_commitment_to_goal(
+        goal_id=goal_id,
+        task_id=req.task_id,
+        user_id=user_id,
+    )
+    if not success:
+        return _err(404, "not_found", "Goal or task not found")
+
+    return _ok({"linked": True})
+
+
+@router.post("/{goal_id}/checkpoint")
+def record_checkpoint(goal_id: str, req: CheckpointRequest, request: Request):
+    """记录检查点进展"""
+    auth = require_auth(request)
+    require_csrf(request, auth)
+    user_id = int(auth["user_id"])
+
+    goal = goal_service.record_checkpoint(
+        goal_id=goal_id,
+        user_id=user_id,
+        checkpoint_date=req.checkpoint_date,
+        description=req.description,
+        progress=req.progress,
+    )
+    if not goal:
+        return _err(404, "not_found", "Goal not found")
+
+    return _ok({"goal": _serialize_goal(goal)})
+
+
+def _serialize_goal(goal: Dict[str, Any]) -> Dict[str, Any]:
+    """序列化目标对象为JSON友好格式"""
+    if not goal:
+        return {}
+
+    result = {}
+    for key, value in goal.items():
+        if key in ("goal_id", "parent_goal_id"):
+            result[key] = str(value) if value else None
+        elif key in ("created_at", "updated_at"):
+            result[key] = value.isoformat() if value else None
+        elif key in ("lead_measures", "assumptions", "checkpoints"):
+            if isinstance(value, str):
+                import json
+                result[key] = json.loads(value)
+            else:
+                result[key] = value
+        else:
+            result[key] = value
+
+    return result

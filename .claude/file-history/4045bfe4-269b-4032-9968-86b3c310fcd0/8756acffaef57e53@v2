@@ -1,0 +1,232 @@
+"""
+Mentis OS v3.0 WebSocket 实时路由
+
+支持：
+- 心跳 (ping/pong)
+- 状态订阅
+- 实时事件推送
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Dict, Set
+from uuid import UUID
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from stores import mentis_db
+
+
+router = APIRouter(prefix="/v3", tags=["realtime"])
+
+# 活跃连接管理
+active_connections: Dict[str, Set[WebSocket]] = {}
+
+
+def _resolve_user_from_token(token: str) -> str | None:
+    if not token:
+        return None
+    try:
+        UUID(token)
+    except Exception:
+        return None
+    row = mentis_db.fetch_one("SELECT id FROM mentis_user WHERE id = %s", (token,))
+    return token if row else None
+
+
+async def broadcast_to_user(user_id: str, message: dict) -> None:
+    """向用户的所有连接广播消息"""
+    if user_id not in active_connections:
+        return
+    dead_connections = set()
+    for ws in active_connections[user_id]:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead_connections.add(ws)
+    # 清理断开的连接
+    active_connections[user_id] -= dead_connections
+
+
+def register_connection(user_id: str, ws: WebSocket) -> None:
+    """注册连接"""
+    if user_id not in active_connections:
+        active_connections[user_id] = set()
+    active_connections[user_id].add(ws)
+
+
+def unregister_connection(user_id: str, ws: WebSocket) -> None:
+    """注销连接"""
+    if user_id in active_connections:
+        active_connections[user_id].discard(ws)
+        if not active_connections[user_id]:
+            del active_connections[user_id]
+
+
+async def send_user_state(ws: WebSocket, user_id: str) -> None:
+    """发送用户状态"""
+    state = mentis_db.fetch_one(
+        """
+        SELECT energy_score, momentum, streak_days, current_mood,
+               mood_intensity, aura_state
+        FROM user_state
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    if state:
+        await ws.send_json({
+            "type": "state_update",
+            "data": {
+                "energy_score": int(state.get("energy_score") or 50),
+                "momentum": int(state.get("momentum") or 0),
+                "streak_days": int(state.get("streak_days") or 0),
+                "current_mood": state.get("current_mood"),
+                "mood_intensity": state.get("mood_intensity"),
+                "aura_state": state.get("aura_state") or "calm",
+            },
+            "timestamp": int(time.time() * 1000),
+        })
+
+
+async def send_pending_tasks(ws: WebSocket, user_id: str) -> None:
+    """发送待处理任务"""
+    tasks = mentis_db.fetch_all(
+        """
+        SELECT id, type, title, description, momentum_reward, expires_at
+        FROM action_task
+        WHERE user_id = %s AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 5
+        """,
+        (user_id,),
+    )
+    if tasks:
+        await ws.send_json({
+            "type": "pending_tasks",
+            "data": {
+                "tasks": [
+                    {
+                        "id": str(t.get("id")),
+                        "type": t.get("type"),
+                        "title": t.get("title"),
+                        "description": t.get("description"),
+                        "momentum_reward": t.get("momentum_reward"),
+                        "expires_at": t.get("expires_at").isoformat() if t.get("expires_at") else None,
+                    }
+                    for t in tasks
+                ],
+            },
+            "timestamp": int(time.time() * 1000),
+        })
+
+
+@router.websocket("/realtime")
+async def realtime(ws: WebSocket):
+    """
+    WebSocket 实时连接
+
+    协议：
+    - 客户端发送: {"type": "ping"}
+    - 服务端响应: {"type": "pong", "timestamp": ...}
+
+    - 客户端发送: {"type": "subscribe", "channels": ["state", "tasks"]}
+    - 服务端响应: {"type": "subscribed", "channels": [...]}
+
+    - 服务端推送: {"type": "state_update", "data": {...}}
+    - 服务端推送: {"type": "pending_tasks", "data": {...}}
+    - 服务端推送: {"type": "new_stream", "data": {...}}
+    """
+    token = ws.query_params.get("token") or ""
+    user_id = _resolve_user_from_token(token)
+
+    if not user_id:
+        await ws.close(code=4401, reason="Unauthorized")
+        return
+
+    await ws.accept()
+    register_connection(user_id, ws)
+
+    # 发送连接确认
+    await ws.send_json({
+        "type": "connected",
+        "user_id": user_id,
+        "timestamp": int(time.time() * 1000),
+    })
+
+    # 心跳任务
+    last_pong = time.time()
+    subscribed_channels: Set[str] = set()
+
+    async def heartbeat_checker():
+        nonlocal last_pong
+        while True:
+            await asyncio.sleep(30)
+            if time.time() - last_pong > 90:  # 90秒无响应断开
+                await ws.close(code=4408, reason="Heartbeat timeout")
+                return
+
+    heartbeat_task = asyncio.create_task(heartbeat_checker())
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=60)
+            except asyncio.TimeoutError:
+                # 发送服务端 ping
+                await ws.send_json({"type": "ping", "timestamp": int(time.time() * 1000)})
+                continue
+
+            msg_type = msg.get("type")
+
+            if msg_type == "ping":
+                await ws.send_json({
+                    "type": "pong",
+                    "timestamp": int(time.time() * 1000),
+                })
+
+            elif msg_type == "pong":
+                last_pong = time.time()
+
+            elif msg_type == "subscribe":
+                channels = msg.get("channels", [])
+                for channel in channels:
+                    if channel in {"state", "tasks", "stream"}:
+                        subscribed_channels.add(channel)
+                        # 立即发送当前数据
+                        if channel == "state":
+                            await send_user_state(ws, user_id)
+                        elif channel == "tasks":
+                            await send_pending_tasks(ws, user_id)
+
+                await ws.send_json({
+                    "type": "subscribed",
+                    "channels": list(subscribed_channels),
+                    "timestamp": int(time.time() * 1000),
+                })
+
+            elif msg_type == "unsubscribe":
+                channels = msg.get("channels", [])
+                for channel in channels:
+                    subscribed_channels.discard(channel)
+                await ws.send_json({
+                    "type": "unsubscribed",
+                    "channels": list(subscribed_channels),
+                    "timestamp": int(time.time() * 1000),
+                })
+
+            elif msg_type == "get_state":
+                await send_user_state(ws, user_id)
+
+            elif msg_type == "get_tasks":
+                await send_pending_tasks(ws, user_id)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        heartbeat_task.cancel()
+        unregister_connection(user_id, ws)

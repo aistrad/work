@@ -1,0 +1,200 @@
+"""
+Prompt Store - SSOT: PostgreSQL
+
+Stores user prompt history in database.
+Replaces file-based storage for horizontal scalability.
+
+Table used:
+- prompt_history: Stores user prompt history by openid
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from datetime import datetime
+from typing import Dict, List
+
+from common.logging import get_logger
+from stores.fortune_db import fetchall, execute
+
+logger = get_logger(__name__)
+
+# Feature flag: Use DB or fallback to file
+USE_DB_STORE = os.getenv("FORTUNE_USE_DB_STORE", "true").lower() in ("true", "1", "yes")
+
+# Legacy file-based paths (fallback only)
+BASE_DIR = os.path.join("user", "prompts")
+
+
+# ============================================================================
+# Database Implementation
+# ============================================================================
+
+
+def _db_get_history(openid: str, limit: int = 20) -> List[Dict]:
+    """Get prompt history from database."""
+    rows = fetchall(
+        """
+        SELECT text, model, created_at
+        FROM prompt_history
+        WHERE openid = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (openid, limit),
+    )
+    return [
+        {
+            "text": r["text"],
+            "model": r.get("model", ""),
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+        }
+        for r in rows
+    ]
+
+
+def _db_append_prompt(openid: str, text: str, model: str) -> None:
+    """Append prompt to history in database, with deduplication."""
+    # Use upsert to handle duplicates (same openid + text md5)
+    text_md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
+    execute(
+        """
+        INSERT INTO prompt_history (openid, text, model)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (openid, md5(text)) DO UPDATE
+        SET model = EXCLUDED.model, created_at = NOW()
+        """,
+        (openid, text, model),
+    )
+
+    # Cleanup: keep only latest 50 per openid
+    execute(
+        """
+        DELETE FROM prompt_history
+        WHERE id IN (
+            SELECT id FROM prompt_history
+            WHERE openid = %s
+            ORDER BY created_at DESC
+            OFFSET 50
+        )
+        """,
+        (openid,),
+    )
+
+
+# ============================================================================
+# Legacy File Implementation (Fallback)
+# ============================================================================
+
+
+def _safe_key(s: str) -> str:
+    return "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_", "@", ".")).strip() or "anon"
+
+
+def _file_for_openid(openid: str) -> str:
+    key = _safe_key(openid)
+    d = os.path.join(BASE_DIR, f"openid_{key}")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "prompts.json")
+
+
+def _file_get_history(openid: str, limit: int = 20) -> List[Dict]:
+    path = _file_for_openid(openid)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+            if not isinstance(arr, list):
+                return []
+            return arr[: max(1, min(limit, 100))]
+    except Exception:
+        return []
+
+
+def _file_append_prompt(openid: str, text: str, model: str) -> None:
+    path = _file_for_openid(openid)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+            if not isinstance(arr, list):
+                arr = []
+    except Exception:
+        arr = []
+
+    # Deduplicate
+    arr = [it for it in arr if (it.get("text") or "") != text]
+    entry = {"text": text, "model": model, "created_at": datetime.utcnow().isoformat()}
+    arr.insert(0, entry)
+
+    # Limit length
+    if len(arr) > 50:
+        arr = arr[:50]
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(arr, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================================
+# Public API (Auto-switch between DB and file)
+# ============================================================================
+
+
+def get_history_for_openid(openid: str, limit: int = 20) -> List[Dict]:
+    """Get prompt history for openid."""
+    if USE_DB_STORE:
+        try:
+            return _db_get_history(openid, limit)
+        except Exception as e:
+            logger.warning(f"DB get_history_for_openid failed, falling back to file: {e}")
+    return _file_get_history(openid, limit)
+
+
+def append_for_openid(openid: str, text: str, model: str) -> None:
+    """Append prompt to history."""
+    text = (text or "").strip()
+    if not text:
+        return
+
+    if USE_DB_STORE:
+        try:
+            _db_append_prompt(openid, text, model)
+            return
+        except Exception as e:
+            logger.warning(f"DB append_for_openid failed, falling back to file: {e}")
+    _file_append_prompt(openid, text, model)
+
+
+def get_presets() -> list:
+    """返回内置的 system prompt 模板列表。
+    每项包含：label, text, model（建议模型，可为空）。
+    """
+    presets = [
+        {
+            "label": "标准·原典限定（严格只依三书）",
+            "model": "standard",
+            "text": (
+                "你是中国传统命理大师。仅可依据原典：《滴天髓》《三命通会》《穷通宝鉴》。"
+                "不得引用或臆造其他来源。若原典无明确定论，请据理推演并说明不确定性。"
+            ),
+        },
+        {
+            "label": "深研·结构化输出（仅依三书）",
+            "model": "deep_research",
+            "text": (
+                "你是中国传统命理研究专家。仅可依据《滴天髓》《三命通会》《穷通宝鉴》进行论证，"
+                "请先给出3-5条关键洞见，再分主题展开，并在末尾列出不确定性来源与可验证证据。"
+            ),
+        },
+        {
+            "label": "简洁·总论与建议（仅依三书）",
+            "model": "standard",
+            "text": (
+                "仅依《滴天髓》《三命通会》《穷通宝鉴》，先给3-5句总论，"
+                "再给事业/财运/健康三类可执行建议，避免迷信化承诺，并标注不确定性。"
+            ),
+        },
+    ]
+    return presets

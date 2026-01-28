@@ -1,0 +1,394 @@
+"""
+TriggerEvaluator - Static-first + LLM Fallback Trigger Evaluation
+
+Design Principles:
+1. Static conditions (exists/==/!=/>/< etc.) evaluated by platform directly
+2. Complex conditions (no data_path, natural language) fall back to LLM
+3. Cron matching + timezone handling + idempotent key
+
+Benefits:
+- Lower latency and cost
+- Lower LLM misjudgment risk
+- Maintains config-driven flexibility
+"""
+
+from typing import Dict, Any, Tuple, Optional, List
+from datetime import datetime
+import logging
+
+import croniter
+import pytz
+
+logger = logging.getLogger(__name__)
+
+# Operators that can be evaluated statically (no LLM needed)
+STATIC_OPERATORS = {"exists", "!exists", "==", "!=", ">", "<", ">=", "<=", "contains"}
+
+
+class TriggerEvaluator:
+    """Static-first + LLM fallback trigger evaluator"""
+
+    def __init__(self, llm_service=None):
+        """
+        Initialize evaluator.
+
+        Args:
+            llm_service: Optional LLM service for complex condition evaluation
+        """
+        self.llm_service = llm_service
+
+    async def evaluate(
+        self,
+        trigger_config: Dict[str, Any],
+        profile: Dict[str, Any],
+        conditions: Optional[List[Dict]] = None,
+        user_timezone: str = "Asia/Shanghai",
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Evaluate trigger conditions.
+
+        Args:
+            trigger_config: Trigger configuration from reminders.yaml
+            profile: User profile data
+            conditions: Optional list of conditions to evaluate
+            user_timezone: User's timezone string
+
+        Returns:
+            Tuple of (triggered: bool, event_info: Optional[Dict], idempotent_key: Optional[str])
+        """
+        trigger_type = trigger_config.get("type")
+
+        # 1. Time-based trigger: deterministic cron matching
+        if trigger_type == "time_based":
+            matched, bucket_key = self._evaluate_cron(
+                trigger_config.get("schedule"),
+                user_timezone
+            )
+            if not matched:
+                return False, None, None
+            # Continue to evaluate conditions
+            if conditions:
+                cond_result = await self._evaluate_conditions(conditions, profile)
+                return cond_result, None, bucket_key
+            return True, None, bucket_key
+
+        # 2. Event-based trigger: deterministic event detection
+        if trigger_type == "event_based":
+            return await self._evaluate_event(trigger_config, profile, conditions)
+
+        # 3. Data condition trigger
+        if trigger_type == "data_condition":
+            result = await self._evaluate_conditions(conditions, profile)
+            return result, None, None
+
+        return False, None, None
+
+    def _evaluate_cron(
+        self,
+        schedule: str,
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Deterministic cron matching with timezone support.
+
+        Args:
+            schedule: Cron expression
+            user_timezone: User's timezone
+
+        Returns:
+            Tuple of (matched: bool, bucket_key: str) - bucket_key for idempotent deduplication
+        """
+        if not schedule:
+            return False, None
+
+        try:
+            tz = pytz.timezone(user_timezone)
+            now = datetime.now(tz)
+
+            cron = croniter.croniter(schedule, now)
+            prev_time = cron.get_prev(datetime)
+
+            # Calculate time bucket (minute-level precision)
+            bucket_key = prev_time.strftime("%Y-%m-%dT%H:%M")
+
+            # Error window aligned with scan frequency (assuming 1-minute scan, error <= 60s)
+            matched = (now - prev_time).total_seconds() < 60
+
+            return matched, bucket_key
+        except Exception as e:
+            logger.warning(f"Cron evaluation failed: {e}")
+            return False, None
+
+    async def _evaluate_conditions(
+        self,
+        conditions: List[Dict],
+        profile: Dict[str, Any],
+    ) -> bool:
+        """
+        Condition evaluation: static-first, LLM fallback.
+
+        Flow:
+        1. Preprocess placeholders ({today}, {now})
+        2. Evaluate static conditions directly
+        3. Fall back to LLM for complex conditions
+        4. All conditions use AND logic
+        """
+        if not conditions:
+            return True
+
+        static_conditions = []
+        complex_conditions = []
+
+        # Classify conditions
+        for cond in conditions:
+            cond = self._preprocess_condition(cond)  # Replace placeholders
+            if self._is_static_condition(cond):
+                static_conditions.append(cond)
+            else:
+                complex_conditions.append(cond)
+
+        # 1. Evaluate static conditions first (short-circuit optimization)
+        for cond in static_conditions:
+            if not self._static_eval(cond, profile):
+                return False  # Short-circuit: static condition not met
+
+        # 2. If static conditions pass, evaluate complex conditions
+        if complex_conditions and self.llm_service:
+            return await self._llm_eval_conditions(complex_conditions, profile)
+
+        return True
+
+    def _is_static_condition(self, cond: Dict) -> bool:
+        """Check if condition can be evaluated statically"""
+        return (
+            "data_path" in cond and
+            cond.get("operator", "exists") in STATIC_OPERATORS
+        )
+
+    def _preprocess_condition(self, cond: Dict) -> Dict:
+        """Preprocess placeholders in condition"""
+        cond = cond.copy()
+        if "value" in cond:
+            value = str(cond["value"])
+            if "{today}" in value:
+                cond["value"] = value.replace("{today}", datetime.now().strftime("%Y-%m-%d"))
+            if "{now}" in value:
+                cond["value"] = value.replace("{now}", datetime.now().isoformat())
+        return cond
+
+    def _static_eval(self, cond: Dict, profile: Dict) -> bool:
+        """Evaluate static condition"""
+        data_path = cond.get("data_path", "")
+        operator = cond.get("operator", "exists")
+        expected = cond.get("value")
+
+        # Get actual value from profile
+        actual = self._get_nested_value(profile, data_path)
+
+        # Evaluate based on operator
+        if operator == "exists":
+            return actual is not None
+        if operator == "!exists":
+            return actual is None
+        if operator == "==":
+            return str(actual) == str(expected)
+        if operator == "!=":
+            return str(actual) != str(expected)
+        if operator == ">":
+            return float(actual or 0) > float(expected)
+        if operator == "<":
+            return float(actual or 0) < float(expected)
+        if operator == ">=":
+            return float(actual or 0) >= float(expected)
+        if operator == "<=":
+            return float(actual or 0) <= float(expected)
+        if operator == "contains":
+            return expected in str(actual or "")
+
+        return False
+
+    def _get_nested_value(self, data: Dict, path: str) -> Any:
+        """Get value at nested path"""
+        keys = path.split(".")
+        for key in keys:
+            if isinstance(data, dict):
+                data = data.get(key)
+            else:
+                return None
+        return data
+
+    async def _llm_eval_conditions(
+        self,
+        conditions: List[Dict],
+        profile: Dict,
+    ) -> bool:
+        """
+        LLM evaluation for complex conditions.
+
+        Only used for conditions that cannot be evaluated statically.
+        """
+        # Build simplified prompt with only relevant data
+        prompt = f"""判断用户是否满足以下条件（全部满足返回 true）：
+
+条件：
+{chr(10).join(f"- {c.get('description', c)}" for c in conditions)}
+
+用户相关数据：
+{self._extract_relevant_data(profile, conditions)}
+
+返回 JSON：{{"triggered": true/false, "reason": "..."}}"""
+
+        try:
+            result = await self.llm_service.evaluate(prompt=prompt)
+            return result.get("triggered", False)
+        except Exception as e:
+            logger.error(f"LLM condition evaluation failed: {e}")
+            return False
+
+    def _extract_relevant_data(self, profile: Dict, conditions: List[Dict]) -> str:
+        """Extract relevant profile data for LLM evaluation"""
+        # For now, return a simplified summary
+        relevant = {}
+        for cond in conditions:
+            if "data_path" in cond:
+                path = cond["data_path"]
+                value = self._get_nested_value(profile, path)
+                if value is not None:
+                    relevant[path] = value
+
+        if relevant:
+            import json
+            return json.dumps(relevant, ensure_ascii=False, indent=2)
+        return "(无相关数据)"
+
+    async def _evaluate_event(
+        self,
+        trigger_config: Dict,
+        profile: Dict,
+        conditions: Optional[List[Dict]],
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Event-based trigger evaluation.
+
+        Prioritize deterministic calculation (birthday, solar terms, etc.),
+        only fall back to LLM for ambiguous scenarios.
+        """
+        event_type = trigger_config.get("event")
+        advance_days = trigger_config.get("advance_days", [0])
+
+        # Deterministic event detection
+        if event_type == "birthday":
+            return self._detect_birthday(profile, advance_days)
+        if event_type == "solar_term":
+            return self._detect_solar_term(advance_days)
+
+        # Complex events fall back to LLM
+        if self.llm_service:
+            return await self._llm_detect_event(event_type, profile, conditions)
+
+        return False, None, None
+
+    def _detect_birthday(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """Deterministic birthday detection"""
+        birth_date_str = self._get_nested_value(profile, "vibe.profile.birth_info.date")
+        if not birth_date_str:
+            return False, None, None
+
+        try:
+            birth = datetime.strptime(birth_date_str, "%Y-%m-%d")
+            today = datetime.now()
+            this_year_birthday = birth.replace(year=today.year)
+
+            # Handle case where birthday already passed this year
+            if this_year_birthday.date() < today.date():
+                this_year_birthday = this_year_birthday.replace(year=today.year + 1)
+
+            days_until = (this_year_birthday.date() - today.date()).days
+
+            if days_until in advance_days:
+                return True, {
+                    "event_type": "birthday",
+                    "event_date": this_year_birthday.strftime("%Y-%m-%d"),
+                    "days_until": days_until,
+                }, f"birthday-{this_year_birthday.strftime('%Y-%m-%d')}"
+
+        except Exception as e:
+            logger.warning(f"Birthday detection failed: {e}")
+
+        return False, None, None
+
+    def _detect_solar_term(
+        self,
+        advance_days: List[int],
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Deterministic solar term detection.
+
+        TODO: Implement actual solar term calculation using astronomical algorithms.
+        For now, returns False as a placeholder.
+        """
+        # Solar term detection requires astronomical calculation
+        # This would use a library like lunarcalendar or ephem
+        return False, None, None
+
+    async def _llm_detect_event(
+        self,
+        event_type: str,
+        profile: Dict,
+        conditions: Optional[List[Dict]],
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """LLM-based event detection for complex events"""
+        # Build prompt for LLM to detect event
+        prompt = f"""检测以下事件是否应该触发：
+
+事件类型：{event_type}
+
+用户数据摘要：
+{self._build_profile_summary(profile)}
+
+返回 JSON：
+{{
+  "triggered": true/false,
+  "event_info": {{"event_type": "...", ...}},
+  "reason": "..."
+}}"""
+
+        try:
+            result = await self.llm_service.evaluate(prompt=prompt)
+            if result.get("triggered"):
+                event_info = result.get("event_info", {"event_type": event_type})
+                idempotent_key = f"{event_type}-{datetime.now().strftime('%Y-%m-%d')}"
+                return True, event_info, idempotent_key
+        except Exception as e:
+            logger.error(f"LLM event detection failed: {e}")
+
+        return False, None, None
+
+    def _build_profile_summary(self, profile: Dict) -> str:
+        """Build profile summary for LLM context"""
+        lines = []
+        vibe = profile.get("vibe", {})
+
+        # Profile data
+        profile_data = vibe.get("profile", {})
+        if birth := profile_data.get("birth_info"):
+            lines.append(f"- 生日: {birth.get('date')}")
+
+        # State
+        state = vibe.get("state", {})
+        if focus := state.get("focus"):
+            lines.append(f"- 关注领域: {', '.join(focus)}")
+        if emotion := state.get("emotion"):
+            lines.append(f"- 当前情绪: {emotion}")
+
+        # Goals
+        goals = vibe.get("goals", [])
+        if goals:
+            goal_names = [g.get("name", str(g)) for g in goals[:3]]
+            lines.append(f"- 目标: {', '.join(goal_names)}")
+
+        return "\n".join(lines) if lines else "（无画像信息）"

@@ -1,0 +1,202 @@
+     1→"""
+     2→VibeLife Database Connection
+     3→PostgreSQL with asyncpg
+     4→
+     5→Test-mode fallback:
+     6→- When VIBELIFE_ENV=test or asyncpg is unavailable, provide a lightweight
+     7→  in-memory stub so that importing repositories does not require the
+     8→  asyncpg binary package. This lets API tests run with service/repo mocks.
+     9→"""
+    10→import os
+    11→from typing import Optional
+    12→from contextlib import asynccontextmanager
+    13→
+    14→# TEST_MODE: 使用 dummy 连接（除非设置了 VIBELIFE_TEST_DB_URL 强制使用真实数据库）
+    15→_env_test = os.getenv("VIBELIFE_ENV") == "test"
+    16→_has_test_db = bool(os.getenv("VIBELIFE_TEST_DB_URL"))
+    17→TEST_MODE = _env_test and not _has_test_db
+    18→
+    19→try:  # Avoid hard-failing when asyncpg wheels are unavailable in CI
+    20→    import asyncpg  # type: ignore
+    21→except Exception:  # pragma: no cover - only in lean test envs
+    22→    asyncpg = None  # type: ignore
+    23→
+    24→
+    25→# ─────────────────────────────────────────────────────────────────
+    26→# Global Connection Pool
+    27→# ─────────────────────────────────────────────────────────────────
+    28→
+    29→_pool: Optional[object] = None
+    30→
+    31→
+    32→# ─────────────────────────────────────────────────────────────────
+    33→# Test-mode stubs
+    34→# ─────────────────────────────────────────────────────────────────
+    35→
+    36→class _DummyConn:
+    37→    async def fetch(self, *args, **kwargs):
+    38→        return []
+    39→
+    40→    async def fetchrow(self, *args, **kwargs):
+    41→        return None
+    42→
+    43→    async def fetchval(self, *args, **kwargs):
+    44→        return None
+    45→
+    46→    async def execute(self, *args, **kwargs):
+    47→        return "OK"
+    48→
+    49→    class _Tx:
+    50→        async def __aenter__(self):
+    51→            return self
+    52→
+    53→        async def __aexit__(self, exc_type, exc, tb):
+    54→            return False
+    55→
+    56→    def transaction(self):
+    57→        return self._Tx()
+    58→
+    59→
+    60→class _AcquireCM:
+    61→    def __init__(self):
+    62→        self._conn = _DummyConn()
+    63→
+    64→    async def __aenter__(self):
+    65→        return self._conn
+    66→
+    67→    async def __aexit__(self, exc_type, exc, tb):
+    68→        return False
+    69→
+    70→
+    71→class _DummyPool:
+    72→    def acquire(self):
+    73→        return _AcquireCM()
+    74→
+    75→
+    76→def get_db_url() -> str:
+    77→    """Get database URL from environment - MUST be set"""
+    78→    # 测试环境优先使用 VIBELIFE_TEST_DB_URL
+    79→    db_url = os.getenv("VIBELIFE_TEST_DB_URL") or os.getenv("VIBELIFE_DB_URL")
+    80→    if not db_url:
+    81→        raise RuntimeError(
+    82→            "CRITICAL: VIBELIFE_DB_URL environment variable is not set. "
+    83→            "Database connection requires explicit configuration."
+    84→        )
+    85→    return db_url
+    86→
+    87→
+    88→async def init_db():
+    89→    """Initialize database connection pool"""
+    90→    global _pool
+    91→
+    92→    if _pool is not None:
+    93→        return
+    94→
+    95→    if TEST_MODE:
+    96→        _pool = _DummyPool()
+    97→        return
+    98→
+    99→    if asyncpg is None:
+   100→        raise RuntimeError(
+   101→            "asyncpg is not installed and TEST mode is not enabled; cannot init DB"
+   102→        )
+   103→
+   104→    db_url = get_db_url()
+   105→
+   106→    _pool = await asyncpg.create_pool(  # type: ignore[attr-defined]
+   107→        db_url,
+   108→        min_size=2,
+   109→        max_size=20,
+   110→        command_timeout=60,
+   111→    )
+   112→
+   113→    # Test connection
+   114→    async with _pool.acquire() as conn:  # type: ignore[union-attr]
+   115→        version = await conn.fetchval("SELECT version()")
+   116→        print(f"📦 PostgreSQL: {str(version)[:50]}...")
+   117→
+   118→
+   119→async def close_db():
+   120→    """Close database connection pool"""
+   121→    global _pool
+   122→
+   123→    if _pool is not None:
+   124→        await _pool.close()
+   125→        _pool = None
+   126→
+   127→
+   128→async def get_db() -> object:
+   129→    """Get database pool (for dependency injection)"""
+   130→    if _pool is None:
+   131→        await init_db()
+   132→    return _pool
+   133→
+   134→
+   135→async def get_db_pool() -> object:
+   136→    """Backward-compatible alias for getting the DB pool"""
+   137→    return await get_db()
+   138→
+   139→
+   140→@asynccontextmanager
+   141→async def get_connection():
+   142→    """Get a database connection from pool"""
+   143→    if TEST_MODE:
+   144→        yield _DummyConn()
+   145→    else:
+   146→        pool = await get_db()
+   147→        async with pool.acquire() as conn:  # type: ignore[union-attr]
+   148→            yield conn
+   149→
+   150→
+   151→@asynccontextmanager
+   152→async def get_transaction():
+   153→    """Get a database connection with transaction support.
+   154→
+   155→    Usage:
+   156→        async with get_transaction() as conn:
+   157→            await conn.execute("INSERT ...")
+   158→            await conn.execute("UPDATE ...")
+   159→            # Auto-commits on success, auto-rollbacks on exception
+   160→    """
+   161→    if TEST_MODE:
+   162→        conn = _DummyConn()
+   163→        async with conn.transaction():
+   164→            yield conn
+   165→    else:
+   166→        pool = await get_db()
+   167→        async with pool.acquire() as conn:  # type: ignore[union-attr]
+   168→            async with conn.transaction():
+   169→                yield conn
+   170→
+   171→
+   172→# ─────────────────────────────────────────────────────────────────
+   173→# Utility Functions
+   174→# ─────────────────────────────────────────────────────────────────
+   175→
+   176→async def execute(query: str, *args):
+   177→    """Execute a query"""
+   178→    async with get_connection() as conn:
+   179→        return await conn.execute(query, *args)
+   180→
+   181→
+   182→async def fetch(query: str, *args):
+   183→    """Fetch all rows"""
+   184→    async with get_connection() as conn:
+   185→        return await conn.fetch(query, *args)
+   186→
+   187→
+   188→async def fetchrow(query: str, *args):
+   189→    """Fetch one row"""
+   190→    async with get_connection() as conn:
+   191→        return await conn.fetchrow(query, *args)
+   192→
+   193→
+   194→async def fetchval(query: str, *args):
+   195→    """Fetch one value"""
+   196→    async with get_connection() as conn:
+   197→        return await conn.fetchval(query, *args)
+   198→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

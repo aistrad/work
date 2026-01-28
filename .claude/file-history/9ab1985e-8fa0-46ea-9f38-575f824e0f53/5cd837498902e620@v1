@@ -1,0 +1,597 @@
+"""
+Mentis OS v3.0 - Life Connect 服务
+
+核心功能:
+- 实体抽取 (人物/事件/待办/目标/地点)
+- 实体管理 (确认/拒绝/合并)
+- 待办和目标追踪
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from stores import mentis_db
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 数据类型定义
+# =============================================================================
+
+@dataclass
+class LifeEntity:
+    """生活实体"""
+    id: Optional[str]
+    user_id: str
+    entity_type: str  # person, event, todo, goal, place
+    name: str
+    description: Optional[str]
+    metadata: Dict[str, Any]
+    source_entries: List[str]
+    related_entities: List[str]
+    status: str  # pending, confirmed, done, dismissed, archived
+    due_date: Optional[datetime]
+    confirmed: bool
+    mention_count: int
+    avg_energy_impact: Optional[float]
+    last_mentioned: Optional[datetime]
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "entity_type": self.entity_type,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata,
+            "source_entries": self.source_entries,
+            "related_entities": self.related_entities,
+            "status": self.status,
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "confirmed": self.confirmed,
+            "mention_count": self.mention_count,
+            "avg_energy_impact": self.avg_energy_impact,
+            "last_mentioned": self.last_mentioned.isoformat() if self.last_mentioned else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+@dataclass
+class PersonEntity(LifeEntity):
+    """人物实体"""
+    relation: Optional[str] = None  # family, friend, colleague, partner, other
+    event: Optional[str] = None  # birthday, meeting, etc.
+
+
+@dataclass
+class TodoEntity(LifeEntity):
+    """待办实体"""
+    priority: str = "medium"  # high, medium, low
+    context: Optional[str] = None
+
+
+@dataclass
+class GoalEntity(LifeEntity):
+    """目标实体"""
+    category: str = "personal"  # health, career, relationship, finance, personal, other
+    timeframe: str = "long_term"  # short_term, long_term
+    progress: float = 0.0
+
+
+# =============================================================================
+# Life Connect 服务
+# =============================================================================
+
+class LifeConnectService:
+    """Life Connect 服务"""
+
+    def __init__(self):
+        pass
+
+    # =========================================================================
+    # 实体查询
+    # =========================================================================
+
+    def list_entities(
+        self,
+        user_id: str,
+        entity_type: Optional[str] = None,
+        status: Optional[str] = None,
+        confirmed: Optional[bool] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[LifeEntity]:
+        """列出实体"""
+        conditions = ["user_id = %s"]
+        params: List[Any] = [user_id]
+
+        if entity_type:
+            conditions.append("entity_type = %s")
+            params.append(entity_type)
+
+        if status:
+            conditions.append("status = %s")
+            params.append(status)
+
+        if confirmed is not None:
+            conditions.append("confirmed = %s")
+            params.append(confirmed)
+
+        where_clause = " AND ".join(conditions)
+        params.extend([limit, offset])
+
+        rows = mentis_db.fetch_all(
+            f"""
+            SELECT id, user_id, entity_type, name, description, metadata,
+                   source_entries, related_entities, status, due_date,
+                   confirmed, mention_count, avg_energy_impact, last_mentioned,
+                   created_at, updated_at
+            FROM life_entity
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+
+        return [self._row_to_entity(row) for row in rows]
+
+    def get_pending_entities(self, user_id: str) -> List[LifeEntity]:
+        """获取待确认的实体"""
+        return self.list_entities(
+            user_id=user_id,
+            confirmed=False,
+            status="pending",
+        )
+
+    def get_entity_by_id(self, entity_id: str) -> Optional[LifeEntity]:
+        """根据 ID 获取实体"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, user_id, entity_type, name, description, metadata,
+                   source_entries, related_entities, status, due_date,
+                   confirmed, mention_count, avg_energy_impact, last_mentioned,
+                   created_at, updated_at
+            FROM life_entity
+            WHERE id = %s
+            """,
+            (entity_id,),
+        )
+        return self._row_to_entity(row) if row else None
+
+    # =========================================================================
+    # 按类型查询
+    # =========================================================================
+
+    def get_people(
+        self,
+        user_id: str,
+        confirmed_only: bool = False,
+    ) -> List[LifeEntity]:
+        """获取人物列表"""
+        return self.list_entities(
+            user_id=user_id,
+            entity_type="person",
+            confirmed=True if confirmed_only else None,
+        )
+
+    def get_todos(
+        self,
+        user_id: str,
+        status: Optional[str] = None,
+    ) -> List[LifeEntity]:
+        """获取待办列表"""
+        entities = self.list_entities(
+            user_id=user_id,
+            entity_type="todo",
+            status=status,
+            confirmed=True,
+        )
+        # 按优先级和截止日期排序
+        def sort_key(e: LifeEntity) -> tuple:
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            p = e.metadata.get("priority", "medium")
+            due = e.due_date or datetime.max.replace(tzinfo=timezone.utc)
+            return (priority_order.get(p, 1), due)
+
+        return sorted(entities, key=sort_key)
+
+    def get_goals(
+        self,
+        user_id: str,
+        category: Optional[str] = None,
+    ) -> List[LifeEntity]:
+        """获取目标列表"""
+        entities = self.list_entities(
+            user_id=user_id,
+            entity_type="goal",
+            confirmed=True,
+        )
+        if category:
+            entities = [e for e in entities if e.metadata.get("category") == category]
+        return entities
+
+    def get_events(
+        self,
+        user_id: str,
+        future_only: bool = False,
+    ) -> List[LifeEntity]:
+        """获取事件列表"""
+        entities = self.list_entities(
+            user_id=user_id,
+            entity_type="event",
+            confirmed=True,
+        )
+        if future_only:
+            now = datetime.now(timezone.utc)
+            entities = [e for e in entities if e.due_date and e.due_date > now]
+        return sorted(entities, key=lambda e: e.due_date or datetime.max.replace(tzinfo=timezone.utc))
+
+    def get_places(self, user_id: str) -> List[LifeEntity]:
+        """获取地点列表"""
+        return self.list_entities(
+            user_id=user_id,
+            entity_type="place",
+            confirmed=True,
+        )
+
+    # =========================================================================
+    # 实体操作
+    # =========================================================================
+
+    def confirm_entity(self, user_id: str, entity_id: str) -> Optional[LifeEntity]:
+        """确认实体"""
+        # 验证权限
+        entity = self.get_entity_by_id(entity_id)
+        if not entity or entity.user_id != user_id:
+            return None
+
+        mentis_db.execute(
+            """
+            UPDATE life_entity
+            SET confirmed = TRUE, status = 'confirmed', updated_at = NOW()
+            WHERE id = %s
+            """,
+            (entity_id,),
+        )
+
+        entity.confirmed = True
+        entity.status = "confirmed"
+        return entity
+
+    def dismiss_entity(self, user_id: str, entity_id: str) -> bool:
+        """拒绝/忽略实体"""
+        entity = self.get_entity_by_id(entity_id)
+        if not entity or entity.user_id != user_id:
+            return False
+
+        mentis_db.execute(
+            """
+            UPDATE life_entity
+            SET status = 'dismissed', updated_at = NOW()
+            WHERE id = %s
+            """,
+            (entity_id,),
+        )
+        return True
+
+    def complete_todo(self, user_id: str, todo_id: str) -> Optional[LifeEntity]:
+        """完成待办"""
+        entity = self.get_entity_by_id(todo_id)
+        if not entity or entity.user_id != user_id or entity.entity_type != "todo":
+            return None
+
+        mentis_db.execute(
+            """
+            UPDATE life_entity
+            SET status = 'done', updated_at = NOW()
+            WHERE id = %s
+            """,
+            (todo_id,),
+        )
+
+        entity.status = "done"
+        return entity
+
+    def update_goal_progress(
+        self,
+        user_id: str,
+        goal_id: str,
+        progress: float,
+    ) -> Optional[LifeEntity]:
+        """更新目标进度"""
+        entity = self.get_entity_by_id(goal_id)
+        if not entity or entity.user_id != user_id or entity.entity_type != "goal":
+            return None
+
+        progress = max(0.0, min(1.0, progress))
+        metadata = entity.metadata
+        metadata["progress"] = progress
+
+        status = "done" if progress >= 1.0 else entity.status
+
+        mentis_db.execute(
+            """
+            UPDATE life_entity
+            SET metadata = %s::jsonb, status = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (json.dumps(metadata, ensure_ascii=False), status, goal_id),
+        )
+
+        entity.metadata = metadata
+        entity.status = status
+        return entity
+
+    def merge_entities(
+        self,
+        user_id: str,
+        primary_id: str,
+        secondary_ids: List[str],
+    ) -> Optional[LifeEntity]:
+        """合并重复实体"""
+        primary = self.get_entity_by_id(primary_id)
+        if not primary or primary.user_id != user_id:
+            return None
+
+        # 收集所有来源条目
+        all_sources = set(primary.source_entries)
+
+        for sid in secondary_ids:
+            secondary = self.get_entity_by_id(sid)
+            if secondary and secondary.user_id == user_id:
+                all_sources.update(secondary.source_entries)
+                # 删除被合并的实体
+                mentis_db.execute(
+                    "DELETE FROM life_entity WHERE id = %s",
+                    (sid,),
+                )
+
+        # 更新主实体
+        mentis_db.execute(
+            """
+            UPDATE life_entity
+            SET source_entries = %s,
+                mention_count = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (list(all_sources), len(all_sources), primary_id),
+        )
+
+        primary.source_entries = list(all_sources)
+        primary.mention_count = len(all_sources)
+        return primary
+
+    def create_entity(
+        self,
+        user_id: str,
+        entity_type: str,
+        name: str,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        due_date: Optional[datetime] = None,
+        auto_confirm: bool = False,
+    ) -> LifeEntity:
+        """手动创建实体"""
+        result = mentis_db.execute_returning_one(
+            """
+            INSERT INTO life_entity (
+                user_id, entity_type, name, description, metadata,
+                source_entries, status, due_date, confirmed
+            )
+            VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+            RETURNING id, created_at
+            """,
+            (
+                user_id,
+                entity_type,
+                name,
+                description,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                [],
+                "confirmed" if auto_confirm else "pending",
+                due_date,
+                auto_confirm,
+            ),
+        )
+
+        return LifeEntity(
+            id=str(result["id"]) if result else None,
+            user_id=user_id,
+            entity_type=entity_type,
+            name=name,
+            description=description,
+            metadata=metadata or {},
+            source_entries=[],
+            related_entities=[],
+            status="confirmed" if auto_confirm else "pending",
+            due_date=due_date,
+            confirmed=auto_confirm,
+            mention_count=0,
+            avg_energy_impact=None,
+            last_mentioned=None,
+            created_at=result.get("created_at") if result else None,
+            updated_at=None,
+        )
+
+    def update_entity(
+        self,
+        user_id: str,
+        entity_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        due_date: Optional[datetime] = None,
+    ) -> Optional[LifeEntity]:
+        """更新实体"""
+        entity = self.get_entity_by_id(entity_id)
+        if not entity or entity.user_id != user_id:
+            return None
+
+        updates = []
+        params = []
+
+        if name is not None:
+            updates.append("name = %s")
+            params.append(name)
+
+        if description is not None:
+            updates.append("description = %s")
+            params.append(description)
+
+        if metadata is not None:
+            updates.append("metadata = %s::jsonb")
+            params.append(json.dumps(metadata, ensure_ascii=False))
+
+        if due_date is not None:
+            updates.append("due_date = %s")
+            params.append(due_date)
+
+        if not updates:
+            return entity
+
+        updates.append("updated_at = NOW()")
+        params.append(entity_id)
+
+        mentis_db.execute(
+            f"""
+            UPDATE life_entity
+            SET {", ".join(updates)}
+            WHERE id = %s
+            """,
+            tuple(params),
+        )
+
+        return self.get_entity_by_id(entity_id)
+
+    def delete_entity(self, user_id: str, entity_id: str) -> bool:
+        """删除实体"""
+        entity = self.get_entity_by_id(entity_id)
+        if not entity or entity.user_id != user_id:
+            return False
+
+        mentis_db.execute(
+            "DELETE FROM life_entity WHERE id = %s",
+            (entity_id,),
+        )
+        return True
+
+    # =========================================================================
+    # 统计和洞察
+    # =========================================================================
+
+    def get_entity_stats(self, user_id: str) -> Dict[str, Any]:
+        """获取实体统计"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE entity_type = 'person' AND confirmed = TRUE) AS people_count,
+                COUNT(*) FILTER (WHERE entity_type = 'event' AND confirmed = TRUE) AS event_count,
+                COUNT(*) FILTER (WHERE entity_type = 'todo' AND confirmed = TRUE AND status != 'done') AS pending_todo_count,
+                COUNT(*) FILTER (WHERE entity_type = 'todo' AND confirmed = TRUE AND status = 'done') AS done_todo_count,
+                COUNT(*) FILTER (WHERE entity_type = 'goal' AND confirmed = TRUE) AS goal_count,
+                COUNT(*) FILTER (WHERE entity_type = 'place' AND confirmed = TRUE) AS place_count,
+                COUNT(*) FILTER (WHERE confirmed = FALSE AND status = 'pending') AS pending_confirmation_count
+            FROM life_entity
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        return {
+            "people_count": int(row.get("people_count") or 0) if row else 0,
+            "event_count": int(row.get("event_count") or 0) if row else 0,
+            "pending_todo_count": int(row.get("pending_todo_count") or 0) if row else 0,
+            "done_todo_count": int(row.get("done_todo_count") or 0) if row else 0,
+            "goal_count": int(row.get("goal_count") or 0) if row else 0,
+            "place_count": int(row.get("place_count") or 0) if row else 0,
+            "pending_confirmation_count": int(row.get("pending_confirmation_count") or 0) if row else 0,
+        }
+
+    def get_people_energy_impact(self, user_id: str) -> List[Dict[str, Any]]:
+        """获取人物的能量影响排名"""
+        rows = mentis_db.fetch_all(
+            """
+            SELECT name, mention_count, avg_energy_impact
+            FROM life_entity
+            WHERE user_id = %s AND entity_type = 'person' AND confirmed = TRUE
+            ORDER BY avg_energy_impact DESC NULLS LAST
+            LIMIT 10
+            """,
+            (user_id,),
+        )
+
+        return [
+            {
+                "name": row.get("name"),
+                "mention_count": int(row.get("mention_count") or 0),
+                "avg_energy_impact": float(row.get("avg_energy_impact") or 0),
+            }
+            for row in rows
+        ]
+
+    # =========================================================================
+    # 私有方法
+    # =========================================================================
+
+    def _row_to_entity(self, row: Dict[str, Any]) -> LifeEntity:
+        """将数据库行转换为 LifeEntity"""
+        metadata = row.get("metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+
+        return LifeEntity(
+            id=str(row.get("id")),
+            user_id=str(row.get("user_id")),
+            entity_type=row.get("entity_type") or "other",
+            name=row.get("name") or "",
+            description=row.get("description"),
+            metadata=metadata,
+            source_entries=row.get("source_entries") or [],
+            related_entities=row.get("related_entities") or [],
+            status=row.get("status") or "pending",
+            due_date=row.get("due_date"),
+            confirmed=bool(row.get("confirmed")),
+            mention_count=int(row.get("mention_count") or 0),
+            avg_energy_impact=float(row.get("avg_energy_impact")) if row.get("avg_energy_impact") else None,
+            last_mentioned=row.get("last_mentioned"),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+        )
+
+
+# =============================================================================
+# 便捷函数
+# =============================================================================
+
+def get_pending_entities(user_id: str) -> List[LifeEntity]:
+    """获取待确认的实体"""
+    service = LifeConnectService()
+    return service.get_pending_entities(user_id)
+
+
+def confirm_entity(user_id: str, entity_id: str) -> Optional[LifeEntity]:
+    """确认实体"""
+    service = LifeConnectService()
+    return service.confirm_entity(user_id, entity_id)
+
+
+def get_todos(user_id: str, status: Optional[str] = None) -> List[LifeEntity]:
+    """获取待办列表"""
+    service = LifeConnectService()
+    return service.get_todos(user_id, status)
+
+
+def complete_todo(user_id: str, todo_id: str) -> Optional[LifeEntity]:
+    """完成待办"""
+    service = LifeConnectService()
+    return service.complete_todo(user_id, todo_id)

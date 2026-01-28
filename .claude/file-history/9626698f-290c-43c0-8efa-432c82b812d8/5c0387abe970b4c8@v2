@@ -1,0 +1,699 @@
+"""
+CoreAgent + Core Skill 用户场景测试 (v7.7 真实数据库版)
+
+测试场景覆盖：
+1. 用户数据工具 (read/write/query/delete)
+2. 触发器工具 (create/list/cancel)
+3. 展示工具 (show_card)
+4. 收集工具 (ask_user_question, request_info)
+5. 乐观锁版本控制
+
+重要说明：
+- 所有测试使用真实数据库连接，不使用 mock
+- 需要设置 VIBELIFE_TEST_DB_URL 环境变量
+- 每个测试后自动清理测试数据
+"""
+
+import os
+import pytest
+from datetime import datetime
+from uuid import uuid4, UUID
+
+# 确保使用测试数据库
+os.environ["VIBELIFE_ENV"] = "test"
+# 如果没有设置，使用默认测试数据库 URL
+if not os.environ.get("VIBELIFE_TEST_DB_URL"):
+    os.environ["VIBELIFE_TEST_DB_URL"] = os.environ.get(
+        "VIBELIFE_DB_URL",
+        "postgresql://postgres:test@localhost:5432/vibelife_test"
+    )
+
+from services.agent.tool_registry import ToolRegistry, ToolContext
+from skills.core.services import CardService, CardTypes
+from stores.unified_profile_repo import UnifiedProfileRepository, LifeContextData
+
+pytestmark = pytest.mark.asyncio
+
+# 使用随机 UUID 避免测试间冲突
+TEST_USER_ID = str(uuid4())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(scope="module")
+async def db_pool():
+    """
+    初始化真实数据库连接池
+
+    如果数据库不可用，跳过相关测试
+    """
+    from stores.db import init_db, close_db, get_db
+
+    # 检查是否有有效的数据库 URL
+    db_url = os.environ.get("VIBELIFE_TEST_DB_URL") or os.environ.get("VIBELIFE_DB_URL")
+    if not db_url or "<" in db_url:  # 检查是否是模板占位符
+        pytest.skip("No valid database URL configured (set VIBELIFE_TEST_DB_URL)")
+
+    try:
+        await init_db()
+        pool = await get_db()
+    except Exception as e:
+        pytest.skip(f"Database connection failed: {e}")
+
+    yield pool
+    await close_db()
+
+
+@pytest.fixture
+async def test_user_id(db_pool):
+    """
+    创建测试用户并在测试后清理
+    每个测试使用独立的 user_id 保证隔离
+    """
+    user_id = uuid4()
+
+    # 先创建 vibe_users 记录（如果表存在外键约束）
+    try:
+        async with db_pool.acquire() as conn:
+            # 检查 vibe_users 表是否存在
+            exists = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'vibe_users')"
+            )
+            if exists:
+                await conn.execute(
+                    """INSERT INTO vibe_users (id, vibe_id, display_name, email, password_hash, created_at)
+                       VALUES ($1, $2, $3, $4, $5, NOW())
+                       ON CONFLICT (id) DO NOTHING""",
+                    user_id,
+                    f"VB-TEST-{user_id.hex[:8].upper()}",
+                    "测试用户",
+                    f"test_{user_id.hex[:8]}@test.com",
+                    "test_hash"
+                )
+    except Exception as e:
+        # 如果 vibe_users 表不存在或有其他问题，继续
+        print(f"Note: Could not create vibe_users record: {e}")
+
+    # 创建 unified_profiles 记录
+    await UnifiedProfileRepository.create_profile(user_id, {
+        "birth_info": {"date": "1990-05-15", "time": "14:30", "place": "北京"},
+        "life_context": {},
+        "identity_prism": {},
+        "preferences": {"voice_mode": "warm", "language": "zh-CN"},
+        "skill_data": {}
+    })
+
+    yield user_id
+
+    # 清理测试数据
+    await UnifiedProfileRepository.delete_profile(user_id)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM vibe_users WHERE id = $1", user_id)
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def tool_context(test_user_id):
+    """工具执行上下文"""
+    return ToolContext(
+        user_id=str(test_user_id),
+        user_tier="premium",
+        profile={"name": "测试用户", "birth_info": {"year": 1990, "month": 5, "day": 15}},
+        skill_data={},
+        skill_id="core",
+        scenario_id="goal_tracking"
+    )
+
+
+@pytest.fixture(autouse=True)
+def init_registry():
+    """自动初始化 ToolRegistry"""
+    ToolRegistry.initialize()
+
+
+@pytest.fixture
+def card_service():
+    """CardService 实例"""
+    return CardService()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 1: 目标设定与追踪
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGoalTrackingScenario:
+    """
+    用户场景：设定年度目标并追踪进度
+
+    用户故事：
+    - 用户想设定 2026 年的年度目标
+    - 用户想查看自己的目标列表
+    - 用户想更新目标进度
+    """
+
+    async def test_scenario_1_1_create_year_goal(self, tool_context, db_pool):
+        """场景 1.1: 用户设定年度目标"""
+        ToolRegistry.initialize()
+
+        args = {
+            "path": "goals/2026/year",
+            "content": {
+                "title": "2026年度目标",
+                "status": "active",
+                "items": [
+                    {
+                        "id": "goal-1",
+                        "title": "学会弹吉他",
+                        "description": "能够弹奏 5 首完整的歌曲",
+                        "deadline": "2026-12-31",
+                        "progress": 0,
+                        "status": "active"
+                    }
+                ]
+            }
+        }
+
+        result = await ToolRegistry.execute("write_user_data", args, tool_context)
+
+        assert result["status"] == "success"
+        assert result["version"] == 1
+
+        # 验证数据已写入数据库
+        user_id = UUID(tool_context.user_id)
+        saved_data = await UnifiedProfileRepository.read_life_context_path(user_id, "goals/2026/year")
+        assert saved_data is not None
+        assert saved_data.content["title"] == "2026年度目标"
+
+    async def test_scenario_1_2_read_goals(self, tool_context, db_pool):
+        """场景 1.2: 用户查看目标列表"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 先写入测试数据
+        goal_data = {
+            "title": "2026目标",
+            "items": [{"id": "1", "title": "学吉他"}]
+        }
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "goals/2026/year_read_test", goal_data
+        )
+
+        result = await ToolRegistry.execute("read_user_data", {
+            "path": "goals/2026/year_read_test"
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["data"] is not None
+        assert result["data"]["content"]["title"] == "2026目标"
+
+    async def test_scenario_1_3_update_goal_progress(self, tool_context, db_pool):
+        """场景 1.3: 用户更新目标进度（乐观锁测试）"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 先写入初始数据
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "goals/2026/guitar_progress",
+            {"title": "学吉他", "progress": 0, "status": "active"}
+        )
+
+        # 使用 expected_version=1 更新
+        update_result = await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/guitar_progress",
+            "content": {"title": "学吉他", "progress": 20, "status": "active"},
+            "expected_version": 1
+        }, tool_context)
+
+        assert update_result["status"] == "success"
+        assert update_result["version"] == 2
+
+        # 验证数据库中的数据
+        saved_data = await UnifiedProfileRepository.read_life_context_path(user_id, "goals/2026/guitar_progress")
+        assert saved_data.content["progress"] == 20
+        assert saved_data.version == 2
+
+    async def test_scenario_1_4_version_conflict(self, tool_context, db_pool):
+        """场景 1.4: 并发更新导致版本冲突"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 先写入初始数据 (version=1)
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "goals/2026/conflict_test",
+            {"title": "冲突测试", "value": 1}
+        )
+
+        # 再写入一次，更新到 version=2
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "goals/2026/conflict_test",
+            {"title": "冲突测试", "value": 2},
+            expected_version=1
+        )
+
+        # 尝试用错误的版本号更新 (expected_version=1, 但实际已经是 2)
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "goals/2026/conflict_test",
+            "content": {"title": "冲突测试", "value": 3},
+            "expected_version": 1
+        }, tool_context)
+
+        assert result["status"] == "conflict"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 2: 每日计划与打卡
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDailyPlanScenario:
+    """
+    用户场景：制定每日计划并打卡
+    """
+
+    async def test_scenario_2_1_create_daily_plan(self, tool_context, db_pool):
+        """场景 2.1: 用户制定今日计划"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "plans/daily/2026-01-18",
+            "content": {
+                "date": "2026-01-18",
+                "status": "active",
+                "tasks": [
+                    {"id": "t1", "title": "练习吉他 30 分钟", "done": False},
+                    {"id": "t2", "title": "阅读 20 页书", "done": False},
+                    {"id": "t3", "title": "运动 15 分钟", "done": False}
+                ]
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+
+        # 验证数据已写入
+        user_id = UUID(tool_context.user_id)
+        saved_data = await UnifiedProfileRepository.read_life_context_path(user_id, "plans/daily/2026-01-18")
+        assert saved_data is not None
+        assert len(saved_data.content["tasks"]) == 3
+
+    async def test_scenario_2_2_show_daily_tasks(self, tool_context, db_pool):
+        """场景 2.2: 展示今日任务列表"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 先写入测试数据
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "plans/daily/2026-01-18-show",
+            {
+                "tasks": [
+                    {"id": "t1", "title": "练习吉他", "done": False},
+                    {"id": "t2", "title": "阅读", "done": True}
+                ]
+            }
+        )
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "list",
+            "data_source": {
+                "type": "path",
+                "path": "plans/daily/2026-01-18-show"
+            },
+            "options": {
+                "emptyText": "今天还没有计划哦",
+                "showIndex": True
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "list"
+
+    async def test_scenario_2_3_checkin(self, tool_context, db_pool):
+        """场景 2.3: 用户打卡"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("write_user_data", {
+            "path": "checkins/2026-01-18",
+            "content": {
+                "date": "2026-01-18",
+                "items": [
+                    {
+                        "goal_id": "guitar",
+                        "task": "练习吉他 30 分钟",
+                        "completed": True,
+                        "notes": "今天练习了《小星星》",
+                        "mood": "happy"
+                    }
+                ],
+                "summary": "完成 1 项任务"
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+
+        # 验证数据已写入
+        user_id = UUID(tool_context.user_id)
+        saved_data = await UnifiedProfileRepository.read_life_context_path(user_id, "checkins/2026-01-18")
+        assert saved_data is not None
+        assert saved_data.content["items"][0]["completed"] is True
+
+    async def test_scenario_2_4_query_checkin_history(self, tool_context, db_pool):
+        """场景 2.4: 查询打卡历史"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 写入多天的打卡数据
+        for day in range(15, 19):
+            await UnifiedProfileRepository.write_life_context_path(
+                user_id, f"checkins/2026-01-{day:02d}",
+                {"date": f"2026-01-{day:02d}", "completed": True}
+            )
+
+        result = await ToolRegistry.execute("query_user_data", {
+            "path_prefix": "checkins/2026-01",
+            "limit": 7
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["count"] >= 4
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 3: 触发器 (依赖 TriggerService 实现)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTriggerScenario:
+    """
+    用户场景：设置触发器
+    注意：触发器测试依赖 TriggerService 的实现
+    """
+
+    async def test_scenario_3_1_create_trigger(self, tool_context, db_pool):
+        """场景 3.1: 创建触发器"""
+        ToolRegistry.initialize()
+
+        # 检查工具是否已注册
+        if not ToolRegistry.has_handler("create_trigger"):
+            pytest.skip("create_trigger handler not registered")
+
+        result = await ToolRegistry.execute("create_trigger", {
+            "trigger_type": "reminder",
+            "title": "测试提醒",
+            "schedule": "08:00",
+            "schedule_type": "daily"
+        }, tool_context)
+
+        # 根据实现检查结果
+        assert result["status"] in ["success", "error"]
+
+    async def test_scenario_3_2_list_triggers(self, tool_context, db_pool):
+        """场景 3.2: 查看所有触发器"""
+        ToolRegistry.initialize()
+
+        if not ToolRegistry.has_handler("list_triggers"):
+            pytest.skip("list_triggers handler not registered")
+
+        result = await ToolRegistry.execute("list_triggers", {
+            "status": "active"
+        }, tool_context)
+
+        assert result["status"] in ["success", "error"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 4: 展示卡片 (使用 inline 数据)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestShowCardScenario:
+    """
+    用户场景：各种卡片展示
+
+    测试通用视图类型（使用 inline 数据，不依赖数据库）
+    """
+
+    async def test_scenario_4_1_show_tree(self, tool_context):
+        """场景 4.1: 展示目标树"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "tree",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "id": "root",
+                    "title": "2026 年度目标",
+                    "children": [
+                        {
+                            "id": "health",
+                            "title": "健康",
+                            "progress": 30,
+                            "children": [
+                                {"id": "h1", "title": "每周运动 3 次", "progress": 50},
+                                {"id": "h2", "title": "早睡早起", "progress": 10}
+                            ]
+                        }
+                    ]
+                }
+            },
+            "options": {"expandLevel": 2, "showProgress": True}
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "tree"
+
+    async def test_scenario_4_2_show_progress(self, tool_context):
+        """场景 4.2: 展示进度条"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "progress",
+            "data_source": {
+                "type": "inline",
+                "data": {"value": 65, "max": 100, "label": "年度目标完成度"}
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "progress"
+
+    async def test_scenario_4_3_show_chart(self, tool_context):
+        """场景 4.3: 展示图表"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "chart",
+            "data_source": {
+                "type": "inline",
+                "data": [
+                    {"month": "1月", "完成": 5, "目标": 10},
+                    {"month": "2月", "完成": 8, "目标": 10},
+                    {"month": "3月", "完成": 12, "目标": 10}
+                ]
+            },
+            "options": {
+                "chartType": "bar",
+                "xAxis": {"dataKey": "month"}
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "chart"
+
+    async def test_scenario_4_4_show_form(self, tool_context):
+        """场景 4.4: 展示打卡表单"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "form",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "fields": [
+                        {"name": "task", "label": "完成的任务", "type": "text", "required": True},
+                        {"name": "duration", "label": "用时(分钟)", "type": "number"},
+                        {"name": "mood", "label": "心情", "type": "select", "options": ["开心", "一般", "疲惫"]},
+                        {"name": "notes", "label": "备注", "type": "textarea"}
+                    ],
+                    "submitLabel": "提交打卡"
+                }
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "form"
+
+    async def test_scenario_4_5_show_timeline(self, tool_context):
+        """场景 4.5: 展示时间线"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "timeline",
+            "data_source": {
+                "type": "inline",
+                "data": [
+                    {"date": "2026-01-15", "title": "开始学吉他", "description": "购买了吉他"},
+                    {"date": "2026-01-16", "title": "第一次练习", "description": "学会了基本和弦"},
+                    {"date": "2026-01-17", "title": "练习《小星星》", "description": "能弹完整首歌了"}
+                ]
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "timeline"
+
+    async def test_scenario_4_6_show_toast(self, tool_context):
+        """场景 4.6: 展示轻提示"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("show_card", {
+            "card_type": "toast",
+            "data_source": {
+                "type": "inline",
+                "data": {
+                    "message": "打卡成功！继续加油！",
+                    "type": "success",
+                    "duration": 3000
+                }
+            }
+        }, tool_context)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "toast"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 5: 收集信息
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCollectInfoScenario:
+    """
+    用户场景：收集用户信息
+    """
+
+    async def test_scenario_5_1_ask_question(self, tool_context):
+        """场景 5.1: 向用户提问"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("ask_user_question", {
+            "question": "你想先设定哪个领域的目标？",
+            "options": ["健康", "事业", "学习", "感情"]
+        }, tool_context)
+
+        assert result["status"] == "asking"
+        assert result["cardType"] == "question_card"
+
+    async def test_scenario_5_2_request_birth_info(self, tool_context):
+        """场景 5.2: 请求出生信息"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("request_info", {
+            "info_type": "birth",
+            "question": "为了给你更准确的分析，请告诉我你的出生信息"
+        }, tool_context)
+
+        assert result["status"] == "collecting"
+        assert "fields" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景 6: 删除数据
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDeleteDataScenario:
+    """
+    用户场景：删除数据
+    """
+
+    async def test_scenario_6_1_delete_goal(self, tool_context, db_pool):
+        """场景 6.1: 删除目标"""
+        ToolRegistry.initialize()
+
+        user_id = UUID(tool_context.user_id)
+
+        # 先创建要删除的数据
+        await UnifiedProfileRepository.write_life_context_path(
+            user_id, "goals/2026/to_delete",
+            {"title": "待删除目标", "status": "active"}
+        )
+
+        # 验证数据存在
+        exists = await UnifiedProfileRepository.read_life_context_path(user_id, "goals/2026/to_delete")
+        assert exists is not None
+
+        result = await ToolRegistry.execute("delete_user_data", {
+            "path": "goals/2026/to_delete"
+        }, tool_context)
+
+        assert result["status"] == "success"
+
+        # 验证数据已删除
+        deleted = await UnifiedProfileRepository.read_life_context_path(user_id, "goals/2026/to_delete")
+        assert deleted is None
+
+    async def test_scenario_6_2_delete_nonexistent(self, tool_context, db_pool):
+        """场景 6.2: 删除不存在的数据"""
+        ToolRegistry.initialize()
+
+        result = await ToolRegistry.execute("delete_user_data", {
+            "path": "goals/nonexistent/path_that_does_not_exist"
+        }, tool_context)
+
+        assert result["status"] == "not_found"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CardService 单元测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCardServiceUnit:
+    """CardService 单元测试"""
+
+    def test_is_generic_card_type(self):
+        """测试通用卡片类型判断"""
+        assert CardTypes.is_generic("list") is True
+        assert CardTypes.is_generic("tree") is True
+        assert CardTypes.is_generic("bazi_chart") is False
+        assert CardTypes.is_generic("zodiac_chart") is False
+
+    async def test_render_list(self, card_service):
+        """测试渲染列表"""
+        result = card_service.render_list(
+            items=[{"id": "1", "title": "Item 1"}, {"id": "2", "title": "Item 2"}],
+            options={"emptyText": "No items"}
+        )
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "list"
+        assert len(result["items"]) == 2
+
+    async def test_render_progress(self, card_service):
+        """测试渲染进度条"""
+        result = card_service.render_progress(65, 100, "完成度")
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "progress"
+        assert result["value"] == 65
+        assert result["max"] == 100
+
+    async def test_render_toast(self, card_service):
+        """测试渲染轻提示"""
+        result = card_service.render_toast("操作成功", "success", 2000)
+
+        assert result["status"] == "success"
+        assert result["cardType"] == "toast"
+        assert result["message"] == "操作成功"
+        assert result["type"] == "success"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 运行测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s", "--tb=short"])

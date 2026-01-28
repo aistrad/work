@@ -1,0 +1,505 @@
+# VibeProfile - 用户画像数据层
+
+> Version: 2.1 | 极简设计 | 全量合并
+
+---
+
+## 1. 概述
+
+VibeProfile 是 VibeLife 的 **唯一用户数据层**，所有用户相关数据都存在 `unified_profiles.profile` (JSONB)。
+
+### 设计原则
+
+- **Single Table** - 一张表存所有用户数据
+- **No Separate Tables** - 废弃 user_data_store, user_reminders, user_skill_subscriptions 等
+- **Daily Proactive** - 每天凌晨扫描一次，按小时投递
+- **30 Days Limit** - checkins 等时间序列数据只保留 30 天
+
+---
+
+## 2. 数据结构
+
+### 2.1 Profile Schema
+
+```yaml
+profile:
+  # ═══════════════════════════════════════════════════════════════
+  # 账户 (只读，从 vibe_users 同步)
+  # ═══════════════════════════════════════════════════════════════
+  account:
+    vibe_id: "VB-A1B2C3D4"
+    display_name: "用户昵称"
+    email: "user@example.com"
+    tier: "free"                    # free | premium
+    status: "active"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 身份
+  # ═══════════════════════════════════════════════════════════════
+  identity:
+    birth_info:
+      date: "1990-05-15"
+      time: "14:30"
+      place: "北京"
+      timezone: "Asia/Shanghai"
+      gender: "male"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 状态
+  # ═══════════════════════════════════════════════════════════════
+  state:
+    emotion: "neutral"              # anxious | sad | neutral | content | excited
+    focus: ["career"]               # 当前关注的话题
+    life_stage: "career_growth"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 偏好 (合并 user_push_preferences, user_skill_subscriptions)
+  # ═══════════════════════════════════════════════════════════════
+  preferences:
+    voice_mode: "warm"
+    language: "zh-CN"
+    push_enabled: true
+    push_hour: 8                    # 推送时间 (0-23)
+    subscribed_skills: ["core", "bazi", "zodiac"]
+
+  # ═══════════════════════════════════════════════════════════════
+  # Skill 数据
+  # ═══════════════════════════════════════════════════════════════
+  skill_data:
+    bazi:
+      chart: { ... }
+      features: { daymaster, strength, pattern }
+      current_dayun: { ... }
+      current_liunian: { ... }
+    zodiac:
+      chart: { ... }
+      current_transits: { ... }
+    tarot:
+      last_reading: { ... }
+    career:
+      assessment: { ... }
+
+  # ═══════════════════════════════════════════════════════════════
+  # 从对话抽取
+  # ═══════════════════════════════════════════════════════════════
+  extracted:
+    facts: ["在互联网公司工作", "有升职压力"]
+    goals: ["年底升职"]             # 当前活跃目标摘要
+    concerns: ["工作压力"]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 生活上下文 (合并 user_data_store)
+  # ═══════════════════════════════════════════════════════════════
+  life_context:
+    # 基础信息
+    occupation:
+      title: "产品经理"
+      industry: "互联网"
+    focus_areas: ["career", "health"]
+
+    # 目标管理 (原 user_data_store.goals)
+    goals:
+      - id: "uuid-1"
+        title: "年底升职到高级产品经理"
+        category: "career"
+        status: "active"            # active | completed | abandoned
+        progress: 0.3
+        deadline: "2026-12-31"
+        created_at: "2026-01-01"
+      - id: "uuid-2"
+        title: "每周运动3次"
+        category: "health"
+        status: "active"
+        progress: 0.5
+
+    # 任务管理 (原 user_data_store.tasks)
+    tasks:
+      - id: "uuid-a"
+        title: "准备季度汇报"
+        status: "pending"           # pending | done | cancelled
+        due_date: "2026-01-25"
+        goal_id: "uuid-1"           # 关联目标
+      - id: "uuid-b"
+        title: "跑步5公里"
+        status: "done"
+        due_date: "2026-01-19"
+        goal_id: "uuid-2"
+
+    # 打卡记录 (原 user_data_store.checkins，只保留 30 天)
+    checkins:
+      "2026-01-19": { mood: 7, energy: 6, notes: "状态不错" }
+      "2026-01-18": { mood: 5, energy: 4, notes: "有点累" }
+      # ... 最多 30 天
+
+    # 提醒 (原 user_reminders)
+    reminders:
+      - id: "uuid-r1"
+        type: "goal_checkin"        # goal_checkin | daily_plan | custom
+        title: "目标打卡提醒"
+        schedule_type: "daily"      # once | daily | weekly
+        trigger_hour: 20            # 每天 20:00 触发
+        status: "active"            # active | paused
+        goal_id: "uuid-1"           # 关联目标
+      - id: "uuid-r2"
+        type: "custom"
+        title: "喝水提醒"
+        schedule_type: "daily"
+        trigger_hour: 10
+        status: "active"
+
+    # 追踪统计
+    tracking:
+      last_checkin: "2026-01-19"
+      streak_days: 5
+```
+
+### 2.2 Cold Layer (独立表，低频写入)
+
+```sql
+-- 洞察 (AI 生成的长期观察)
+CREATE TABLE vibe_profile_insights (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    insight_type VARCHAR(50),       -- discovery | pattern | timing | growth
+    skill_id VARCHAR(50),
+    content TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- 时间线 (重要事件记录)
+CREATE TABLE vibe_profile_timeline (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    event_type VARCHAR(50),         -- dayun_change | goal_completed | milestone
+    event_date DATE,
+    title VARCHAR(200),
+    data JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+---
+
+## 3. 数据访问
+
+### 3.1 Repository
+
+```python
+class VibeProfileRepository:
+    """唯一数据访问层"""
+
+    # ─────────────────────────────────────────────────────────────
+    # 读取
+    # ─────────────────────────────────────────────────────────────
+    async def get_profile(user_id: UUID) -> Dict
+    async def get_identity(user_id: UUID) -> Dict
+    async def get_skill_data(user_id: UUID, skill: str) -> Dict
+    async def get_life_context(user_id: UUID) -> Dict
+
+    # ─────────────────────────────────────────────────────────────
+    # 写入
+    # ─────────────────────────────────────────────────────────────
+    async def update_birth_info(user_id: UUID, birth_info: Dict)
+    async def update_state(user_id: UUID, state: Dict)
+    async def update_skill_data(user_id: UUID, skill: str, data: Dict)
+    async def update_preferences(user_id: UUID, preferences: Dict)
+
+    # ─────────────────────────────────────────────────────────────
+    # 生活管理 (goals, tasks, checkins, reminders)
+    # ─────────────────────────────────────────────────────────────
+    async def add_goal(user_id: UUID, goal: Dict)
+    async def update_goal(user_id: UUID, goal_id: str, updates: Dict)
+    async def add_task(user_id: UUID, task: Dict)
+    async def update_task(user_id: UUID, task_id: str, updates: Dict)
+    async def add_checkin(user_id: UUID, date: str, checkin: Dict)
+    async def add_reminder(user_id: UUID, reminder: Dict)
+    async def update_reminder(user_id: UUID, reminder_id: str, updates: Dict)
+
+    # ─────────────────────────────────────────────────────────────
+    # Proactive 支持
+    # ─────────────────────────────────────────────────────────────
+    async def get_users_for_push(push_hour: int) -> List[Dict]
+    async def get_users_with_reminders(trigger_hour: int) -> List[Dict]
+
+    # ─────────────────────────────────────────────────────────────
+    # 数据维护
+    # ─────────────────────────────────────────────────────────────
+    async def cleanup_old_checkins(user_id: UUID, keep_days: int = 30)
+```
+
+### 3.2 缓存
+
+```python
+# 简单内存缓存，5分钟 TTL
+_cache: Dict[UUID, CacheEntry] = {}
+TTL = 300
+```
+
+---
+
+## 4. Proactive 流程
+
+### 每日扫描 (04:00)
+
+```
+04:00 凌晨
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  ProactiveWorker.daily_scan()                                │
+│                                                              │
+│  1. 获取所有 push_enabled 用户                               │
+│                                                              │
+│  2. 为每个用户生成今日内容:                                  │
+│     - 检查 subscribed_skills，生成运势推送                   │
+│     - 检查 reminders，生成提醒推送                           │
+│     - 检查 goals，生成目标进度推送                           │
+│                                                              │
+│  3. 存入 notifications 表，标记 deliver_hour                 │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+
+每小时 (00, 01, 02, ...)
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  NotificationWorker.deliver()                                │
+│                                                              │
+│  SELECT * FROM notifications                                 │
+│  WHERE deliver_hour = current_hour AND delivered = false     │
+│                                                              │
+│  投递到用户设备                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### reminders 触发逻辑
+
+```python
+# 每日扫描时检查 reminders
+for user in users:
+    reminders = user["profile"]["life_context"]["reminders"]
+    for reminder in reminders:
+        if reminder["status"] != "active":
+            continue
+
+        # 检查今天是否应该触发
+        if should_trigger_today(reminder):
+            # 生成通知，在 trigger_hour 投递
+            create_notification(
+                user_id=user["id"],
+                type="reminder",
+                content=reminder["title"],
+                deliver_hour=reminder["trigger_hour"]
+            )
+
+def should_trigger_today(reminder):
+    if reminder["schedule_type"] == "daily":
+        return True
+    if reminder["schedule_type"] == "weekly":
+        return today.weekday() == reminder.get("trigger_weekday", 0)
+    if reminder["schedule_type"] == "once":
+        return reminder.get("trigger_date") == today
+    return False
+```
+
+---
+
+## 5. Skill 访问规则
+
+| Skill | 可读 | 可写 |
+|-------|------|------|
+| **Core Layer** | | |
+| core | 全部 | state, extracted |
+| lifecoach | 全部 | state, extracted, life_context |
+| mindfulness | 全部 | state |
+| **Professional Layer** | | |
+| bazi | identity, state | skill_data.bazi |
+| zodiac | identity, state | skill_data.zodiac |
+| tarot | identity, state | skill_data.tarot |
+| career | identity, state, life_context | skill_data.career |
+
+---
+
+## 6. 迁移
+
+### 废弃的表
+
+迁移后删除：
+- `user_data_store`
+- `user_reminders`
+- `user_skill_subscriptions`
+- `user_push_preferences`
+- `skill_recommendation_blocks`
+
+### 迁移脚本
+
+```sql
+-- 1. 合并 subscribed_skills
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{preferences,subscribed_skills}',
+    COALESCE((
+        SELECT jsonb_agg(skill_id)
+        FROM user_skill_subscriptions
+        WHERE user_id = up.user_id AND status = 'subscribed'
+    ), '["core"]'::jsonb)
+);
+
+-- 2. 合并 push_hour
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{preferences,push_hour}',
+    to_jsonb(COALESCE(
+        (SELECT default_push_hour FROM user_push_preferences WHERE user_id = up.user_id),
+        8
+    ))
+);
+
+-- 3. 合并 goals
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{life_context,goals}',
+    COALESCE((
+        SELECT jsonb_agg(content)
+        FROM user_data_store
+        WHERE user_id = up.user_id AND data_type = 'goals'
+    ), '[]'::jsonb)
+);
+
+-- 4. 合并 tasks (只保留 pending 状态)
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{life_context,tasks}',
+    COALESCE((
+        SELECT jsonb_agg(content)
+        FROM user_data_store
+        WHERE user_id = up.user_id AND data_type = 'tasks'
+          AND content->>'status' = 'pending'
+    ), '[]'::jsonb)
+);
+
+-- 5. 合并 checkins (只保留 30 天)
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{life_context,checkins}',
+    COALESCE((
+        SELECT jsonb_object_agg(
+            to_char((content->>'date')::date, 'YYYY-MM-DD'),
+            content
+        )
+        FROM user_data_store
+        WHERE user_id = up.user_id AND data_type = 'checkins'
+          AND (content->>'date')::date >= CURRENT_DATE - 30
+    ), '{}'::jsonb)
+);
+
+-- 6. 合并 reminders
+UPDATE unified_profiles up
+SET profile = jsonb_set(
+    profile,
+    '{life_context,reminders}',
+    COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'id', id,
+            'type', reminder_type,
+            'title', title,
+            'schedule_type', schedule_type,
+            'trigger_hour', EXTRACT(HOUR FROM next_trigger_at)::int,
+            'status', status,
+            'goal_id', metadata->>'goal_id'
+        ))
+        FROM user_reminders
+        WHERE user_id = up.user_id AND status = 'active'
+    ), '[]'::jsonb)
+);
+```
+
+---
+
+## 7. 数据大小控制
+
+### 预估大小
+
+| 字段 | 预估大小 |
+|------|---------|
+| account | 200 bytes |
+| identity | 500 bytes |
+| state | 200 bytes |
+| preferences | 300 bytes |
+| skill_data | 5 KB |
+| extracted | 500 bytes |
+| life_context.goals (10个) | 2 KB |
+| life_context.tasks (20个) | 2 KB |
+| life_context.checkins (30天) | 3 KB |
+| life_context.reminders (10个) | 1 KB |
+| **总计** | **~15 KB** |
+
+### 限制规则
+
+```python
+MAX_GOALS = 20
+MAX_TASKS = 50
+MAX_CHECKIN_DAYS = 30
+MAX_REMINDERS = 20
+MAX_FACTS = 50
+
+# 写入时检查
+async def add_goal(user_id, goal):
+    profile = await get_profile(user_id)
+    goals = profile["life_context"].get("goals", [])
+    if len(goals) >= MAX_GOALS:
+        raise LimitExceeded("最多支持 20 个目标")
+    # ...
+```
+
+---
+
+## 8. API
+
+### 内部 Python API
+
+```python
+# 读取
+profile = await VibeProfileRepository.get_profile(user_id)
+goals = profile["life_context"]["goals"]
+
+# 写入
+await VibeProfileRepository.add_goal(user_id, {
+    "title": "学习英语",
+    "category": "learning",
+    "status": "active"
+})
+
+await VibeProfileRepository.add_checkin(user_id, "2026-01-19", {
+    "mood": 8,
+    "energy": 7,
+    "notes": "今天很棒"
+})
+```
+
+### HTTP API
+
+```
+GET  /api/v1/profile/summary       # 用户认知摘要
+GET  /api/v1/profile/goals         # 目标列表
+POST /api/v1/profile/goals         # 添加目标
+PUT  /api/v1/profile/goals/:id     # 更新目标
+POST /api/v1/profile/checkins      # 打卡
+GET  /api/v1/profile/reminders     # 提醒列表
+POST /api/v1/profile/reminders     # 添加提醒
+```
+
+---
+
+## 附录：极简原则
+
+1. **Single Table** - 所有用户数据一张表
+2. **Daily Scan** - 每天凌晨扫描，按小时投递
+3. **30 Days Limit** - 时间序列数据只保留 30 天
+4. **Convention > Code** - 访问规则靠 Review 保证
+5. **Simple Cache** - 内存缓存，5分钟 TTL

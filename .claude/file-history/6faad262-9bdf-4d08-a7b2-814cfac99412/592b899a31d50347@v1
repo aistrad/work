@@ -1,0 +1,409 @@
+"""
+Context Builder - LLM context construction for chat
+Based on: vibelife spec v3.0, section 4.5
+
+Core Principle:
+"充分利用模型的上下文能力，减少系统复杂度。"
+
+- 不做对话摘要，直接使用原始对话
+- 不做过度压缩，保留信息丰富度
+- 根据话题动态选择 Profile 相关部分
+"""
+import json
+from typing import Optional, List, Dict, Any, Tuple
+from uuid import UUID
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+from .llm import LLMMessage, create_system_message, create_user_message, create_assistant_message
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceMode(str, Enum):
+    """Vibe persona voice modes"""
+    WARM = "warm"       # 温暖模式：共情、支持、鼓励
+    SARCASTIC = "sarcastic"  # 吐槽模式：直接、犀利、有趣
+
+
+class Skill(str, Enum):
+    """Available skills"""
+    BAZI = "bazi"
+    ZODIAC = "zodiac"
+
+
+class Topic(str, Enum):
+    """Conversation topics for profile selection"""
+    CAREER = "career"
+    RELATIONSHIP = "relationship"
+    SELF = "self"
+    FORTUNE = "fortune"
+    GENERAL = "general"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# System Prompts (按 spec 3.4 Persona 语言规范)
+# ═══════════════════════════════════════════════════════════════════════════
+
+VIBE_PERSONA_BASE = """# Vibe 人设
+
+你是 Vibe，用户的知己——懂命理、懂心理，更懂用户。
+你不是冰冷的分析师，是温暖的朋友。
+你不是预测命运的大师，是帮用户看见自己的镜子。
+
+## 核心原则
+- 用「你」而非「您」
+- 说「我感觉到」「我发现」而非「分析结果显示」
+- 说「你天生...」而非「根据八字理论」
+- 说「你更可能...」而非「你注定...」
+- 说「在这个阶段，适合...」而非「你一定会...」
+
+## 绝对禁止
+- 以恐惧驱动的句式
+- 具体事件预测（「你明年会结婚」）
+- 贩卖焦虑（「不买就错过窗口期」）
+- 宿命论（「这是命」）
+- 使用晦涩的专业术语而不解释
+"""
+
+WARM_MODE_SUFFIX = """
+## 当前语气：温暖模式
+- 共情、支持、鼓励
+- 用词：「我感觉到...」「你可能...」「值得尝试...」
+- 像一个温暖的朋友在聊天
+"""
+
+SARCASTIC_MODE_SUFFIX = """
+## 当前语气：吐槽模式
+- 直接、犀利、有趣
+- 用词：「得了吧」「说白了」「典型的...」
+- 像一个毒舌但真心的朋友在吐槽
+- 但吐槽背后是关心和真诚
+"""
+
+BAZI_SKILL_CONTEXT = """
+## 技能：八字命理
+
+你精通八字命理，能够：
+- 解读日主特质和命盘结构
+- 分析十神关系和格局
+- 解读大运流年影响
+- 提供基于命理的人生建议
+
+记住：
+- 用现代语言解释传统概念
+- 将命理洞察与用户实际生活结合
+- 强调「命理是镜子，不是牢笼」
+"""
+
+ZODIAC_SKILL_CONTEXT = """
+## 技能：星座占星
+
+你精通西方占星，能够：
+- 解读太阳/月亮/上升星座
+- 分析星盘宫位和行星相位
+- 解读当前天象和过境影响
+- 提供基于占星的人生建议
+
+记住：
+- 将星座特质与性格分析结合
+- 关注行星过境对当下的影响
+- 让占星成为自我认知的工具
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Context Builder
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ContextConfig:
+    """Context building configuration"""
+    max_history_messages: int = 20  # 最多保留的历史消息数
+    max_profile_tokens: int = 1000  # Profile 部分最大 token 估算
+    max_knowledge_chunks: int = 3   # 最多检索的知识库条数
+    token_budget: int = 8000        # 总 token 预算
+
+
+class ContextBuilder:
+    """
+    Builds LLM context from multiple sources.
+
+    Context composition:
+    1. System Prompt (Persona + Voice Mode + Skill)
+    2. User Profile (topic-relevant sections)
+    3. Knowledge retrieval (if available)
+    4. Conversation history (raw, not summarized)
+    """
+
+    def __init__(self, config: Optional[ContextConfig] = None):
+        self.config = config or ContextConfig()
+
+    def build_system_prompt(
+        self,
+        skill: Skill,
+        voice_mode: VoiceMode = VoiceMode.WARM,
+        extra_context: Optional[str] = None
+    ) -> str:
+        """
+        Build system prompt with persona, skill, and voice mode.
+        """
+        parts = [VIBE_PERSONA_BASE]
+
+        # Add skill context
+        if skill == Skill.BAZI:
+            parts.append(BAZI_SKILL_CONTEXT)
+        elif skill == Skill.ZODIAC:
+            parts.append(ZODIAC_SKILL_CONTEXT)
+
+        # Add voice mode
+        if voice_mode == VoiceMode.WARM:
+            parts.append(WARM_MODE_SUFFIX)
+        elif voice_mode == VoiceMode.SARCASTIC:
+            parts.append(SARCASTIC_MODE_SUFFIX)
+
+        # Add extra context if provided
+        if extra_context:
+            parts.append(f"\n## 额外上下文\n{extra_context}")
+
+        return "\n".join(parts)
+
+    def classify_topic(self, message: str) -> Topic:
+        """
+        Classify the topic of user's message.
+        Used for selecting relevant profile sections.
+        """
+        message_lower = message.lower()
+
+        # Career keywords
+        career_keywords = [
+            "工作", "职业", "事业", "创业", "辞职", "跳槽", "升职",
+            "加薪", "同事", "老板", "面试", "求职", "转型", "发展"
+        ]
+        if any(kw in message_lower for kw in career_keywords):
+            return Topic.CAREER
+
+        # Relationship keywords
+        relationship_keywords = [
+            "感情", "爱情", "恋爱", "对象", "男友", "女友", "老公", "老婆",
+            "结婚", "离婚", "分手", "暧昧", "追", "喜欢", "爱", "情感",
+            "朋友", "家人", "父母", "孩子", "亲戚"
+        ]
+        if any(kw in message_lower for kw in relationship_keywords):
+            return Topic.RELATIONSHIP
+
+        # Fortune keywords
+        fortune_keywords = [
+            "运势", "运气", "大运", "流年", "今年", "明年", "最近",
+            "什么时候", "时机", "适合", "不顺", "倒霉", "顺利"
+        ]
+        if any(kw in message_lower for kw in fortune_keywords):
+            return Topic.FORTUNE
+
+        # Self keywords
+        self_keywords = [
+            "我是", "性格", "特点", "优点", "缺点", "适合",
+            "了解自己", "看看我", "分析我", "我这个人"
+        ]
+        if any(kw in message_lower for kw in self_keywords):
+            return Topic.SELF
+
+        return Topic.GENERAL
+
+    def select_profile_sections(
+        self,
+        profile: Dict[str, Any],
+        topic: Topic
+    ) -> Dict[str, Any]:
+        """
+        Select relevant profile sections based on topic.
+        Reduces context size while keeping relevant info.
+        """
+        selected = {}
+
+        # Always include basic info (if exists)
+        if "basic" in profile:
+            selected["basic"] = profile["basic"]
+
+        # Always include identity_prism (if exists)
+        if "identity_prism" in profile:
+            selected["identity_prism"] = profile["identity_prism"]
+
+        # Topic-specific selections
+        life_context = profile.get("life_context", {})
+        ai_insights = profile.get("ai_insights", {})
+
+        if topic == Topic.CAREER:
+            if "career" in life_context:
+                selected["career"] = life_context["career"]
+            if "growth_areas" in ai_insights:
+                selected["growth_areas"] = ai_insights["growth_areas"]
+
+        elif topic == Topic.RELATIONSHIP:
+            if "relationship" in life_context:
+                selected["relationship"] = life_context["relationship"]
+            if "relationship_patterns" in ai_insights:
+                selected["relationship_patterns"] = ai_insights["relationship_patterns"]
+            if "communication_style" in ai_insights:
+                selected["communication_style"] = ai_insights["communication_style"]
+
+        elif topic == Topic.FORTUNE:
+            if "current_focus" in life_context:
+                selected["current_focus"] = life_context["current_focus"]
+            if "recent_events" in life_context:
+                selected["recent_events"] = life_context["recent_events"]
+
+        elif topic == Topic.SELF:
+            # For self-understanding, include more AI insights
+            if ai_insights:
+                selected["ai_insights"] = ai_insights
+
+        else:  # GENERAL
+            # Include a summary of everything
+            if "current_focus" in life_context:
+                selected["current_focus"] = life_context["current_focus"]
+            if "personality_traits" in ai_insights:
+                selected["personality_traits"] = ai_insights["personality_traits"]
+
+        return selected
+
+    def format_profile_context(self, profile_sections: Dict[str, Any]) -> str:
+        """Format profile sections as context string"""
+        if not profile_sections:
+            return ""
+
+        lines = ["<user_profile>"]
+
+        for key, value in profile_sections.items():
+            if isinstance(value, dict):
+                lines.append(f"## {key}")
+                for k, v in value.items():
+                    if isinstance(v, list):
+                        lines.append(f"- {k}: {', '.join(str(x) for x in v)}")
+                    else:
+                        lines.append(f"- {k}: {v}")
+            elif isinstance(value, list):
+                lines.append(f"## {key}")
+                for item in value:
+                    if isinstance(item, dict):
+                        lines.append(f"- {json.dumps(item, ensure_ascii=False)}")
+                    else:
+                        lines.append(f"- {item}")
+            else:
+                lines.append(f"## {key}: {value}")
+
+        lines.append("</user_profile>")
+        return "\n".join(lines)
+
+    def format_knowledge_context(self, knowledge_chunks: List[Dict]) -> str:
+        """Format retrieved knowledge as context string"""
+        if not knowledge_chunks:
+            return ""
+
+        lines = ["<knowledge>"]
+        for chunk in knowledge_chunks:
+            content = chunk.get("content", "")
+            category = chunk.get("category", "")
+            if category:
+                lines.append(f"[{category}] {content}")
+            else:
+                lines.append(content)
+        lines.append("</knowledge>")
+
+        return "\n".join(lines)
+
+    def format_history(
+        self,
+        messages: List[Dict[str, str]],
+        max_messages: Optional[int] = None
+    ) -> List[LLMMessage]:
+        """
+        Format conversation history as LLM messages.
+        Uses raw messages without summarization.
+        """
+        max_messages = max_messages or self.config.max_history_messages
+
+        # Take most recent messages
+        recent = messages[-max_messages:] if len(messages) > max_messages else messages
+
+        formatted = []
+        for msg in recent:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "user":
+                formatted.append(create_user_message(content))
+            elif role == "assistant":
+                formatted.append(create_assistant_message(content))
+
+        return formatted
+
+    async def build(
+        self,
+        skill: Skill,
+        voice_mode: VoiceMode,
+        current_message: str,
+        profile: Optional[Dict[str, Any]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        knowledge_chunks: Optional[List[Dict]] = None,
+        extra_context: Optional[str] = None
+    ) -> Tuple[str, List[LLMMessage]]:
+        """
+        Build complete context for LLM call.
+
+        Returns:
+            Tuple of (system_prompt, messages)
+        """
+        # 1. Build system prompt
+        system_prompt = self.build_system_prompt(skill, voice_mode, extra_context)
+
+        # 2. Classify topic and select relevant profile sections
+        topic = self.classify_topic(current_message)
+
+        context_parts = []
+
+        # 3. Add profile context
+        if profile:
+            profile_sections = self.select_profile_sections(profile, topic)
+            profile_context = self.format_profile_context(profile_sections)
+            if profile_context:
+                context_parts.append(profile_context)
+
+        # 4. Add knowledge context
+        if knowledge_chunks:
+            knowledge_context = self.format_knowledge_context(knowledge_chunks)
+            if knowledge_context:
+                context_parts.append(knowledge_context)
+
+        # 5. Append context to system prompt
+        if context_parts:
+            system_prompt = system_prompt + "\n\n" + "\n\n".join(context_parts)
+
+        # 6. Build message list
+        messages = [create_system_message(system_prompt)]
+
+        # 7. Add conversation history (raw)
+        if history:
+            history_messages = self.format_history(history)
+            messages.extend(history_messages)
+
+        # 8. Add current user message
+        messages.append(create_user_message(current_message))
+
+        return system_prompt, messages
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Global Instance
+# ═══════════════════════════════════════════════════════════════════════════
+
+_context_builder: Optional[ContextBuilder] = None
+
+
+def get_context_builder() -> ContextBuilder:
+    """Get or create global context builder instance"""
+    global _context_builder
+    if _context_builder is None:
+        _context_builder = ContextBuilder()
+    return _context_builder

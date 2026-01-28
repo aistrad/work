@@ -1,0 +1,315 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * useDashboard Hook - Dashboard v2.0 数据管理
+     5→ *
+     6→ * 使用 SWR 进行数据获取，支持乐观更新
+     7→ * 遵循 React Best Practices: client-swr-dedup
+     8→ */
+     9→
+    10→import useSWR from "swr";
+    11→import { useCallback, useEffect } from "react";
+    12→import { apiClient } from "@/lib/api";
+    13→import type {
+    14→  DashboardDTO,
+    15→  DashboardResponse,
+    16→  CheckinResponse,
+    17→  LeverToggleResponse,
+    18→  SkillSubscribeResponse,
+    19→  SkillCardData,
+    20→} from "@/types/dashboard";
+    21→
+    22→const DASHBOARD_KEY = "/dashboard";
+    23→const CACHE_KEY = "vibelife-dashboard-cache";
+    24→
+    25→// ═══════════════════════════════════════════════════════════════════════════
+    26→// Local Storage Cache for Offline Support
+    27→// ═══════════════════════════════════════════════════════════════════════════
+    28→
+    29→function getCachedData(): DashboardDTO | undefined {
+    30→  if (typeof window === "undefined") return undefined;
+    31→  try {
+    32→    const cached = localStorage.getItem(CACHE_KEY);
+    33→    if (cached) {
+    34→      const parsed = JSON.parse(cached);
+    35→      // Check if cache is from today (for daily data freshness)
+    36→      const cachedDate = new Date(parsed.generatedAt).toDateString();
+    37→      const today = new Date().toDateString();
+    38→      if (cachedDate === today) {
+    39→        return parsed;
+    40→      }
+    41→    }
+    42→  } catch {
+    43→    // Ignore parse errors
+    44→  }
+    45→  return undefined;
+    46→}
+    47→
+    48→function setCachedData(data: DashboardDTO): void {
+    49→  if (typeof window === "undefined") return;
+    50→  try {
+    51→    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+    52→  } catch {
+    53→    // Ignore storage errors (quota exceeded, etc.)
+    54→  }
+    55→}
+    56→
+    57→// Fetcher function
+    58→async function fetcher(url: string): Promise<DashboardDTO> {
+    59→  const { data } = await apiClient.get<DashboardResponse>(url);
+    60→  return data.data;
+    61→}
+    62→
+    63→export function useDashboard() {
+    64→  const { data, error, isLoading, mutate } = useSWR<DashboardDTO>(
+    65→    DASHBOARD_KEY,
+    66→    fetcher,
+    67→    {
+    68→      revalidateOnFocus: false,
+    69→      revalidateOnReconnect: true,
+    70→      dedupingInterval: 60000, // 1 minute dedup
+    71→      errorRetryCount: 3,
+    72→      fallbackData: getCachedData(), // Offline support
+    73→      onSuccess: (data) => {
+    74→        // Cache successful responses for offline use
+    75→        setCachedData(data);
+    76→      },
+    77→    }
+    78→  );
+    79→
+    80→  // ═══════════════════════════════════════════════════════════════════════════
+    81→  // Actions with optimistic updates
+    82→  // ═══════════════════════════════════════════════════════════════════════════
+    83→
+    84→  /**
+    85→   * 签到
+    86→   */
+    87→  const checkIn = useCallback(async () => {
+    88→    if (!data) return;
+    89→
+    90→    const currentStreak = data.status.streak;
+    91→
+    92→    // 1. Optimistic update
+    93→    await mutate(
+    94→      {
+    95→        ...data,
+    96→        status: {
+    97→          ...data.status,
+    98→          checkedIn: true,
+    99→          streak: currentStreak + 1,
+   100→        },
+   101→      },
+   102→      false
+   103→    );
+   104→
+   105→    try {
+   106→      // 2. API call
+   107→      const { data: result } = await apiClient.post<CheckinResponse>(
+   108→        "/dashboard/checkin"
+   109→      );
+   110→
+   111→      // 3. Update with server data
+   112→      await mutate(
+   113→        {
+   114→          ...data,
+   115→          status: {
+   116→            ...data.status,
+   117→            checkedIn: true,
+   118→            streak: result.data.streak,
+   119→          },
+   120→        },
+   121→        false
+   122→      );
+   123→
+   124→      return result.data;
+   125→    } catch (err) {
+   126→      // 4. Rollback on error
+   127→      await mutate(data, false);
+   128→      throw err;
+   129→    }
+   130→  }, [data, mutate]);
+   131→
+   132→  /**
+   133→   * 切换杠杆完成状态
+   134→   */
+   135→  const toggleLever = useCallback(
+   136→    async (leverId: string) => {
+   137→      if (!data) return;
+   138→
+   139→      const lever = data.lifecoach.todayLevers.find((l) => l.id === leverId);
+   140→      if (!lever) return;
+   141→
+   142→      const newCompleted = !lever.completed;
+   143→
+   144→      // 1. Optimistic update
+   145→      const optimisticData = {
+   146→        ...data,
+   147→        lifecoach: {
+   148→          ...data.lifecoach,
+   149→          todayLevers: data.lifecoach.todayLevers.map((l) =>
+   150→            l.id === leverId ? { ...l, completed: newCompleted } : l
+   151→          ),
+   152→        },
+   153→      };
+   154→      await mutate(optimisticData, false);
+   155→
+   156→      try {
+   157→        // 2. API call
+   158→        await apiClient.patch<LeverToggleResponse>(
+   159→          `/dashboard/lever/${leverId}`,
+   160→          { completed: newCompleted }
+   161→        );
+   162→
+   163→        // Keep optimistic data (server will confirm)
+   164→      } catch (err) {
+   165→        // 3. Rollback on error
+   166→        await mutate(data, false);
+   167→        throw err;
+   168→      }
+   169→    },
+   170→    [data, mutate]
+   171→  );
+   172→
+   173→  /**
+   174→   * 切换大石头完成状态
+   175→   */
+   176→  const toggleRock = useCallback(
+   177→    async (rockId: string) => {
+   178→      if (!data) return;
+   179→
+   180→      const rock = data.lifecoach.weekRocks.find((r) => r.id === rockId);
+   181→      if (!rock) return;
+   182→
+   183→      const newCompleted = !rock.completed;
+   184→
+   185→      // 1. Optimistic update
+   186→      const optimisticData = {
+   187→        ...data,
+   188→        lifecoach: {
+   189→          ...data.lifecoach,
+   190→          weekRocks: data.lifecoach.weekRocks.map((r) =>
+   191→            r.id === rockId ? { ...r, completed: newCompleted } : r
+   192→          ),
+   193→        },
+   194→      };
+   195→      await mutate(optimisticData, false);
+   196→
+   197→      try {
+   198→        // 2. API call
+   199→        await apiClient.patch(`/dashboard/rock/${rockId}`, {
+   200→          completed: newCompleted,
+   201→        });
+   202→      } catch (err) {
+   203→        // 3. Rollback on error
+   204→        await mutate(data, false);
+   205→        throw err;
+   206→      }
+   207→    },
+   208→    [data, mutate]
+   209→  );
+   210→
+   211→  /**
+   212→   * 订阅 Skill
+   213→   */
+   214→  const subscribeSkill = useCallback(
+   215→    async (skillId: string) => {
+   216→      if (!data) return;
+   217→
+   218→      // Find the skill in discover
+   219→      const targetSkill = data.discover.find((s) => s.skillId === skillId);
+   220→      if (!targetSkill) return;
+   221→
+   222→      // 1. Optimistic update: move from discover to mySkills (with placeholder)
+   223→      const placeholderCard: SkillCardData = {
+   224→        skillId,
+   225→        cardId: "loading",
+   226→        title: targetSkill.title,
+   227→        icon: targetSkill.icon,
+   228→        content: {
+   229→          headline: "加载中…",
+   230→          insights: [],
+   231→        },
+   232→        computedAt: new Date().toISOString(),
+   233→        actionLabel: "加载中…",
+   234→        actionRoute: "",
+   235→      };
+   236→
+   237→      const optimisticData = {
+   238→        ...data,
+   239→        mySkills: [...data.mySkills, placeholderCard],
+   240→        discover: data.discover.filter((s) => s.skillId !== skillId),
+   241→      };
+   242→      await mutate(optimisticData, false);
+   243→
+   244→      try {
+   245→        // 2. API call
+   246→        await apiClient.post(`/skills/${skillId}/subscribe`);
+   247→
+   248→        // 3. Update with placeholder card (backend doesn't return card data yet)
+   249→        // Create a proper placeholder card from the discover item
+   250→        const subscribedCard: SkillCardData = {
+   251→          skillId,
+   252→          cardId: `${skillId}-subscribed`,
+   253→          title: targetSkill.title,
+   254→          icon: targetSkill.icon,
+   255→          content: {
+   256→            headline: "已订阅",
+   257→            insights: [targetSkill.description],
+   258→          },
+   259→          computedAt: new Date().toISOString(),
+   260→          actionLabel: "开始使用",
+   261→          actionRoute: `/chat?skill=${skillId}`,
+   262→        };
+   263→
+   264→        await mutate(
+   265→          {
+   266→            ...optimisticData,
+   267→            mySkills: optimisticData.mySkills.map((s) =>
+   268→              s.skillId === skillId ? subscribedCard : s
+   269→            ),
+   270→          },
+   271→          false
+   272→        );
+   273→
+   274→        return { subscription: { skillId, subscribedAt: new Date().toISOString() }, card: subscribedCard };
+   275→      } catch (err) {
+   276→        // 4. Rollback on error
+   277→        await mutate(data, false);
+   278→        throw err;
+   279→      }
+   280→    },
+   281→    [data, mutate]
+   282→  );
+   283→
+   284→  /**
+   285→   * 刷新数据
+   286→   */
+   287→  const refresh = useCallback(() => {
+   288→    return mutate();
+   289→  }, [mutate]);
+   290→
+   291→  return {
+   292→    // Data
+   293→    dashboard: data,
+   294→    isLoading,
+   295→    error,
+   296→
+   297→    // Computed
+   298→    isCheckedIn: data?.status.checkedIn ?? false,
+   299→    streak: data?.status.streak ?? 0,
+   300→
+   301→    // Actions
+   302→    checkIn,
+   303→    toggleLever,
+   304→    toggleRock,
+   305→    subscribeSkill,
+   306→    refresh,
+   307→  };
+   308→}
+   309→
+   310→export default useDashboard;
+   311→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

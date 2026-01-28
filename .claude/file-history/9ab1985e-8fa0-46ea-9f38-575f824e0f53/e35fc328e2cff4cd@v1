@@ -1,0 +1,331 @@
+"""
+Mentis OS v3.0 - Share Cards API 路由
+
+端点:
+- POST /v3/share/card                 - 创建分享卡片
+- GET  /v3/share/cards                - 列出我的卡片
+- GET  /v3/share/cards/{id}           - 获取卡片详情
+- DELETE /v3/share/cards/{id}         - 删除卡片
+- POST /v3/share/cards/{id}/publish   - 发布卡片
+- POST /v3/share/cards/{id}/unpublish - 取消发布
+
+- GET  /v3/public/{token}             - 公开访问 (无需认证)
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from api.auth_routes import resolve_user_id
+from services import share_card_service
+
+router = APIRouter(prefix="/v3/share", tags=["share"])
+
+
+# =============================================================================
+# 请求/响应模型
+# =============================================================================
+
+class PrivacySettingsRequest(BaseModel):
+    """隐私设置请求"""
+    blur_names: bool = True
+    remove_places: bool = True
+    keep_original: bool = False
+
+
+class CreateMomentCardRequest(BaseModel):
+    """创建 moment 卡片请求"""
+    source_type: str = Field("entry", pattern="^(entry)$")
+    entry_id: str
+    template: str = "default"
+    privacy_settings: Optional[PrivacySettingsRequest] = None
+
+
+class CreateDailyCardRequest(BaseModel):
+    """创建 daily 卡片请求"""
+    source_type: str = Field("digest", pattern="^(digest)$")
+    digest_id: str
+    template: str = "default"
+    privacy_settings: Optional[PrivacySettingsRequest] = None
+
+
+class CreateMilestoneCardRequest(BaseModel):
+    """创建 milestone 卡片请求"""
+    source_type: str = Field("achievement", pattern="^(achievement)$")
+    milestone_type: str = Field(..., pattern="^(streak|energy_high|entries_count|mood_improved)$")
+    data: Dict[str, Any]
+    template: str = "default"
+
+
+class PublishCardRequest(BaseModel):
+    """发布卡片请求"""
+    expires_days: Optional[int] = Field(None, ge=1, le=365)
+
+
+class PrivacySettingsResponse(BaseModel):
+    """隐私设置响应"""
+    blur_names: bool
+    remove_places: bool
+    keep_original: bool
+
+
+class ShareCardResponse(BaseModel):
+    """分享卡片响应"""
+    id: str
+    user_id: str
+    card_type: str
+    title: Optional[str]
+    content: Dict[str, Any]
+    template: str
+    style: Optional[Dict[str, Any]]
+    source_type: Optional[str]
+    source_id: Optional[str]
+    share_token: Optional[str]
+    share_url: Optional[str]
+    is_public: bool
+    privacy_settings: PrivacySettingsResponse
+    image_url: Optional[str]
+    view_count: int
+    expires_at: Optional[str]
+    created_at: Optional[str]
+
+
+class ShareCardListResponse(BaseModel):
+    """卡片列表响应"""
+    cards: List[ShareCardResponse]
+    total: int
+
+
+class PublicCardResponse(BaseModel):
+    """公开卡片响应 (无用户敏感信息)"""
+    card_type: str
+    title: Optional[str]
+    content: Dict[str, Any]
+    template: str
+    style: Optional[Dict[str, Any]]
+    view_count: int
+    created_at: Optional[str]
+
+
+# =============================================================================
+# 路由
+# =============================================================================
+
+@router.post("/card", response_model=ShareCardResponse)
+async def create_share_card(
+    request: CreateMomentCardRequest | CreateDailyCardRequest | CreateMilestoneCardRequest,
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    创建分享卡片
+
+    支持的类型:
+    - entry: 从日记条目创建 moment 卡片
+    - digest: 从 Daily Digest 创建 daily 卡片
+    - achievement: 创建 milestone 卡片
+    """
+    service = share_card_service.ShareCardService()
+
+    try:
+        if hasattr(request, "entry_id"):
+            # moment 卡片
+            privacy = None
+            if request.privacy_settings:
+                privacy = share_card_service.PrivacySettings(
+                    blur_names=request.privacy_settings.blur_names,
+                    remove_places=request.privacy_settings.remove_places,
+                    keep_original=request.privacy_settings.keep_original,
+                )
+            card = await service.create_card_from_entry(
+                user_id=user_id,
+                entry_id=request.entry_id,
+                template=request.template,
+                privacy_settings=privacy,
+            )
+        elif hasattr(request, "digest_id"):
+            # daily 卡片
+            privacy = None
+            if request.privacy_settings:
+                privacy = share_card_service.PrivacySettings(
+                    blur_names=request.privacy_settings.blur_names,
+                    remove_places=request.privacy_settings.remove_places,
+                    keep_original=request.privacy_settings.keep_original,
+                )
+            card = await service.create_card_from_digest(
+                user_id=user_id,
+                digest_id=request.digest_id,
+                template=request.template,
+                privacy_settings=privacy,
+            )
+        elif hasattr(request, "milestone_type"):
+            # milestone 卡片
+            card = service.create_milestone_card(
+                user_id=user_id,
+                milestone_type=request.milestone_type,
+                data=request.data,
+                template=request.template,
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid request")
+
+        return _card_to_response(card)
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create card: {str(e)}")
+
+
+@router.get("/cards", response_model=ShareCardListResponse)
+async def list_share_cards(
+    card_type: Optional[str] = Query(None, pattern="^(moment|daily|milestone|insight)$"),
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user_id: str = Depends(resolve_user_id),
+):
+    """列出我的分享卡片"""
+    service = share_card_service.ShareCardService()
+    cards = service.list_cards(user_id, card_type, limit, offset)
+
+    return ShareCardListResponse(
+        cards=[_card_to_response(c) for c in cards],
+        total=len(cards),
+    )
+
+
+@router.get("/cards/{card_id}", response_model=ShareCardResponse)
+async def get_share_card(
+    card_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取卡片详情"""
+    service = share_card_service.ShareCardService()
+    card = service.get_card_by_id(card_id)
+
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if card.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return _card_to_response(card)
+
+
+@router.delete("/cards/{card_id}")
+async def delete_share_card(
+    card_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """删除卡片"""
+    service = share_card_service.ShareCardService()
+    success = service.delete_card(user_id, card_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Card not found or access denied")
+
+    return {"success": True}
+
+
+@router.post("/cards/{card_id}/publish", response_model=ShareCardResponse)
+async def publish_share_card(
+    card_id: str,
+    request: PublishCardRequest = PublishCardRequest(),
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    发布卡片 (生成分享链接)
+
+    - **expires_days**: 过期天数 (可选, 1-365)
+    """
+    service = share_card_service.ShareCardService()
+
+    try:
+        card = service.publish_card(user_id, card_id, request.expires_days)
+        return _card_to_response(card)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/cards/{card_id}/unpublish")
+async def unpublish_share_card(
+    card_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """取消发布卡片"""
+    service = share_card_service.ShareCardService()
+    success = service.unpublish_card(user_id, card_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Card not found or access denied")
+
+    return {"success": True}
+
+
+# =============================================================================
+# 公开访问路由 (无需认证)
+# =============================================================================
+
+# 注意: 这个路由需要在 main.py 中单独注册，不使用认证中间件
+public_router = APIRouter(prefix="/v3/public", tags=["public"])
+
+
+@public_router.get("/{share_token}", response_model=PublicCardResponse)
+async def get_public_card(share_token: str):
+    """
+    公开访问分享卡片
+
+    无需登录，通过分享链接访问
+    """
+    service = share_card_service.ShareCardService()
+    card = service.get_public_card(share_token)
+
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found or expired")
+
+    return PublicCardResponse(
+        card_type=card.card_type,
+        title=card.title,
+        content=card.content,
+        template=card.template,
+        style=card.style,
+        view_count=card.view_count,
+        created_at=card.created_at.isoformat() if card.created_at else None,
+    )
+
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+def _card_to_response(card: share_card_service.ShareCard) -> ShareCardResponse:
+    """将 ShareCard 转换为响应模型"""
+    # 生成分享 URL
+    share_url = None
+    if card.share_token and card.is_public:
+        share_url = f"/v3/public/{card.share_token}"
+
+    return ShareCardResponse(
+        id=card.id or "",
+        user_id=card.user_id,
+        card_type=card.card_type,
+        title=card.title,
+        content=card.content,
+        template=card.template,
+        style=card.style,
+        source_type=card.source_type,
+        source_id=card.source_id,
+        share_token=card.share_token,
+        share_url=share_url,
+        is_public=card.is_public,
+        privacy_settings=PrivacySettingsResponse(
+            blur_names=card.privacy_settings.blur_names,
+            remove_places=card.privacy_settings.remove_places,
+            keep_original=card.privacy_settings.keep_original,
+        ),
+        image_url=card.image_url,
+        view_count=card.view_count,
+        expires_at=card.expires_at.isoformat() if card.expires_at else None,
+        created_at=card.created_at.isoformat() if card.created_at else None,
+    )

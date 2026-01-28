@@ -1,0 +1,241 @@
+# VibeLife 支付双轨制设计
+
+## 背景
+
+由于不同地区用户的支付习惯和法规要求差异，VibeLife 采用双轨制支付方案：
+
+| 用户群体 | 支付模式 | 货币 | 主要支付方式 |
+|---------|---------|------|-------------|
+| 海外用户 | 订阅制 | USD | 信用卡、Apple Pay、Google Pay |
+| 大陆/香港用户 | 预付制 | HKD | 支付宝、微信支付、信用卡 |
+
+---
+
+## 订阅制（海外用户）
+
+### 特点
+
+- **自动续费**：每月/季/年自动扣款
+- **按周期计费**：订阅期间内无限使用
+- **随时取消**：取消后服务持续到当前周期结束
+- **计划升级/降级**：可在 Customer Portal 自助操作
+
+### 价格方案（建议）
+
+| 计划 | 价格 | 折扣 |
+|-----|------|------|
+| 月付 | $9.99/月 | - |
+| 季付 | $24.99/季 | ~17% |
+| 年付 | $79.99/年 | ~33% |
+
+### 技术实现
+
+```python
+# 创建订阅 Checkout Session
+session = await stripe_service.create_checkout_session(
+    user_id=user_id,
+    price_id="price_monthly_usd",
+    success_url=f"{BASE_URL}/payment/success",
+    cancel_url=f"{BASE_URL}/pricing"
+)
+# 返回 session.url 供前端跳转
+```
+
+### 订阅状态流转
+
+```
+用户订阅 → active
+     ↓
+用户取消 → active (cancel_at_period_end=true)
+     ↓
+周期结束 → canceled
+     ↓
+重新订阅 → active
+```
+
+---
+
+## 预付制（大陆/香港用户）
+
+### 特点
+
+- **一次性付款**：无自动续费
+- **按时长计费**：购买固定时长的服务
+- **无需信用卡**：支持支付宝、微信支付
+- **到期提醒**：到期前发送续费提醒
+
+### 价格方案（建议）
+
+| 套餐 | 价格（HKD） | 单月均价 |
+|-----|------------|---------|
+| 1个月 | HK$78 | HK$78 |
+| 3个月 | HK$198 | HK$66 |
+| 12个月 | HK$588 | HK$49 |
+
+### 技术实现
+
+```python
+# 创建一次性支付 PaymentIntent
+intent = await stripe_service.create_payment_intent(
+    amount=7800,  # HK$78 = 7800 cents
+    currency="hkd",
+    metadata={
+        "user_id": user_id,
+        "package": "prepaid_1m",
+        "duration_days": 30
+    }
+)
+# 返回 client_secret 供前端确认支付
+```
+
+### 用户时长管理
+
+```python
+# 支付成功后增加用户时长
+async def add_user_time(user_id: str, duration_days: int):
+    user = await get_user(user_id)
+    current_expiry = user.premium_expires_at or datetime.now()
+    new_expiry = max(current_expiry, datetime.now()) + timedelta(days=duration_days)
+    await update_user(user_id, premium_expires_at=new_expiry)
+```
+
+---
+
+## 地区判断逻辑
+
+### 方案 1：用户自选
+
+```tsx
+<div className="payment-mode-selector">
+  <button onClick={() => setMode("subscription")}>
+    海外用户（订阅）
+  </button>
+  <button onClick={() => setMode("prepaid")}>
+    大陆/香港用户（预付）
+  </button>
+</div>
+```
+
+### 方案 2：IP 地理位置自动判断
+
+```python
+import geoip2.database
+
+def get_payment_mode(ip: str) -> str:
+    reader = geoip2.database.Reader('GeoLite2-Country.mmdb')
+    try:
+        response = reader.country(ip)
+        country = response.country.iso_code
+        if country in ["CN", "HK", "MO"]:
+            return "prepaid"
+        return "subscription"
+    except:
+        return "subscription"  # 默认订阅
+```
+
+### 方案 3：混合（推荐）
+
+- 默认根据 IP 判断
+- 允许用户手动切换
+
+---
+
+## 数据库设计
+
+```sql
+-- 用户订阅/时长表
+CREATE TABLE user_memberships (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES vibe_users(id),
+
+    -- 订阅模式字段
+    membership_type VARCHAR(20) NOT NULL, -- 'subscription' | 'prepaid'
+    stripe_customer_id VARCHAR(255),
+    stripe_subscription_id VARCHAR(255),
+    subscription_status VARCHAR(50), -- 'active' | 'canceled' | 'past_due'
+
+    -- 时长模式字段
+    premium_expires_at TIMESTAMPTZ,
+
+    -- 通用字段
+    plan VARCHAR(50), -- 'monthly' | 'quarterly' | 'yearly' | '1m' | '3m' | '12m'
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 检查用户是否有效会员
+CREATE OR REPLACE FUNCTION is_premium_user(p_user_id UUID) RETURNS BOOLEAN AS $$
+DECLARE
+    membership RECORD;
+BEGIN
+    SELECT * INTO membership FROM user_memberships WHERE user_id = p_user_id;
+
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+
+    IF membership.membership_type = 'subscription' THEN
+        RETURN membership.subscription_status = 'active';
+    ELSE
+        RETURN membership.premium_expires_at > NOW();
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+---
+
+## Webhook 处理差异
+
+### 订阅模式事件
+
+| 事件 | 处理 |
+|-----|------|
+| `customer.subscription.created` | 激活订阅状态 |
+| `customer.subscription.updated` | 更新计划/状态 |
+| `customer.subscription.deleted` | 取消订阅 |
+| `invoice.paid` | 续费成功，延长周期 |
+| `invoice.payment_failed` | 续费失败，发送提醒 |
+
+### 预付模式事件
+
+| 事件 | 处理 |
+|-----|------|
+| `payment_intent.succeeded` | 增加用户时长 |
+| `payment_intent.payment_failed` | 支付失败，提示重试 |
+
+---
+
+## 前端展示
+
+### 定价页面布局
+
+```
+┌─────────────────────────────────────────────┐
+│         VibeLife Pro Membership             │
+├─────────────────────────────────────────────┤
+│                                             │
+│  [海外用户]              [大陆/香港用户]      │
+│                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐     │
+│  │  月付   │  │  季付   │  │  年付   │     │
+│  │ $9.99  │  │ $24.99 │  │ $79.99 │     │
+│  └─────────┘  └─────────┘  └─────────┘     │
+│                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐     │
+│  │ 1个月   │  │ 3个月   │  │ 12个月  │     │
+│  │ HK$78  │  │ HK$198 │  │ HK$588 │     │
+│  └─────────┘  └─────────┘  └─────────┘     │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## 注意事项
+
+1. **货币一致性**：订阅用 USD，预付用 HKD，不要混用
+2. **时区处理**：所有时间使用 UTC 存储
+3. **重复支付防护**：检查是否已有活跃订阅/未过期时长
+4. **退款处理**：订阅退款通过 Stripe 处理，预付退款需人工审核
+5. **发票合规**：大陆用户可能需要发票，预留发票功能接口

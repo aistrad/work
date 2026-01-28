@@ -1,0 +1,2455 @@
+     1→"""
+     2→Unified Profile Repository - 统一 Profile 数据访问层
+     3→
+     4→基于 unified_profiles 表，提供统一的 Profile 访问接口。
+     5→使用 jsonb_set() 进行局部更新，避免重写整个 profile。
+     6→
+     7→v9.0 重构：彻底清理旧代码
+     8→- 移除 skill_data 双写，只写入 skills
+     9→- 移除旧结构回退逻辑
+    10→- 标记废弃方法
+    11→
+    12→v8.0 重构：三层架构 (Identity + Skills + Vibe)
+    13→
+    14→Profile 结构（v9.0）:
+    15→{
+    16→    "identity": {
+    17→        "display_name": "用户昵称",
+    18→        "birth_info": {...}
+    19→    },
+    20→    "skills": {
+    21→        "bazi": {"chart": {...}, "dayun": {...}},
+    22→        "zodiac": {"chart": {...}},
+    23→        "lifecoach": {"north_star": {...}, "goals": [...], ...},
+    24→        "tarot": {"last_reading": {...}}
+    25→    },
+    26→    "vibe": {
+    27→        "insight": {"essence": {...}, "dynamic": {...}, "pattern": {...}},
+    28→        "target": {"goals": [...], "focus": {...}, "milestones": {...}}
+    29→    },
+    30→    "preferences": {...}
+    31→}
+    32→
+    33→废弃字段（仅保留向后兼容读取，不再写入）:
+    34→- skill_data → 迁移到 skills
+    35→- life_context._paths.lifecoach → 迁移到 skills.lifecoach
+    36→- extracted → 迁移到 vibe.insight
+    37→- state.focus → 迁移到 vibe.target.focus
+    38→"""
+    39→import json
+    40→import logging
+    41→from dataclasses import dataclass
+    42→from datetime import datetime, timezone
+    43→from typing import Optional, Dict, Any, List
+    44→from uuid import UUID
+    45→
+    46→from .db import get_connection, fetch, fetchrow, fetchval, execute
+    47→
+    48→logger = logging.getLogger(__name__)
+    49→
+    50→
+    51→# ═══════════════════════════════════════════════════════════════════════════
+    52→# Data Classes
+    53→# ═══════════════════════════════════════════════════════════════════════════
+    54→
+    55→@dataclass
+    56→class SkillSubscription:
+    57→    """Skill 订阅数据类 (兼容旧接口)"""
+    58→    skill_id: str
+    59→    status: str  # subscribed | unsubscribed | not_subscribed
+    60→    push_enabled: bool
+    61→    subscribed_at: Optional[datetime]
+    62→    unsubscribed_at: Optional[datetime]
+    63→    trial_messages_used: int
+    64→
+    65→    def to_dict(self) -> Dict[str, Any]:
+    66→        return {
+    67→            "skill_id": self.skill_id,
+    68→            "status": self.status,
+    69→            "push_enabled": self.push_enabled,
+    70→            "subscribed_at": self.subscribed_at.isoformat() if self.subscribed_at else None,
+    71→            "unsubscribed_at": self.unsubscribed_at.isoformat() if self.unsubscribed_at else None,
+    72→            "trial_messages_used": self.trial_messages_used,
+    73→        }
+    74→
+    75→
+    76→@dataclass
+    77→class UserPushPreferences:
+    78→    """用户推送偏好 (兼容旧接口)"""
+    79→    user_id: UUID
+    80→    default_push_hour: int = 8
+    81→    max_daily_pushes: int = 5
+    82→    quiet_start_hour: int = 22
+    83→    quiet_end_hour: int = 7
+    84→
+    85→    def to_dict(self) -> Dict[str, Any]:
+    86→        return {
+    87→            "user_id": str(self.user_id),
+    88→            "default_push_hour": self.default_push_hour,
+    89→            "max_daily_pushes": self.max_daily_pushes,
+    90→            "quiet_start_hour": self.quiet_start_hour,
+    91→            "quiet_end_hour": self.quiet_end_hour,
+    92→        }
+    93→
+    94→
+    95→def deep_merge(base: Dict, update: Dict) -> Dict:
+    96→    """
+    97→    深度合并两个字典
+    98→
+    99→    规则：
+   100→    - 如果 update 中的值是 dict，递归合并
+   101→    - 如果 update 中的值是 None，删除该键
+   102→    - 否则，update 的值覆盖 base
+   103→    """
+   104→    result = base.copy()
+   105→    for key, value in update.items():
+   106→        if value is None:
+   107→            # None 表示删除该键
+   108→            result.pop(key, None)
+   109→        elif key in result and isinstance(result[key], dict) and isinstance(value, dict):
+   110→            # 递归合并嵌套字典
+   111→            result[key] = deep_merge(result[key], value)
+   112→        else:
+   113→            # 覆盖值
+   114→            result[key] = value
+   115→    return result
+   116→
+   117→
+   118→class UnifiedProfileRepository:
+   119→    """统一 Profile 数据访问层"""
+   120→
+   121→    # ═══════════════════════════════════════════════════════════════════════════
+   122→    # 读取操作
+   123→    # ═══════════════════════════════════════════════════════════════════════════
+   124→
+   125→    @staticmethod
+   126→    async def get_profile(user_id: UUID) -> Optional[Dict[str, Any]]:
+   127→        """获取完整 Profile"""
+   128→        row = await fetchrow(
+   129→            "SELECT profile FROM unified_profiles WHERE user_id = $1",
+   130→            user_id
+   131→        )
+   132→        if not row:
+   133→            return None
+   134→
+   135→        profile = row["profile"]
+   136→        if isinstance(profile, str):
+   137→            profile = json.loads(profile)
+   138→
+   139→        # v9.1: 自动规范化数据结构（兼容旧数据）
+   140→        # 确保 birth_info 在 identity 下（Single Source of Truth）
+   141→        identity = profile.get("identity", {})
+   142→        if not identity.get("birth_info") and profile.get("birth_info"):
+   143→            if "identity" not in profile:
+   144→                profile["identity"] = {}
+   145→            profile["identity"]["birth_info"] = profile.get("birth_info")
+   146→
+   147→        return profile
+   148→
+   149→    @staticmethod
+   150→    async def get_birth_info(user_id: UUID) -> Dict[str, Any]:
+   151→        """获取出生信息
+   152→
+   153→        支持两种存储结构：
+   154→        - 新结构: profile.identity.birth_info
+   155→        - 旧结构: profile.birth_info
+   156→        """
+   157→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   158→        if profile:
+   159→            # 优先从新结构读取
+   160→            identity = profile.get("identity", {})
+   161→            birth_info = identity.get("birth_info", {})
+   162→            if birth_info:
+   163→                return birth_info
+   164→            # 回退到旧结构
+   165→            return profile.get("birth_info", {})
+   166→        return {}
+   167→
+   168→    @staticmethod
+   169→    async def get_skill_data(user_id: UUID, skill: str) -> Dict[str, Any]:
+   170→        """
+   171→        获取 Skill 数据
+   172→
+   173→        v9.0: 只从 skills.{skill} 读取，已移除旧结构回退
+   174→        """
+   175→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   176→        if not profile:
+   177→            return {}
+   178→
+   179→        return profile.get("skills", {}).get(skill, {})
+   180→
+   181→    @staticmethod
+   182→    async def get_all_skill_data(user_id: UUID) -> Dict[str, Any]:
+   183→        """
+   184→        获取所有 Skill 数据
+   185→
+   186→        v9.0: 只从 skills 读取，已移除旧结构回退
+   187→        """
+   188→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   189→        if not profile:
+   190→            return {}
+   191→
+   192→        return profile.get("skills", {})
+   193→
+   194→    @staticmethod
+   195→    async def get_preferences(user_id: UUID) -> Dict[str, Any]:
+   196→        """获取用户偏好"""
+   197→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   198→        if profile:
+   199→            return profile.get("preferences", {"voice_mode": "warm", "language": "zh-CN"})
+   200→        return {"voice_mode": "warm", "language": "zh-CN"}
+   201→
+   202→    @staticmethod
+   203→    async def get_account(user_id: UUID) -> Dict[str, Any]:
+   204→        """
+   205→        获取账户信息 (从 vibe_users 同步)
+   206→
+   207→        Returns:
+   208→            {
+   209→                "vibe_id": "VB-A1B2C3D4",
+   210→                "display_name": "用户昵称",
+   211→                "tier": "free",
+   212→                "status": "active"
+   213→            }
+   214→        """
+   215→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   216→        if profile:
+   217→            return profile.get("account", {})
+   218→        return {}
+   219→
+   220→    @staticmethod
+   221→    async def get_tier(user_id: UUID) -> str:
+   222→        """获取用户等级 (free, basic, pro, enterprise)"""
+   223→        account = await UnifiedProfileRepository.get_account(user_id)
+   224→        return account.get("tier", "free")
+   225→
+   226→    @staticmethod
+   227→    async def get_account_full(user_id: UUID) -> Dict[str, Any]:
+   228→        """
+   229→        获取完整账户信息（替代 UserRepository.get_by_id）
+   230→
+   231→        Returns:
+   232→            完整的账户+偏好信息，包括：
+   233→            {
+   234→                "vibe_id": "VB-xxx",
+   235→                "display_name": "用户昵称",
+   236→                "avatar_url": "https://...",
+   237→                "tier": "free",
+   238→                "status": "active",
+   239→                "timezone": "Asia/Shanghai",
+   240→                "language": "zh-CN",
+   241→                "deletion_requested_at": null,
+   242→                "deletion_scheduled_at": null
+   243→            }
+   244→        """
+   245→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   246→        if not profile:
+   247→            return {}
+   248→
+   249→        account = profile.get("account", {})
+   250→        prefs = profile.get("preferences", {})
+   251→
+   252→        return {
+   253→            "vibe_id": account.get("vibe_id"),
+   254→            "display_name": account.get("display_name"),
+   255→            "avatar_url": account.get("avatar_url"),
+   256→            "tier": account.get("tier", "free"),
+   257→            "status": account.get("status", "active"),
+   258→            "timezone": prefs.get("timezone", "Asia/Shanghai"),
+   259→            "language": prefs.get("language", "zh-CN"),
+   260→            "deletion_requested_at": account.get("deletion_requested_at"),
+   261→            "deletion_scheduled_at": account.get("deletion_scheduled_at"),
+   262→        }
+   263→
+   264→    # ═══════════════════════════════════════════════════════════════════════════
+   265→    # 写入操作
+   266→    # ═══════════════════════════════════════════════════════════════════════════
+   267→
+   268→    @staticmethod
+   269→    async def create_profile(user_id: UUID, initial_profile: Dict[str, Any] = None) -> Dict[str, Any]:
+   270→        """
+   271→        创建新的 Profile
+   272→
+   273→        v9.0 三层架构:
+   274→        - Layer 1: identity (birth_info)
+   275→        - Layer 2: skills
+   276→        - Layer 3: vibe (insight + target)
+   277→        """
+   278→        profile = initial_profile or {
+   279→            "account": {},  # Will be synced from vibe_users via trigger
+   280→            "identity": {"birth_info": {}},
+   281→            "skills": {},
+   282→            "vibe": {"insight": {}, "target": {}},
+   283→            "preferences": {"voice_mode": "warm", "language": "zh-CN"}
+   284→        }
+   285→
+   286→        await execute(
+   287→            """INSERT INTO unified_profiles (user_id, profile)
+   288→               VALUES ($1, $2::jsonb)
+   289→               ON CONFLICT (user_id) DO NOTHING""",
+   290→            user_id, json.dumps(profile, ensure_ascii=False, default=str)
+   291→        )
+   292→
+   293→        return profile
+   294→
+   295→    @staticmethod
+   296→    async def update_profile(user_id: UUID, updates: Dict[str, Any]) -> None:
+   297→        """
+   298→        更新 Profile (全量合并更新)
+   299→
+   300→        Args:
+   301→            user_id: 用户 ID
+   302→            updates: 要更新的字段，会与现有数据深度合并
+   303→        """
+   304→        current = await UnifiedProfileRepository.get_profile(user_id)
+   305→
+   306→        if current:
+   307→            merged = deep_merge(current, updates)
+   308→            await execute(
+   309→                """UPDATE unified_profiles
+   310→                   SET profile = $2::jsonb, updated_at = NOW()
+   311→                   WHERE user_id = $1""",
+   312→                user_id, json.dumps(merged, ensure_ascii=False, default=str)
+   313→            )
+   314→        else:
+   315→            # 不存在则创建（v9.0 三层架构）
+   316→            default_profile = {
+   317→                "identity": {"birth_info": {}},
+   318→                "skills": {},
+   319→                "vibe": {"insight": {}, "target": {}},
+   320→                "preferences": {"voice_mode": "warm", "language": "zh-CN"}
+   321→            }
+   322→            merged = deep_merge(default_profile, updates)
+   323→            await execute(
+   324→                """INSERT INTO unified_profiles (user_id, profile)
+   325→                   VALUES ($1, $2::jsonb)""",
+   326→                user_id, json.dumps(merged, ensure_ascii=False, default=str)
+   327→            )
+   328→
+   329→        # 失效缓存
+   330→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   331→
+   332→    @staticmethod
+   333→    async def update_birth_info(user_id: UUID, birth_info: Dict[str, Any]) -> None:
+   334→        """
+   335→        更新出生信息 (使用 jsonb_set 局部更新)
+   336→
+   337→        Args:
+   338→            user_id: 用户 ID
+   339→            birth_info: 出生信息 {date, time, place, gender, timezone}
+   340→        """
+   341→        # 确保记录存在
+   342→        exists = await fetchval(
+   343→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   344→            user_id
+   345→        )
+   346→
+   347→        if exists:
+   348→            # v2.0: 统一写入 identity.birth_info
+   349→            await execute(
+   350→                """UPDATE unified_profiles
+   351→                   SET profile = jsonb_set(
+   352→                       jsonb_set(
+   353→                           COALESCE(profile, '{}'::jsonb),
+   354→                           '{identity}',
+   355→                           COALESCE(profile -> 'identity', '{}'::jsonb)
+   356→                       ),
+   357→                       '{identity, birth_info}',
+   358→                       $2::jsonb
+   359→                   ),
+   360→                   updated_at = NOW()
+   361→                   WHERE user_id = $1""",
+   362→                user_id, json.dumps(birth_info, ensure_ascii=False, default=str)
+   363→            )
+   364→        else:
+   365→            await UnifiedProfileRepository.create_profile(user_id, {"identity": {"birth_info": birth_info}})
+   366→
+   367→        # 失效所有缓存 (birth_info 影响所有 skill)
+   368→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   369→
+   370→    @staticmethod
+   371→    async def update_skill_data(user_id: UUID, skill: str, data: Dict[str, Any]) -> None:
+   372→        """
+   373→        更新 Skill 数据
+   374→
+   375→        v9.0: 只写入 skills.{skill}，已移除 skill_data 双写
+   376→
+   377→        Args:
+   378→            user_id: 用户 ID
+   379→            skill: Skill 标识 (bazi, zodiac, tarot, career, lifecoach)
+   380→            data: Skill 数据 (如命盘数据)
+   381→        """
+   382→        # 确保记录存在
+   383→        exists = await fetchval(
+   384→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   385→            user_id
+   386→        )
+   387→
+   388→        data_json = json.dumps(data, ensure_ascii=False, default=str)
+   389→
+   390→        if exists:
+   391→            # 只写入 skills
+   392→            await execute(
+   393→                """UPDATE unified_profiles
+   394→                   SET profile = jsonb_set(
+   395→                       jsonb_set(
+   396→                           COALESCE(profile, '{}'::jsonb),
+   397→                           '{skills}',
+   398→                           COALESCE(profile -> 'skills', '{}'::jsonb)
+   399→                       ),
+   400→                       ARRAY['skills', $2],
+   401→                       $3::jsonb
+   402→                   ),
+   403→                   updated_at = NOW()
+   404→                   WHERE user_id = $1""",
+   405→                user_id, skill, data_json
+   406→            )
+   407→        else:
+   408→            await UnifiedProfileRepository.create_profile(user_id, {
+   409→                "skills": {skill: data}
+   410→            })
+   411→
+   412→        # 只失效该 skill 的缓存
+   413→        await UnifiedProfileRepository._invalidate_cache(user_id, skill)
+   414→        # v2.0: 按设计文档，移除 Skill→Vibe 自动同步（保持 Skill 数据独立）。
+   415→        # 如需同步，应由上层 Agent/规则显式触发。
+   416→
+   417→    @staticmethod
+   418→    async def update_preferences(user_id: UUID, preferences: Dict[str, Any]) -> None:
+   419→        """更新用户偏好 (使用 jsonb_set 局部更新)"""
+   420→        exists = await fetchval(
+   421→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   422→            user_id
+   423→        )
+   424→
+   425→        if exists:
+   426→            # 合并现有偏好
+   427→            current_prefs = await UnifiedProfileRepository.get_preferences(user_id)
+   428→            merged_prefs = {**current_prefs, **preferences}
+   429→
+   430→            await execute(
+   431→                """UPDATE unified_profiles
+   432→                   SET profile = jsonb_set(
+   433→                       COALESCE(profile, '{}'::jsonb),
+   434→                       '{preferences}',
+   435→                       $2::jsonb
+   436→                   ),
+   437→                   updated_at = NOW()
+   438→                   WHERE user_id = $1""",
+   439→                user_id, json.dumps(merged_prefs, ensure_ascii=False)
+   440→            )
+   441→        else:
+   442→            await UnifiedProfileRepository.create_profile(user_id, {"preferences": preferences})
+   443→
+   444→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   445→
+   446→    @staticmethod
+   447→    async def update_account_info(
+   448→        user_id: UUID,
+   449→        display_name: str = None,
+   450→        avatar_url: str = None
+   451→    ) -> None:
+   452→        """
+   453→        更新账户信息 (Migration 022 compatible)
+   454→
+   455→        Post-Migration 022: display_name 和 avatar_url 只存在于 unified_profiles.profile.account
+   456→        不再写入 vibe_users (字段已删除)
+   457→
+   458→        Args:
+   459→            user_id: 用户 ID
+   460→            display_name: 显示名称
+   461→            avatar_url: 头像 URL
+   462→        """
+   463→        update_fields = {}
+   464→        if display_name is not None:
+   465→            update_fields["display_name"] = display_name
+   466→        if avatar_url is not None:
+   467→            update_fields["avatar_url"] = avatar_url
+   468→
+   469→        if update_fields:
+   470→            # 直接更新 unified_profiles.profile.account
+   471→            async with get_connection() as conn:
+   472→                # Build JSONB update path
+   473→                for key, value in update_fields.items():
+   474→                    await conn.execute(
+   475→                        """
+   476→                        UPDATE unified_profiles
+   477→                        SET profile = jsonb_set(
+   478→                            COALESCE(profile, '{}'::jsonb),
+   479→                            $2,
+   480→                            to_jsonb($3::text),
+   481→                            true
+   482→                        ),
+   483→                        updated_at = NOW()
+   484→                        WHERE user_id = $1
+   485→                        """,
+   486→                        user_id,
+   487→                        ['account', key],
+   488→                        value
+   489→                    )
+   490→
+   491→            # 失效缓存
+   492→            await UnifiedProfileRepository._invalidate_cache(user_id)
+   493→
+   494→    @staticmethod
+   495→    async def update_deletion_status(
+   496→        user_id: UUID,
+   497→        status: str,
+   498→        deletion_requested_at: datetime = None,
+   499→        deletion_scheduled_at: datetime = None
+   500→    ) -> None:
+   501→        """
+   502→        更新账户删除状态 (Migration 022 compatible)
+   503→
+   504→        Post-Migration 022:
+   505→        - status: 更新 vibe_users.status (触发器自动同步到 unified_profiles)
+   506→        - deletion_*: 只存在于 unified_profiles.profile.account
+   507→
+   508→        Args:
+   509→            user_id: 用户 ID
+   510→            status: 账户状态 ('active' | 'pending_deletion' | 'deleted')
+   511→            deletion_requested_at: 删除请求时间
+   512→            deletion_scheduled_at: 计划删除时间
+   513→        """
+   514→        from .user_repo import UserRepository
+   515→
+   516→        # Update status in vibe_users (trigger will sync to unified_profiles)
+   517→        await UserRepository.update(user_id, status=status)
+   518→
+   519→        # Update deletion timestamps in unified_profiles (vibe_users doesn't have these fields)
+   520→        if deletion_requested_at is not None or deletion_scheduled_at is not None:
+   521→            async with get_connection() as conn:
+   522→                account_updates = {}
+   523→                if deletion_requested_at is not None:
+   524→                    account_updates['deletion_requested_at'] = deletion_requested_at.isoformat() if deletion_requested_at else None
+   525→                if deletion_scheduled_at is not None:
+   526→                    account_updates['deletion_scheduled_at'] = deletion_scheduled_at.isoformat() if deletion_scheduled_at else None
+   527→
+   528→                # Update unified_profiles.profile.account with deletion timestamps
+   529→                for key, value in account_updates.items():
+   530→                    await conn.execute(
+   531→                        """
+   532→                        UPDATE unified_profiles
+   533→                        SET profile = jsonb_set(
+   534→                            COALESCE(profile, '{}'::jsonb),
+   535→                            $2,
+   536→                            to_jsonb($3::text),
+   537→                            true
+   538→                        ),
+   539→                        updated_at = NOW()
+   540→                        WHERE user_id = $1
+   541→                        """,
+   542→                        user_id,
+   543→                        ['account', key],
+   544→                        value
+   545→                    )
+   546→
+   547→        # 失效缓存
+   548→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   549→
+   550→    # ═══════════════════════════════════════════════════════════════════════════
+   551→    # State 管理 (会话状态)
+   552→    # ═══════════════════════════════════════════════════════════════════════════
+   553→
+   554→    @staticmethod
+   555→    async def get_state(user_id: UUID) -> Dict[str, Any]:
+   556→        """
+   557→        获取用户状态
+   558→
+   559→        用于会话管理（active_session）。
+   560→        注意：用户关注话题（focus）已迁移到 vibe.target.focus
+   561→
+   562→        Returns:
+   563→            {
+   564→                "active_session": {...},
+   565→                "updated_at": "2026-01-19T10:00:00Z"
+   566→            }
+   567→        """
+   568→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   569→        if profile:
+   570→            return profile.get("state", {"active_session": None, "updated_at": None})
+   571→        return {"active_session": None, "updated_at": None}
+   572→
+   573→    @staticmethod
+   574→    async def update_state(user_id: UUID, state: Dict[str, Any]) -> None:
+   575→        """
+   576→        更新用户状态 (使用 jsonb_set 局部更新)
+   577→
+   578→        用于会话管理（active_session）。
+   579→        注意：用户关注话题（focus）已迁移到 vibe.target.focus
+   580→
+   581→        Args:
+   582→            user_id: 用户 ID
+   583→            state: 状态数据 {active_session: {...}, ...}
+   584→        """
+   585→        # 自动添加更新时间
+   586→        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+   587→
+   588→        exists = await fetchval(
+   589→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   590→            user_id
+   591→        )
+   592→
+   593→        if exists:
+   594→            # 获取现有 state 并合并（保留其他字段）
+   595→            current_state = await UnifiedProfileRepository.get_state(user_id)
+   596→            merged_state = {**current_state, **state}
+   597→
+   598→            await execute(
+   599→                """UPDATE unified_profiles
+   600→                   SET profile = jsonb_set(
+   601→                       COALESCE(profile, '{}'::jsonb),
+   602→                       '{state}',
+   603→                       $2::jsonb
+   604→                   ),
+   605→                   updated_at = NOW()
+   606→                   WHERE user_id = $1""",
+   607→                user_id, json.dumps(merged_state, ensure_ascii=False, default=str)
+   608→            )
+   609→        else:
+   610→            await UnifiedProfileRepository.create_profile(user_id, {"state": state})
+   611→
+   612→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   613→
+   614→    # ═══════════════════════════════════════════════════════════════════════════
+   615→    # Relationships 管理 (v10.0 新增 - 合盘功能)
+   616→    # ═══════════════════════════════════════════════════════════════════════════
+   617→
+   618→    @staticmethod
+   619→    async def get_relationships(user_id: UUID) -> List[Dict[str, Any]]:
+   620→        """
+   621→        获取用户的所有关系对象
+   622→
+   623→        Returns:
+   624→            List of relationship objects:
+   625→            [
+   626→                {
+   627→                    "id": "rel_abc123",
+   628→                    "name": "小明",
+   629→                    "relationship_type": "romantic",
+   630→                    "birth_info": {...},
+   631→                    "created_at": "2026-01-22T10:00:00Z",
+   632→                    "last_synastry_at": "2026-01-22T10:30:00Z",
+   633→                    "synastry_count": 5
+   634→                }
+   635→            ]
+   636→        """
+   637→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   638→        if not profile:
+   639→            return []
+   640→        return profile.get("relationships", [])
+   641→
+   642→    @staticmethod
+   643→    async def get_relationship(user_id: UUID, relationship_id: str) -> Optional[Dict[str, Any]]:
+   644→        """获取单个关系对象"""
+   645→        relationships = await UnifiedProfileRepository.get_relationships(user_id)
+   646→        for rel in relationships:
+   647→            if rel.get("id") == relationship_id:
+   648→                return rel
+   649→        return None
+   650→
+   651→    @staticmethod
+   652→    async def add_relationship(user_id: UUID, relationship: Dict[str, Any]) -> str:
+   653→        """
+   654→        添加关系对象
+   655→
+   656→        Args:
+   657→            user_id: 用户 ID
+   658→            relationship: 关系对象数据 (不含 id)
+   659→                {
+   660→                    "name": "小明",
+   661→                    "relationship_type": "romantic",
+   662→                    "birth_info": {...},
+   663→                    "notes": "备注"
+   664→                }
+   665→
+   666→        Returns:
+   667→            生成的 relationship_id
+   668→        """
+   669→        import uuid as uuid_module
+   670→
+   671→        # 生成 ID
+   672→        rel_id = f"rel_{uuid_module.uuid4().hex[:8]}"
+   673→        now = datetime.now(timezone.utc).isoformat()
+   674→
+   675→        # 构建完整对象
+   676→        full_relationship = {
+   677→            "id": rel_id,
+   678→            "name": relationship.get("name", ""),
+   679→            "relationship_type": relationship.get("relationship_type", "friend"),
+   680→            "birth_info": relationship.get("birth_info", {}),
+   681→            "notes": relationship.get("notes"),
+   682→            "created_at": now,
+   683→            "updated_at": now,
+   684→            "last_synastry_at": None,
+   685→            "synastry_count": 0
+   686→        }
+   687→
+   688→        # 获取当前列表
+   689→        relationships = await UnifiedProfileRepository.get_relationships(user_id)
+   690→        relationships.append(full_relationship)
+   691→
+   692→        # 更新
+   693→        await execute(
+   694→            """UPDATE unified_profiles
+   695→               SET profile = jsonb_set(
+   696→                   COALESCE(profile, '{}'::jsonb),
+   697→                   '{relationships}',
+   698→                   $2::jsonb
+   699→               ),
+   700→               updated_at = NOW()
+   701→               WHERE user_id = $1""",
+   702→            user_id, json.dumps(relationships, ensure_ascii=False, default=str)
+   703→        )
+   704→
+   705→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   706→        return rel_id
+   707→
+   708→    @staticmethod
+   709→    async def update_relationship(
+   710→        user_id: UUID,
+   711→        relationship_id: str,
+   712→        updates: Dict[str, Any]
+   713→    ) -> bool:
+   714→        """
+   715→        更新关系对象
+   716→
+   717→        Args:
+   718→            user_id: 用户 ID
+   719→            relationship_id: 关系对象 ID
+   720→            updates: 要更新的字段
+   721→
+   722→        Returns:
+   723→            是否更新成功
+   724→        """
+   725→        relationships = await UnifiedProfileRepository.get_relationships(user_id)
+   726→
+   727→        found = False
+   728→        for rel in relationships:
+   729→            if rel.get("id") == relationship_id:
+   730→                rel.update(updates)
+   731→                rel["updated_at"] = datetime.now(timezone.utc).isoformat()
+   732→                found = True
+   733→                break
+   734→
+   735→        if not found:
+   736→            return False
+   737→
+   738→        await execute(
+   739→            """UPDATE unified_profiles
+   740→               SET profile = jsonb_set(
+   741→                   COALESCE(profile, '{}'::jsonb),
+   742→                   '{relationships}',
+   743→                   $2::jsonb
+   744→               ),
+   745→               updated_at = NOW()
+   746→               WHERE user_id = $1""",
+   747→            user_id, json.dumps(relationships, ensure_ascii=False, default=str)
+   748→        )
+   749→
+   750→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   751→        return True
+   752→
+   753→    @staticmethod
+   754→    async def delete_relationship(user_id: UUID, relationship_id: str) -> bool:
+   755→        """删除关系对象"""
+   756→        relationships = await UnifiedProfileRepository.get_relationships(user_id)
+   757→
+   758→        new_relationships = [r for r in relationships if r.get("id") != relationship_id]
+   759→
+   760→        if len(new_relationships) == len(relationships):
+   761→            return False  # 未找到
+   762→
+   763→        await execute(
+   764→            """UPDATE unified_profiles
+   765→               SET profile = jsonb_set(
+   766→                   COALESCE(profile, '{}'::jsonb),
+   767→                   '{relationships}',
+   768→                   $2::jsonb
+   769→               ),
+   770→               updated_at = NOW()
+   771→               WHERE user_id = $1""",
+   772→            user_id, json.dumps(new_relationships, ensure_ascii=False, default=str)
+   773→        )
+   774→
+   775→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   776→        return True
+   777→
+   778→    @staticmethod
+   779→    async def record_synastry(user_id: UUID, relationship_id: str) -> bool:
+   780→        """
+   781→        记录一次合盘，更新 last_synastry_at 和 synastry_count
+   782→
+   783→        Args:
+   784→            user_id: 用户 ID
+   785→            relationship_id: 关系对象 ID
+   786→
+   787→        Returns:
+   788→            是否更新成功
+   789→        """
+   790→        relationships = await UnifiedProfileRepository.get_relationships(user_id)
+   791→
+   792→        found = False
+   793→        for rel in relationships:
+   794→            if rel.get("id") == relationship_id:
+   795→                rel["last_synastry_at"] = datetime.now(timezone.utc).isoformat()
+   796→                rel["synastry_count"] = rel.get("synastry_count", 0) + 1
+   797→                found = True
+   798→                break
+   799→
+   800→        if not found:
+   801→            return False
+   802→
+   803→        await execute(
+   804→            """UPDATE unified_profiles
+   805→               SET profile = jsonb_set(
+   806→                   COALESCE(profile, '{}'::jsonb),
+   807→                   '{relationships}',
+   808→                   $2::jsonb
+   809→               ),
+   810→               updated_at = NOW()
+   811→               WHERE user_id = $1""",
+   812→            user_id, json.dumps(relationships, ensure_ascii=False, default=str)
+   813→        )
+   814→
+   815→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   816→        return True
+   817→
+   818→    # ═══════════════════════════════════════════════════════════════════════════
+   819→    # Vibe 层管理 (v8.0 新增 - 共享深度信息)
+   820→    # ═══════════════════════════════════════════════════════════════════════════
+   821→
+   822→    @staticmethod
+   823→    async def get_vibe(user_id: UUID) -> Dict[str, Any]:
+   824→        """
+   825→        获取完整 Vibe 数据（v2.0 合并视图）
+   826→
+   827→        返回包含以下键：
+   828→        - profile: 稳定画像
+   829→        - state: 当前状态
+   830→        - goals: 目标列表
+   831→        - timeline: 重要事件
+   832→        - insight/target/relationship: 兼容旧结构
+   833→        """
+   834→        profile = await UnifiedProfileRepository.get_profile(user_id)
+   835→        base = {"insight": {}, "target": {}, "relationship": {}}
+   836→        if not profile:
+   837→            return {**base, "profile": {}, "state": {}, "goals": [], "timeline": []}
+   838→
+   839→        vibe = profile.get("vibe", {}) or {}
+   840→        return {
+   841→            # v2.0 keys
+   842→            "profile": vibe.get("profile", {}),
+   843→            "state": vibe.get("state", {}) or vibe.get("current", {}),  # 兼容 current
+   844→            "goals": vibe.get("goals", []) or vibe.get("profile", {}).get("goals", []),
+   845→            "timeline": vibe.get("timeline", []),
+   846→            # legacy keys (if any)
+   847→            "insight": vibe.get("insight", {}),
+   848→            "target": vibe.get("target", {}),
+   849→            "relationship": vibe.get("relationship", {}),
+   850→        }
+   851→
+   852→    @staticmethod
+   853→    async def get_vibe_insight(user_id: UUID) -> Dict[str, Any]:
+   854→        """
+   855→        获取 VibeInsight（我是谁）
+   856→
+   857→        Returns:
+   858→            {
+   859→                "essence": {"archetype": {...}, "traits": [...]},
+   860→                "dynamic": {"emotion": {...}, "energy": {...}},
+   861→                "pattern": {"behaviors": [...], "insights": [...]}
+   862→            }
+   863→        """
+   864→        vibe = await UnifiedProfileRepository.get_vibe(user_id)
+   865→        return vibe.get("insight", {})
+   866→
+   867→    @staticmethod
+   868→    async def get_vibe_target(user_id: UUID) -> Dict[str, Any]:
+   869→        """
+   870→        获取 VibeTarget（我要成为谁）
+   871→
+   872→        Returns:
+   873→            {
+   874→                "north_star": {...},
+   875→                "goals": [...],
+   876→                "focus": {"primary": "...", "active_goal": "..."},
+   877→                "milestones": {...}
+   878→            }
+   879→        """
+   880→        vibe = await UnifiedProfileRepository.get_vibe(user_id)
+   881→        return vibe.get("target", {})
+   882→
+   883→    @staticmethod
+   884→    async def update_vibe_insight(user_id: UUID, insight: Dict[str, Any]) -> None:
+   885→        """
+   886→        更新 VibeInsight（仅 ProfileExtractor 使用）
+   887→
+   888→        Args:
+   889→            user_id: 用户 ID
+   890→            insight: VibeInsight 数据 {essence, dynamic, pattern}
+   891→        """
+   892→        # 添加更新时间
+   893→        insight["updated_at"] = datetime.now(timezone.utc).isoformat()
+   894→
+   895→        exists = await fetchval(
+   896→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   897→            user_id
+   898→        )
+   899→
+   900→        if exists:
+   901→            await execute(
+   902→                """UPDATE unified_profiles
+   903→                   SET profile = jsonb_set(
+   904→                       jsonb_set(
+   905→                           COALESCE(profile, '{}'::jsonb),
+   906→                           '{vibe}',
+   907→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+   908→                       ),
+   909→                       '{vibe, insight}',
+   910→                       $2::jsonb
+   911→                   ),
+   912→                   updated_at = NOW()
+   913→                   WHERE user_id = $1""",
+   914→                user_id, json.dumps(insight, ensure_ascii=False, default=str)
+   915→            )
+   916→        else:
+   917→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"insight": insight}})
+   918→
+   919→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   920→
+   921→    @staticmethod
+   922→    async def update_vibe_target(user_id: UUID, target: Dict[str, Any]) -> None:
+   923→        """
+   924→        更新 VibeTarget（仅 ProfileExtractor 使用）
+   925→
+   926→        Args:
+   927→            user_id: 用户 ID
+   928→            target: VibeTarget 数据 {north_star, goals, focus, milestones}
+   929→        """
+   930→        # 添加更新时间
+   931→        target["updated_at"] = datetime.now(timezone.utc).isoformat()
+   932→
+   933→        exists = await fetchval(
+   934→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+   935→            user_id
+   936→        )
+   937→
+   938→        if exists:
+   939→            await execute(
+   940→                """UPDATE unified_profiles
+   941→                   SET profile = jsonb_set(
+   942→                       jsonb_set(
+   943→                           COALESCE(profile, '{}'::jsonb),
+   944→                           '{vibe}',
+   945→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+   946→                       ),
+   947→                       '{vibe, target}',
+   948→                       $2::jsonb
+   949→                   ),
+   950→                   updated_at = NOW()
+   951→                   WHERE user_id = $1""",
+   952→                user_id, json.dumps(target, ensure_ascii=False, default=str)
+   953→            )
+   954→        else:
+   955→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"target": target}})
+   956→
+   957→        await UnifiedProfileRepository._invalidate_cache(user_id)
+   958→
+   959→    @staticmethod
+   960→    async def get_vibe_relationship(user_id: UUID) -> Dict[str, Any]:
+   961→        """
+   962→        获取 VibeRelationship（我与他人）
+   963→
+   964→        v10.1 简化版：关系对象 + 合盘洞察存储在一起
+   965→
+   966→        Returns:
+   967→            {
+   968→                "relationships": [
+   969→                    {
+   970→                        "id": "rel_001",
+   971→                        "name": "小明",
+   972→                        "type": "romantic",
+   973→                        "birth_info": {...},
+   974→                        "synastry": {
+   975→                            "zodiac": {...}  # 合盘洞察
+   976→                        },
+   977→                        "created_at": "...",
+   978→                        "last_synastry_at": "..."
+   979→                    }
+   980→                ],
+   981→                "updated_at": "..."
+   982→            }
+   983→        """
+   984→        vibe = await UnifiedProfileRepository.get_vibe(user_id)
+   985→        return vibe.get("relationship", {"relationships": []})
+   986→
+   987→    @staticmethod
+   988→    async def get_vibe_relationships(user_id: UUID) -> List[Dict[str, Any]]:
+   989→        """
+   990→        获取所有关系对象（简化版 API）
+   991→
+   992→        Returns:
+   993→            关系对象列表
+   994→        """
+   995→        vibe_rel = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+   996→        return vibe_rel.get("relationships", [])
+   997→
+   998→    @staticmethod
+   999→    async def get_vibe_relationship_by_id(user_id: UUID, rel_id: str) -> Optional[Dict[str, Any]]:
+  1000→        """
+  1001→        获取单个关系对象
+  1002→
+  1003→        Args:
+  1004→            user_id: 用户 ID
+  1005→            rel_id: 关系对象 ID
+  1006→
+  1007→        Returns:
+  1008→            关系对象或 None
+  1009→        """
+  1010→        relationships = await UnifiedProfileRepository.get_vibe_relationships(user_id)
+  1011→        for rel in relationships:
+  1012→            if rel.get("id") == rel_id:
+  1013→                return rel
+  1014→        return None
+  1015→
+  1016→    @staticmethod
+  1017→    async def add_vibe_relationship(user_id: UUID, relationship: Dict[str, Any]) -> str:
+  1018→        """
+  1019→        添加关系对象到 vibe.relationship.relationships
+  1020→
+  1021→        Args:
+  1022→            user_id: 用户 ID
+  1023→            relationship: 关系对象数据
+  1024→                {
+  1025→                    "name": "小明",
+  1026→                    "type": "romantic",
+  1027→                    "birth_info": {...}
+  1028→                }
+  1029→
+  1030→        Returns:
+  1031→            生成的 relationship_id
+  1032→        """
+  1033→        import uuid as uuid_module
+  1034→
+  1035→        # 生成 ID
+  1036→        rel_id = f"rel_{uuid_module.uuid4().hex[:8]}"
+  1037→        now = datetime.now(timezone.utc).isoformat()
+  1038→
+  1039→        # 构建完整对象
+  1040→        full_relationship = {
+  1041→            "id": rel_id,
+  1042→            "name": relationship.get("name", ""),
+  1043→            "type": relationship.get("type", "friend"),
+  1044→            "birth_info": relationship.get("birth_info", {}),
+  1045→            "synastry": {},  # 初始为空，等合盘后填充
+  1046→            "created_at": now,
+  1047→            "last_synastry_at": None
+  1048→        }
+  1049→
+  1050→        # 获取当前数据
+  1051→        vibe_rel = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+  1052→        relationships = vibe_rel.get("relationships", [])
+  1053→        relationships.append(full_relationship)
+  1054→
+  1055→        # 更新
+  1056→        vibe_rel["relationships"] = relationships
+  1057→        vibe_rel["updated_at"] = now
+  1058→        await UnifiedProfileRepository.update_vibe_relationship(user_id, vibe_rel)
+  1059→
+  1060→        return rel_id
+  1061→
+  1062→    @staticmethod
+  1063→    async def save_synastry_insight(
+  1064→        user_id: UUID,
+  1065→        rel_id: str,
+  1066→        skill_id: str,
+  1067→        insight: Dict[str, Any]
+  1068→    ) -> bool:
+  1069→        """
+  1070→        保存合盘洞察到关系对象
+  1071→
+  1072→        Args:
+  1073→            user_id: 用户 ID
+  1074→            rel_id: 关系对象 ID
+  1075→            skill_id: Skill ID (zodiac, bazi, jungastro)
+  1076→            insight: 合盘洞察数据
+  1077→                {
+  1078→                    "overall_score": 78,
+  1079→                    "categories": [...],
+  1080→                    "aspects": [...],
+  1081→                    "strengths": [...],
+  1082→                    "challenges": [...],
+  1083→                    "advice": "..."
+  1084→                }
+  1085→
+  1086→        Returns:
+  1087→            是否保存成功
+  1088→        """
+  1089→        vibe_rel = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+  1090→        relationships = vibe_rel.get("relationships", [])
+  1091→
+  1092→        found = False
+  1093→        now = datetime.now(timezone.utc).isoformat()
+  1094→
+  1095→        for rel in relationships:
+  1096→            if rel.get("id") == rel_id:
+  1097→                # 初始化 synastry 字段
+  1098→                if "synastry" not in rel:
+  1099→                    rel["synastry"] = {}
+  1100→
+  1101→                # 保存洞察
+  1102→                rel["synastry"][skill_id] = {
+  1103→                    **insight,
+  1104→                    "calculated_at": now
+  1105→                }
+  1106→                rel["last_synastry_at"] = now
+  1107→                found = True
+  1108→                break
+  1109→
+  1110→        if not found:
+  1111→            return False
+  1112→
+  1113→        vibe_rel["relationships"] = relationships
+  1114→        vibe_rel["updated_at"] = now
+  1115→        await UnifiedProfileRepository.update_vibe_relationship(user_id, vibe_rel)
+  1116→
+  1117→        return True
+  1118→
+  1119→    @staticmethod
+  1120→    async def delete_vibe_relationship(user_id: UUID, rel_id: str) -> bool:
+  1121→        """
+  1122→        删除关系对象
+  1123→
+  1124→        Args:
+  1125→            user_id: 用户 ID
+  1126→            rel_id: 关系对象 ID
+  1127→
+  1128→        Returns:
+  1129→            是否删除成功
+  1130→        """
+  1131→        vibe_rel = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+  1132→        relationships = vibe_rel.get("relationships", [])
+  1133→
+  1134→        new_relationships = [r for r in relationships if r.get("id") != rel_id]
+  1135→
+  1136→        if len(new_relationships) == len(relationships):
+  1137→            return False  # 未找到
+  1138→
+  1139→        vibe_rel["relationships"] = new_relationships
+  1140→        vibe_rel["updated_at"] = datetime.now(timezone.utc).isoformat()
+  1141→        await UnifiedProfileRepository.update_vibe_relationship(user_id, vibe_rel)
+  1142→
+  1143→        return True
+  1144→
+  1145→    @staticmethod
+  1146→    async def update_vibe_relationship(user_id: UUID, relationship: Dict[str, Any]) -> None:
+  1147→        """
+  1148→        更新 VibeRelationship（合盘结果存储）
+  1149→
+  1150→        Args:
+  1151→            user_id: 用户 ID
+  1152→            relationship: VibeRelationship 数据
+  1153→        """
+  1154→        # 添加更新时间
+  1155→        relationship["updated_at"] = datetime.now(timezone.utc).isoformat()
+  1156→
+  1157→        exists = await fetchval(
+  1158→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1159→            user_id
+  1160→        )
+  1161→
+  1162→        if exists:
+  1163→            await execute(
+  1164→                """UPDATE unified_profiles
+  1165→                   SET profile = jsonb_set(
+  1166→                       jsonb_set(
+  1167→                           COALESCE(profile, '{}'::jsonb),
+  1168→                           '{vibe}',
+  1169→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+  1170→                       ),
+  1171→                       '{vibe, relationship}',
+  1172→                       $2::jsonb
+  1173→                   ),
+  1174→                   updated_at = NOW()
+  1175→                   WHERE user_id = $1""",
+  1176→                user_id, json.dumps(relationship, ensure_ascii=False, default=str)
+  1177→            )
+  1178→        else:
+  1179→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"relationship": relationship}})
+  1180→
+  1181→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1182→
+  1183→    @staticmethod
+  1184→    async def update_primary_partner(
+  1185→        user_id: UUID,
+  1186→        partner_data: Dict[str, Any]
+  1187→    ) -> None:
+  1188→        """
+  1189→        更新主要伴侣的关系洞察
+  1190→
+  1191→        Args:
+  1192→            user_id: 用户 ID
+  1193→            partner_data: 伴侣关系洞察数据
+  1194→                {
+  1195→                    "personId": "rel_001",
+  1196→                    "name": "小明",
+  1197→                    "type": "romantic",
+  1198→                    "overallHarmony": 78,
+  1199→                    "coreInsight": "...",
+  1200→                    "strengths": [...],
+  1201→                    "growthAreas": [...]
+  1202→                }
+  1203→        """
+  1204→        current = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+  1205→        current["primaryPartner"] = {
+  1206→            **partner_data,
+  1207→            "lastUpdated": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+  1208→        }
+  1209→        await UnifiedProfileRepository.update_vibe_relationship(user_id, current)
+  1210→
+  1211→    @staticmethod
+  1212→    async def add_key_relationship(
+  1213→        user_id: UUID,
+  1214→        relationship_data: Dict[str, Any],
+  1215→        max_relationships: int = 5
+  1216→    ) -> None:
+  1217→        """
+  1218→        添加/更新重要关系洞察
+  1219→
+  1220→        Args:
+  1221→            user_id: 用户 ID
+  1222→            relationship_data: 关系洞察数据
+  1223→            max_relationships: 最多保存的关系数量
+  1224→        """
+  1225→        current = await UnifiedProfileRepository.get_vibe_relationship(user_id)
+  1226→        key_relationships = current.get("keyRelationships", [])
+  1227→
+  1228→        # 检查是否已存在（按 personId）
+  1229→        person_id = relationship_data.get("personId")
+  1230→        found = False
+  1231→        for i, rel in enumerate(key_relationships):
+  1232→            if rel.get("personId") == person_id:
+  1233→                key_relationships[i] = {
+  1234→                    **relationship_data,
+  1235→                    "lastUpdated": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+  1236→                }
+  1237→                found = True
+  1238→                break
+  1239→
+  1240→        if not found:
+  1241→            key_relationships.append({
+  1242→                **relationship_data,
+  1243→                "lastUpdated": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+  1244→            })
+  1245→
+  1246→        # 限制数量
+  1247→        current["keyRelationships"] = key_relationships[:max_relationships]
+  1248→        await UnifiedProfileRepository.update_vibe_relationship(user_id, current)
+  1249→
+  1250→    # ═══════════════════════════════════════════════════════════════════════════
+  1251→    # Vibe v13 API（配置驱动 + LLM 执行架构）
+  1252→    # ═══════════════════════════════════════════════════════════════════════════
+  1253→
+  1254→    @staticmethod
+  1255→    async def get_vibe_current(user_id: UUID) -> Dict[str, Any]:
+  1256→        """
+  1257→        获取 vibe.state（v2.0 Hot Layer - 实时状态）
+  1258→
+  1259→        v2.0 术语：
+  1260→        - Hot Layer: 实时状态，覆盖写入
+  1261→        - 包含 emotion, energy, focus, topics, context 等
+  1262→
+  1263→        Returns:
+  1264→            当前状态字典，不存在返回空字典
+  1265→        """
+  1266→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1267→        if not profile:
+  1268→            return {}
+  1269→        vibe = profile.get("vibe", {}) or {}
+  1270→        return vibe.get("state", {}) or vibe.get("current", {})
+  1271→
+  1272→    @staticmethod
+  1273→    async def get_vibe_profile(user_id: UUID) -> Dict[str, Any]:
+  1274→        """
+  1275→        获取 vibe.profile（v2.0 Warm Layer - 稳定画像）
+  1276→
+  1277→        v2.0 术语：
+  1278→        - Warm Layer: 稳定画像，增量合并
+  1279→        - 包含 identity, people, context, preferences 等
+  1280→
+  1281→        Returns:
+  1282→            {
+  1283→                "identity": {"archetypes": [...], "traits": [...], "style": "..."},
+  1284→                "people": [...],
+  1285→                "context": {"occupation": "...", "concerns": [...]},
+  1286→                "preferences": {...},
+  1287→                "updated_at": "..."
+  1288→            }
+  1289→        """
+  1290→        full = await UnifiedProfileRepository.get_vibe(user_id)
+  1291→        return full.get("profile", {})
+  1292→
+  1293→    @staticmethod
+  1294→    async def get_vibe_goals(user_id: UUID) -> List[Dict[str, Any]]:
+  1295→        """获取 vibe.goals（v2.0 顶层 goals 列表）"""
+  1296→        full = await UnifiedProfileRepository.get_vibe(user_id)
+  1297→        goals = full.get("goals", [])
+  1298→        # 兜底：若旧数据仍在 profile.goals，则已在 get_vibe() 合并处理
+  1299→        return goals or []
+  1300→
+  1301→    @staticmethod
+  1302→    async def get_vibe_timeline(user_id: UUID, limit: int = 20) -> List[Dict[str, Any]]:
+  1303→        """
+  1304→        获取 vibe.timeline（Cold Layer - 事件时间线）
+  1305→
+  1306→        v13 新增：三层存储架构
+  1307→
+  1308→        Returns:
+  1309→            [
+  1310→                {"id": "e_001", "date": "2026-01-22", "type": "goal", "event": "..."},
+  1311→                ...
+  1312→            ]
+  1313→        """
+  1314→        vibe = await UnifiedProfileRepository.get_vibe(user_id)
+  1315→        timeline = vibe.get("timeline", [])
+  1316→        return timeline[:limit]
+  1317→
+  1318→    @staticmethod
+  1319→    async def update_vibe_current(user_id: UUID, current: Dict[str, Any]) -> None:
+  1320→        """
+  1321→        更新 vibe.state（v2.0 - 覆盖写入）
+  1322→        兼容：保留方法名以保持向后兼容
+  1323→
+  1324→        Args:
+  1325→            user_id: 用户 ID
+  1326→            current: 当前状态数据 {emotion, energy, focus, topics, context}
+  1327→        """
+  1328→        # 添加更新时间
+  1329→        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+  1330→
+  1331→        exists = await fetchval(
+  1332→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1333→            user_id
+  1334→        )
+  1335→
+  1336→        if exists:
+  1337→            await execute(
+  1338→                """UPDATE unified_profiles
+  1339→                   SET profile = jsonb_set(
+  1340→                       jsonb_set(
+  1341→                           COALESCE(profile, '{}'::jsonb),
+  1342→                           '{vibe}',
+  1343→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+  1344→                       ),
+  1345→                       '{vibe, state}',
+  1346→                       $2::jsonb
+  1347→                   ),
+  1348→                   updated_at = NOW()
+  1349→                   WHERE user_id = $1""",
+  1350→                user_id, json.dumps(current, ensure_ascii=False, default=str)
+  1351→            )
+  1352→        else:
+  1353→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"state": current}})
+  1354→
+  1355→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1356→
+  1357→    @staticmethod
+  1358→    async def update_vibe_profile(
+  1359→        user_id: UUID,
+  1360→        updates: Dict[str, Any],
+  1361→        merge_rules: Optional[Dict[str, Any]] = None
+  1362→    ) -> None:
+  1363→        """
+  1364→        更新 vibe.profile（Warm Layer - 增量合并）
+  1365→
+  1366→        v14 更新：由 LLM 通过 save 工具调用
+  1367→
+  1368→        Args:
+  1369→            user_id: 用户 ID
+  1370→            updates: 需要更新的数据
+  1371→            merge_rules: 合并规则（由 LLM 执行，这里只做简单深度合并）
+  1372→        """
+  1373→        # 获取当前 profile
+  1374→        current_profile = await UnifiedProfileRepository.get_vibe_profile(user_id)
+  1375→
+  1376→        # 深度合并
+  1377→        merged = deep_merge(current_profile, updates)
+  1378→        merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+  1379→
+  1380→        exists = await fetchval(
+  1381→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1382→            user_id
+  1383→        )
+  1384→
+  1385→        if exists:
+  1386→            await execute(
+  1387→                """UPDATE unified_profiles
+  1388→                   SET profile = jsonb_set(
+  1389→                       jsonb_set(
+  1390→                           COALESCE(profile, '{}'::jsonb),
+  1391→                           '{vibe}',
+  1392→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+  1393→                       ),
+  1394→                       '{vibe, profile}',
+  1395→                       $2::jsonb
+  1396→                   ),
+  1397→                   updated_at = NOW()
+  1398→                   WHERE user_id = $1""",
+  1399→                user_id, json.dumps(merged, ensure_ascii=False, default=str)
+  1400→            )
+  1401→        else:
+  1402→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"profile": merged}})
+  1403→
+  1404→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1405→
+  1406→    @staticmethod
+  1407→    async def update_vibe_profile_path(
+  1408→        user_id: UUID,
+  1409→        path: str,
+  1410→        data: Dict[str, Any]
+  1411→    ) -> None:
+  1412→        """
+  1413→        更新 vibe.profile 的指定路径
+  1414→
+  1415→        v14 更新：由 LLM 通过 save 工具调用
+  1416→
+  1417→        Args:
+  1418→            user_id: 用户 ID
+  1419→            path: 路径，如 "identity" 或 "identity.archetypes"
+  1420→            data: 数据
+  1421→        """
+  1422→        current_profile = await UnifiedProfileRepository.get_vibe_profile(user_id)
+  1423→
+  1424→        # 设置嵌套路径
+  1425→        keys = path.split(".")
+  1426→        current = current_profile
+  1427→        for key in keys[:-1]:
+  1428→            if key not in current:
+  1429→                current[key] = {}
+  1430→            current = current[key]
+  1431→        current[keys[-1]] = data
+  1432→
+  1433→        current_profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+  1434→
+  1435→        await UnifiedProfileRepository.update_vibe_profile(user_id, current_profile)
+  1436→
+  1437→    @staticmethod
+  1438→    async def append_vibe_timeline(
+  1439→        user_id: UUID,
+  1440→        event: Dict[str, Any],
+  1441→        max_items: int = 100
+  1442→    ) -> str:
+  1443→        """
+  1444→        追加事件到 vibe.timeline（Cold Layer - 追加存储）
+  1445→
+  1446→        v14 更新：由 LLM 通过 save 工具调用
+  1447→        P0 修复：使用原子操作避免并发丢失数据
+  1448→
+  1449→        Args:
+  1450→            user_id: 用户 ID
+  1451→            event: 事件数据 {type, event, data}
+  1452→            max_items: 最大保留条目数
+  1453→
+  1454→        Returns:
+  1455→            事件 ID
+  1456→        """
+  1457→        import uuid as uuid_module
+  1458→
+  1459→        # 生成事件 ID
+  1460→        event_id = f"e_{uuid_module.uuid4().hex[:8]}"
+  1461→        event["id"] = event_id
+  1462→        event["date"] = event.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+  1463→
+  1464→        event_json = json.dumps(event, ensure_ascii=False, default=str)
+  1465→
+  1466→        exists = await fetchval(
+  1467→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1468→            user_id
+  1469→        )
+  1470→
+  1471→        if exists:
+  1472→            # P0 FIX: 使用原子操作 - jsonb 数组前置拼接
+  1473→            # 避免 read-modify-write 竞态条件
+  1474→            # 1. 先确保 vibe 和 vibe.timeline 路径存在
+  1475→            # 2. 使用 || 操作符原子地前置新事件
+  1476→            # 3. 使用子查询截取前 max_items 条
+  1477→            await execute(
+  1478→                """UPDATE unified_profiles
+  1479→                   SET profile = jsonb_set(
+  1480→                       jsonb_set(
+  1481→                           COALESCE(profile, '{}'::jsonb),
+  1482→                           '{vibe}',
+  1483→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+  1484→                       ),
+  1485→                       '{vibe, timeline}',
+  1486→                       (
+  1487→                           SELECT jsonb_agg(elem)
+  1488→                           FROM (
+  1489→                               SELECT elem
+  1490→                               FROM jsonb_array_elements(
+  1491→                                   $2::jsonb || COALESCE(
+  1492→                                       profile -> 'vibe' -> 'timeline',
+  1493→                                       '[]'::jsonb
+  1494→                                   )
+  1495→                               ) WITH ORDINALITY AS t(elem, idx)
+  1496→                               ORDER BY idx
+  1497→                               LIMIT $3
+  1498→                           ) sub
+  1499→                       )
+  1500→                   ),
+  1501→                   updated_at = NOW()
+  1502→                   WHERE user_id = $1""",
+  1503→                user_id, f'[{event_json}]', max_items
+  1504→            )
+  1505→        else:
+  1506→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"timeline": [event]}})
+  1507→
+  1508→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1509→        return event_id
+  1510→
+  1511→    @staticmethod
+  1512→    async def append_vibe_timeline_batch(
+  1513→        user_id: UUID,
+  1514→        events: List[Dict[str, Any]],
+  1515→        max_items: int = 100
+  1516→    ) -> List[str]:
+  1517→        """
+  1518→        批量追加事件到 vibe.timeline（P1 优化 - 单次 DB 写入）
+  1519→
+  1520→        Args:
+  1521→            user_id: 用户 ID
+  1522→            events: 事件列表 [{type, event, data}, ...]
+  1523→            max_items: 最大保留条目数
+  1524→
+  1525→        Returns:
+  1526→            事件 ID 列表
+  1527→        """
+  1528→        import uuid as uuid_module
+  1529→
+  1530→        if not events:
+  1531→            return []
+  1532→
+  1533→        # 为每个事件生成 ID
+  1534→        event_ids = []
+  1535→        prepared_events = []
+  1536→        for event in events:
+  1537→            if not event:
+  1538→                continue
+  1539→            event_id = f"e_{uuid_module.uuid4().hex[:8]}"
+  1540→            event_ids.append(event_id)
+  1541→            prepared_events.append({
+  1542→                **event,
+  1543→                "id": event_id,
+  1544→                "date": event.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+  1545→            })
+  1546→
+  1547→        if not prepared_events:
+  1548→            return []
+  1549→
+  1550→        events_json = json.dumps(prepared_events, ensure_ascii=False, default=str)
+  1551→
+  1552→        exists = await fetchval(
+  1553→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1554→            user_id
+  1555→        )
+  1556→
+  1557→        if exists:
+  1558→            # 使用原子操作 - 批量前置拼接
+  1559→            await execute(
+  1560→                """UPDATE unified_profiles
+  1561→                   SET profile = jsonb_set(
+  1562→                       jsonb_set(
+  1563→                           COALESCE(profile, '{}'::jsonb),
+  1564→                           '{vibe}',
+  1565→                           COALESCE(profile -> 'vibe', '{}'::jsonb)
+  1566→                       ),
+  1567→                       '{vibe, timeline}',
+  1568→                       (
+  1569→                           SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+  1570→                           FROM (
+  1571→                               SELECT elem
+  1572→                               FROM jsonb_array_elements(
+  1573→                                   $2::jsonb || COALESCE(
+  1574→                                       profile -> 'vibe' -> 'timeline',
+  1575→                                       '[]'::jsonb
+  1576→                                   )
+  1577→                               ) WITH ORDINALITY AS t(elem, idx)
+  1578→                               ORDER BY idx
+  1579→                               LIMIT $3
+  1580→                           ) sub
+  1581→                       )
+  1582→                   ),
+  1583→                   updated_at = NOW()
+  1584→                   WHERE user_id = $1""",
+  1585→                user_id, events_json, max_items
+  1586→            )
+  1587→        else:
+  1588→            await UnifiedProfileRepository.create_profile(user_id, {"vibe": {"timeline": prepared_events[:max_items]}})
+  1589→
+  1590→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1591→        return event_ids
+  1592→
+  1593→    # ═══════════════════════════════════════════════════════════════════════════
+  1594→    # v2.0 通用路径更新（LLM-First）
+  1595→    # ═══════════════════════════════════════════════════════════════════════════
+  1596→
+  1597→    @staticmethod
+  1598→    async def update_by_path(user_id: UUID, path: str, data: Any) -> None:
+  1599→        """
+  1600→        按点分隔路径更新 JSON（递归创建缺失的中间节点）
+  1601→
+  1602→        示例: path="vibe.profile.identity.traits"
+  1603→
+  1604→        PostgreSQL 的 jsonb_set 只创建最后一级 key，不创建中间路径。
+  1605→        此方法通过递归 jsonb_set 来确保中间路径存在。
+  1606→        """
+  1607→        parts = path.split(".") if path else []
+  1608→        if not parts:
+  1609→            return
+  1610→
+  1611→        exists = await fetchval(
+  1612→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  1613→            user_id
+  1614→        )
+  1615→
+  1616→        if not exists:
+  1617→            # 初始化最小骨架
+  1618→            initial: Dict[str, Any] = {}
+  1619→            cur = initial
+  1620→            for key in parts[:-1]:
+  1621→                cur[key] = {}
+  1622→                cur = cur[key]
+  1623→            cur[parts[-1]] = data
+  1624→            await UnifiedProfileRepository.create_profile(user_id, initial)
+  1625→            return
+  1626→
+  1627→        payload = json.dumps(data, ensure_ascii=False, default=str)
+  1628→
+  1629→        # 递归创建中间路径
+  1630→        # 例如 path="vibe.profile.context.occupation"，需要确保:
+  1631→        # 1. profile['vibe'] 存在（如果不存在，创建为 {}）
+  1632→        # 2. profile['vibe']['profile'] 存在
+  1633→        # 3. profile['vibe']['profile']['context'] 存在
+  1634→        # 4. 最后设置 profile['vibe']['profile']['context']['occupation'] = data
+  1635→
+  1636→        # 使用 CTE 递归构建路径
+  1637→        # 先确保所有中间路径存在，再设置最终值
+  1638→        if len(parts) == 1:
+  1639→            # 单层路径，直接 jsonb_set
+  1640→            await execute(
+  1641→                """UPDATE unified_profiles
+  1642→                   SET profile = jsonb_set(
+  1643→                       COALESCE(profile, '{}'::jsonb),
+  1644→                       $2::text[],
+  1645→                       $3::jsonb,
+  1646→                       true
+  1647→                   ),
+  1648→                   updated_at = NOW()
+  1649→                   WHERE user_id = $1""",
+  1650→                user_id, parts, payload
+  1651→            )
+  1652→        else:
+  1653→            # 多层路径：先确保中间路径存在，再设置值
+  1654→            # 构建嵌套的 jsonb_set 调用
+  1655→            # 从最内层开始构建
+  1656→            sql_parts = []
+  1657→            for i in range(1, len(parts)):
+  1658→                partial_path = parts[:i]
+  1659→                sql_parts.append(f"""
+  1660→                    jsonb_set(
+  1661→                        COALESCE(profile, '{{}}'::jsonb),
+  1662→                        ${{path_{i}}}::text[],
+  1663→                        COALESCE(profile #> ${{path_{i}}}::text[], '{{}}'::jsonb),
+  1664→                        true
+  1665→                    )
+  1666→                """)
+  1667→
+  1668→            # 最终的 SQL：先确保中间路径存在，再设置最终值
+  1669→            # 使用单次更新，通过嵌套 jsonb_set 实现
+  1670→            # 简化方案：使用 Python 构建完整的嵌套结构后写入
+  1671→            current_profile = await fetchrow(
+  1672→                "SELECT profile FROM unified_profiles WHERE user_id = $1",
+  1673→                user_id
+  1674→            )
+  1675→            profile = current_profile["profile"] if current_profile else {}
+  1676→            if profile is None:
+  1677→                profile = {}
+  1678→            # Handle case where JSONB is returned as string
+  1679→            if isinstance(profile, str):
+  1680→                profile = json.loads(profile)
+  1681→
+  1682→            # 在 Python 中遍历路径，确保中间节点存在
+  1683→            current = profile
+  1684→            for i, key in enumerate(parts[:-1]):
+  1685→                if not isinstance(current, dict):
+  1686→                    # 中间节点不是 dict，无法继续
+  1687→                    logger.error(f"update_by_path: path conflict at {parts[:i]}, expected dict but got {type(current)}")
+  1688→                    return
+  1689→                if key not in current or not isinstance(current.get(key), dict):
+  1690→                    current[key] = {}
+  1691→                current = current[key]
+  1692→
+  1693→            # 设置最终值
+  1694→            if isinstance(current, dict):
+  1695→                current[parts[-1]] = data
+  1696→            else:
+  1697→                logger.error(f"update_by_path: cannot set {parts[-1]} on non-dict")
+  1698→
+  1699→            # 写回数据库
+  1700→            await execute(
+  1701→                """UPDATE unified_profiles
+  1702→                   SET profile = $2::jsonb,
+  1703→                       updated_at = NOW()
+  1704→                   WHERE user_id = $1""",
+  1705→                user_id, json.dumps(profile, ensure_ascii=False, default=str)
+  1706→            )
+  1707→
+  1708→    # ═══════════════════════════════════════════════════════════════════════════
+  1709→    # 删除操作
+  1710→    # ═══════════════════════════════════════════════════════════════════════════
+  1711→
+  1712→    @staticmethod
+  1713→    async def delete_profile(user_id: UUID) -> bool:
+  1714→        """删除用户 Profile"""
+  1715→        result = await execute(
+  1716→            "DELETE FROM unified_profiles WHERE user_id = $1",
+  1717→            user_id
+  1718→        )
+  1719→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1720→        return "DELETE 1" in str(result)
+  1721→
+  1722→    # ═══════════════════════════════════════════════════════════════════════════
+  1723→    # 历史归档
+  1724→    # ═══════════════════════════════════════════════════════════════════════════
+  1725→
+  1726→    @staticmethod
+  1727→    async def archive_profile(user_id: UUID) -> bool:
+  1728→        """归档当前 Profile 到历史表"""
+  1729→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1730→        if not profile:
+  1731→            return False
+  1732→
+  1733→        await execute(
+  1734→            """INSERT INTO unified_profiles_history (user_id, profile)
+  1735→               VALUES ($1, $2::jsonb)""",
+  1736→            user_id, json.dumps(profile, ensure_ascii=False, default=str)
+  1737→        )
+  1738→        return True
+  1739→
+  1740→    @staticmethod
+  1741→    async def get_profile_history(user_id: UUID, limit: int = 10) -> List[Dict[str, Any]]:
+  1742→        """获取 Profile 历史记录"""
+  1743→        rows = await fetch(
+  1744→            """SELECT profile, archived_at FROM unified_profiles_history
+  1745→               WHERE user_id = $1
+  1746→               ORDER BY archived_at DESC
+  1747→               LIMIT $2""",
+  1748→            user_id, limit
+  1749→        )
+  1750→        return [
+  1751→            {
+  1752→                "profile": row["profile"] if isinstance(row["profile"], dict) else json.loads(row["profile"]),
+  1753→                "archived_at": row["archived_at"]
+  1754→            }
+  1755→            for row in rows
+  1756→        ]
+  1757→
+  1758→    # ═══════════════════════════════════════════════════════════════════════════
+  1759→    # Skill 订阅管理 (v7.6 - 从 SkillSubscriptionRepository 迁移)
+  1760→    # ═══════════════════════════════════════════════════════════════════════════
+  1761→
+  1762→    @staticmethod
+  1763→    async def get_skill_subscription(user_id: UUID, skill_id: str) -> Optional[SkillSubscription]:
+  1764→        """获取单个 Skill 订阅状态"""
+  1765→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1766→        if not profile:
+  1767→            return None
+  1768→
+  1769→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1770→        sub_data = subscribed_skills.get(skill_id)
+  1771→
+  1772→        if not sub_data:
+  1773→            return None
+  1774→
+  1775→        return SkillSubscription(
+  1776→            skill_id=skill_id,
+  1777→            status=sub_data.get("status", "not_subscribed"),
+  1778→            push_enabled=sub_data.get("push_enabled", False),
+  1779→            subscribed_at=datetime.fromisoformat(sub_data["subscribed_at"]) if sub_data.get("subscribed_at") else None,
+  1780→            unsubscribed_at=datetime.fromisoformat(sub_data["unsubscribed_at"]) if sub_data.get("unsubscribed_at") else None,
+  1781→            trial_messages_used=sub_data.get("trial_messages_used", 0),
+  1782→        )
+  1783→
+  1784→    @staticmethod
+  1785→    async def get_user_subscriptions(user_id: UUID) -> List[SkillSubscription]:
+  1786→        """获取用户所有订阅"""
+  1787→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1788→        if not profile:
+  1789→            return []
+  1790→
+  1791→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1792→        subscriptions = []
+  1793→
+  1794→        for skill_id, sub_data in subscribed_skills.items():
+  1795→            subscriptions.append(SkillSubscription(
+  1796→                skill_id=skill_id,
+  1797→                status=sub_data.get("status", "not_subscribed"),
+  1798→                push_enabled=sub_data.get("push_enabled", False),
+  1799→                subscribed_at=datetime.fromisoformat(sub_data["subscribed_at"]) if sub_data.get("subscribed_at") else None,
+  1800→                unsubscribed_at=datetime.fromisoformat(sub_data["unsubscribed_at"]) if sub_data.get("unsubscribed_at") else None,
+  1801→                trial_messages_used=sub_data.get("trial_messages_used", 0),
+  1802→            ))
+  1803→
+  1804→        # 按订阅时间排序 (最新优先)
+  1805→        # 使用 timezone-aware 的最小日期作为默认值
+  1806→        min_dt = datetime.min.replace(tzinfo=timezone.utc)
+  1807→        subscriptions.sort(key=lambda s: s.subscribed_at.replace(tzinfo=timezone.utc) if s.subscribed_at and s.subscribed_at.tzinfo is None else (s.subscribed_at or min_dt), reverse=True)
+  1808→        return subscriptions
+  1809→
+  1810→    @staticmethod
+  1811→    async def get_subscribed_skill_ids(user_id: UUID) -> List[str]:
+  1812→        """获取用户已订阅的 Skill ID 列表"""
+  1813→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1814→        if not profile:
+  1815→            return []
+  1816→
+  1817→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1818→        return [
+  1819→            skill_id for skill_id, sub_data in subscribed_skills.items()
+  1820→            if sub_data.get("status") == "subscribed"
+  1821→        ]
+  1822→
+  1823→    @staticmethod
+  1824→    async def subscribe(
+  1825→        user_id: UUID,
+  1826→        skill_id: str,
+  1827→        push_enabled: bool = True
+  1828→    ) -> SkillSubscription:
+  1829→        """订阅 Skill"""
+  1830→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1831→        if not profile:
+  1832→            profile = await UnifiedProfileRepository.create_profile(user_id)
+  1833→
+  1834→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1835→        existing = subscribed_skills.get(skill_id, {})
+  1836→
+  1837→        now = datetime.now(timezone.utc)
+  1838→        sub_data = {
+  1839→            "status": "subscribed",
+  1840→            "push_enabled": push_enabled,
+  1841→            "subscribed_at": now.isoformat(),
+  1842→            "unsubscribed_at": None,
+  1843→            "trial_messages_used": existing.get("trial_messages_used", 0),
+  1844→        }
+  1845→
+  1846→        subscribed_skills[skill_id] = sub_data
+  1847→
+  1848→        # 使用 jsonb_set 更新
+  1849→        await execute(
+  1850→            """UPDATE unified_profiles
+  1851→               SET profile = jsonb_set(
+  1852→                   jsonb_set(
+  1853→                       COALESCE(profile, '{}'::jsonb),
+  1854→                       '{preferences}',
+  1855→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  1856→                   ),
+  1857→                   '{preferences, subscribed_skills}',
+  1858→                   $2::jsonb
+  1859→               ),
+  1860→               updated_at = NOW()
+  1861→               WHERE user_id = $1""",
+  1862→            user_id, json.dumps(subscribed_skills, ensure_ascii=False, default=str)
+  1863→        )
+  1864→
+  1865→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1866→
+  1867→        return SkillSubscription(
+  1868→            skill_id=skill_id,
+  1869→            status="subscribed",
+  1870→            push_enabled=push_enabled,
+  1871→            subscribed_at=now,
+  1872→            unsubscribed_at=None,
+  1873→            trial_messages_used=existing.get("trial_messages_used", 0),
+  1874→        )
+  1875→
+  1876→    @staticmethod
+  1877→    async def unsubscribe(user_id: UUID, skill_id: str) -> SkillSubscription:
+  1878→        """取消订阅 Skill"""
+  1879→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1880→        if not profile:
+  1881→            return SkillSubscription(
+  1882→                skill_id=skill_id,
+  1883→                status="unsubscribed",
+  1884→                push_enabled=False,
+  1885→                subscribed_at=None,
+  1886→                unsubscribed_at=datetime.now(timezone.utc),
+  1887→                trial_messages_used=0,
+  1888→            )
+  1889→
+  1890→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1891→        existing = subscribed_skills.get(skill_id, {})
+  1892→
+  1893→        now = datetime.now(timezone.utc)
+  1894→        sub_data = {
+  1895→            "status": "unsubscribed",
+  1896→            "push_enabled": False,
+  1897→            "subscribed_at": existing.get("subscribed_at"),
+  1898→            "unsubscribed_at": now.isoformat(),
+  1899→            "trial_messages_used": existing.get("trial_messages_used", 0),
+  1900→        }
+  1901→
+  1902→        subscribed_skills[skill_id] = sub_data
+  1903→
+  1904→        await execute(
+  1905→            """UPDATE unified_profiles
+  1906→               SET profile = jsonb_set(
+  1907→                   jsonb_set(
+  1908→                       COALESCE(profile, '{}'::jsonb),
+  1909→                       '{preferences}',
+  1910→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  1911→                   ),
+  1912→                   '{preferences, subscribed_skills}',
+  1913→                   $2::jsonb
+  1914→               ),
+  1915→               updated_at = NOW()
+  1916→               WHERE user_id = $1""",
+  1917→            user_id, json.dumps(subscribed_skills, ensure_ascii=False, default=str)
+  1918→        )
+  1919→
+  1920→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1921→
+  1922→        return SkillSubscription(
+  1923→            skill_id=skill_id,
+  1924→            status="unsubscribed",
+  1925→            push_enabled=False,
+  1926→            subscribed_at=datetime.fromisoformat(existing["subscribed_at"]) if existing.get("subscribed_at") else None,
+  1927→            unsubscribed_at=now,
+  1928→            trial_messages_used=existing.get("trial_messages_used", 0),
+  1929→        )
+  1930→
+  1931→    @staticmethod
+  1932→    async def update_push(
+  1933→        user_id: UUID,
+  1934→        skill_id: str,
+  1935→        enabled: bool
+  1936→    ) -> Optional[SkillSubscription]:
+  1937→        """更新推送状态"""
+  1938→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  1939→        if not profile:
+  1940→            return None
+  1941→
+  1942→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  1943→        existing = subscribed_skills.get(skill_id)
+  1944→
+  1945→        if not existing:
+  1946→            return None
+  1947→
+  1948→        existing["push_enabled"] = enabled
+  1949→        subscribed_skills[skill_id] = existing
+  1950→
+  1951→        await execute(
+  1952→            """UPDATE unified_profiles
+  1953→               SET profile = jsonb_set(
+  1954→                   jsonb_set(
+  1955→                       COALESCE(profile, '{}'::jsonb),
+  1956→                       '{preferences}',
+  1957→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  1958→                   ),
+  1959→                   '{preferences, subscribed_skills}',
+  1960→                   $2::jsonb
+  1961→               ),
+  1962→               updated_at = NOW()
+  1963→               WHERE user_id = $1""",
+  1964→            user_id, json.dumps(subscribed_skills, ensure_ascii=False, default=str)
+  1965→        )
+  1966→
+  1967→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  1968→
+  1969→        return SkillSubscription(
+  1970→            skill_id=skill_id,
+  1971→            status=existing.get("status", "not_subscribed"),
+  1972→            push_enabled=enabled,
+  1973→            subscribed_at=datetime.fromisoformat(existing["subscribed_at"]) if existing.get("subscribed_at") else None,
+  1974→            unsubscribed_at=datetime.fromisoformat(existing["unsubscribed_at"]) if existing.get("unsubscribed_at") else None,
+  1975→            trial_messages_used=existing.get("trial_messages_used", 0),
+  1976→        )
+  1977→
+  1978→    @staticmethod
+  1979→    async def is_push_enabled(user_id: UUID, skill_id: str) -> bool:
+  1980→        """检查推送是否开启"""
+  1981→        subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+  1982→        if not subscription:
+  1983→            return False
+  1984→        return subscription.status == "subscribed" and subscription.push_enabled
+  1985→
+  1986→    @staticmethod
+  1987→    async def get_users_with_push_enabled(skill_id: str) -> List[UUID]:
+  1988→        """获取某 Skill 开启推送的所有用户 ID"""
+  1989→        query = """
+  1990→            SELECT user_id
+  1991→            FROM unified_profiles
+  1992→            WHERE profile -> 'preferences' -> 'subscribed_skills' -> $1 ->> 'status' = 'subscribed'
+  1993→            AND (profile -> 'preferences' -> 'subscribed_skills' -> $1 ->> 'push_enabled')::boolean = true
+  1994→        """
+  1995→        rows = await fetch(query, skill_id)
+  1996→        return [row["user_id"] for row in rows]
+  1997→
+  1998→    @staticmethod
+  1999→    async def increment_trial_usage(user_id: UUID, skill_id: str) -> int:
+  2000→        """增加试用次数，返回新的使用次数"""
+  2001→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2002→        if not profile:
+  2003→            profile = await UnifiedProfileRepository.create_profile(user_id)
+  2004→
+  2005→        subscribed_skills = profile.get("preferences", {}).get("subscribed_skills", {})
+  2006→        existing = subscribed_skills.get(skill_id, {
+  2007→            "status": "not_subscribed",
+  2008→            "push_enabled": False,
+  2009→            "subscribed_at": None,
+  2010→            "unsubscribed_at": None,
+  2011→            "trial_messages_used": 0,
+  2012→        })
+  2013→
+  2014→        existing["trial_messages_used"] = existing.get("trial_messages_used", 0) + 1
+  2015→        subscribed_skills[skill_id] = existing
+  2016→
+  2017→        await execute(
+  2018→            """UPDATE unified_profiles
+  2019→               SET profile = jsonb_set(
+  2020→                   jsonb_set(
+  2021→                       COALESCE(profile, '{}'::jsonb),
+  2022→                       '{preferences}',
+  2023→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  2024→                   ),
+  2025→                   '{preferences, subscribed_skills}',
+  2026→                   $2::jsonb
+  2027→               ),
+  2028→               updated_at = NOW()
+  2029→               WHERE user_id = $1""",
+  2030→            user_id, json.dumps(subscribed_skills, ensure_ascii=False, default=str)
+  2031→        )
+  2032→
+  2033→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  2034→        return existing["trial_messages_used"]
+  2035→
+  2036→    @staticmethod
+  2037→    async def get_trial_usage(user_id: UUID, skill_id: str) -> int:
+  2038→        """获取试用次数"""
+  2039→        subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+  2040→        return subscription.trial_messages_used if subscription else 0
+  2041→
+  2042→    @staticmethod
+  2043→    async def is_subscribed(user_id: UUID, skill_id: str) -> bool:
+  2044→        """检查是否已订阅"""
+  2045→        subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+  2046→        return subscription is not None and subscription.status == "subscribed"
+  2047→
+  2048→    @staticmethod
+  2049→    async def can_use_skill(
+  2050→        user_id: UUID,
+  2051→        skill_id: str,
+  2052→        skill_category: str,
+  2053→        trial_limit: int = 3
+  2054→    ) -> tuple:
+  2055→        """
+  2056→        检查用户是否可以使用 Skill
+  2057→
+  2058→        Returns:
+  2059→            (can_use, reason)
+  2060→            - (True, "subscribed") - 已订阅
+  2061→            - (True, "default") - 默认 Skill
+  2062→            - (True, "core") - Core Skill
+  2063→            - (True, "trial") - 试用中
+  2064→            - (False, "trial_exhausted") - 试用次数用完
+  2065→            - (False, "not_subscribed") - 未订阅
+  2066→        """
+  2067→        # Core Skill 始终可用
+  2068→        if skill_category == "core":
+  2069→            return True, "core"
+  2070→
+  2071→        subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+  2072→
+  2073→        # Default Skill: 如果没有订阅记录或已订阅，则可用
+  2074→        if skill_category == "default":
+  2075→            if not subscription or subscription.status == "subscribed":
+  2076→                return True, "default"
+  2077→            return False, "unsubscribed"
+  2078→
+  2079→        # Professional Skill: 需要订阅或在试用期内
+  2080→        if subscription and subscription.status == "subscribed":
+  2081→            return True, "subscribed"
+  2082→
+  2083→        # 检查试用
+  2084→        trial_used = subscription.trial_messages_used if subscription else 0
+  2085→        if trial_used < trial_limit:
+  2086→            return True, "trial"
+  2087→
+  2088→        return False, "trial_exhausted"
+  2089→
+  2090→    # ═══════════════════════════════════════════════════════════════════════════
+  2091→    # 推送偏好管理 (v7.6 - 从 UserPushPreferencesRepository 迁移)
+  2092→    # ═══════════════════════════════════════════════════════════════════════════
+  2093→
+  2094→    @staticmethod
+  2095→    async def get_push_settings(user_id: UUID) -> Optional[UserPushPreferences]:
+  2096→        """获取用户推送偏好"""
+  2097→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2098→        if not profile:
+  2099→            return None
+  2100→
+  2101→        push_settings = profile.get("preferences", {}).get("push_settings", {})
+  2102→        if not push_settings:
+  2103→            return None
+  2104→
+  2105→        return UserPushPreferences(
+  2106→            user_id=user_id,
+  2107→            default_push_hour=push_settings.get("default_push_hour", 8),
+  2108→            max_daily_pushes=push_settings.get("max_daily_pushes", 5),
+  2109→            quiet_start_hour=push_settings.get("quiet_start_hour", 22),
+  2110→            quiet_end_hour=push_settings.get("quiet_end_hour", 7),
+  2111→        )
+  2112→
+  2113→    @staticmethod
+  2114→    async def upsert_push_settings(
+  2115→        user_id: UUID,
+  2116→        default_push_hour: Optional[int] = None,
+  2117→        max_daily_pushes: Optional[int] = None,
+  2118→        quiet_start_hour: Optional[int] = None,
+  2119→        quiet_end_hour: Optional[int] = None,
+  2120→    ) -> UserPushPreferences:
+  2121→        """创建或更新用户推送偏好"""
+  2122→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2123→        if not profile:
+  2124→            profile = await UnifiedProfileRepository.create_profile(user_id)
+  2125→
+  2126→        current_settings = profile.get("preferences", {}).get("push_settings", {})
+  2127→        push_settings = {
+  2128→            "default_push_hour": default_push_hour if default_push_hour is not None else current_settings.get("default_push_hour", 8),
+  2129→            "max_daily_pushes": max_daily_pushes if max_daily_pushes is not None else current_settings.get("max_daily_pushes", 5),
+  2130→            "quiet_start_hour": quiet_start_hour if quiet_start_hour is not None else current_settings.get("quiet_start_hour", 22),
+  2131→            "quiet_end_hour": quiet_end_hour if quiet_end_hour is not None else current_settings.get("quiet_end_hour", 7),
+  2132→        }
+  2133→
+  2134→        await execute(
+  2135→            """UPDATE unified_profiles
+  2136→               SET profile = jsonb_set(
+  2137→                   jsonb_set(
+  2138→                       COALESCE(profile, '{}'::jsonb),
+  2139→                       '{preferences}',
+  2140→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  2141→                   ),
+  2142→                   '{preferences, push_settings}',
+  2143→                   $2::jsonb
+  2144→               ),
+  2145→               updated_at = NOW()
+  2146→               WHERE user_id = $1""",
+  2147→            user_id, json.dumps(push_settings, ensure_ascii=False)
+  2148→        )
+  2149→
+  2150→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  2151→
+  2152→        return UserPushPreferences(
+  2153→            user_id=user_id,
+  2154→            default_push_hour=push_settings["default_push_hour"],
+  2155→            max_daily_pushes=push_settings["max_daily_pushes"],
+  2156→            quiet_start_hour=push_settings["quiet_start_hour"],
+  2157→            quiet_end_hour=push_settings["quiet_end_hour"],
+  2158→        )
+  2159→
+  2160→    @staticmethod
+  2161→    async def get_push_hour(user_id: UUID, skill_id: Optional[str] = None) -> int:
+  2162→        """
+  2163→        获取用户的推送时间
+  2164→
+  2165→        优先级:
+  2166→        1. 用户全局偏好 (preferences.push_settings.default_push_hour)
+  2167→        2. 系统默认值 (8)
+  2168→        """
+  2169→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2170→        if profile:
+  2171→            push_settings = profile.get("preferences", {}).get("push_settings", {})
+  2172→            if "default_push_hour" in push_settings:
+  2173→                return push_settings["default_push_hour"]
+  2174→        return 8
+  2175→
+  2176→    @staticmethod
+  2177→    async def is_in_quiet_hours(user_id: UUID, current_hour: int) -> bool:
+  2178→        """检查当前是否在用户的静默时段"""
+  2179→        prefs = await UnifiedProfileRepository.get_push_settings(user_id)
+  2180→        if not prefs:
+  2181→            # 默认静默时段 22:00 - 07:00
+  2182→            return current_hour >= 22 or current_hour < 7
+  2183→
+  2184→        start = prefs.quiet_start_hour
+  2185→        end = prefs.quiet_end_hour
+  2186→
+  2187→        # 处理跨午夜的情况
+  2188→        if start > end:
+  2189→            return current_hour >= start or current_hour < end
+  2190→        else:
+  2191→            return start <= current_hour < end
+  2192→
+  2193→    # ═══════════════════════════════════════════════════════════════════════════
+  2194→    # Skill 推荐屏蔽 (v7.6 - 从 SkillRecommendationBlockRepository 迁移)
+  2195→    # ═══════════════════════════════════════════════════════════════════════════
+  2196→
+  2197→    @staticmethod
+  2198→    async def get_blocked_skills(user_id: UUID) -> List[str]:
+  2199→        """获取用户屏蔽的 Skill 列表"""
+  2200→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2201→        if not profile:
+  2202→            return []
+  2203→        return profile.get("preferences", {}).get("blocked_skills", [])
+  2204→
+  2205→    @staticmethod
+  2206→    async def block_skill(user_id: UUID, skill_id: str) -> None:
+  2207→        """屏蔽 Skill 推荐"""
+  2208→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2209→        if not profile:
+  2210→            profile = await UnifiedProfileRepository.create_profile(user_id)
+  2211→
+  2212→        blocked_skills = profile.get("preferences", {}).get("blocked_skills", [])
+  2213→        if skill_id not in blocked_skills:
+  2214→            blocked_skills.append(skill_id)
+  2215→
+  2216→        await execute(
+  2217→            """UPDATE unified_profiles
+  2218→               SET profile = jsonb_set(
+  2219→                   jsonb_set(
+  2220→                       COALESCE(profile, '{}'::jsonb),
+  2221→                       '{preferences}',
+  2222→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  2223→                   ),
+  2224→                   '{preferences, blocked_skills}',
+  2225→                   $2::jsonb
+  2226→               ),
+  2227→               updated_at = NOW()
+  2228→               WHERE user_id = $1""",
+  2229→            user_id, json.dumps(blocked_skills, ensure_ascii=False)
+  2230→        )
+  2231→
+  2232→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  2233→
+  2234→    @staticmethod
+  2235→    async def unblock_skill(user_id: UUID, skill_id: str) -> None:
+  2236→        """取消屏蔽 Skill 推荐"""
+  2237→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2238→        if not profile:
+  2239→            return
+  2240→
+  2241→        blocked_skills = profile.get("preferences", {}).get("blocked_skills", [])
+  2242→        if skill_id in blocked_skills:
+  2243→            blocked_skills.remove(skill_id)
+  2244→
+  2245→        await execute(
+  2246→            """UPDATE unified_profiles
+  2247→               SET profile = jsonb_set(
+  2248→                   jsonb_set(
+  2249→                       COALESCE(profile, '{}'::jsonb),
+  2250→                       '{preferences}',
+  2251→                       COALESCE(profile -> 'preferences', '{}'::jsonb)
+  2252→                   ),
+  2253→                   '{preferences, blocked_skills}',
+  2254→                   $2::jsonb
+  2255→               ),
+  2256→               updated_at = NOW()
+  2257→               WHERE user_id = $1""",
+  2258→            user_id, json.dumps(blocked_skills, ensure_ascii=False)
+  2259→        )
+  2260→
+  2261→        await UnifiedProfileRepository._invalidate_cache(user_id)
+  2262→
+  2263→    @staticmethod
+  2264→    async def is_skill_blocked(user_id: UUID, skill_id: str) -> bool:
+  2265→        """检查 Skill 是否被屏蔽"""
+  2266→        blocked_skills = await UnifiedProfileRepository.get_blocked_skills(user_id)
+  2267→        return skill_id in blocked_skills
+  2268→
+  2269→    # ═══════════════════════════════════════════════════════════════════════════
+  2270→    # Skill 状态管理 - REFACTOR_PLAN.md Phase 1
+  2271→    # ═══════════════════════════════════════════════════════════════════════════
+  2272→
+  2273→    @staticmethod
+  2274→    async def get_skill_state(user_id: UUID, skill_id: str) -> Dict[str, Any]:
+  2275→        """
+  2276→        获取 Skill 状态
+  2277→
+  2278→        按照 REFACTOR_PLAN.md，所有 Skill 数据统一存储在 profile.skills.{skill_id}
+  2279→
+  2280→        Returns:
+  2281→            skill 状态数据，如果不存在则返回空字典
+  2282→        """
+  2283→        profile = await UnifiedProfileRepository.get_profile(user_id)
+  2284→        if not profile:
+  2285→            return {}
+  2286→        return profile.get("skills", {}).get(skill_id, {})
+  2287→
+  2288→    @staticmethod
+  2289→    async def update_skill_state(
+  2290→        user_id: UUID,
+  2291→        skill_id: str,
+  2292→        section: str,
+  2293→        data: Dict[str, Any]
+  2294→    ) -> None:
+  2295→        """
+  2296→        更新 Skill 状态（深度合并）
+  2297→
+  2298→        使用 PostgreSQL || 操作符进行深度合并，不会覆盖未指定的字段
+  2299→
+  2300→        Args:
+  2301→            user_id: 用户 ID
+  2302→            skill_id: Skill ID
+  2303→            section: 要更新的部分，如 "north_star"、"protocol"
+  2304→            data: 要写入的数据
+  2305→        """
+  2306→        exists = await fetchval(
+  2307→            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+  2308→            user_id
+  2309→        )
+  2310→
+  2311→        if exists:
+  2312→            # 使用 jsonb_set + || 进行深度合并
+  2313→            await execute(
+  2314→                """UPDATE unified_profiles
+  2315→                   SET profile = jsonb_set(
+  2316→                       jsonb_set(
+  2317→                           jsonb_set(
+  2318→                               COALESCE(profile, '{}'::jsonb),
+  2319→                               '{skills}',
+  2320→                               COALESCE(profile -> 'skills', '{}'::jsonb)
+  2321→                           ),
+  2322→                           ARRAY['skills', $2::text],
+  2323→                           COALESCE(profile -> 'skills' -> $2::text, '{}'::jsonb)
+  2324→                       ),
+  2325→                       ARRAY['skills', $2::text, $3::text],
+  2326→                       COALESCE(profile -> 'skills' -> $2::text -> $3::text, '{}'::jsonb) || $4::jsonb
+  2327→                   ),
+  2328→                   updated_at = NOW()
+  2329→                   WHERE user_id = $1""",
+  2330→                user_id, skill_id, section, json.dumps(data, ensure_ascii=False, default=str)
+  2331→            )
+  2332→        else:
+  2333→            # 创建新 profile
+  2334→            await UnifiedProfileRepository.create_profile(
+  2335→                user_id,
+  2336→                {"skills": {skill_id: {section: data}}}
+  2337→            )
+  2338→
+  2339→        # 失效缓存
+  2340→        await UnifiedProfileRepository._invalidate_cache(user_id, skill_id)
+  2341→
+  2342→    @staticmethod
+  2343→    async def append_to_skill_list(
+  2344→        user_id: UUID,
+  2345→        skill_id: str,
+  2346→        path: str,
+  2347→        entry: Dict[str, Any],
+  2348→        max_items: int = 100
+  2349→    ) -> None:
+  2350→        """
+  2351→        向 Skill 数据中的列表追加条目
+  2352→
+  2353→        Args:
+  2354→            user_id: 用户 ID
+  2355→            skill_id: Skill ID
+  2356→            path: 列表路径，如 "journal" 或 "progress.milestones"
+  2357→            entry: 要追加的条目
+  2358→            max_items: 列表最大长度（超出则删除最旧的）
+  2359→        """
+  2360→        # 获取当前数据
+  2361→        skill_data = await UnifiedProfileRepository.get_skill_state(user_id, skill_id)
+  2362→
+  2363→        # 解析路径
+  2364→        parts = path.split(".")
+  2365→        current = skill_data
+  2366→        for part in parts[:-1]:
+  2367→            current = current.setdefault(part, {})
+  2368→
+  2369→        # 获取或创建列表
+  2370→        list_key = parts[-1]
+  2371→        current_list = current.get(list_key, [])
+  2372→        if not isinstance(current_list, list):
+  2373→            current_list = []
+  2374→
+  2375→        # 追加并限制长度（新条目在前）
+  2376→        current_list = [entry] + current_list[:max_items - 1]
+  2377→        current[list_key] = current_list
+  2378→
+  2379→        # 写回
+  2380→        if len(parts) > 1:
+  2381→            # 多级路径：更新父级对象
+  2382→            await UnifiedProfileRepository.update_skill_state(
+  2383→                user_id, skill_id, parts[0], skill_data.get(parts[0], {})
+  2384→            )
+  2385→        else:
+  2386→            # 单级路径：直接更新
+  2387→            await UnifiedProfileRepository.update_skill_state(
+  2388→                user_id, skill_id, list_key, current_list
+  2389→            )
+  2390→
+  2391→    # ═══════════════════════════════════════════════════════════════════════════
+  2392→    # 缓存管理
+  2393→    # ═══════════════════════════════════════════════════════════════════════════
+  2394→
+  2395→    @staticmethod
+  2396→    async def _invalidate_cache(user_id: UUID, skill: str = None) -> None:
+  2397→        """
+  2398→        失效缓存
+  2399→
+  2400→        Args:
+  2401→            user_id: 用户 ID
+  2402→            skill: 如果指定，只失效该 skill 的缓存；否则失效所有缓存
+  2403→        """
+  2404→        try:
+  2405→            from stores.profile_cache import get_profile_cache
+  2406→            cache = get_profile_cache()
+  2407→
+  2408→            if skill:
+  2409→                # 只失效特定 skill 的缓存
+  2410→                await cache.invalidate_by_key(f"{user_id}:{skill}")
+  2411→                # 也失效 all 缓存
+  2412→                await cache.invalidate_by_key(f"{user_id}:all")
+  2413→            else:
+  2414→                # 失效该用户所有缓存
+  2415→                await cache.invalidate_by_prefix(str(user_id))
+  2416→
+  2417→            logger.debug(f"缓存已失效: user_id={user_id}, skill={skill}")
+  2418→        except Exception as e:
+  2419→            logger.warning(f"缓存失效失败: {e}")
+  2420→
+  2421→
+  2422→# ═══════════════════════════════════════════════════════════════════════════
+  2423→# 便捷函数 (兼容旧代码)
+  2424→# ═══════════════════════════════════════════════════════════════════════════
+  2425→
+  2426→async def get_unified_profile(user_id: UUID) -> Optional[Dict[str, Any]]:
+  2427→    """获取统一 Profile (便捷函数)"""
+  2428→    return await UnifiedProfileRepository.get_profile(user_id)
+  2429→
+  2430→
+  2431→async def get_unified_profile_with_skill(user_id: UUID, skill: str = None) -> Dict[str, Any]:
+  2432→    """
+  2433→    获取 Profile 和 Skill 数据 (兼容 profile_cache 接口)
+  2434→
+  2435→    Returns:
+  2436→        {
+  2437→            "profile": {...},
+  2438→            "skill_data": {...}
+  2439→        }
+  2440→    """
+  2441→    profile = await UnifiedProfileRepository.get_profile(user_id)
+  2442→
+  2443→    if profile:
+  2444→        skill_data = profile.get("skill_data", {})
+  2445→        return {
+  2446→            "profile": profile,
+  2447→            "skill_data": skill_data
+  2448→        }
+  2449→
+  2450→    return {"profile": {}, "skill_data": {}}
+  2451→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

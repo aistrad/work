@@ -1,0 +1,315 @@
+"use client";
+
+/**
+ * useJourneyData Hook - Journey 页面数据管理
+ *
+ * 读取 lifecoach skill_data，支持乐观更新
+ * 遵循 React Best Practices: client-swr-dedup
+ */
+
+import useSWR from "swr";
+import { useCallback } from "react";
+import { apiClient } from "@/lib/api";
+import type {
+  LifecoachSkillData,
+  ReadLifecoachStateResponse,
+  JourneyState,
+  WeeklyAction,
+  DailyLever,
+  Milestone,
+} from "@/types/journey";
+import { getJourneyState } from "@/types/journey";
+
+const JOURNEY_KEY = "/journey";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fetcher
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function fetcher(): Promise<LifecoachSkillData> {
+  try {
+    const { data } = await apiClient.get<ReadLifecoachStateResponse>(JOURNEY_KEY);
+
+    if (data.status === "error") {
+      throw new Error(data.message || "Failed to load journey data");
+    }
+
+    return data.data || {};
+  } catch (error: any) {
+    // Handle authentication errors
+    if (error.response?.status === 401) {
+      throw new Error("Unauthorized");
+    }
+    // Re-throw other errors
+    throw error;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hook
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function useJourneyData() {
+  const { data, error, isLoading, mutate } = useSWR<LifecoachSkillData>(
+    JOURNEY_KEY,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: true,
+      dedupingInterval: 60000, // 1 minute dedup
+      errorRetryCount: 3,
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Computed Values
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const journeyState: JourneyState = getJourneyState(data);
+  const hasNorthStar = !!data?.north_star?.vision_scene;
+  const hasIdentity = !!data?.identity?.target;
+  const hasRoadmap = (data?.roadmap?.goals?.length ?? 0) > 0 || (data?.goals?.length ?? 0) > 0;
+  const hasWeeklyActions = (data?.weekly?.rocks?.length ?? 0) > 0 || (data?.weekly_rocks?.rocks?.length ?? 0) > 0;
+  const hasMonthlyBoss = !!data?.monthly_boss?.title;
+  const hasDailyLevers = (data?.daily_levers?.levers?.length ?? 0) > 0;
+
+  // Normalize weekly data (support both formats)
+  const weekly = data?.weekly_rocks || data?.weekly;
+
+  // Normalize goals data
+  const goals = data?.roadmap?.goals || data?.goals || [];
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Actions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 切换周大石头完成状态
+   */
+  const toggleAction = useCallback(
+    async (actionId: string) => {
+      const rocks = weekly?.rocks;
+      if (!rocks) return;
+
+      const actionIndex = rocks.findIndex(
+        (r) => r.id === actionId || r.task === actionId
+      );
+      if (actionIndex === -1) return;
+
+      const action = rocks[actionIndex];
+      const newStatus: WeeklyAction["status"] =
+        action.status === "completed" ? "pending" : "completed";
+
+      // 1. Optimistic update
+      const updatedRocks = rocks.map((r, i) =>
+        i === actionIndex ? { ...r, status: newStatus } : r
+      );
+      const optimisticData: LifecoachSkillData = {
+        ...data,
+        weekly: data?.weekly ? { ...data.weekly, rocks: updatedRocks } : undefined,
+        weekly_rocks: data?.weekly_rocks ? { ...data.weekly_rocks, rocks: updatedRocks } : undefined,
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call - 通过 Journey API route
+        await apiClient.post("/journey", {
+          args: {
+            section: "current",
+            data: {
+              week: {
+                rocks: updatedRocks,
+              },
+            },
+          },
+        });
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, weekly, mutate]
+  );
+
+  /**
+   * 切换每日杠杆完成状态
+   */
+  const toggleLever = useCallback(
+    async (leverId: string) => {
+      const levers = data?.daily_levers?.levers;
+      if (!levers) return;
+
+      const leverIndex = levers.findIndex((l) => l.id === leverId);
+      if (leverIndex === -1) return;
+
+      const lever = levers[leverIndex];
+      const newStatus: DailyLever["status"] =
+        lever.status === "completed" ? "pending" : "completed";
+
+      // 1. Optimistic update
+      const updatedLevers = levers.map((l, i) =>
+        i === leverIndex
+          ? { ...l, status: newStatus, completed_at: newStatus === "completed" ? new Date().toISOString() : undefined }
+          : l
+      );
+      const optimisticData: LifecoachSkillData = {
+        ...data,
+        daily_levers: data?.daily_levers
+          ? { ...data.daily_levers, levers: updatedLevers }
+          : undefined,
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.post("/skills/lifecoach/lever_complete", {
+          lever_id: leverId,
+        });
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 切换月度 Boss 里程碑完成状态
+   */
+  const toggleMilestone = useCallback(
+    async (milestoneId: string) => {
+      const milestones = data?.monthly_boss?.milestones;
+      if (!milestones) return;
+
+      const milestoneIndex = milestones.findIndex((m) => m.id === milestoneId);
+      if (milestoneIndex === -1) return;
+
+      const milestone = milestones[milestoneIndex];
+      const newCompleted = !milestone.completed;
+
+      // 1. Optimistic update
+      const updatedMilestones: Milestone[] = milestones.map((m, i) =>
+        i === milestoneIndex
+          ? { ...m, completed: newCompleted, completed_at: newCompleted ? new Date().toISOString() : undefined }
+          : m
+      );
+
+      // Calculate new progress
+      const completedCount = updatedMilestones.filter((m) => m.completed).length;
+      const newProgress = Math.round((completedCount / updatedMilestones.length) * 100);
+
+      const optimisticData: LifecoachSkillData = {
+        ...data,
+        monthly_boss: data?.monthly_boss
+          ? { ...data.monthly_boss, milestones: updatedMilestones, progress: newProgress }
+          : undefined,
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.post("/journey", {
+          args: {
+            section: "current",
+            data: {
+              month: {
+                milestones: updatedMilestones,
+                progress: newProgress,
+              },
+            },
+          },
+        });
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 每日签到
+   */
+  const checkin = useCallback(
+    async (energyLevel?: number, intention?: string) => {
+      try {
+        const response = await apiClient.post<{
+          success: boolean;
+          streak: number;
+          message: string;
+          daily_levers?: LifecoachSkillData["daily_levers"];
+        }>("/skills/lifecoach/checkin", {
+          energy_level: energyLevel,
+          intention,
+        });
+
+        if (response.data.success) {
+          // Update local data with new streak and daily levers
+          const optimisticData: LifecoachSkillData = {
+            ...data,
+            progress: data?.progress
+              ? {
+                  ...data.progress,
+                  current_streak: response.data.streak,
+                  today_checked_in: true,
+                }
+              : undefined,
+            daily_levers: response.data.daily_levers || data?.daily_levers,
+          };
+          await mutate(optimisticData, false);
+        }
+
+        return response.data;
+      } catch (err) {
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 刷新数据
+   */
+  const refresh = useCallback(() => {
+    return mutate();
+  }, [mutate]);
+
+  return {
+    // Data
+    data,
+    isLoading,
+    error,
+
+    // Computed
+    journeyState,
+    hasNorthStar,
+    hasIdentity,
+    hasRoadmap,
+    hasWeeklyActions,
+    hasMonthlyBoss,
+    hasDailyLevers,
+
+    // Sections
+    northStar: data?.north_star,
+    identity: data?.identity,
+    roadmap: data?.roadmap,
+    goals,
+    weekly,
+    monthlyBoss: data?.monthly_boss,
+    dailyLevers: data?.daily_levers,
+    progress: data?.progress,
+    systemState: data?._state,
+
+    // Actions
+    toggleAction,
+    toggleLever,
+    toggleMilestone,
+    checkin,
+    refresh,
+  };
+}
+
+export default useJourneyData;

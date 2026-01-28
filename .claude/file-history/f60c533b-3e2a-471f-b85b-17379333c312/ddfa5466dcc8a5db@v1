@@ -1,0 +1,286 @@
+"""
+UserDataService - 用户数据读写服务
+
+职责:
+1. 读取/写入/查询用户数据 (user_data_store)
+2. 支持虚拟文件系统路径
+3. 版本控制和乐观锁
+"""
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from stores.db import get_connection
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UserData:
+    """用户数据对象"""
+    id: UUID
+    user_id: UUID
+    data_type: str
+    data_path: str
+    content: Dict[str, Any]
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "data_type": self.data_type,
+            "data_path": self.data_path,
+            "content": self.content,
+            "version": self.version,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class UserDataService:
+    """用户数据服务"""
+
+    async def read(
+        self,
+        user_id: UUID,
+        path: str,
+    ) -> Optional[UserData]:
+        """
+        读取用户数据
+
+        Args:
+            user_id: 用户 ID
+            path: 虚拟路径，如 "goals/2026/year"
+
+        Returns:
+            UserData 对象，不存在返回 None
+        """
+        query = """
+            SELECT id, user_id, data_type, data_path, content, version, created_at, updated_at
+            FROM user_data_store
+            WHERE user_id = $1 AND data_path = $2
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, user_id, path)
+                if row:
+                    return UserData(
+                        id=row["id"],
+                        user_id=row["user_id"],
+                        data_type=row["data_type"],
+                        data_path=row["data_path"],
+                        content=row["content"],
+                        version=row["version"],
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                    )
+                return None
+        except Exception as e:
+            logger.error(f"Failed to read user data: {e}")
+            raise
+
+    async def write(
+        self,
+        user_id: UUID,
+        path: str,
+        content: Dict[str, Any],
+        data_type: Optional[str] = None,
+    ) -> UserData:
+        """
+        写入用户数据（创建或更新）
+
+        Args:
+            user_id: 用户 ID
+            path: 虚拟路径
+            content: JSON 内容
+            data_type: 数据类型（可选，默认从路径推断）
+
+        Returns:
+            更新后的 UserData 对象
+        """
+        # 推断 data_type
+        if not data_type:
+            data_type = path.split("/")[0] if "/" in path else "general"
+
+        query = """
+            INSERT INTO user_data_store (user_id, data_type, data_path, content)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, data_path)
+            DO UPDATE SET
+                content = $4,
+                data_type = $2,
+                updated_at = NOW(),
+                version = user_data_store.version + 1
+            RETURNING id, user_id, data_type, data_path, content, version, created_at, updated_at
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, user_id, data_type, path, content)
+                return UserData(
+                    id=row["id"],
+                    user_id=row["user_id"],
+                    data_type=row["data_type"],
+                    data_path=row["data_path"],
+                    content=row["content"],
+                    version=row["version"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+        except Exception as e:
+            logger.error(f"Failed to write user data: {e}")
+            raise
+
+    async def query(
+        self,
+        user_id: UUID,
+        data_type: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 100,
+    ) -> List[UserData]:
+        """
+        查询用户数据
+
+        Args:
+            user_id: 用户 ID
+            data_type: 数据类型过滤
+            path_prefix: 路径前缀过滤，如 "goals/2026"
+            filters: JSONB 过滤条件
+            limit: 返回数量限制
+
+        Returns:
+            UserData 列表
+        """
+        conditions = ["user_id = $1"]
+        params: List[Any] = [user_id]
+        param_idx = 2
+
+        if data_type:
+            conditions.append(f"data_type = ${param_idx}")
+            params.append(data_type)
+            param_idx += 1
+
+        if path_prefix:
+            conditions.append(f"data_path LIKE ${param_idx}")
+            params.append(f"{path_prefix}%")
+            param_idx += 1
+
+        if filters:
+            conditions.append(f"content @> ${param_idx}")
+            params.append(filters)
+            param_idx += 1
+
+        query = f"""
+            SELECT id, user_id, data_type, data_path, content, version, created_at, updated_at
+            FROM user_data_store
+            WHERE {' AND '.join(conditions)}
+            ORDER BY updated_at DESC
+            LIMIT {limit}
+        """
+
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, *params)
+                return [
+                    UserData(
+                        id=row["id"],
+                        user_id=row["user_id"],
+                        data_type=row["data_type"],
+                        data_path=row["data_path"],
+                        content=row["content"],
+                        version=row["version"],
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                    )
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to query user data: {e}")
+            raise
+
+    async def delete(
+        self,
+        user_id: UUID,
+        path: str,
+    ) -> bool:
+        """
+        删除用户数据
+
+        Args:
+            user_id: 用户 ID
+            path: 虚拟路径
+
+        Returns:
+            是否删除成功
+        """
+        query = """
+            DELETE FROM user_data_store
+            WHERE user_id = $1 AND data_path = $2
+            RETURNING id
+        """
+        try:
+            async with get_connection() as conn:
+                row = await conn.fetchrow(query, user_id, path)
+                return row is not None
+        except Exception as e:
+            logger.error(f"Failed to delete user data: {e}")
+            raise
+
+    async def list_paths(
+        self,
+        user_id: UUID,
+        path_prefix: Optional[str] = None,
+    ) -> List[str]:
+        """
+        列出用户的所有数据路径
+
+        Args:
+            user_id: 用户 ID
+            path_prefix: 路径前缀过滤
+
+        Returns:
+            路径列表
+        """
+        if path_prefix:
+            query = """
+                SELECT data_path FROM user_data_store
+                WHERE user_id = $1 AND data_path LIKE $2
+                ORDER BY data_path
+            """
+            params = [user_id, f"{path_prefix}%"]
+        else:
+            query = """
+                SELECT data_path FROM user_data_store
+                WHERE user_id = $1
+                ORDER BY data_path
+            """
+            params = [user_id]
+
+        try:
+            async with get_connection() as conn:
+                rows = await conn.fetch(query, *params)
+                return [row["data_path"] for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to list paths: {e}")
+            raise
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Singleton
+# ═══════════════════════════════════════════════════════════════════════════
+
+_service: Optional[UserDataService] = None
+
+
+def get_user_data_service() -> UserDataService:
+    """获取单例 UserDataService"""
+    global _service
+    if _service is None:
+        _service = UserDataService()
+    return _service

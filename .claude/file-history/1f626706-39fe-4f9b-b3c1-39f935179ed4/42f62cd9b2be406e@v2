@@ -1,0 +1,514 @@
+# VibeLife 核心算法流程 Review
+
+> **版本**: v4.0
+> **日期**: 2026-01-09
+> **对比基准**: `vibelife spec v3.0.md` + `architecture-decisions.md`
+> **分析深度**: 架构级 + 关键路径代码级
+
+---
+
+# 一、核心流程总览 (9 个流程)
+
+| # | 流程名称 | 设计文档位置 | 代码实现位置 | 实现状态 |
+|---|---------|-------------|--------------|---------|
+| 1 | **Context 构建** | Spec 4.5 | `context.py` | ✅ 基本完成 |
+| 2 | **深度报告生成** | Spec 2.2.1 | `report_service.py` + `prologue_generator.py` | ⚠️ 部分实现 |
+| 3 | **RAG 知识库检索** | Spec 4.5 | `retrieval.py` + `knowledge_repo.py` | ✅ 基本完成 |
+| 4 | **AI 强制访谈** | Spec 4.2 | `interview_service.py` | ✅ 基本完成 |
+| 5 | **智能信息采集** | Spec 4.3 | `extraction_service.py` | ✅ 基本完成 |
+| 6 | **Identity Prism** | Spec 2.2.3 + 4.6 | `portrait.py` | ⚠️ 数据结构有，算法缺失 |
+| 7 | **对话流式响应** | Spec 2.2.2 | `chat.py` | ✅ 完成 |
+| 8 | **用户 Profile 累积** | Spec 4.4 | `portrait.py` + `profile_repo.py` | ⚠️ 结构有，更新逻辑弱 |
+| 9 | **关系模拟器/人生K线** | Spec 2.2.4 + 2.2.5 | 前端 tools + 后端计算 | ⚠️ 前端有，后端计算存根 |
+
+---
+
+# 二、重点流程深度对比
+
+## 2.1 Context 构建流程
+
+### 设计规格 (Spec 4.5)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                 设计中的 Context 构建流程                       │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  1. 话题分类 (classify_topic)                                  │
+│     └─ 根据消息内容识别: CAREER / RELATIONSHIP / FORTUNE / SELF│
+│                                                                │
+│  2. Profile 动态选择 (select_profile_sections)                 │
+│     ├─ 总是包含: basic, identity_prism                         │
+│     ├─ career 话题: career, growth_areas                       │
+│     ├─ relationship 话题: relationship, relationship_patterns  │
+│     ├─ fortune 话题: current_focus, recent_events              │
+│     └─ self 话题: 全部 ai_insights                             │
+│                                                                │
+│  3. 知识库检索 (retrieve_knowledge)                            │
+│     └─ 根据 skill + query 检索相关内容                         │
+│                                                                │
+│  4. System Prompt 构建                                         │
+│     └─ Persona + Voice Mode + Skill Context + 额外上下文       │
+│                                                                │
+│  5. 对话历史 (原始保留，不摘要)                                 │
+│     └─ 最近 N 轮对话                                           │
+│                                                                │
+│  6. 组装并返回                                                  │
+│     └─ (system_prompt, messages)                               │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 实际实现 (context.py)
+
+```python
+# 文件: apps/api/services/vibe_engine/context.py
+
+async def build(
+    self,
+    skill: Skill,
+    voice_mode: VoiceMode,
+    current_message: str,
+    profile: Optional[Dict[str, Any]] = None,
+    history: Optional[List[Dict[str, str]]] = None,
+    knowledge_chunks: Optional[List[Dict]] = None,  # 来自外部传入
+    extra_context: Optional[str] = None
+) -> Tuple[str, List[LLMMessage]]:
+
+    # 1. 构建 System Prompt ✅
+    system_prompt = self.build_system_prompt(skill, voice_mode, extra_context)
+
+    # 2. 话题分类 ✅ (关键词匹配)
+    topic = self.classify_topic(current_message)
+
+    # 3. Profile 选择 ✅
+    if profile:
+        profile_sections = self.select_profile_sections(profile, topic)
+        profile_context = self.format_profile_context(profile_sections)
+        # ...
+
+    # 4. 知识库结果格式化 ✅ (注意: 检索在外部完成)
+    if knowledge_chunks:
+        knowledge_context = self.format_knowledge_context(knowledge_chunks)
+        # ...
+
+    # 5. 拼接到 system_prompt
+    if context_parts:
+        system_prompt = system_prompt + "\n\n" + "\n\n".join(context_parts)
+
+    # 6. 构建消息列表 ✅
+    messages = [create_system_message(system_prompt)]
+    if history:
+        history_messages = self.format_history(history)  # 原始保留
+        messages.extend(history_messages)
+    messages.append(create_user_message(current_message))
+
+    return system_prompt, messages
+```
+
+### 差异分析
+
+| 设计点 | 设计规格 | 实际实现 | 差异 |
+|--------|---------|---------|------|
+| **话题分类** | LLM 分类 + 关键词回落 | 仅关键词匹配 | ⚠️ 精度不足 |
+| **Profile 选择** | 动态选择相关部分 | ✅ 按话题选择 | 一致 |
+| **知识库检索** | 在 Context 内部调用 | 在 chat.py 外部调用后传入 | ✅ 职责分离更清晰 |
+| **Token 预算管理** | 8000 token 预算 + 动态调整 | 定义了 ContextConfig 但未强制执行 | ⚠️ 无实际 token 计数 |
+| **对话历史** | 原始保留，不摘要 | ✅ 原始保留 | 一致 |
+| **Voice Mode** | 温暖/吐槽切换 | ✅ 两种模式 Suffix | 一致 |
+
+### 关键代码路径
+
+```
+chat_stream() (chat.py:150)
+    ├─ get_user_profile(user_id)        # L177
+    ├─ get_conversation_history(conv_id) # L180
+    ├─ RetrievalService.search()        # L185-189 ← RAG 检索
+    └─ context_builder.build()          # L195-202 ← Context 组装
+        ├─ build_system_prompt()        # context.py:143
+        ├─ classify_topic()             # context.py:172 ← 关键词匹配
+        ├─ select_profile_sections()    # context.py:214
+        ├─ format_profile_context()     # context.py:271
+        ├─ format_knowledge_context()   # context.py:299
+        └─ format_history()             # context.py:316
+```
+
+---
+
+## 2.2 深度报告生成流程
+
+### 设计规格 (Spec 2.2.1)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                 设计中的报告生成流程                            │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  1. 基础信息采集                                                │
+│     ├─ 必填: 生日（年/月/日）                                  │
+│     └─ 选填: 时辰、性别、出生地                                │
+│                                                                │
+│  2. AI 强制访谈 ★（必须完成，不可跳过）                        │
+│     ├─ 2-3 个核心问题                                          │
+│     ├─ 采集: 当前困境、目标、关注点                            │
+│     └─ 这是报告质量的关键保障                                  │
+│                                                                │
+│  3. 用户上传资料（可选）                                       │
+│     ├─ 其他 App 排盘截图                                       │
+│     └─ AI 自动抽取关键信息融入分析                             │
+│                                                                │
+│  4. 生成报告                                                    │
+│     ├─ 综合判断卷首语 (第一人称叙事，10+ 句)                   │
+│     └─ 标准报告 (4 个章节)                                     │
+│                                                                │
+│  5. AI 生图海报 (付费版)                                       │
+│     └─ 调用 gemini_tool API                                    │
+│                                                                │
+│  报告形态:                                                      │
+│  ├─ 简版 (免费): 卷首语 + 2 章节 + 预览图带水印                │
+│  └─ 完整版 (¥19.9): 全部内容 + 高清海报                        │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 实际实现 (report_service.py)
+
+```python
+# 文件: apps/api/services/report/report_service.py
+
+async def generate_report(
+    self,
+    user_id: UUID,
+    skill: str,
+    report_type: str,       # "lite" or "full"
+    profile: Dict[str, Any],
+    interview_result: Optional[Dict[str, Any]] = None,
+) -> Report:
+
+    report = Report(
+        id=report_id,
+        user_id=user_id,
+        skill=skill_enum,
+        report_type=type_enum,
+        status=ReportStatus.GENERATING,
+        # ...
+    )
+
+    # Step 1: 生成卷首语 ✅
+    from .prologue_generator import PrologueGenerator
+    prologue_gen = PrologueGenerator()
+    report.prologue = await prologue_gen.generate(
+        profile=profile,
+        skill=skill,
+        interview_summary=report.interview_summary,
+    )
+
+    # Step 2: 生成章节 ✅ (4 个章节)
+    sections = BAZI_SECTIONS if skill == "bazi" else ZODIAC_SECTIONS
+
+    for i, (section_id, title, subtitle) in enumerate(sections):
+        # 简版只生成前 2 章节
+        is_premium = type_enum == ReportType.LITE and i >= 2
+
+        if is_premium and type_enum == ReportType.LITE:
+            section = ReportSection(
+                id=section_id,
+                title=title,
+                subtitle=subtitle,
+                content="解锁完整报告查看更多内容...",  # 占位
+                is_premium=True,
+            )
+        else:
+            section = await self._generate_section(...)  # LLM 生成
+
+        report.sections.append(section)
+
+    # Step 3: 生成 AI 海报 (仅完整版) ⚠️
+    if type_enum == ReportType.FULL:
+        from .image_generator import ImageGenerator
+        img_gen = ImageGenerator()
+        image_result = await img_gen.generate_poster(...)  # ← 可能是存根
+        # ...
+
+    return report
+```
+
+### 差异分析
+
+| 设计点 | 设计规格 | 实际实现 | 差异 |
+|--------|---------|---------|------|
+| **AI 访谈** | 必须完成，不可跳过 | interview_service 支持跳过 | ⚠️ 可跳过，与设计不符 |
+| **卷首语** | 第一人称，10+ 句，融合多源数据 | 有实现，风格参数化 | ✅ 基本一致 |
+| **章节结构** | 4 章节 (命盘/性格/运势/建议) | ✅ 4 章节定义一致 | 一致 |
+| **lite/full 区分** | 前 2 章节免费 | ✅ is_premium 标记 | 一致 |
+| **AI 生图** | 调用 gemini_tool API | ImageGenerator 存在，需验证实际调用 | ⚠️ 需确认是否真实调用 |
+| **报告持久化** | 保存到数据库 | 生成后未保存到 DB | ❌ 缺失持久化 |
+
+### 关键缺失
+
+1. **报告持久化**: `report_service.py` 生成报告后直接返回，未调用 `report_repo` 保存
+2. **访谈强制性**: 设计要求"不可跳过"，但 `skip_session()` 允许跳过
+3. **升级流程**: `upgrade_report()` 抛出 `NotImplementedError`
+
+### 关键代码路径
+
+```
+POST /report/generate (假设存在)
+    ├─ InterviewService.start_session()   # 开始访谈
+    ├─ InterviewService.submit_answer()   # 提交答案 (循环)
+    ├─ InterviewService.get_result()      # 获取抽取结果
+    └─ ReportService.generate_report()    # 生成报告
+        ├─ PrologueGenerator.generate()   # 卷首语
+        ├─ _generate_section() × 4        # 4 个章节
+        └─ ImageGenerator.generate_poster() # AI 海报
+```
+
+---
+
+## 2.3 RAG 知识库检索流程
+
+### 设计规格 (Spec 4.5 + Architecture Decisions)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                 设计中的知识库检索流程                          │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  1. 查询预处理                                                  │
+│     └─ Jieba 分词 (中文处理)                                   │
+│                                                                │
+│  2. 混合检索 (Hybrid Search)                                   │
+│     ├─ 向量检索: embedding → cosine similarity                 │
+│     ├─ 全文检索: FTS → ts_rank                                 │
+│     └─ RRF 融合: Reciprocal Rank Fusion                        │
+│                                                                │
+│  3. 权重配置                                                    │
+│     ├─ 向量权重: 0.7                                           │
+│     └─ 文本权重: 0.3                                           │
+│                                                                │
+│  4. 返回 Top-K 结果 (默认 3 条)                                │
+│     └─ 注入到 Context 的 <knowledge> 标签                      │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 实际实现 (retrieval.py + knowledge_repo.py)
+
+```python
+# 文件: apps/api/services/knowledge/retrieval.py
+
+@classmethod
+async def search(
+    cls,
+    query: str,
+    skill_id: str,
+    top_k: int = 5,
+    use_hybrid: bool = True,
+    vector_weight: float = 0.7,
+    text_weight: float = 0.3
+) -> List[Dict[str, Any]]:
+
+    # 1. 生成 query embedding ✅
+    query_embedding = await EmbeddingService.embed_query(query)
+
+    if use_hybrid:
+        # 2. Jieba 分词预处理 ✅
+        query_preprocessed = cls.preprocess_query(query)
+
+        # 3. 调用 SQL 函数进行混合检索 ✅
+        results = await KnowledgeRepository.hybrid_search(
+            query_preprocessed=query_preprocessed,
+            embedding=query_embedding,
+            skill_id=skill_id,
+            top_k=top_k,
+            vector_weight=vector_weight,
+            text_weight=text_weight
+        )
+    else:
+        # 仅向量检索
+        results = await KnowledgeRepository.vector_search(...)
+
+    return results
+
+# ──────────────────────────────────────────────────────────
+
+# 文件: apps/api/stores/knowledge_repo.py
+
+@staticmethod
+async def hybrid_search(...) -> List[dict]:
+    """调用 PostgreSQL SQL 函数 hybrid_search_v2()"""
+    async with get_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM hybrid_search_v2($1, $2::vector, $3, $4, 60, $5, $6)
+            """,
+            query_preprocessed,  # Jieba 分词后的查询
+            embedding,           # 向量
+            skill_id,
+            top_k,
+            vector_weight,
+            text_weight
+        )
+        return [dict(row) for row in rows]
+```
+
+### 差异分析
+
+| 设计点 | 设计规格 | 实际实现 | 差异 |
+|--------|---------|---------|------|
+| **Jieba 分词** | 应用层分词 | ✅ `preprocess_query()` | 一致 |
+| **混合检索** | Vector + FTS + RRF | ✅ SQL 函数 `hybrid_search_v2()` | 一致 |
+| **权重** | 向量 0.7, 文本 0.3 | ✅ 默认参数一致 | 一致 |
+| **Top-K** | 默认 3 条 | 默认 5 条，chat.py 传 3 | ✅ 灵活配置 |
+| **结果注入** | `<knowledge>` 标签 | ✅ `format_knowledge_context()` | 一致 |
+
+### SQL 函数依赖
+
+```sql
+-- 需要在 PostgreSQL 中创建:
+-- hybrid_search_v2(query_text, embedding::vector, skill_id, top_k, k_param, vec_weight, text_weight)
+-- vector_search_v2(embedding::vector, skill_id, top_k)
+-- 表: knowledge_chunks_v2 (含 search_vector tsvector 列)
+```
+
+### 关键代码路径
+
+```
+chat_stream() (chat.py:150)
+    └─ RetrievalService.search(query, skill_id, top_k=3)  # L185
+        ├─ EmbeddingService.embed_query(query)            # 生成向量
+        ├─ preprocess_query(query)                        # Jieba 分词
+        └─ KnowledgeRepository.hybrid_search(...)         # SQL 函数
+            └─ hybrid_search_v2()                         # PostgreSQL
+```
+
+---
+
+# 三、其他流程实现状态简表
+
+## 3.1 AI 强制访谈 (interview_service.py)
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| 3 个核心问题 | ✅ `CORE_QUESTIONS` 定义 |
+| 问题: 当前困境 | ✅ `q1_concerns` |
+| 问题: 生活状态 | ✅ `q2_life_status` |
+| 问题: 期望目标 | ✅ `q3_expectations` |
+| 答案结构化抽取 | ✅ `_extract_answer_info()` LLM 抽取 |
+| Profile 合并 | ✅ `_merge_extracted()` |
+| 会话持久化 | ✅ `interview_sessions` 表 |
+| **不可跳过** | ❌ `skip_session()` 允许跳过 |
+
+## 3.2 智能信息采集 (extraction_service.py)
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| 图片 OCR + Vision LLM | ✅ 支持 |
+| PDF/DOCX 解析 | ✅ 支持 |
+| 排盘截图识别 | ✅ `content_type: bazi_screenshot` |
+| 聊天记录分析 | ✅ `content_type: chat_history` |
+| Profile 更新建议 | ✅ `profile_updates` 字段 |
+
+## 3.3 Identity Prism (portrait.py)
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| Core/Inner/Outer 三层结构 | ✅ `DEFAULT_PROFILE` 包含 `identity_prism` |
+| 八字 → Core 映射算法 | ❌ 未实现计算逻辑 |
+| 星座 → Inner/Outer 映射 | ❌ 未实现计算逻辑 |
+| AI 洞察 → Inner 推断 | ❌ 未实现 |
+| 自然语言生成 | ❌ 只有数据结构，无生成逻辑 |
+
+**核心差异**: Identity Prism 在设计中是核心差异化功能 (Spec 2.2.3 + 4.6)，但代码中只定义了数据结构，没有实现计算/生成算法。
+
+## 3.4 对话流式响应 (chat.py)
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| SSE 流式响应 | ✅ `EventSourceResponse` |
+| AI SDK 格式 (`text-delta`) | ⚠️ 使用自定义格式 `{"type": "chunk"}` |
+| Tool Calling | ✅ 支持工具调用 |
+| 消息持久化 | ✅ `save_message()` |
+| Voice Mode 切换 | ✅ `/chat/voice-mode` 端点 |
+| 会话列表 | ❌ `/conversations` 返回空数组 |
+
+**格式差异**:
+```
+设计 (AI SDK):  {"type": "text-delta", "textDelta": "你好"}
+实际实现:       {"type": "chunk", "content": "你好"}
+```
+
+## 3.5 用户 Profile 累积 (portrait.py + profile_repo.py)
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| 4 层 Profile 结构 | ✅ basic / life_context / ai_insights / identity_prism |
+| 对话洞察抽取 | ⚠️ portrait.py 有 `UPDATE_INTERVAL_MESSAGES = 10`，但未在 chat 中调用 |
+| deep_merge | ✅ 存在，但在 portrait.py 和 profile_repo.py 中重复 |
+| 版本化存储 | ❌ 未实现版本快照 |
+
+## 3.6 关系模拟器 / 人生 K 线
+
+| 设计点 | 实现状态 |
+|--------|---------|
+| 关系模拟器 UI | ✅ 前端 tools 定义 |
+| 合盘计算算法 | ⚠️ 依赖外部命理计算库，未见核心算法 |
+| 人生 K 线 UI | ✅ 前端 KLinePanel 组件 |
+| 大运流年计算 | ⚠️ 需确认后端计算服务 |
+
+---
+
+# 四、差异汇总与优先级建议
+
+## 4.1 Critical 差异 (P0)
+
+| 问题 | 设计 | 实现 | 影响 | 修复建议 |
+|------|------|------|------|---------|
+| **SSE 格式不兼容** | AI SDK 6 `text-delta` | 自定义 `chunk` | 前端 useChat 可能不工作 | 修改 chat.py SSE 事件格式 |
+| **报告无持久化** | 保存到数据库 | 生成后未保存 | 报告丢失 | 调用 report_repo 保存 |
+| **会话列表空** | 返回历史会话 | 返回空数组 | 用户无法查看历史 | 实现 conversation_repo 查询 |
+
+## 4.2 High 差异 (P1)
+
+| 问题 | 设计 | 实现 | 影响 | 修复建议 |
+|------|------|------|------|---------|
+| **访谈可跳过** | 必须完成 | 允许跳过 | 报告质量下降 | 移除 skip 或添加强制逻辑 |
+| **Identity Prism 算法缺失** | 八字→三元视角计算 | 只有数据结构 | 核心功能空壳 | 实现 PrismCalculator |
+| **Profile 不自动更新** | 对话中抽取洞察 | 未在 chat 中调用 | 用户画像不成长 | 在 chat 中集成 portrait.update |
+| **Token 预算未执行** | 8000 token 限制 | 无实际计数 | 可能超限报错 | 实现 tiktoken 计数 |
+
+## 4.3 Medium 差异 (P2)
+
+| 问题 | 设计 | 实现 | 影响 | 修复建议 |
+|------|------|------|------|---------|
+| **话题分类精度** | LLM + 关键词 | 仅关键词 | 分类不准 | 可选: 添加 LLM 回落 |
+| **Profile 版本化** | 保留 10 个版本 | 无版本快照 | 无法回溯 | 添加 profile_versions 表 |
+| **deep_merge 重复** | 统一函数 | portrait.py + profile_repo.py 各一份 | 维护问题 | 提取到 utils |
+
+---
+
+# 五、后续 Review 任务清单
+
+本次完成了 **架构级对比** 和 **3 个重点流程的代码级分析**。后续可分次深入：
+
+- [ ] **Identity Prism 算法设计**: 设计八字/星座→三元视角的映射算法
+- [ ] **SSE 格式适配**: 修改后端 SSE 格式兼容 AI SDK 6
+- [ ] **报告持久化完善**: 完成 report_repo CRUD
+- [ ] **人生 K 线后端计算**: 确认大运/流年计算服务实现状态
+- [ ] **关系模拟器合盘算法**: 确认八字/星座合盘计算实现状态
+- [ ] **前端集成验证**: 验证 useVibeChat 与后端 SSE 兼容性
+
+---
+
+# 附录: 关键文件清单
+
+| 模块 | 文件路径 | 行数 |
+|------|----------|------|
+| Context 构建 | `apps/api/services/vibe_engine/context.py` | 410 |
+| RAG 检索 | `apps/api/services/knowledge/retrieval.py` | 213 |
+| 知识库存储 | `apps/api/stores/knowledge_repo.py` | 276 |
+| Chat 路由 | `apps/api/routes/chat.py` | 790 |
+| 报告服务 | `apps/api/services/report/report_service.py` | 411 |
+| 访谈服务 | `apps/api/services/interview/interview_service.py` | 587 |
+| Portrait 服务 | `apps/api/services/vibe_engine/portrait.py` | 541 |
+| Profile 存储 | `apps/api/stores/profile_repo.py` | 11765 |

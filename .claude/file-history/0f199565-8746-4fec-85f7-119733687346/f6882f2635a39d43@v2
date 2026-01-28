@@ -1,0 +1,1325 @@
+# Fortune AI Claude MVP v1.1 - 系统设计文档
+
+**文档类型**: System Design Document
+**版本**: v1.0
+**日期**: 2025-12-30
+**输入依据**: `requirements.md` v1.0
+**HOS 来源**: `spec.md` (digest: `0dcb8e5c5d563160`)
+**状态**: Draft
+
+---
+
+## 1. 概述 (Overview)
+
+### 1.1 设计目标
+
+实现 Fortune AI 的核心功能闭环：
+
+```
+用户输入 → Agent 理解 → 孪生更新 → 行动建议 → 用户执行 → 状态反馈 → 孪生进化
+```
+
+### 1.2 设计原则
+
+| 原则 | 描述 | 落地方式 |
+|------|------|----------|
+| **SSOT** | 单一数据真相源 | 所有写入通过 FastAPI，PostgreSQL 为唯一存储 |
+| **渐进式迁移** | 保持现有系统稳定 | FastAPI + Agent Service 双服务架构 |
+| **可插拔** | 专家/知识库可扩展 | KB Registry + Expert Factory 模式 |
+| **可观测** | 全链路追踪 | 结构化日志 + Agent 审计表 |
+| **安全优先** | 多层防护 | 认证 + CSRF + Tool API 隔离 |
+
+### 1.3 系统边界
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Fortune AI MVP v1.1                            │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                     用户交互层 (Presentation)                     │    │
+│  │   Web UI (Jinja2 + JS)  │  API Clients  │  Share Cards          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                    │                                     │
+│  ┌─────────────────────────────────┼─────────────────────────────────┐  │
+│  │              应用服务层 (Application Services)                     │  │
+│  │                                 │                                  │  │
+│  │  ┌──────────────────┐    ┌──────┴──────┐    ┌──────────────────┐  │  │
+│  │  │   FastAPI 后端   │◄───│  Tool API   │───►│  Agent Service   │  │  │
+│  │  │   (Python)       │    │  (Internal) │    │  (TypeScript)    │  │  │
+│  │  │                  │    └─────────────┘    │                  │  │  │
+│  │  │  • Auth          │                       │  • Orchestrator  │  │  │
+│  │  │  • Twin          │                       │  • Coach Agent   │  │  │
+│  │  │  • Social        │                       │  • Analyst Agent │  │  │
+│  │  │  • Currency      │                       │  • Expert Factory│  │  │
+│  │  │  • JITAI         │                       │  • KB Retriever  │  │  │
+│  │  └──────────────────┘                       └──────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                    │                                     │
+│  ┌─────────────────────────────────┼─────────────────────────────────┐  │
+│  │                      数据层 (Data Layer)                           │  │
+│  │                                 │                                  │  │
+│  │  ┌──────────────────────────────┴──────────────────────────────┐  │  │
+│  │  │                    PostgreSQL + pgvector                     │  │  │
+│  │  │                                                              │  │  │
+│  │  │  • fortune_user            • fortune_digital_twin            │  │  │
+│  │  │  • fortune_conversation_*  • fortune_twin_update_log         │  │  │
+│  │  │  • fortune_commitment      • fortune_social_edge             │  │  │
+│  │  │  • fortune_currency_*      • fortune_kb_chunk                │  │  │
+│  │  │  • fortune_agent_run       • fortune_jitai_*                 │  │  │
+│  │  └──────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                      外部服务 (External)                           │  │
+│  │   GLM API (Z.AI)  │  Claude API  │  OpenAI API  │  Push Service  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 架构设计 (Architecture)
+
+### 2.1 双服务架构
+
+#### 2.1.1 FastAPI 后端 (Python)
+
+**职责**：
+- 用户认证与会话管理
+- 数据持久化 (SSOT)
+- Tool API 端点
+- JITAI 定时任务
+- 静态资源与模板渲染
+
+**部署**：`uvicorn api.main:app --port 8230`
+
+#### 2.1.2 Agent Service (TypeScript)
+
+**职责**：
+- LLM 调用与流式输出
+- 多 Agent 编排
+- Tool Calling 执行
+- 知识库检索
+- A2UI 输出组装
+
+**部署**：`node agent_service/dist/server.js --port 3000`
+
+### 2.2 通信协议
+
+```
+┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+│   Browser   │  HTTP   │   FastAPI   │  HTTP   │   Agent     │
+│             │────────►│   :8230     │────────►│   Service   │
+│             │◄────────│             │◄────────│   :3000     │
+└─────────────┘  JSON   └─────────────┘  JSON   └─────────────┘
+                              │                        │
+                              │ SQL                    │ HTTP
+                              ▼                        ▼
+                        ┌───────────┐           ┌───────────┐
+                        │ PostgreSQL│           │ LLM APIs  │
+                        │   :5432   │           │ (GLM/etc) │
+                        └───────────┘           └───────────┘
+```
+
+### 2.3 认证流程
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                           认证架构                                      │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  [Browser] ──► [FastAPI] ──► [PostgreSQL]                              │
+│      │             │                                                    │
+│      │  1. Login   │  2. Verify password                               │
+│      │─────────────►│  3. Create session                                │
+│      │             │  4. Return cookies                                 │
+│      │◄────────────│     (fortune_session + fortune_csrf)              │
+│      │             │                                                    │
+│  ────┼─────────────┼────────────────────────────────────────────────── │
+│      │             │                                                    │
+│      │  5. API call│  6. Verify session                                │
+│      │  + CSRF     │  7. Process request                               │
+│      │─────────────►│  8. Return response                               │
+│      │◄────────────│                                                    │
+│                                                                         │
+│  [Agent Service] ──► [FastAPI Tool API]                                │
+│      │                    │                                             │
+│      │  SERVICE_TOKEN     │  HMAC verify                               │
+│      │────────────────────►│  No user session needed                    │
+│      │◄───────────────────│                                             │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 详细执行流程设计 (Detailed Execution Flow)
+
+> **权威部分**：以下流程必须 1:1 映射到代码实现
+
+### 3.1 数字孪生服务流程
+
+#### 3.1.1 孪生创建流程 [REQ-TWIN-001]
+
+```
+触发: 用户注册成功后
+前置: fortune_user 记录已创建
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] auth_service.register_user() 完成用户创建               │
+│    │ 日志: USER_CREATED | INFO | {user_id, email_hash}                │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] twin_service.create_twin(user_id)                      │
+│    │   2.1 查询 fortune_bazi_snapshot 获取最新八字数据                 │
+│    │   2.2 构建初始孪生数据:                                           │
+│    │       metadata_astrology = bazi_snapshot or {}                   │
+│    │       metadata_psychology = {}                                    │
+│    │       metadata_memory = {}                                        │
+│    │       dynamic_* = {} (全部空)                                     │
+│    │       aura_points = 0                                             │
+│    │       overall_wellbeing = 50.00                                   │
+│    │       growth_streak = 0                                           │
+│    │       dimension_scores = {energy:50, clarity:50, ...}            │
+│    │   2.3 INSERT INTO fortune_digital_twin                           │
+│    │ 日志: TWIN_CREATED | INFO | {user_id, twin_id, initial_scores}   │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 返回注册成功响应                                        │
+│    │ 日志: REGISTER_SUCCESS | INFO | {user_id, has_twin: true}        │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- 八字数据不存在: 继续创建，metadata_astrology = {}
+- 数据库写入失败: 回滚用户创建，返回 500
+- 孪生已存在 (幂等): 跳过创建，记录 WARN 日志
+```
+
+#### 3.1.2 孪生查询流程 [REQ-TWIN-002]
+
+```
+触发: GET /api/twin?layer={L1|L2|L3|all}
+前置: 用户已认证
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] deps.require_auth() 验证会话                           │
+│    │ 日志: AUTH_CHECK | DEBUG | {user_id, session_id}                 │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] twin_service.get_twin(user_id, layer)                  │
+│    │   2.1 SELECT FROM fortune_digital_twin WHERE user_id = $1        │
+│    │   2.2 根据 layer 参数过滤返回字段:                                │
+│    │       L1 → metadata_* 字段                                       │
+│    │       L2 → dynamic_* 字段                                        │
+│    │       L3 → aura_points, dimension_scores, growth_streak          │
+│    │       all → 全部字段                                              │
+│    │ 日志: TWIN_QUERY | DEBUG | {user_id, layer, response_size}       │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 返回 JSON 响应                                          │
+│    │ 响应结构: {twin: {...}, metrics: {...}, last_updated: timestamp} │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- 孪生不存在: 自动创建（调用 3.1.1），然后返回
+- 无效 layer 参数: 返回 400 Bad Request
+```
+
+#### 3.1.3 孪生更新流程 [REQ-TWIN-003, REQ-TWIN-004]
+
+```
+触发: Tool API POST /api/agent/tool/twin_update
+前置: SERVICE_TOKEN 验证通过
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] verify_service_token() 验证 Agent Service 令牌         │
+│    │ 日志: TOOL_AUTH | DEBUG | {endpoint, success}                    │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 解析请求体:                                             │
+│    │   {user_id, layer, path, new_value, confidence, source, trigger} │
+│    │ 验证: confidence ∈ [0, 1], layer ∈ {L1, L2, L3}                 │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] twin_service.update_twin(...)                          │
+│    │   3.1 开启事务 BEGIN                                              │
+│    │   3.2 SELECT FOR UPDATE fortune_digital_twin WHERE user_id = $1  │
+│    │   3.3 提取 old_value = jsonb_extract_path(column, path_parts)    │
+│    │   3.4 构建 UPDATE SQL，使用 jsonb_set() 更新嵌套路径             │
+│    │   3.5 UPDATE fortune_digital_twin SET {column} = ..., updated_at │
+│    │   3.6 INSERT INTO fortune_twin_update_log (trigger_type, layer,  │
+│    │       path, old_value, new_value, confidence, source)            │
+│    │   3.7 如果 layer = L2，触发 L3 重算（步骤 4）                     │
+│    │   3.8 COMMIT                                                      │
+│    │ 日志: TWIN_UPDATE | INFO | {user_id, trigger, layer, path, log_id}│
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] twin_service.recalculate_dimensions(user_id) [条件触发] │
+│    │   4.1 读取当前 L2 状态                                            │
+│    │   4.2 计算各维度分数:                                             │
+│    │       energy = f(mood_intensity, sleep_score, ...)               │
+│    │       clarity = f(recent_insights, meditation_count, ...)        │
+│    │       connection = f(support_network_score, buff_received, ...)  │
+│    │       growth = f(growth_streak, commitment_completion_rate, ...) │
+│    │       balance = f(energy, clarity, connection, growth) / 4       │
+│    │   4.3 边界检查: 所有分数 clamp 到 [0, 100]                        │
+│    │   4.4 UPDATE fortune_digital_twin SET dimension_scores = $1      │
+│    │ 日志: DIMENSION_RECALC | DEBUG | {user_id, old_scores, new_scores}│
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [FastAPI] 返回响应: {updated: true, log_id: xxx}                 │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- 无效路径: 返回 400，不记录 update_log
+- 事务失败: ROLLBACK，返回 500，记录 ERROR 日志
+- 孪生不存在: 返回 404
+```
+
+---
+
+### 3.2 Agent Service 流程
+
+#### 3.2.1 对话处理主流程 [REQ-AGENT-001 ~ REQ-AGENT-006]
+
+```
+触发: POST /api/chat/send {message, session_id}
+前置: 用户已认证
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] deps.require_auth(), deps.require_csrf()               │
+│    │ 日志: AUTH_CHECK | DEBUG | {user_id, session_id}                 │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 保存用户消息到 fortune_conversation_message            │
+│    │   INSERT INTO fortune_conversation_message                        │
+│    │   (session_id, role='user', content, created_at)                 │
+│    │ 日志: MSG_SAVED | DEBUG | {message_id, session_id, role}         │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 调用 Agent Service                                      │
+│    │   3.1 构建请求: POST http://agent-service:3000/api/chat          │
+│    │   3.2 请求体: {user_id, session_id, message, stream: true}       │
+│    │   3.3 Headers: {X-Service-Token: xxx}                            │
+│    │ 日志: AGENT_CALL_START | INFO | {user_id, session_id}            │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [Agent Service] orchestrator.process(request)                    │
+│    │   4.1 意图识别: classify_intent(message) → intent                │
+│    │   4.2 获取用户上下文: call Tool API /api/agent/tool/context      │
+│    │   4.3 安全检查: safety.check_input(message)                      │
+│    │       - 危机关键词检测 → crisis_protocol                         │
+│    │       - 算命请求检测 → 添加 disclaimer                           │
+│    │   4.4 路由到对应 Agent:                                           │
+│    │       intent=chat → coach_agent                                  │
+│    │       intent=analysis → analyst_agent → coach_agent              │
+│    │       intent=social → social_agent                               │
+│    │       intent=expert → expert_factory.get(domain)                 │
+│    │ 日志: AGENT_ROUTE | INFO | {intent, agents_selected}             │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [Agent Service] agent.run(context, message)                      │
+│    │   5.1 构建系统提示词 (interpolate user context)                   │
+│    │   5.2 调用 Vercel AI SDK streamText():                           │
+│    │       const result = await streamText({                          │
+│    │         model: registry.get(agent.model),                        │
+│    │         system: systemPrompt,                                    │
+│    │         messages: [...history, userMessage],                     │
+│    │         tools: agent.tools,                                      │
+│    │         maxSteps: 5,                                             │
+│    │       });                                                        │
+│    │   5.3 处理 Tool Calls (如果有):                                   │
+│    │       for each toolCall:                                         │
+│    │         result = await executeTool(toolCall)                     │
+│    │         日志: TOOL_CALL | INFO | {tool_name, success, latency}   │
+│    │   5.4 组装 A2UI 输出                                              │
+│    │ 日志: AGENT_RUN | INFO | {agent_name, tool_calls_count, latency} │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 6  │ [Agent Service] 流式返回响应                                      │
+│    │   6.1 SSE 格式: data: {chunk}\n\n                                │
+│    │   6.2 最终块包含完整 A2UI JSON                                    │
+│    │ 日志: STREAM_END | INFO | {total_tokens, duration_ms}            │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 7  │ [FastAPI] 保存助手消息                                            │
+│    │   INSERT INTO fortune_conversation_message                        │
+│    │   (session_id, role='assistant', content, a2ui)                  │
+│    │ 日志: MSG_SAVED | DEBUG | {message_id, has_a2ui: true}           │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 8  │ [FastAPI] 记录 Agent 运行审计                                     │
+│    │   INSERT INTO fortune_agent_run                                   │
+│    │   (user_id, session_id, agent_name, prompt_version, facts_hash,  │
+│    │    input, output, tool_calls, usage, latency_ms)                 │
+│    │ 日志: AGENT_RUN_LOGGED | DEBUG | {run_id}                        │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 9  │ [FastAPI] 异步触发孪生分析（如果有洞察）                          │
+│    │   queue_twin_analysis(user_id, assistant_message, tool_calls)    │
+│    │ 日志: TWIN_ANALYSIS_QUEUED | DEBUG | {user_id}                   │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- Agent Service 不可用: 返回 503，使用降级响应
+- LLM API 超时: 重试最多 3 次，然后返回错误
+- Tool Call 失败: 记录错误，继续生成响应（无 Tool 结果）
+- 危机协议触发: 立即返回安全响应，跳过 LLM 调用
+```
+
+#### 3.2.2 Tool Calling 执行流程 [REQ-AGENT-004]
+
+```
+触发: LLM 返回 tool_calls
+前置: Agent 运行中
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [Agent Service] 解析 tool_call:                                  │
+│    │   {name: "createCommitment", arguments: {...}}                   │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [Agent Service] 验证参数 (zod schema)                            │
+│    │   const params = toolSchema.parse(arguments);                    │
+│    │ 日志: TOOL_VALIDATE | DEBUG | {tool_name, valid}                 │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [Agent Service] 调用 FastAPI Tool API                            │
+│    │   3.1 构建请求:                                                   │
+│    │       URL: http://fastapi:8000/api/agent/tool/{endpoint}         │
+│    │       Headers: {Authorization: Bearer {SERVICE_TOKEN}}           │
+│    │       Body: {user_id, ...params}                                 │
+│    │   3.2 发送请求，设置超时 5s                                       │
+│    │   3.3 重试策略: 最多 3 次，指数退避                               │
+│    │ 日志: TOOL_CALL | INFO | {tool_name, endpoint, latency, retry}   │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] 处理 Tool API 请求（见 3.3 节）                         │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [Agent Service] 处理响应                                          │
+│    │   5.1 成功: 将结果加入对话上下文                                  │
+│    │   5.2 失败: 记录错误，返回错误信息给 LLM                          │
+│    │ 日志: TOOL_RESULT | DEBUG | {tool_name, success, result_size}    │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- 参数验证失败: 返回验证错误给 LLM，不调用 API
+- API 超时: 重试，最终失败返回超时错误
+- API 返回错误: 传递错误信息给 LLM 处理
+```
+
+---
+
+### 3.3 Tool API 流程
+
+#### 3.3.1 服务令牌认证 [REQ-TOOL-001]
+
+```
+触发: 所有 /api/agent/tool/* 请求
+前置: 无
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 提取 Authorization header                              │
+│    │   auth_header = request.headers.get("Authorization")             │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 验证格式                                                │
+│    │   if not auth_header.startswith("Bearer "):                      │
+│    │       raise HTTPException(401, "Invalid auth format")            │
+│    │   token = auth_header[7:]                                        │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 安全比较                                                │
+│    │   expected = settings.AGENT_SERVICE_TOKEN                        │
+│    │   if not hmac.compare_digest(token, expected):                   │
+│    │       日志: TOOL_AUTH_FAIL | WARN | {endpoint, client_ip}        │
+│    │       raise HTTPException(401, "Unauthorized")                   │
+│    │ 日志: TOOL_AUTH | DEBUG | {endpoint, success: true}              │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+安全考虑:
+- 使用 hmac.compare_digest 防止时序攻击
+- 不在错误响应中泄露 token 信息
+- 记录所有失败尝试用于安全审计
+```
+
+#### 3.3.2 获取用户上下文 [REQ-TOOL-002]
+
+```
+触发: GET /api/agent/tool/context
+前置: SERVICE_TOKEN 验证通过
+
+请求参数:
+  - user_id: int (required)
+  - layers: list[str] = ["L1", "L2", "L3"]
+  - include_recent_messages: int = 5
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 并行查询数据:                                           │
+│    │   twin_task = twin_service.get_twin(user_id, layers)             │
+│    │   messages_task = conversation_service.get_recent(user_id, limit)│
+│    │   commitments_task = commitment_service.get_active(user_id)      │
+│    │   plan_task = plan_service.get_current_enrollment(user_id)       │
+│    │   await asyncio.gather(...)                                      │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 计算 facts_hash                                         │
+│    │   facts_json = json.dumps(twin.metadata_astrology, sort_keys=True)│
+│    │   facts_hash = hashlib.sha256(facts_json.encode()).hexdigest()[:16]│
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 组装响应                                                │
+│    │   return {                                                        │
+│    │     user_id,                                                      │
+│    │     twin: twin.model_dump(),                                      │
+│    │     recent_messages: [...],                                       │
+│    │     active_commitments: [...],                                    │
+│    │     current_plan: plan or None,                                   │
+│    │     facts_hash,                                                   │
+│    │   }                                                               │
+│    │ 日志: TOOL_CONTEXT | DEBUG | {user_id, response_time_ms}         │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+性能优化:
+- 使用 asyncio.gather 并行查询
+- 缓存 facts_hash（八字数据不常变）
+- 消息列表只返回最近 N 条
+```
+
+---
+
+### 3.4 社交能量网络流程
+
+#### 3.4.1 能量打赏流程 [REQ-SOCIAL-002]
+
+```
+触发: POST /api/social/buff
+前置: 用户已认证
+
+请求体:
+  - to_user_id: int
+  - buff_type: str ("energy"|"luck"|"calm"|"focus")
+  - amount: int
+  - message: str (optional)
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 验证好友关系                                            │
+│    │   SELECT FROM fortune_social_edge                                 │
+│    │   WHERE user_id = $1 AND peer_user_id = $2 AND status = 'accepted'│
+│    │   if not exists: raise HTTPException(403, "Not friends")         │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 验证发送者余额                                          │
+│    │   balance = currency_service.get_balance(from_user_id)           │
+│    │   if balance.coins < amount:                                     │
+│    │       raise HTTPException(400, "Insufficient balance")           │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 开启事务，执行转账                                      │
+│    │   3.1 BEGIN                                                       │
+│    │   3.2 扣除发送者: currency_service.deduct(from_user_id, amount,  │
+│    │       category='transfer_out', reason='send_buff')               │
+│    │   3.3 增加接收者: currency_service.add(to_user_id, amount,       │
+│    │       category='transfer_in', reason='receive_buff')             │
+│    │   3.4 INSERT INTO fortune_energy_buff                             │
+│    │       (from_user_id, to_user_id, buff_type, amount, message)     │
+│    │   3.5 COMMIT                                                      │
+│    │ 日志: ENERGY_BUFF | INFO | {from, to, type, amount}              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] 更新接收者孪生                                          │
+│    │   twin_service.update_twin(                                       │
+│    │     user_id=to_user_id,                                          │
+│    │     layer='L2',                                                   │
+│    │     path='dynamic_social.recent_buffs_received',                 │
+│    │     new_value=increment(1),                                      │
+│    │     trigger='social_event'                                       │
+│    │   )                                                               │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [FastAPI] 发送推送通知                                            │
+│    │   push_service.send(to_user_id, {                                │
+│    │     type: 'buff_received',                                       │
+│    │     title: '收到能量！',                                          │
+│    │     body: f'{from_name} 给你充能 +{amount}',                     │
+│    │   })                                                              │
+│    │ 日志: PUSH_SENT | DEBUG | {user_id, type}                        │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 6  │ [FastAPI] 返回成功响应                                            │
+│    │   return {buff_id, success: true, new_balance}                   │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+异常处理:
+- 事务失败: ROLLBACK，返回 500
+- 推送失败: 不影响主流程，记录 WARN 日志
+```
+
+#### 3.4.2 好运接龙流程 [REQ-SOCIAL-004]
+
+```
+触发: POST /api/social/chain/join
+前置: 用户已认证
+
+请求体:
+  - chain_id: int
+  - contribution: str (optional)
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 获取接龙信息                                            │
+│    │   chain = SELECT FROM fortune_luck_chain WHERE chain_id = $1     │
+│    │   if chain.status != 'active':                                   │
+│    │       raise HTTPException(400, "Chain not active")               │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 检查是否已参与                                          │
+│    │   existing = SELECT FROM fortune_luck_chain_participant           │
+│    │              WHERE chain_id = $1 AND user_id = $2                │
+│    │   if existing: raise HTTPException(400, "Already joined")        │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 开启事务，加入接龙                                      │
+│    │   3.1 BEGIN                                                       │
+│    │   3.2 获取当前参与人数 (FOR UPDATE 锁)                            │
+│    │   3.3 INSERT INTO fortune_luck_chain_participant                  │
+│    │       (chain_id, user_id, position, contribution)                │
+│    │   3.4 UPDATE fortune_luck_chain SET participant_count += 1       │
+│    │   3.5 COMMIT                                                      │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] 计算并发放奖励                                          │
+│    │   4.1 奖励公式: reward = floor(base_reward * log2(count + 2))    │
+│    │   4.2 获取所有参与者                                              │
+│    │   4.3 为每个参与者发放 Aura:                                      │
+│    │       currency_service.add(user_id, reward,                      │
+│    │         category='earn', reason='luck_chain')                    │
+│    │   4.4 更新参与记录的 reward_earned                                │
+│    │ 日志: CHAIN_REWARD | INFO | {chain_id, reward, recipients_count} │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [FastAPI] 返回响应                                                │
+│    │   return {                                                        │
+│    │     position,                                                     │
+│    │     reward,                                                       │
+│    │     total_participants: count + 1,                               │
+│    │     chain_strength: log2(count + 2),                             │
+│    │   }                                                               │
+│    │ 日志: CHAIN_JOIN | INFO | {chain_id, user_id, position, reward}  │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+计算验证:
+- log2(3) ≈ 1.58, log2(10) ≈ 3.32, log2(100) ≈ 6.64
+- base_reward=10 时: 2人=15, 10人=33, 100人=66 Aura
+```
+
+---
+
+### 3.5 JITAI 引擎流程
+
+#### 3.5.1 定时评估流程 [REQ-JITAI-003]
+
+```
+触发: Cron GET /api/cron/jitai (每 15 分钟)
+前置: CRON_SECRET 验证
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 验证 Cron Secret                                        │
+│    │   if request.headers['Authorization'] != f'Bearer {CRON_SECRET}':│
+│    │       raise HTTPException(401)                                   │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 获取活跃用户列表                                        │
+│    │   SELECT DISTINCT user_id FROM fortune_conversation_message      │
+│    │   WHERE created_at > NOW() - INTERVAL '7 days'                   │
+│    │ 日志: JITAI_START | INFO | {active_users_count}                  │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 遍历用户，评估触发器                                    │
+│    │   for user_id in active_users:                                   │
+│    │     3.1 获取用户数据:                                             │
+│    │         twin = twin_service.get_twin(user_id, 'all')             │
+│    │         behavior = behavior_service.get_recent(user_id)          │
+│    │         context = astro_service.get_context()                    │
+│    │     3.2 遍历触发器:                                               │
+│    │         for trigger in jitai_triggers:                           │
+│    │           3.2.1 检查冷却: is_in_cooldown(user_id, trigger.id)    │
+│    │           3.2.2 评估条件: evaluate_conditions(trigger, data)     │
+│    │           3.2.3 如果触发: 加入候选列表                            │
+│    │     3.3 按优先级排序，取最高优先级的一个                          │
+│    │     3.4 执行干预: execute_intervention(user_id, intervention)    │
+│    │     3.5 记录冷却: set_cooldown(user_id, trigger.id, hours)       │
+│    │ 日志: JITAI_USER_EVAL | DEBUG | {user_id, triggered, intervention}│
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] 返回统计                                                │
+│    │   return {                                                        │
+│    │     evaluated: active_users.length,                              │
+│    │     intervened: intervention_count,                              │
+│    │     timestamp: now(),                                            │
+│    │   }                                                               │
+│    │ 日志: JITAI_CRON | INFO | {evaluated, intervened, duration_ms}   │
+└────┴──────────────────────────────────────────────────────────────────┘
+
+性能考虑:
+- 批量查询用户数据
+- 并行评估（使用 asyncio）
+- 单次 Cron 限制最大处理用户数
+```
+
+---
+
+### 3.6 付费/货币系统流程
+
+#### 3.6.1 货币赚取流程 [REQ-PAY-003]
+
+```
+触发: 用户完成特定行为
+前置: 用户已认证
+
+示例: 完成每日打卡
+
+步骤:
+┌────┬──────────────────────────────────────────────────────────────────┐
+│ #  │ 操作                                                              │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 1  │ [FastAPI] 检查今日是否已打卡                                      │
+│    │   existing = SELECT FROM fortune_checkin                          │
+│    │              WHERE user_id = $1 AND DATE(created_at) = CURRENT_DATE│
+│    │   if existing: return {already_checked_in: true}                 │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 2  │ [FastAPI] 记录打卡                                                │
+│    │   INSERT INTO fortune_checkin (user_id, mood, intensity, ...)    │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 3  │ [FastAPI] 计算奖励                                                │
+│    │   3.1 基础奖励: base_reward = 10 Aura                            │
+│    │   3.2 检查连续打卡:                                               │
+│    │       streak = twin.growth_streak                                │
+│    │       if streak in [7, 21, 30, 100]:                             │
+│    │           bonus = streak_bonus[streak]  # 50, 100, 200, 500      │
+│    │   3.3 总奖励: total = base_reward + bonus                        │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 4  │ [FastAPI] 发放奖励                                                │
+│    │   currency_service.add(user_id, total, 'aura',                   │
+│    │     category='earn', reason='daily_checkin',                     │
+│    │     ref_type='checkin', ref_id=checkin_id)                       │
+│    │ 日志: CURRENCY_EARN | INFO | {user_id, amount, reason}           │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 5  │ [FastAPI] 更新孪生连续天数                                        │
+│    │   twin_service.update_twin(user_id, 'L3', 'growth_streak',       │
+│    │     value=streak + 1, trigger='checkin_completed')               │
+├────┼──────────────────────────────────────────────────────────────────┤
+│ 6  │ [FastAPI] 返回响应                                                │
+│    │   return {                                                        │
+│    │     checkin_id,                                                   │
+│    │     reward: {aura: total, breakdown: {...}},                     │
+│    │     new_streak: streak + 1,                                      │
+│    │     milestone_reached: bonus > 0 ? streak : null,                │
+│    │   }                                                               │
+└────┴──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 组件与接口设计 (Components & Interfaces)
+
+### 4.1 FastAPI 服务组件
+
+```
+fortune_ai/
+├── api/
+│   ├── main.py                 # 应用入口，路由注册
+│   ├── deps.py                 # 依赖注入 (复用)
+│   ├── routes/
+│   │   ├── auth_routes.py      # 认证路由 (复用)
+│   │   ├── twin_routes.py      # 孪生路由 [新增]
+│   │   ├── agent_tool.py       # Tool API [新增]
+│   │   ├── social_routes.py    # 社交路由 [新增]
+│   │   ├── currency_routes.py  # 货币路由 [新增]
+│   │   ├── jitai_routes.py     # JITAI Cron [新增]
+│   │   └── ... (复用现有)
+│   └── templates/              # Jinja2 模板 (复用)
+│
+├── services/
+│   ├── auth_service.py         # 认证服务 (复用)
+│   ├── twin_service.py         # 孪生服务 [新增]
+│   ├── social_service.py       # 社交服务 [新增]
+│   ├── currency_service.py     # 货币服务 [新增]
+│   ├── jitai_service.py        # JITAI 服务 [新增]
+│   └── ... (复用现有)
+│
+├── models/
+│   ├── twin.py                 # 孪生数据模型 [新增]
+│   ├── social.py               # 社交数据模型 [新增]
+│   ├── currency.py             # 货币数据模型 [新增]
+│   └── jitai.py                # JITAI 数据模型 [新增]
+│
+└── stores/
+    └── fortune_db.py           # 数据库连接 (复用)
+```
+
+### 4.2 Agent Service 组件
+
+```
+fortune_ai/agent_service/
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── server.ts               # HTTP 服务入口
+│   ├── config/
+│   │   ├── env.ts              # 环境配置
+│   │   └── models.ts           # LLM 模型注册
+│   │
+│   ├── orchestrator/
+│   │   ├── index.ts            # 编排主入口
+│   │   ├── intent.ts           # 意图识别
+│   │   ├── router.ts           # Agent 路由
+│   │   └── safety.ts           # 安全检查
+│   │
+│   ├── agents/
+│   │   ├── base.ts             # Agent 基类
+│   │   ├── coach.ts            # Coach Agent
+│   │   ├── analyst.ts          # Analyst Agent
+│   │   ├── social.ts           # Social Agent
+│   │   └── expert-factory.ts   # Expert Factory
+│   │
+│   ├── tools/
+│   │   ├── index.ts            # Tool 导出
+│   │   ├── fastapi-client.ts   # FastAPI Tool 客户端
+│   │   ├── commitment.ts       # 承诺 Tool
+│   │   ├── twin-update.ts      # 孪生更新 Tool
+│   │   └── share-card.ts       # 分享卡 Tool
+│   │
+│   ├── kb/
+│   │   ├── registry.ts         # KB 注册表
+│   │   ├── retriever.ts        # 混合检索
+│   │   └── presets.ts          # 预置 KB
+│   │
+│   └── types/
+│       ├── a2ui.ts             # A2UI 类型定义
+│       ├── twin.ts             # 孪生类型定义
+│       └── context.ts          # 上下文类型
+│
+└── dist/                       # 编译输出
+```
+
+### 4.3 接口定义
+
+#### 4.3.1 Tool API 接口
+
+```typescript
+// POST /api/agent/tool/context
+interface ContextRequest {
+  user_id: number;
+  layers?: ('L1' | 'L2' | 'L3')[];
+  include_recent_messages?: number;
+}
+
+interface ContextResponse {
+  user_id: number;
+  twin: TwinData;
+  recent_messages: Message[];
+  active_commitments: Commitment[];
+  current_plan: PlanEnrollment | null;
+  facts_hash: string;
+}
+
+// POST /api/agent/tool/commitment
+interface CommitmentCreateRequest {
+  user_id: number;
+  title: string;
+  description?: string;
+  category: 'energy_boost' | 'reflection' | 'practice' | 'social';
+  duration_minutes?: number;
+  aura_reward: number;
+  due_date?: string;
+}
+
+interface CommitmentCreateResponse {
+  commitment_id: number;
+  status: 'created';
+}
+
+// POST /api/agent/tool/twin_update
+interface TwinUpdateRequest {
+  user_id: number;
+  layer: 'L1' | 'L2' | 'L3';
+  path: string;
+  new_value: any;
+  confidence: number;  // 0-1
+  source: string;
+  trigger: string;
+}
+
+interface TwinUpdateResponse {
+  updated: boolean;
+  log_id: number;
+}
+```
+
+#### 4.3.2 A2UI 接口
+
+```typescript
+interface A2UIOutput {
+  meta: {
+    summary: string;
+    intent?: string;
+    agents_used?: string[];
+    processing_time_ms?: number;
+  };
+  ui_components: A2UIComponent[];
+}
+
+interface A2UIComponent {
+  type: A2UIComponentType;
+  id: string;
+  title?: string;
+  data: any;
+  style?: {
+    theme?: 'light' | 'dark' | 'cosmic';
+    accent_color?: string;
+  };
+}
+
+type A2UIComponentType =
+  | 'markdown_text'
+  | 'action_buttons'
+  | 'commitment_card'
+  | 'twin_snapshot'
+  | 'aura_radar'
+  | 'timeline'
+  | 'ritual_guide'
+  | 'compatibility'
+  | 'share_card'
+  | 'buff_animation'
+  | 'progress_ring';
+```
+
+---
+
+## 5. 数据模型 (Data Models)
+
+### 5.1 数据库表结构
+
+#### 5.1.1 数字孪生表
+
+```sql
+-- 孪生主表
+CREATE TABLE fortune_digital_twin (
+    twin_id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL UNIQUE REFERENCES fortune_user(user_id),
+
+    -- L1 元数据层
+    metadata_astrology JSONB NOT NULL DEFAULT '{}',
+    metadata_psychology JSONB NOT NULL DEFAULT '{}',
+    metadata_memory JSONB NOT NULL DEFAULT '{}',
+
+    -- L2 动态状态层
+    dynamic_astro JSONB NOT NULL DEFAULT '{}',
+    dynamic_bio JSONB NOT NULL DEFAULT '{}',
+    dynamic_social JSONB NOT NULL DEFAULT '{}',
+    dynamic_emotional JSONB NOT NULL DEFAULT '{}',
+
+    -- L3 聚合指标
+    aura_points INTEGER NOT NULL DEFAULT 0,
+    overall_wellbeing NUMERIC(5,2) NOT NULL DEFAULT 50.00,
+    growth_streak INTEGER NOT NULL DEFAULT 0,
+    dimension_scores JSONB NOT NULL DEFAULT
+        '{"energy":50,"clarity":50,"connection":50,"growth":50,"balance":50}',
+
+    -- 元信息
+    compute_version TEXT NOT NULL DEFAULT 'v1.0',
+    last_full_refresh TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 孪生更新日志
+CREATE TABLE fortune_twin_update_log (
+    log_id BIGSERIAL PRIMARY KEY,
+    twin_id BIGINT NOT NULL REFERENCES fortune_digital_twin(twin_id),
+    trigger_type TEXT NOT NULL,
+    layer TEXT NOT NULL,
+    path TEXT NOT NULL,
+    old_value JSONB,
+    new_value JSONB NOT NULL,
+    confidence NUMERIC(3,2) NOT NULL,
+    source TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_twin_log_twin ON fortune_twin_update_log(twin_id, created_at DESC);
+```
+
+#### 5.1.2 社交关系表
+
+```sql
+-- 好友关系
+CREATE TABLE fortune_social_edge (
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    peer_user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    relationship_type TEXT NOT NULL DEFAULT 'friend',
+    status TEXT NOT NULL DEFAULT 'pending',
+    compatibility_score NUMERIC(5,2),
+    compatibility_data JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, peer_user_id)
+);
+
+-- 能量打赏
+CREATE TABLE fortune_energy_buff (
+    buff_id BIGSERIAL PRIMARY KEY,
+    from_user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    to_user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    buff_type TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    message TEXT,
+    source TEXT NOT NULL DEFAULT 'app',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 好运接龙
+CREATE TABLE fortune_luck_chain (
+    chain_id BIGSERIAL PRIMARY KEY,
+    creator_user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    title TEXT NOT NULL,
+    description TEXT,
+    ritual_type TEXT NOT NULL,
+    base_reward INTEGER NOT NULL DEFAULT 10,
+    participant_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE fortune_luck_chain_participant (
+    chain_id BIGINT NOT NULL REFERENCES fortune_luck_chain(chain_id),
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    position INTEGER NOT NULL,
+    contribution TEXT,
+    reward_earned INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (chain_id, user_id)
+);
+```
+
+#### 5.1.3 货币系统表
+
+```sql
+-- 用户余额
+CREATE TABLE fortune_user_balance (
+    user_id BIGINT PRIMARY KEY REFERENCES fortune_user(user_id),
+    coins INTEGER NOT NULL DEFAULT 0,
+    aura INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 货币账本
+CREATE TABLE fortune_currency_ledger (
+    entry_id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    currency_type TEXT NOT NULL,  -- 'coins' | 'aura'
+    amount INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    ref_type TEXT,
+    ref_id TEXT,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_ledger_user ON fortune_currency_ledger(user_id, created_at DESC);
+```
+
+#### 5.1.4 JITAI 表
+
+```sql
+-- JITAI 干预记录
+CREATE TABLE fortune_jitai_intervention (
+    intervention_id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    trigger_id TEXT NOT NULL,
+    intervention_type TEXT NOT NULL,
+    content JSONB NOT NULL,
+    delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    clicked_at TIMESTAMPTZ,
+    dismissed_at TIMESTAMPTZ
+);
+
+-- JITAI 冷却状态
+CREATE TABLE fortune_jitai_cooldown (
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    trigger_id TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (user_id, trigger_id)
+);
+```
+
+#### 5.1.5 Agent 审计表
+
+```sql
+CREATE TABLE fortune_agent_run (
+    run_id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    session_id UUID REFERENCES fortune_conversation_session(session_id),
+    agent_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    facts_hash TEXT,
+    input JSONB NOT NULL,
+    output JSONB NOT NULL,
+    tool_calls JSONB,
+    usage JSONB,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_agent_run_user ON fortune_agent_run(user_id, created_at DESC);
+```
+
+#### 5.1.6 知识库表
+
+```sql
+-- pgvector 扩展
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- KB chunk 表
+CREATE TABLE fortune_kb_chunk (
+    chunk_id BIGSERIAL PRIMARY KEY,
+    collection TEXT NOT NULL,
+    source_doc TEXT NOT NULL,
+    title TEXT,
+    content TEXT NOT NULL,
+    embedding vector(1536),
+    meta JSONB NOT NULL DEFAULT '{}',
+    content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_kb_collection ON fortune_kb_chunk(collection);
+CREATE INDEX idx_kb_tsv ON fortune_kb_chunk USING GIN(content_tsv);
+CREATE INDEX idx_kb_embedding ON fortune_kb_chunk USING ivfflat (embedding vector_cosine_ops);
+
+-- 用户 KB 解锁
+CREATE TABLE fortune_user_kb_unlock (
+    user_id BIGINT NOT NULL REFERENCES fortune_user(user_id),
+    kb_id TEXT NOT NULL,
+    unlocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    unlock_source TEXT NOT NULL DEFAULT 'purchase',
+    PRIMARY KEY (user_id, kb_id)
+);
+```
+
+---
+
+## 6. 目录结构 (Directory Structure)
+
+```
+fortune_ai/
+├── .claude/
+│   └── specs/
+│       └── claude_mvp_v1/
+│           ├── spec.md
+│           ├── requirements.md
+│           ├── design.md
+│           └── tasks.md
+│
+├── api/                        # FastAPI 应用 [复用+扩展]
+│   ├── main.py
+│   ├── deps.py
+│   ├── routes/
+│   │   ├── auth_routes.py      # [复用]
+│   │   ├── chat_routes.py      # [修改] 集成 Agent Service
+│   │   ├── twin_routes.py      # [新增]
+│   │   ├── agent_tool.py       # [新增]
+│   │   ├── social_routes.py    # [新增]
+│   │   ├── currency_routes.py  # [新增]
+│   │   └── jitai_routes.py     # [新增]
+│   ├── templates/              # [复用]
+│   └── static/                 # [复用]
+│
+├── services/                   # 业务服务层 [复用+扩展]
+│   ├── auth_service.py         # [复用]
+│   ├── bazi_engine.py          # [复用]
+│   ├── twin_service.py         # [新增]
+│   ├── social_service.py       # [新增]
+│   ├── currency_service.py     # [新增]
+│   ├── jitai_service.py        # [新增]
+│   └── ...
+│
+├── models/                     # Pydantic 模型 [新增]
+│   ├── __init__.py
+│   ├── twin.py
+│   ├── social.py
+│   ├── currency.py
+│   └── jitai.py
+│
+├── stores/                     # 数据层 [复用]
+│   └── fortune_db.py
+│
+├── agent_service/              # Agent Service [新增]
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── src/
+│   │   ├── server.ts
+│   │   ├── config/
+│   │   ├── orchestrator/
+│   │   ├── agents/
+│   │   ├── tools/
+│   │   ├── kb/
+│   │   └── types/
+│   └── dist/
+│
+├── migrations/                 # 数据库迁移 [扩展]
+│   ├── 20251229_final_mvp.sql  # [复用]
+│   └── 20251230_claude_mvp.sql # [新增]
+│
+├── tests/                      # 测试 [扩展]
+│   ├── test_twin_service.py    # [新增]
+│   ├── test_tool_api.py        # [新增]
+│   ├── test_social_service.py  # [新增]
+│   ├── test_currency_service.py# [新增]
+│   └── test_jitai_service.py   # [新增]
+│
+├── docs/                       # 文档
+│   └── architech/
+│       └── system_design_claude_mvp v1.md
+│
+├── .env.example                # 环境配置模板
+├── requirements.txt            # Python 依赖
+└── docker-compose.yml          # 开发环境配置
+```
+
+---
+
+## 7. 日志架构 (Logging Architecture)
+
+### 7.1 日志格式
+
+```json
+{
+  "timestamp": "2025-12-30T10:30:45.123Z",
+  "level": "INFO",
+  "component": "twin_service",
+  "operation": "update_twin",
+  "correlation_id": "req-abc123",
+  "user_id": 12345,
+  "duration_ms": 45,
+  "outcome": "success",
+  "context": {
+    "layer": "L2",
+    "path": "dynamic_emotional.mood",
+    "trigger": "checkin_completed"
+  }
+}
+```
+
+### 7.2 事件-级别-字段表
+
+| 事件 | 级别 | 必备字段 | 触发位置 | REQ-ID |
+|------|------|----------|----------|--------|
+| TWIN_CREATED | INFO | user_id, twin_id, initial_scores | twin_service.create | REQ-TWIN-001 |
+| TWIN_QUERY | DEBUG | user_id, layer, response_size | twin_routes.get | REQ-TWIN-002 |
+| TWIN_UPDATE | INFO | user_id, trigger, layer, path, log_id | twin_service.update | REQ-TWIN-003 |
+| DIMENSION_RECALC | DEBUG | user_id, old_scores, new_scores | twin_service.recalc | REQ-TWIN-004 |
+| AGENT_ROUTE | INFO | user_id, intent, agents_selected | orchestrator.route | REQ-AGENT-001 |
+| AGENT_RUN | INFO | agent_name, tool_calls_count, latency | agent.run | REQ-AGENT-002 |
+| TOOL_CALL | INFO | tool_name, endpoint, latency, retry | tools.execute | REQ-AGENT-004 |
+| STREAM_END | INFO | total_tokens, duration_ms | agent.stream | REQ-AGENT-005 |
+| TOOL_AUTH_FAIL | WARN | endpoint, client_ip, reason | verify_token | REQ-TOOL-001 |
+| ENERGY_BUFF | INFO | from_user, to_user, type, amount | social_service.buff | REQ-SOCIAL-002 |
+| CHAIN_JOIN | INFO | chain_id, user_id, position, reward | social_service.join | REQ-SOCIAL-004 |
+| JITAI_CRON | INFO | evaluated, intervened, duration_ms | jitai_routes.cron | REQ-JITAI-003 |
+| CURRENCY_EARN | INFO | user_id, amount, reason | currency_service.add | REQ-PAY-003 |
+| KB_RETRIEVAL | DEBUG | query_hash, kb_count, chunk_count | kb.retrieve | REQ-KB-003 |
+
+---
+
+## 8. 错误处理 (Error Handling)
+
+### 8.1 错误码定义
+
+| 错误码 | HTTP Status | 描述 | 处理建议 |
+|--------|-------------|------|----------|
+| TWIN_NOT_FOUND | 404 | 孪生不存在 | 自动创建 |
+| TWIN_UPDATE_CONFLICT | 409 | 并发更新冲突 | 重试 |
+| AGENT_TIMEOUT | 504 | Agent 响应超时 | 降级响应 |
+| TOOL_CALL_FAILED | 502 | Tool API 调用失败 | 重试或跳过 |
+| INSUFFICIENT_BALANCE | 400 | 余额不足 | 提示充值 |
+| NOT_FRIENDS | 403 | 非好友关系 | 提示添加好友 |
+| COOLDOWN_ACTIVE | 429 | 操作冷却中 | 返回剩余时间 |
+| CRISIS_DETECTED | 200 | 危机信号检测 | 返回安全响应 |
+
+### 8.2 错误响应格式
+
+```json
+{
+  "error": {
+    "code": "INSUFFICIENT_BALANCE",
+    "message": "余额不足",
+    "details": {
+      "required": 100,
+      "available": 50,
+      "currency": "coins"
+    }
+  }
+}
+```
+
+---
+
+## 9. 测试策略 (Testing Strategy)
+
+### 9.1 测试层次
+
+| 层次 | 覆盖目标 | 工具 | 比例 |
+|------|----------|------|------|
+| 单元测试 | 服务层逻辑、计算公式 | pytest | 60% |
+| 集成测试 | API 端点、数据库交互 | pytest + httpx | 25% |
+| E2E 测试 | 完整用户流程 | pytest + Playwright | 10% |
+| 性能测试 | 延迟、吞吐量 | locust | 5% |
+
+### 9.2 关键测试用例
+
+```python
+# tests/test_twin_service.py
+
+class TestTwinService:
+    async def test_create_twin_on_register(self):
+        """REQ-TWIN-001: 注册时自动创建孪生"""
+        user = await create_test_user()
+        twin = await twin_service.get_twin(user.user_id)
+        assert twin is not None
+        assert twin.dimension_scores['energy'] == 50
+
+    async def test_dimension_calculation(self):
+        """REQ-TWIN-004: 维度分数计算边界"""
+        # 测试极端值
+        await twin_service.update_twin(
+            user_id=1,
+            layer='L2',
+            path='dynamic_emotional.mood_intensity',
+            new_value=10,  # 最大值
+            confidence=1.0,
+            trigger='test'
+        )
+        twin = await twin_service.get_twin(1)
+        assert 0 <= twin.dimension_scores['energy'] <= 100
+```
+
+---
+
+## 10. 文档同步计划 (Documentation Sync Plan)
+
+| 文档 | 同步时机 | 责任人 |
+|------|----------|--------|
+| API 文档 | 每次路由变更 | 开发者 |
+| 数据模型 | 每次迁移 | 开发者 |
+| 配置说明 | 每次环境变更 | DevOps |
+| 用户指南 | 每次功能发布 | PM |
+
+---
+
+## 11. 审批记录
+
+| 版本 | 日期 | 审批人 | 状态 | 备注 |
+|------|------|--------|------|------|
+| v1.0 | 2025-12-30 | - | Draft | 初始版本 |
+
+---
+
+**文档结束**

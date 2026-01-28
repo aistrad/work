@@ -1,0 +1,417 @@
+"""
+Smart Chunker - Three-phase intelligent text chunking
+
+Phase 1: Structure Parsing (by Markdown headings)
+Phase 2: Smart Merging (merge small chunks upward)
+Phase 3: Safe Splitting (split oversized chunks at sentence boundaries)
+
+Design principles:
+- Semantic completeness > uniform length
+- Tables/lists as complete units (never split)
+- Preserve hierarchy path (e.g., "Ten Gods > Companion > Traits")
+"""
+import re
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+# Set jieba cache directory before importing jieba (use environment variable)
+_jieba_tmpdir = os.getenv('VIBELIFE_JIEBA_TMPDIR', '/tmp/vibelife/jieba')
+os.environ.setdefault('TMPDIR', _jieba_tmpdir)
+os.makedirs(_jieba_tmpdir, exist_ok=True)
+
+import jieba
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────
+
+CHUNK_SIZE = 600          # Target chunk size (Chinese characters)
+CHUNK_OVERLAP = 80        # Overlap for context preservation
+MIN_CHUNK_SIZE = 100      # Minimum chunk (merge if smaller)
+MAX_CHUNK_SIZE = 1200     # Maximum chunk (allow tables to exceed)
+
+
+@dataclass
+class Chunk:
+    """Represents a text chunk with metadata"""
+    content: str
+    section_path: list[str] = field(default_factory=list)
+    section_title: Optional[str] = None
+    has_table: bool = False
+    has_list: bool = False
+    char_count: int = 0
+    chunk_index: int = 0
+
+    def __post_init__(self):
+        self.char_count = len(self.content)
+        if self.section_path and not self.section_title:
+            self.section_title = self.section_path[-1] if self.section_path else None
+
+
+@dataclass
+class Section:
+    """Represents a document section"""
+    title: str
+    level: int
+    content: str
+    path: list[str]
+    children: list["Section"] = field(default_factory=list)
+
+
+class SmartChunker:
+    """
+    Three-phase intelligent chunker optimized for Chinese metaphysics content
+    """
+
+    def __init__(
+        self,
+        chunk_size: int = CHUNK_SIZE,
+        chunk_overlap: int = CHUNK_OVERLAP,
+        min_chunk_size: int = MIN_CHUNK_SIZE,
+        max_chunk_size: int = MAX_CHUNK_SIZE,
+    ):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+
+        # Regex patterns
+        self._heading_pattern = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+        self._table_pattern = re.compile(r"^\|.+\|$", re.MULTILINE)
+        self._list_pattern = re.compile(r"^[\s]*[-*+]\s+.+$", re.MULTILINE)
+        self._code_block_pattern = re.compile(r"```[\s\S]*?```")
+
+        # Chinese sentence endings
+        self._sentence_endings = re.compile(r"([。！？；\.\!\?\;])")
+
+    def chunk(self, markdown_text: str) -> list[Chunk]:
+        """
+        Main entry point - chunk markdown text into semantic units
+
+        Args:
+            markdown_text: Markdown formatted text
+
+        Returns:
+            List of Chunk objects
+        """
+        if not markdown_text or not markdown_text.strip():
+            return []
+
+        # Phase 1: Parse structure
+        sections = self._parse_structure(markdown_text)
+
+        # Phase 2: Merge small sections
+        merged = self._merge_small_sections(sections)
+
+        # Phase 3: Split oversized sections
+        chunks = self._split_and_finalize(merged)
+
+        # Assign indices
+        for i, chunk in enumerate(chunks):
+            chunk.chunk_index = i
+
+        logger.info(f"Chunked into {len(chunks)} pieces")
+        return chunks
+
+    def preprocess_for_search(self, text: str) -> str:
+        """
+        Jieba tokenization for FTS
+
+        Args:
+            text: Raw text
+
+        Returns:
+            Space-separated tokens for PostgreSQL simple config
+        """
+        # Cut with search mode for better recall
+        tokens = jieba.cut_for_search(text)
+        return " ".join(tokens)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 1: Structure Parsing
+    # ─────────────────────────────────────────────────────────────────
+
+    def _parse_structure(self, text: str) -> list[Section]:
+        """Parse markdown into hierarchical sections"""
+        lines = text.split("\n")
+        root_sections: list[Section] = []
+        section_stack: list[Section] = []
+        current_content: list[str] = []
+        current_path: list[str] = []
+
+        def flush_content():
+            """Save accumulated content to current section"""
+            if current_content and section_stack:
+                section_stack[-1].content = "\n".join(current_content).strip()
+                current_content.clear()
+            elif current_content and not section_stack:
+                # Content before any heading - create implicit section
+                content = "\n".join(current_content).strip()
+                if content:
+                    section = Section(
+                        title="",
+                        level=0,
+                        content=content,
+                        path=[]
+                    )
+                    root_sections.append(section)
+                current_content.clear()
+
+        for line in lines:
+            heading_match = self._heading_pattern.match(line)
+
+            if heading_match:
+                flush_content()
+
+                level = len(heading_match.group(1))
+                title = heading_match.group(2).strip()
+
+                # Pop sections until we find parent
+                while section_stack and section_stack[-1].level >= level:
+                    section_stack.pop()
+                    if current_path:
+                        current_path.pop()
+
+                # Update path
+                current_path.append(title)
+
+                # Create new section
+                new_section = Section(
+                    title=title,
+                    level=level,
+                    content="",
+                    path=list(current_path)
+                )
+
+                if section_stack:
+                    section_stack[-1].children.append(new_section)
+                else:
+                    root_sections.append(new_section)
+
+                section_stack.append(new_section)
+            else:
+                current_content.append(line)
+
+        flush_content()
+        return root_sections
+
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 2: Smart Merging
+    # ─────────────────────────────────────────────────────────────────
+
+    def _merge_small_sections(self, sections: list[Section]) -> list[Section]:
+        """Merge sections smaller than MIN_CHUNK_SIZE with siblings"""
+        if not sections:
+            return []
+
+        result: list[Section] = []
+
+        for section in sections:
+            # Recursively process children first
+            if section.children:
+                section.children = self._merge_small_sections(section.children)
+
+            # Calculate total content size
+            total_size = len(section.content)
+            for child in section.children:
+                total_size += len(child.content)
+
+            # If section is too small, try to merge with previous
+            if total_size < self.min_chunk_size and result:
+                prev = result[-1]
+                # Merge content
+                merged_content = prev.content
+                if section.content:
+                    merged_content += f"\n\n## {section.title}\n{section.content}" if section.title else f"\n\n{section.content}"
+                prev.content = merged_content
+                # Merge children
+                prev.children.extend(section.children)
+            else:
+                result.append(section)
+
+        return result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 3: Split and Finalize
+    # ─────────────────────────────────────────────────────────────────
+
+    def _split_and_finalize(self, sections: list[Section]) -> list[Chunk]:
+        """Convert sections to chunks, splitting oversized ones"""
+        chunks: list[Chunk] = []
+
+        def process_section(section: Section):
+            # Build full content including title
+            full_content = ""
+            if section.title:
+                prefix = "#" * section.level if section.level > 0 else "##"
+                full_content = f"{prefix} {section.title}\n\n"
+            full_content += section.content
+
+            # Check for special content
+            has_table = bool(self._table_pattern.search(full_content))
+            has_list = bool(self._list_pattern.search(full_content))
+
+            content_len = len(full_content)
+
+            # Tables/code blocks: never split even if oversized
+            if has_table or self._code_block_pattern.search(full_content):
+                chunks.append(Chunk(
+                    content=full_content.strip(),
+                    section_path=section.path,
+                    has_table=has_table,
+                    has_list=has_list,
+                ))
+            elif content_len <= self.max_chunk_size:
+                # Normal size - keep as is
+                chunks.append(Chunk(
+                    content=full_content.strip(),
+                    section_path=section.path,
+                    has_table=has_table,
+                    has_list=has_list,
+                ))
+            else:
+                # Oversized - split at sentence boundaries
+                split_chunks = self._split_at_sentences(
+                    full_content,
+                    section.path,
+                    has_list
+                )
+                chunks.extend(split_chunks)
+
+            # Process children
+            for child in section.children:
+                process_section(child)
+
+        for section in sections:
+            process_section(section)
+
+        # Post-process: merge small chunks with next sibling
+        return self._merge_small_chunks(chunks)
+
+    def _merge_small_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        """Merge chunks smaller than MIN_CHUNK_SIZE with neighbors"""
+        if not chunks:
+            return []
+
+        # Multiple passes until no more merges needed
+        result = chunks
+        changed = True
+
+        while changed:
+            changed = False
+            new_result: list[Chunk] = []
+            i = 0
+
+            while i < len(result):
+                chunk = result[i]
+
+                # If chunk is small, try to merge with next
+                if chunk.char_count < self.min_chunk_size and i + 1 < len(result):
+                    next_chunk = result[i + 1]
+                    combined_size = chunk.char_count + next_chunk.char_count
+
+                    if combined_size <= self.max_chunk_size:
+                        merged_content = chunk.content + "\n\n" + next_chunk.content
+                        merged = Chunk(
+                            content=merged_content.strip(),
+                            section_path=chunk.section_path,
+                            has_table=chunk.has_table or next_chunk.has_table,
+                            has_list=chunk.has_list or next_chunk.has_list,
+                        )
+                        new_result.append(merged)
+                        i += 2
+                        changed = True
+                        continue
+
+                new_result.append(chunk)
+                i += 1
+
+            result = new_result
+
+        return result
+
+    def _split_at_sentences(
+        self,
+        text: str,
+        section_path: list[str],
+        has_list: bool
+    ) -> list[Chunk]:
+        """Split text at sentence boundaries with overlap"""
+        chunks: list[Chunk] = []
+
+        # Split into sentences
+        sentences = self._sentence_endings.split(text)
+
+        # Reconstruct sentences (endings get split out)
+        reconstructed: list[str] = []
+        for i in range(0, len(sentences) - 1, 2):
+            sentence = sentences[i]
+            ending = sentences[i + 1] if i + 1 < len(sentences) else ""
+            reconstructed.append(sentence + ending)
+        if len(sentences) % 2 == 1 and sentences[-1].strip():
+            reconstructed.append(sentences[-1])
+
+        current_chunk: list[str] = []
+        current_len = 0
+
+        for sentence in reconstructed:
+            sentence_len = len(sentence)
+
+            if current_len + sentence_len > self.chunk_size and current_chunk:
+                # Save current chunk
+                chunk_text = "".join(current_chunk).strip()
+                if chunk_text:
+                    chunks.append(Chunk(
+                        content=chunk_text,
+                        section_path=section_path,
+                        has_list=has_list,
+                    ))
+
+                # Start new chunk with overlap
+                overlap_text = self._get_overlap(current_chunk)
+                current_chunk = [overlap_text, sentence] if overlap_text else [sentence]
+                current_len = len(overlap_text) + sentence_len
+            else:
+                current_chunk.append(sentence)
+                current_len += sentence_len
+
+        # Don't forget last chunk
+        if current_chunk:
+            chunk_text = "".join(current_chunk).strip()
+            if chunk_text:
+                chunks.append(Chunk(
+                    content=chunk_text,
+                    section_path=section_path,
+                    has_list=has_list,
+                ))
+
+        return chunks
+
+    def _get_overlap(self, sentences: list[str]) -> str:
+        """Get overlap text from end of sentence list"""
+        if not sentences:
+            return ""
+
+        overlap = ""
+        for sentence in reversed(sentences):
+            if len(overlap) + len(sentence) <= self.chunk_overlap:
+                overlap = sentence + overlap
+            else:
+                break
+
+        return overlap
+
+    # ─────────────────────────────────────────────────────────────────
+    # Utility Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    def estimate_chunks(self, text: str) -> int:
+        """Estimate number of chunks without actually chunking"""
+        char_count = len(text)
+        if char_count <= self.chunk_size:
+            return 1
+        return max(1, char_count // (self.chunk_size - self.chunk_overlap))

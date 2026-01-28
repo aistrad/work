@@ -1,0 +1,220 @@
+"""
+VibeLife API - The Living Companion Backend
+
+v6.8 重构版本:
+- 统一 Skill Gateway (/api/v1/skills/*)
+- 统一 Account 路由 (/api/v1/account/*)
+- 统一 Commerce 路由 (/api/v1/commerce/*)
+"""
+import os
+import time
+import logging
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+from stores.db import init_db, close_db
+from workers import IngestionWorker
+
+# ─────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────
+
+log_dir = Path(os.environ.get("VIBELIFE_LOGS_ROOT", "/tmp/vibelife/logs"))
+log_dir.mkdir(parents=True, exist_ok=True)
+
+request_logger = logging.getLogger("vibelife.requests")
+request_logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler(log_dir / "api_requests.log")
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+request_logger.addHandler(file_handler)
+
+# ─────────────────────────────────────────────────────────────────
+# Load environment (.env at repo root)
+# ─────────────────────────────────────────────────────────────────
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+# ─────────────────────────��───────────────────────────────────────
+# Lifespan (startup/shutdown)
+# ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler"""
+    # Startup
+    print("Starting VibeLife API v7.0...")
+    await init_db()
+    print("Database connected")
+
+    # Initialize Tool Registry (v6.0)
+    from services.agent import ToolRegistry
+    import services.agent.global_handlers  # noqa: F401
+    ToolRegistry.initialize()
+    print(f"ToolRegistry initialized: {len(ToolRegistry._handlers)} handlers")
+
+    # Initialize Skill Service Registry (v6.8)
+    from services.agent.skill_service_registry import SkillServiceRegistry
+    SkillServiceRegistry.initialize()
+    print(f"SkillServiceRegistry initialized: {len(SkillServiceRegistry._services)} services")
+
+    # Start ingestion worker (if enabled)
+    ingestion_worker = None
+    if os.getenv("VIBELIFE_WORKER_ENABLED", "1") == "1":
+        ingestion_worker = IngestionWorker()
+        await ingestion_worker.start()
+        print("Ingestion worker started")
+
+    yield
+
+    # Shutdown
+    print("Shutting down VibeLife API...")
+
+    if ingestion_worker:
+        await ingestion_worker.stop()
+        print("Ingestion worker stopped")
+
+    await close_db()
+    print("Database closed")
+
+
+# ─────────────────────────────────────────────────────────────────
+# App Creation
+# ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="VibeLife API",
+    description="The Living Companion - AI-powered personal growth platform",
+    version="6.8.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
+
+# ─────────────────────────────────────────────────────────────────
+# CORS Middleware
+# ─────────────────────────────────────────────────────────────────
+
+cors_origins = os.getenv("VIBELIFE_CORS_ORIGINS", "http://localhost:3000").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request Logging Middleware
+# ─────────────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有 HTTP 请求的详细信息"""
+    start_time = time.time()
+
+    client_ip = request.client.host if request.client else "unknown"
+    xff = request.headers.get("x-forwarded-for", "-")
+    x_real_ip = request.headers.get("x-real-ip", "-")
+    cf_ip = request.headers.get("cf-connecting-ip", "-")
+
+    response = await call_next(request)
+
+    process_time = (time.time() - start_time) * 1000
+
+    request_logger.info(
+        f'{client_ip} "{request.method} {request.url.path}" '
+        f'{response.status_code} {process_time:.2f}ms '
+        f'xff="{xff}" xrealip="{x_real_ip}" cf_ip="{cf_ip}" '
+        f'ua="{request.headers.get("user-agent", "-")}"'
+    )
+
+    return response
+
+
+# ─────────────────────────────────────────────────────────────────
+# Routes Import (v6.8 Simplified)
+# ─────────────────────────────────────────────────────────────────
+
+# Core routes (always needed)
+from routes.health import router as health_router
+from routes.chat_v5 import router as chat_v5_router
+from routes.tools import router as tools_router
+
+# v6.8 Unified routes
+from routes.skills import router as skills_router
+from routes.account import router as account_router
+from routes.commerce import router as commerce_router
+
+# Platform routes
+from routes.notifications import router as notifications_router
+
+# VibeID v5.0
+from routes.vibe_id import router as vibe_id_router
+
+# ─────────────────────────────────────────────────────────────────
+# Register Routers (v6.8 Simplified - 7 routers total)
+# ─────────────────────────────────────────────────────────────────
+
+# Health check (no prefix)
+app.include_router(health_router, tags=["Health"])
+
+# Core API
+app.include_router(chat_v5_router, prefix="/api/v1", tags=["Chat"])
+app.include_router(tools_router, prefix="/api/v1", tags=["Tools"])
+
+# v6.8 Unified routes
+app.include_router(skills_router, prefix="/api/v1", tags=["Skills"])
+app.include_router(account_router, prefix="/api/v1", tags=["Account"])
+app.include_router(commerce_router, prefix="/api/v1", tags=["Commerce"])
+
+# Platform routes
+app.include_router(notifications_router, prefix="/api/v1", tags=["Notifications"])
+
+# VibeID v5.0
+app.include_router(vibe_id_router, prefix="/api/v1", tags=["VibeID"])
+
+
+# ─────────────────────────────────────��───────────────────────────
+# Root Endpoint
+# ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    """Root endpoint - return 404 to hide API info"""
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Run with uvicorn (for development)
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("VIBELIFE_API_PORT", 8000))
+    host = os.getenv("VIBELIFE_API_HOST", "0.0.0.0")
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=os.getenv("VIBELIFE_DEV", "0") == "1",
+    )

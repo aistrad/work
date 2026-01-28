@@ -1,0 +1,1251 @@
+     1→from fastapi import FastAPI, HTTPException, Request
+     2→from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+     3→from starlette.middleware.gzip import GZipMiddleware
+     4→from fastapi.middleware.cors import CORSMiddleware
+     5→from fastapi.staticfiles import StaticFiles
+     6→from fastapi.templating import Jinja2Templates
+     7→from pydantic import BaseModel, Field, validator
+     8→from typing import Optional, Dict, Any, Tuple, List
+     9→from uuid import uuid4
+    10→import os
+    11→import urllib.parse
+    12→import json
+    13→import re
+    14→import time
+    15→from datetime import datetime
+    16→
+    17→from common.logging import get_logger
+    18→from services import task_service
+    19→from services.rectification import rectify_birth_time_v2, rectify_birth_time_v2_iter
+    20→from services import rectification_v3
+    21→from user_store import update_fortune_user_rectification_by_name, get_fortune_user_by_name, create_fortune_user
+    22→from services.bazi_engine import calculate_bazi
+    23→from services.bazi_engine import DEFAULT_LOCATION
+    24→from services import prompt_store
+    25→import os as _os
+    26→from integrations import backend_router as be
+    27→from services.conversation_store import append_output, append_prompt, find_user_by_job, save_job_index
+    28→from common.a2ui import validate_a2ui, ValidationError
+    29→import httpx
+    30→from services.task_service import sync_job_gemini_url_to_user
+    31→from services import rectification_store
+    32→from services.tieban import service as tieban_service
+    33→from api.auth_routes import router as auth_router
+    34→from api.deps import get_current_auth
+    35→from api.user_routes import router as user_router
+    36→from api.session_routes import router as session_router
+    37→from api.chat_routes import router as chat_router
+    38→from api.bento_routes import router as bento_router
+    39→from api.dashboard_routes import router as dashboard_router
+    40→from api.bazi_routes import router as bazi_router
+    41→from api.kb_routes import router as kb_router
+    42→from api.plan_routes import router as plan_router
+    43→from api.report_routes import router as report_router
+    44→from api.push_routes import router as push_router
+    45→from api.twin_routes import router as twin_router
+    46→from api.agent_tool import router as agent_tool_router
+    47→from api.social_routes import router as social_router
+    48→from api.jitai_routes import router as jitai_router
+    49→from api.currency_routes import router as currency_router
+    50→from api.goal_routes import router as goal_router
+    51→from api.reflection_routes import router as reflection_router
+    52→from api.yunshi_routes import router as yunshi_router
+    53→from api.poster_routes import router as poster_router
+    54→
+    55→logger = get_logger(__name__)
+    56→
+    57→
+    58→def _patch_anyio_threading_for_tests() -> None:
+    59→    """
+    60→    Work around threadpool hangs in the sandboxed test runtime.
+    61→
+    62→    FastAPI runs sync endpoints via `anyio.to_thread.run_sync()`. In this
+    63→    environment it can deadlock; for tests/stub mode we run sync callables inline.
+    64→    """
+    65→    if os.getenv("STUB_DB") != "1" and not os.getenv("PYTEST_CURRENT_TEST"):
+    66→        return
+    67→
+    68→    try:
+    69→        import anyio.to_thread
+    70→
+    71→        async def _run_sync_inline(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+    72→            kwargs.pop("abandon_on_cancel", None)
+    73→            kwargs.pop("cancellable", None)
+    74→            kwargs.pop("limiter", None)
+    75→            return func(*args, **kwargs)
+    76→
+    77→        anyio.to_thread.run_sync = _run_sync_inline  # type: ignore[assignment]
+    78→    except Exception:
+    79→        return
+    80→
+    81→
+    82→_patch_anyio_threading_for_tests()
+    83→app = FastAPI(title="Fortune AI API")
+    84→app.add_middleware(GZipMiddleware, minimum_size=1024)
+    85→
+    86→# CORS middleware for frontend (port 8231) accessing backend (port 8230)
+    87→app.add_middleware(
+    88→    CORSMiddleware,
+    89→    allow_origins=[
+    90→        "http://106.37.170.238:8231",
+    91→        "http://localhost:8231",
+    92→        "http://127.0.0.1:8231",
+    93→    ],
+    94→    allow_credentials=True,
+    95→    allow_methods=["*"],
+    96→    allow_headers=["*"],
+    97→)
+    98→
+    99→# Strong cache for static files to speed up repeat loads
+   100→@app.middleware("http")
+   101→async def _static_cache_mw(request: Request, call_next):
+   102→    response = await call_next(request)
+   103→    try:
+   104→        path = request.url.path
+   105→        if path.startswith("/static/"):
+   106→            # 1 year immutable cache; files are content-addressed by deploy hash only via manual bumps
+   107→            response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+   108→    except Exception:
+   109→        pass
+   110→    return response
+   111→app.mount("/static", StaticFiles(directory="api/static"), name="static")
+   112→templates = Jinja2Templates(directory="api/templates")
+   113→
+   114→app.include_router(auth_router)
+   115→app.include_router(user_router)
+   116→app.include_router(session_router)
+   117→app.include_router(chat_router)
+   118→app.include_router(bento_router)  # 保持向后兼容
+   119→app.include_router(dashboard_router)  # 新 Dashboard API（Zone B）
+   120→app.include_router(bazi_router)
+   121→app.include_router(kb_router)
+   122→app.include_router(plan_router)
+   123→app.include_router(report_router)
+   124→app.include_router(push_router)
+   125→app.include_router(twin_router)
+   126→app.include_router(agent_tool_router)
+   127→app.include_router(social_router)
+   128→app.include_router(jitai_router)
+   129→app.include_router(currency_router)
+   130→app.include_router(goal_router)
+   131→app.include_router(reflection_router)
+   132→app.include_router(yunshi_router)
+   133→app.include_router(poster_router)
+   134→
+   135→
+   136→class BaziRequest(BaseModel):
+   137→    name: str = Field(..., min_length=1)
+   138→    gender: str = Field(..., min_length=1)
+   139→    year: int
+   140→    month: int
+   141→    day: int
+   142→    hour: int
+   143→    minute: int
+   144→    longitude: Optional[float] = None
+   145→    latitude: Optional[float] = None
+   146→    location_name: Optional[str] = None
+   147→    system_prompt: Optional[str] = None
+   148→
+   149→    @validator("longitude")
+   150→    def longitude_range(cls, v):
+   151→        if v is None:
+   152→            return v
+   153→        if v < -180 or v > 180:
+   154→            raise ValueError("longitude out of range")
+   155→        return v
+   156→
+   157→
+   158→class AskRequest(BaseModel):
+   159→    """Ask on Bazi (sync) request payload (REQ-003)."""
+   160→    name: str = Field(..., min_length=1)
+   161→    gender: str = Field(..., min_length=1)
+   162→    date: str = Field(..., description="YYYY-MM-DD")
+   163→    time: str = Field(..., description="HH:MM[:SS]")
+   164→    tz_offset_hours: Optional[float] = Field(8.0, description="Local time offset from UTC in hours, default +8")
+   165→    longitude: Optional[float] = None
+   166→    latitude: Optional[float] = None
+   167→    location_name: Optional[str] = None
+   168→    question: str = Field("", description="User question text")
+   169→    model: Optional[str] = Field("standard", description="Model hint")
+   170→
+   171→
+   172→class ChatMessage(BaseModel):
+   173→    role: str = Field(..., description="user|assistant")
+   174→    text: str = Field(..., min_length=1)
+   175→
+   176→
+   177→class ChatAskRequest(BaseModel):
+   178→    name: Optional[str] = None
+   179→    session_id: Optional[str] = None
+   180→    system_prompt: Optional[str] = None
+   181→    messages: List[ChatMessage]
+   182→    model: Optional[str] = Field("standard", description="Model hint")
+   183→
+   184→
+   185→def _parse_date_time(date_str: str, time_str: str) -> Tuple[int, int, int, int, int]:
+   186→    """Parse 'YYYY-MM-DD' and 'HH:MM[:SS]' into ints.
+   187→
+   188→    Returns: year, month, day, hour, minute
+   189→    """
+   190→    try:
+   191→        y, m, d = [int(x) for x in date_str.split("-")]
+   192→        parts = time_str.split(":")
+   193→        hh = int(parts[0]); mm = int(parts[1]);
+   194→        return y, m, d, hh, mm
+   195→    except Exception:
+   196→        raise HTTPException(status_code=400, detail="invalid_date_time")
+   197→
+   198→
+   199→def _wuxing_counts(wuxing: Optional[str]) -> Dict[str, int]:
+   200→    counts = {"金": 0, "木": 0, "水": 0, "火": 0, "土": 0}
+   201→    if not wuxing:
+   202→        return counts
+   203→    for ch in counts:
+   204→        counts[ch] = wuxing.count(ch)
+   205→    return counts
+   206→
+   207→
+   208→def _build_chat_prompt(system_prompt: Optional[str], messages: List[ChatMessage]) -> str:
+   209→    lines: List[str] = []
+   210→    if system_prompt and system_prompt.strip():
+   211→        lines.append(system_prompt.strip())
+   212→    lines.append("【对话】")
+   213→    for m in messages:
+   214→        role = "用户" if m.role == "user" else "助手"
+   215→        lines.append(f"{role}: {m.text}")
+   216→    lines.append("助手:")
+   217→    return "\n".join(lines)
+   218→
+   219→
+   220→def _latest_report_summary_for_user(name: str) -> Tuple[Optional[str], Optional[str]]:
+   221→    """Find latest assistant text for a user name from local conversation logs.
+   222→
+   223→    Returns (summary_text, doc_url)
+   224→    """
+   225→    try:
+   226→        from user_store import get_fortune_user_by_name
+   227→    except Exception:
+   228→        return None, None
+   229→    u = get_fortune_user_by_name(name)
+   230→    if not u or u.get("user_id") is None:
+   231→        return None, None
+   232→    uid = int(u["user_id"])  # type: ignore
+   233→    conv_dir = os.path.join("user", str(uid), "conversations")
+   234→    if not os.path.isdir(conv_dir):
+   235→        return None, None
+   236→    latest_path = None
+   237→    latest_mtime = 0.0
+   238→    for fn in os.listdir(conv_dir):
+   239→        if not fn.endswith(".jsonl"):
+   240→            continue
+   241→        p = os.path.join(conv_dir, fn)
+   242→        try:
+   243→            mt = os.path.getmtime(p)
+   244→        except Exception:
+   245→            continue
+   246→        if mt > latest_mtime:
+   247→            latest_mtime = mt
+   248→            latest_path = p
+   249→    if not latest_path:
+   250→        return None, None
+   251→    last_text = None
+   252→    doc_url = None
+   253→    try:
+   254→        with open(latest_path, "r", encoding="utf-8") as f:
+   255→            for line in f:
+   256→                line = line.strip()
+   257→                if not line:
+   258→                    continue
+   259→                try:
+   260→                    rec = json.loads(line)
+   261→                except Exception:
+   262→                    continue
+   263→                if rec.get("role") == "assistant":
+   264→                    last_text = rec.get("content") or last_text
+   265→                    if rec.get("doc_url"):
+   266→                        doc_url = rec.get("doc_url")
+   267→    except Exception:
+   268→        return None, None
+   269→    if not last_text:
+   270→        return None, None
+   271→    # 300–600 字摘要（简单截断作为占位）
+   272→    summary = str(last_text).strip()
+   273→    if len(summary) > 600:
+   274→        summary = summary[:600] + "…"
+   275→    return summary, doc_url
+   276→
+   277→
+   278→class AskRequest(BaseModel):
+   279→    """Ask on Bazi (sync) request payload (REQ-003)."""
+   280→    name: str = Field(..., min_length=1)
+   281→    gender: str = Field(..., min_length=1)
+   282→    date: str = Field(..., description="YYYY-MM-DD")
+   283→    time: str = Field(..., description="HH:MM[:SS]")
+   284→    tz_offset_hours: Optional[float] = Field(8.0, description="Local time offset from UTC in hours, default +8")
+   285→    longitude: Optional[float] = None
+   286→    latitude: Optional[float] = None
+   287→    location_name: Optional[str] = None
+   288→    question: str = Field("", description="User question text")
+   289→    model: Optional[str] = Field("standard", description="Model hint")
+   290→
+   291→
+   292→class RectifyEvent(BaseModel):
+   293→    date: str
+   294→    type: str
+   295→    impact: Optional[str] = None
+   296→
+   297→
+   298→class RectifyRequest(BaseModel):
+   299→    name: str = Field(..., min_length=1)
+   300→    birthday: str = Field(..., description="YYYY-MM-DD")
+   301→    latitude: Optional[float] = None
+   302→    longitude: Optional[float] = None
+   303→    window_start: str = Field(..., description="HH:MM or HH:MM:SS")
+   304→    window_end: str = Field(..., description="HH:MM or HH:MM:SS")
+   305→    events: list[RectifyEvent]
+   306→    tz_offset_hours: Optional[float] = Field(8.0, description="Local time offset from UTC in hours, default +8")
+   307→    debug: Optional[bool] = Field(False, description="Return debug breakdown when true")
+   308→
+   309→
+   310→class SystemPromptSaveRequest(BaseModel):
+   311→    openid: str = Field("web", description="User identifier for prompt history grouping")
+   312→    text: str = Field(..., min_length=1, description="System prompt text")
+   313→    model: Optional[str] = Field("standard", description="Associated model suggestion")
+   314→
+   315→class BaziAskRequest(BaseModel):
+   316→    question: str
+   317→    name: Optional[str] = None
+   318→    gender: Optional[str] = None
+   319→    date: Optional[str] = None
+   320→    time: Optional[str] = None
+   321→    tz_offset_hours: Optional[float] = 8.0
+   322→    location_name: Optional[str] = None
+   323→    longitude: Optional[float] = None
+   324→    latitude: Optional[float] = None
+   325→
+   326→
+   327→class TiebanInitRequest(BaseModel):
+   328→    name: str = Field(..., min_length=1)
+   329→    gender: str = Field(..., min_length=1)
+   330→    date: str = Field(..., description="YYYY-MM-DD")
+   331→    time: str = Field(..., description="HH:MM or HH:MM:SS")
+   332→    tz_offset_hours: Optional[float] = Field(8.0, description="Local time offset from UTC in hours, default +8")
+   333→    location_name: Optional[str] = None
+   334→    longitude: Optional[float] = None
+   335→    latitude: Optional[float] = None
+   336→    known_facts: Optional[Dict[str, Any]] = None
+   337→    ruleset_names: Optional[list[str]] = None
+   338→    debug: Optional[bool] = False
+   339→
+   340→
+   341→class TiebanVerifyRequest(BaseModel):
+   342→    run_id: str
+   343→    answers: Dict[str, Any]
+   344→    state_version: Optional[str] = None
+   345→
+   346→
+   347→class TiebanLockRequest(BaseModel):
+   348→    run_id: str
+   349→    state_version: Optional[str] = None
+   350→
+   351→
+   352→class TiebanSelectRequest(BaseModel):
+   353→    run_id: str
+   354→    candidate_id: str
+   355→    state_version: Optional[str] = None
+   356→
+   357→
+   358→def _persist_rectification_result(req: RectifyRequest, result, lat: float, lon: float) -> None:
+   359→    """Best-effort persistence of rectification results to fortune_user."""
+   360→    user_id: Optional[int] = None
+   361→    used_default_location = (req.latitude is None) or (req.longitude is None)
+   362→    try:
+   363→        user = get_fortune_user_by_name(req.name)
+   364→        if not user:
+   365→            bt_local = result.best_time_local
+   366→            bazi = calculate_bazi(
+   367→                bt_local.year,
+   368→                bt_local.month,
+   369→                bt_local.day,
+   370→                bt_local.hour,
+   371→                bt_local.minute,
+   372→                {"longitude": lon, "latitude": lat, "name": req.name},
+   373→            )
+   374→            base_url = os.getenv("GEMINI_BASE_URL", "https://gemini.local/user")
+   375→            create_fortune_user(
+   376→                name=req.name,
+   377→                birthday=f"{bt_local.year:04d}-{bt_local.month:02d}-{bt_local.day:02d} {bt_local.hour:02d}:{bt_local.minute:02d}:{bt_local.second:02d}",
+   378→                location={"longitude": lon, "latitude": lat, "name": req.name},
+   379→                bazi_digest=f"{bazi.year_pillar}-{bazi.month_pillar}-{bazi.day_pillar}-{bazi.hour_pillar}",
+   380→                gemini_url=f"{base_url}/{os.getenv('ENV','dev')}-{int(result.best_time_utc.timestamp())}",
+   381→                notes="created by rectify",
+   382→            )
+   383→            user = get_fortune_user_by_name(req.name)
+   384→        if user and user.get("user_id") is not None:
+   385→            try:
+   386→                user_id = int(user["user_id"])
+   387→            except Exception:
+   388→                user_id = None
+   389→    except Exception:
+   390→        user_id = None
+   391→
+   392→    # DB persistence (may fail if columns not yet migrated).
+   393→    try:
+   394→        update_fortune_user_rectification_by_name(
+   395→            name=req.name,
+   396→            rectified_time=result.best_time_utc.isoformat(),
+   397→            birth_window={
+   398→                "start": result.window_start_utc.isoformat(),
+   399→                "end": result.window_end_utc.isoformat(),
+   400→                "start_local": result.window_start_local.isoformat(),
+   401→                "end_local": result.window_end_local.isoformat(),
+   402→                "tz_offset_hours": req.tz_offset_hours or 8.0,
+   403→                "step_seconds": 30,
+   404→                "location": {"longitude": lon, "latitude": lat, "used_default": used_default_location},
+   405→            },
+   406→            life_events=[e.dict() for e in req.events],
+   407→        )
+   408→    except Exception as e:
+   409→        logger.warning("rectify persist db failed", extra={"operation": "rectify_persist_db", "error": str(e)[:200]})
+   410→
+   411→    # Local persistence (always attempt) for audit/debug without exposing via API.
+   412→    if user_id is not None:
+   413→        try:
+   414→            req_payload = {
+   415→                "birthday": req.birthday,
+   416→                "tz_offset_hours": req.tz_offset_hours or 8.0,
+   417→                "latitude": lat,
+   418→                "longitude": lon,
+   419→                "used_default_location": used_default_location,
+   420→                "window_start": req.window_start,
+   421→                "window_end": req.window_end,
+   422→                "events": [e.dict() for e in req.events],
+   423→            }
+   424→            result_payload = _rectify_response_payload(result, received_events=req_payload["events"])
+   425→            rec = rectification_store.make_rectification_record(name=req.name, req_payload=req_payload, result_payload=result_payload)
+   426→            rectification_store.save_rectification_run(user_id, rec)
+   427→        except Exception:
+   428→            return
+   429→
+   430→
+   431→def _rectify_response_payload(result, received_events: Optional[list] = None) -> Dict[str, Any]:
+   432→    payload: Dict[str, Any] = {
+   433→        "status": "ok",
+   434→        "best_time": result.best_time_utc.isoformat(),
+   435→        "best_local_time": result.best_time_local.isoformat(),
+   436→        "candidates": [
+   437→            {
+   438→                "time": c.time_utc.isoformat(),
+   439→                "local_time": c.time_local.isoformat(),
+   440→                "score": round(float(c.score), 3),
+   441→                **({"breakdown": c.breakdown} if c.breakdown is not None else {}),
+   442→            }
+   443→            for c in result.candidates
+   444→        ],
+   445→        "window": {
+   446→            "start": result.window_start_utc.isoformat(),
+   447→            "end": result.window_end_utc.isoformat(),
+   448→            "start_local": result.window_start_local.isoformat(),
+   449→            "end_local": result.window_end_local.isoformat(),
+   450→            "location": getattr(result, "window_location", None) or None,
+   451→        },
+   452→        "used_swisseph": result.used_swisseph,
+   453→    }
+   454→    if result.debug is not None:
+   455→        payload["debug"] = result.debug
+   456→    if received_events is not None:
+   457→        payload["received_events"] = received_events
+   458→    return payload
+   459→
+   460→
+   461→@app.on_event("startup")
+   462→def startup():
+   463→    if os.getenv("STUB_DB") == "1":
+   464→        return
+   465→    # 初始化保留给 gemini 后端；cli 后端无需池化
+   466→    if os.getenv("GEMINI_BACKEND", "gemini").lower() != "cli":
+   467→        try:
+   468→            from integrations.gemini_repo import init_connection_pool
+   469→            init_connection_pool()
+   470→        except Exception:
+   471→            pass
+   472→
+   473→
+   474→@app.get("/healthz")
+   475→def healthz():
+   476→    return {"status": "ok"}
+   477→
+   478→
+   479→@app.get("/", include_in_schema=False)
+   480→def root_redirect():
+   481→    # Redirect root to /new frontend
+   482→    return RedirectResponse(url="/new", status_code=307)
+   483→
+   484→
+   485→@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+   486→def page_login(request: Request):
+   487→    # Redirect to new frontend login
+   488→    return RedirectResponse(url="/new/login", status_code=307)
+   489→
+   490→
+   491→@app.get("/register", response_class=HTMLResponse, include_in_schema=False)
+   492→def page_register(request: Request):
+   493→    # Redirect to new frontend register
+   494→    return RedirectResponse(url="/new/register", status_code=307)
+   495→
+   496→
+   497→@app.get("/bazi", response_class=HTMLResponse)
+   498→def page_bazi(request: Request):
+   499→    # 使用新版页面（视觉风格与 /tieban 对齐，复用 tieban.css）
+   500→    return templates.TemplateResponse("bazi.html", {"request": request})
+   501→
+   502→
+   503→@app.get("/tieban", response_class=HTMLResponse)
+   504→def tieban_page(request: Request):
+   505→    asset_version = os.getenv("ASSET_VER") or str(int(time.time() // 3600))
+   506→    return templates.TemplateResponse("tieban.html", {"request": request, "asset_version": asset_version})
+   507→
+   508→@app.get("/bazi2", response_class=HTMLResponse)
+   509→def bazi2_page(request: Request):
+   510→    # 兼容旧链接：跳转到 /new
+   511→    return RedirectResponse(url="/new", status_code=307)
+   512→
+   513→@app.get("/main", response_class=HTMLResponse)
+   514→def bazi_main_page(request: Request):
+   515→    """Legacy /main page - redirect to /new frontend."""
+   516→    # Redirect to new frontend
+   517→    return RedirectResponse(url="/new", status_code=307)
+   518→
+   519→
+   520→@app.get("/zone-b")
+   521→@app.get("/dashboard")
+   522→def page_dashboard():
+   523→    """Zone B Dashboard → 重定向到新前端 /new"""
+   524→    from fastapi.responses import RedirectResponse
+   525→    return RedirectResponse(url="/new", status_code=307)
+   526→
+   527→
+   528→# ------------------------------ Ask on Bazi (sync + SSE) ------------------------------
+   529→
+   530→
+   531→@app.post("/api/bazi/ask")
+   532→def api_bazi_ask(req: AskRequest):
+   533→    """Synchronous Ask endpoint (REQ-003)."""
+   534→    audit_id = str(uuid4())
+   535→    try:
+   536→        y, m, d, hh, mm = _parse_date_time(req.date, req.time)
+   537→        bazi = calculate_bazi(
+   538→            y, m, d, hh, mm,
+   539→            {"longitude": req.longitude or DEFAULT_LOCATION["longitude"],
+   540→             "latitude": req.latitude or DEFAULT_LOCATION["latitude"],
+   541→             "name": req.location_name or DEFAULT_LOCATION.get("name", "")},
+   542→        )
+   543→        counts = _wuxing_counts(bazi.wuxing)
+   544→        report_summary, doc_url = _latest_report_summary_for_user(req.name)
+   545→
+   546→        # Build structured markdown per spec
+   547→        lines = []
+   548→        lines.append("### 结论要点")
+   549→        trend = ", ".join([f"{k}{v}" for k, v in counts.items() if v > 0]) or "暂无"
+   550→        lines.append(f"- 五行倾向：{trend}")
+   551→        lines.append("- 近期关注：事业/健康/情绪（结合个人上下文自检）")
+   552→        lines.append("")
+   553→        lines.append("### 依据与引用")
+   554→        lines.append(f"- 四柱：{bazi.year_pillar}・{bazi.month_pillar}・{bazi.day_pillar}・{bazi.hour_pillar}")
+   555→        lines.append(f"- 五行：{bazi.wuxing or '未知'}")
+   556→        if report_summary:
+   557→            lines.append("- 历史报告摘要：")
+   558→            lines.append(report_summary)
+   559→        else:
+   560→            lines.append("- 历史报告：未找到，已仅基于八字作答")
+   561→        lines.append("")
+   562→        lines.append("### 不确定性与下一步")
+   563→        lines.append("- 若存在校准结果，请补充校准时间以提升准确度。")
+   564→        lines.append("- 可提供近三年关键事件以获得更个性化建议。")
+   565→
+   566→        answer_md = "\n".join(lines)
+   567→
+   568→        # Best-effort: append conversation snapshot to local logs
+   569→        try:
+   570→            u = get_fortune_user_by_name(req.name)
+   571→            user_id = int(u.get("user_id")) if u and u.get("user_id") is not None else None
+   572→        except Exception:
+   573→            user_id = None
+   574→        try:
+   575→            if user_id is not None:
+   576→                session_id = int(time.time())
+   577→                if req.question:
+   578→                    append_prompt(user_id, session_id, req.question, req.model or "standard")
+   579→                append_output(user_id, session_id, answer_md, url=doc_url)
+   580→        except Exception:
+   581→            pass
+   582→
+   583→        return {
+   584→            "status": "ok",
+   585→            "answer_md": answer_md,
+   586→            "used_context": {
+   587→                "bazi_used": {
+   588→                    "year_pillar": bazi.year_pillar,
+   589→                    "month_pillar": bazi.month_pillar,
+   590→                    "day_pillar": bazi.day_pillar,
+   591→                    "hour_pillar": bazi.hour_pillar,
+   592→                    "wuxing": bazi.wuxing,
+   593→                    "counts": counts,
+   594→                },
+   595→                "report_used": bool(report_summary),
+   596→                "doc_url": doc_url,
+   597→            },
+   598→            "audit_id": audit_id,
+   599→        }
+   600→    except HTTPException:
+   601→        raise
+   602→    except Exception as e:
+   603→        logger.error("ask sync failed", extra={"operation": "bazi_ask_sync", "error": str(e), "audit_id": audit_id})
+   604→        raise HTTPException(status_code=500, detail="ask_failed")
+   605→
+   606→
+   607→@app.get("/api/bazi/ask/stream")
+   608→def api_bazi_ask_stream(
+   609→    name: str,
+   610→    gender: str,
+   611→    date: str,
+   612→    time: str,
+   613→    tz_offset_hours: float = 8.0,
+   614→    longitude: Optional[float] = None,
+   615→    latitude: Optional[float] = None,
+   616→    location_name: Optional[str] = None,
+   617→    question: str = "",
+   618→    model: str = "standard",
+   619→):
+   620→    audit_id = str(uuid4())
+   621→
+   622→    def _sse(obj: Dict[str, Any]) -> bytes:
+   623→        return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
+   624→
+   625→    def _gen():
+   626→        try:
+   627→            y, m, d, hh, mm = _parse_date_time(date, time)
+   628→            bazi = calculate_bazi(
+   629→                y, m, d, hh, mm,
+   630→                {"longitude": longitude or DEFAULT_LOCATION["longitude"],
+   631→                 "latitude": latitude or DEFAULT_LOCATION["latitude"],
+   632→                 "name": location_name or DEFAULT_LOCATION.get("name", "")},
+   633→            )
+   634→            counts = _wuxing_counts(bazi.wuxing)
+   635→            report_summary, _doc_url = _latest_report_summary_for_user(name)
+   636→
+   637→            chunks = [
+   638→                {"type": "chunk", "text": "### 结论要点\n"},
+   639→                {"type": "chunk", "text": f"- 五行倾向：{', '.join([f'{k}{v}' for k,v in counts.items() if v>0]) or '暂无'}\n"},
+   640→                {"type": "chunk", "text": "\n### 依据与引用\n"},
+   641→                {"type": "chunk", "text": f"- 四柱：{bazi.year_pillar}・{bazi.month_pillar}・{bazi.day_pillar}・{bazi.hour_pillar}\n"},
+   642→                {"type": "chunk", "text": f"- 五行：{bazi.wuxing or '未知'}\n"},
+   643→            ]
+   644→            if report_summary:
+   645→                chunks.append({"type": "chunk", "text": "- 历史报告摘要：\n" + report_summary + "\n"})
+   646→            else:
+   647→                chunks.append({"type": "chunk", "text": "- 历史报告：未找到，已仅基于八字作答\n"})
+   648→            chunks.extend([
+   649→                {"type": "chunk", "text": "\n### 不确定性与下一步\n"},
+   650→                {"type": "chunk", "text": "- 若存在校准结果，请补充校准时间以提升准确度。\n"},
+   651→                {"type": "chunk", "text": "- 可提供近三年关键事件以获得更个性化建议。\n"},
+   652→            ])
+   653→
+   654→            for c in chunks:
+   655→                yield _sse({**c, "audit_id": audit_id})
+   656→                time.sleep(0.05)
+   657→
+   658→            yield _sse({
+   659→                "type": "done",
+   660→                "audit_id": audit_id,
+   661→            })
+   662→        except Exception as e:
+   663→            logger.error("ask stream failed", extra={"operation": "bazi_ask_stream", "error": str(e), "audit_id": audit_id})
+   664→            yield _sse({"type": "error", "detail": "ask_failed", "audit_id": audit_id})
+   665→
+   666→    return StreamingResponse(
+   667→        _gen(),
+   668→        media_type="text/event-stream",
+   669→        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+   670→    )
+   671→
+   672→
+   673→@app.get("/h5/a2ui", response_class=HTMLResponse)
+   674→def h5_a2ui(request: Request):
+   675→    # Legacy page - redirect to new frontend
+   676→    return RedirectResponse(url="/new", status_code=307)
+   677→
+   678→
+   679→@app.get("/fortune", response_class=HTMLResponse)
+   680→def fortune(request: Request):
+   681→    """Legacy page - redirect to new frontend."""
+   682→    return RedirectResponse(url="/new", status_code=307)
+   683→
+   684→
+   685→@app.get("/api/system-prompts")
+   686→def api_system_prompts(openid: str = "web"):
+   687→    # Legacy API - disabled for security
+   688→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+   689→
+   690→
+   691→@app.post("/api/system-prompts")
+   692→def api_save_system_prompt(req: SystemPromptSaveRequest):
+   693→    # Legacy API - disabled for security
+   694→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+   695→
+   696→
+   697→@app.post("/api/tieban/init")
+   698→def api_tieban_init(req: TiebanInitRequest):
+   699→    try:
+   700→        payload = req.dict()
+   701→        result = tieban_service.init_tieban(payload)
+   702→        return result
+   703→    except Exception as e:
+   704→        logger.error("tieban init failed", extra={"operation": "tieban_init", "error": str(e)[:200]})
+   705→        raise HTTPException(status_code=500, detail="tieban_init_error")
+   706→
+   707→
+   708→@app.post("/api/tieban/verify")
+   709→def api_tieban_verify(req: TiebanVerifyRequest):
+   710→    try:
+   711→        result = tieban_service.verify_tieban(req.run_id, req.answers, req.state_version)
+   712→        return result
+   713→    except Exception as e:
+   714→        if str(e) == "state_version_conflict":
+   715→            raise HTTPException(status_code=409, detail="state_version_conflict")
+   716→        logger.error("tieban verify failed", extra={"operation": "tieban_verify", "error": str(e)[:200]})
+   717→        raise HTTPException(status_code=500, detail="tieban_verify_error")
+   718→
+   719→
+   720→@app.post("/api/tieban/select")
+   721→def api_tieban_select(req: TiebanSelectRequest):
+   722→    try:
+   723→        result = tieban_service.select_tieban(req.run_id, req.candidate_id, req.state_version)
+   724→        return result
+   725→    except Exception as e:
+   726→        if str(e) == "state_version_conflict":
+   727→            raise HTTPException(status_code=409, detail="state_version_conflict")
+   728→        if str(e) in ("missing_required_facts", "required_fact_not_matched", "candidate_not_found"):
+   729→            raise HTTPException(status_code=400, detail=str(e))
+   730→        logger.error("tieban select failed", extra={"operation": "tieban_select", "error": str(e)[:200]})
+   731→        raise HTTPException(status_code=500, detail="tieban_select_error")
+   732→
+   733→
+   734→@app.post("/api/tieban/lock")
+   735→def api_tieban_lock(req: TiebanLockRequest):
+   736→    try:
+   737→        result = tieban_service.lock_tieban(req.run_id, req.state_version)
+   738→        return result
+   739→    except Exception as e:
+   740→        if str(e) == "state_version_conflict":
+   741→            raise HTTPException(status_code=409, detail="state_version_conflict")
+   742→        if str(e) == "deprecated_use_select":
+   743→            raise HTTPException(status_code=400, detail="deprecated_use_select")
+   744→        logger.error("tieban lock failed", extra={"operation": "tieban_lock", "error": str(e)[:200]})
+   745→        raise HTTPException(status_code=500, detail="tieban_lock_error")
+   746→
+   747→
+   748→@app.get("/api/tieban/report")
+   749→def api_tieban_report(run_id: str):
+   750→    try:
+   751→        return tieban_service.get_report(run_id)
+   752→    except Exception as e:
+   753→        logger.error("tieban report failed", extra={"operation": "tieban_report", "error": str(e)[:200]})
+   754→        raise HTTPException(status_code=404, detail="tieban_report_error")
+   755→
+   756→
+   757→@app.post("/api/calculate")
+   758→def create_report(req: BaziRequest, backend: str | None = None):
+   759→    # Legacy API - deprecated, use authenticated /api/chat endpoints instead
+   760→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+   761→    correlation_id = str(uuid4())
+   762→    try:
+   763→        # 先计算八字命盘并即时返回；后台另起 v2 任务走“standard”模型
+   764→        base = req.dict()
+   765→        from time import time as _now
+   766→        job_id, user_id, used_default, bazi = task_service.submit_bazi_task_v2(
+   767→            {
+   768→                "openid": "web",
+   769→                "src": "web",
+   770→                "model": "standard",
+   771→                **base,
+   772→            },
+   773→            correlation_id=correlation_id,
+   774→            backend_hint=backend,
+   775→            force_nonce=str(int(_now())),
+   776→        )
+   777→        try:
+   778→            if req.system_prompt:
+   779→                prompt_store.append_for_openid("web", req.system_prompt, "standard")
+   780→        except Exception:
+   781→            pass
+   782→        return {
+   783→            "job_id": job_id,
+   784→            "user_id": user_id,
+   785→            "status": "processing",
+   786→            "used_default_location": used_default,
+   787→            "default_location": DEFAULT_LOCATION if used_default else None,
+   788→            "bazi": {
+   789→                "year_pillar": bazi.year_pillar,
+   790→                "month_pillar": bazi.month_pillar,
+   791→                "day_pillar": bazi.day_pillar,
+   792→                "hour_pillar": bazi.hour_pillar,
+   793→                "wuxing": bazi.wuxing,
+   794→                "location": bazi.location,
+   795→            },
+   796→        }
+   797→    except ValueError as ve:
+   798→        logger.warning("validation failed", extra={"operation": "api_calculate", "error": str(ve), "correlation_id": correlation_id})
+   799→        raise HTTPException(status_code=400, detail=str(ve))
+   800→    except Exception as e:
+   801→        msg = str(e)
+   802→        logger.error("calculate failed", extra={"operation": "api_calculate", "error": msg, "correlation_id": correlation_id})
+   803→        if msg in ("empty_prompt", "no_tasks", "no_tasks_built"):
+   804→            raise HTTPException(status_code=400, detail=msg)
+   805→        raise HTTPException(status_code=500, detail="internal_error")
+   806→
+   807→
+   808→@app.get("/api/report/{job_id}")
+   809→def get_report(job_id: int, backend: str | None = None):
+   810→    # Legacy API - deprecated, use authenticated /api/chat endpoints instead
+   811→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+   812→    tasks = be.get_tasks_by_job_id(job_id, backend=backend)
+   813→    if not tasks:
+   814→        return {"status": "error", "message": "no_tasks"}
+   815→
+   816→    main_task = tasks[0]
+   817→    status_val = main_task.get("status", 0)
+   818→    if status_val < 99:
+   819→        return {"status": "processing", "progress": status_val}
+   820→    if not main_task.get("output_text") and not main_task.get("output_url"):
+   821→        # For CLI backend, try expose the first inline file as a download link
+   822→        if (backend or os.getenv("GEMINI_BACKEND", "gemini")).strip().lower() == "cli":
+   823→            try:
+   824→                from integrations.cli_worker_repo import list_output_files_by_job_id
+   825→                files = list_output_files_by_job_id(job_id)
+   826→                if files:
+   827→                    # choose the first file; if it has content, we can stream it via /api/files
+   828→                    dl = f"/api/files/{job_id}?backend=cli"
+   829→                    return {"status": "completed", "content": None, "doc_url": dl}
+   830→            except Exception:
+   831→                pass
+   832→        return {"status": "error", "message": "task_missing_output"}
+   833→
+   834→    content = main_task.get("output_text")
+   835→    doc_url = main_task.get("output_url")
+   836→    # persist conversation output if user is known
+   837→    try:
+   838→        uid = find_user_by_job(job_id)
+   839→        if uid is not None and (content or doc_url):
+   840→            append_output(uid, job_id, content or "", doc_url)
+   841→    except Exception:
+   842→        pass
+   843→
+   844→    # best-effort: sync gemini_url to fortune_user when job is done
+   845→    try:
+   846→        sync_job_gemini_url_to_user(job_id)
+   847→    except Exception:
+   848→        pass
+   849→
+   850→    return {
+   851→        "status": "completed",
+   852→        "content": content,
+   853→        "doc_url": doc_url,
+   854→    }
+   855→
+   856→
+   857→@app.post("/api/rectify")
+   858→def api_rectify(req: RectifyRequest):
+   859→    try:
+   860→        # 对于未提供经纬度的情况，使用默认北京经纬度（与八字计算一致）
+   861→        lat = req.latitude if req.latitude is not None else DEFAULT_LOCATION["latitude"]
+   862→        lon = req.longitude if req.longitude is not None else DEFAULT_LOCATION["longitude"]
+   863→        result = rectify_birth_time_v2(
+   864→            name=req.name,
+   865→            birthday=req.birthday,
+   866→            lat=lat,
+   867→            lon=lon,
+   868→            window_start_hms=req.window_start,
+   869→            window_end_hms=req.window_end,
+   870→            events_raw=[e.dict() for e in req.events],
+   871→            tz_offset_hours=req.tz_offset_hours or 8.0,
+   872→            step_seconds=30,
+   873→            debug=bool(req.debug),
+   874→        )
+   875→        _persist_rectification_result(req, result, lat=lat, lon=lon)
+   876→        return _rectify_response_payload(result, received_events=[e.dict() for e in req.events])
+   877→    except Exception as e:
+   878→        logger.error("rectify failed", extra={"operation": "api_rectify", "error": str(e)})
+   879→        raise HTTPException(status_code=400, detail="rectify_failed")
+   880→
+   881→
+   882→@app.post("/api/rectify/stream")
+   883→def api_rectify_stream(req: RectifyRequest):
+   884→    lat = req.latitude if req.latitude is not None else DEFAULT_LOCATION["latitude"]
+   885→    lon = req.longitude if req.longitude is not None else DEFAULT_LOCATION["longitude"]
+   886→    correlation_id = str(uuid4())
+   887→
+   888→    def _sse(obj: Dict[str, Any]) -> bytes:
+   889→        return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
+   890→
+   891→    def _gen():
+   892→        try:
+   893→            received_events = [e.dict() for e in req.events]
+   894→            for msg in rectify_birth_time_v2_iter(
+   895→                name=req.name,
+   896→                birthday=req.birthday,
+   897→                lat=lat,
+   898→                lon=lon,
+   899→                window_start_hms=req.window_start,
+   900→                window_end_hms=req.window_end,
+   901→                events_raw=[e.dict() for e in req.events],
+   902→                tz_offset_hours=req.tz_offset_hours or 8.0,
+   903→                step_seconds=30,
+   904→                debug=bool(req.debug),
+   905→            ):
+   906→                if msg.get("type") == "result":
+   907→                    result = msg["result"]
+   908→                    _persist_rectification_result(req, result, lat=lat, lon=lon)
+   909→                    yield _sse({"type": "done", **_rectify_response_payload(result, received_events=received_events)})
+   910→                else:
+   911→                    out = dict(msg)
+   912→                    out.setdefault("correlation_id", correlation_id)
+   913→                    yield _sse(out)
+   914→        except Exception as e:
+   915→            logger.error(
+   916→                "rectify stream failed",
+   917→                extra={"operation": "api_rectify_stream", "error": str(e), "correlation_id": correlation_id},
+   918→            )
+   919→            yield _sse({"type": "error", "detail": "rectify_failed", "correlation_id": correlation_id})
+   920→
+   921→    return StreamingResponse(
+   922→        _gen(),
+   923→        media_type="text/event-stream",
+   924→        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+   925→    )
+   926→
+   927→
+   928→# ------------------------------ v3 (interval + fuzzy distribution) ------------------------------
+   929→
+   930→
+   931→@app.post("/api/rectify/v3")
+   932→def api_rectify_v3(req: RectifyRequest):
+   933→    try:
+   934→        lat = req.latitude if req.latitude is not None else DEFAULT_LOCATION["latitude"]
+   935→        lon = req.longitude if req.longitude is not None else DEFAULT_LOCATION["longitude"]
+   936→        result = rectification_v3.rectify_birth_time_v3(
+   937→            name=req.name,
+   938→            birthday=req.birthday,
+   939→            lat=lat,
+   940→            lon=lon,
+   941→            window_start_hms=req.window_start,
+   942→            window_end_hms=req.window_end,
+   943→            events_raw=[e.dict() for e in req.events],
+   944→            tz_offset_hours=req.tz_offset_hours or 8.0,
+   945→            step_seconds=30,
+   946→        )
+   947→        _persist_rectification_result(req, result, lat=lat, lon=lon)
+   948→        result["received_events"] = [e.dict() for e in req.events]
+   949→        return result
+   950→    except Exception as e:
+   951→        logger.error("rectify v3 failed", extra={"operation": "api_rectify_v3", "error": str(e)})
+   952→        raise HTTPException(status_code=400, detail="rectify_failed")
+   953→
+   954→
+   955→@app.post("/api/rectify/v3/stream")
+   956→def api_rectify_v3_stream(req: RectifyRequest):
+   957→    lat = req.latitude if req.latitude is not None else DEFAULT_LOCATION["latitude"]
+   958→    lon = req.longitude if req.longitude is not None else DEFAULT_LOCATION["longitude"]
+   959→    correlation_id = str(uuid4())
+   960→
+   961→    def _sse(obj: Dict[str, Any]) -> bytes:
+   962→        return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
+   963→
+   964→    def _gen():
+   965→        try:
+   966→            received_events = [e.dict() for e in req.events]
+   967→            for msg in rectification_v3.rectify_birth_time_v3_iter(
+   968→                name=req.name,
+   969→                birthday=req.birthday,
+   970→                lat=lat,
+   971→                lon=lon,
+   972→                window_start_hms=req.window_start,
+   973→                window_end_hms=req.window_end,
+   974→                events_raw=received_events,
+   975→                tz_offset_hours=req.tz_offset_hours or 8.0,
+   976→                step_seconds=30,
+   977→            ):
+   978→                if msg.get("type") == "result":
+   979→                    res = msg["result"]
+   980→                    res["received_events"] = received_events
+   981→                    _persist_rectification_result(req, res, lat=lat, lon=lon)
+   982→                    yield _sse({"type": "done", **res})
+   983→                else:
+   984→                    out = dict(msg)
+   985→                    out.setdefault("correlation_id", correlation_id)
+   986→                    yield _sse(out)
+   987→        except Exception as e:
+   988→            logger.error(
+   989→                "rectify v3 stream failed",
+   990→                extra={"operation": "api_rectify_v3_stream", "error": str(e), "correlation_id": correlation_id},
+   991→            )
+   992→            yield _sse({"type": "error", "detail": "rectify_failed", "correlation_id": correlation_id})
+   993→
+   994→    return StreamingResponse(
+   995→        _gen(),
+   996→        media_type="text/event-stream",
+   997→        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+   998→    )
+   999→
+  1000→
+  1001→# ------------------------------
+  1002→# v2 API per docs/design v2.md
+  1003→# ------------------------------
+  1004→
+  1005→class V2SubmitBirthData(BaseModel):
+  1006→    name: str
+  1007→    gender: str
+  1008→    year: int
+  1009→    month: int
+  1010→    day: int
+  1011→    hour: int
+  1012→    minute: int
+  1013→    longitude: Optional[float] = None
+  1014→    latitude: Optional[float] = None
+  1015→    location_name: Optional[str] = None
+  1016→
+  1017→
+  1018→class V2SubmitRequest(BaseModel):
+  1019→    openid: str = Field(..., min_length=3)
+  1020→    src: str = Field("wechat", description="来源渠道")
+  1021→    model: str = Field("standard", description="Gemini 模型：standard | deep_research")
+  1022→    system_prompt: Optional[str] = Field(None, description="可选 system prompt，拼接在八字前作为提示")
+  1023→    birth_data: V2SubmitBirthData
+  1024→
+  1025→
+  1026→@app.post("/api/v2/submit")
+  1027→def v2_submit(req: V2SubmitRequest, backend: str | None = None):
+  1028→    # Legacy v2 API - deprecated, use authenticated /api/chat endpoints instead
+  1029→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+  1030→    correlation_id = str(uuid4())
+  1031→    try:
+  1032→        if os.getenv("DEMO_MODE") == "1":
+  1033→            # 极简演示：不依赖 DB，直接返回一个模拟 job_id
+  1034→            return {
+  1035→                "job_id": 101,
+  1036→                "user_id": 1,
+  1037→                "status": "processing",
+  1038→                "eta_seconds": 2,
+  1039→                "used_default_location": False,
+  1040→                "default_location": None,
+  1041→            }
+  1042→        # 为降低 CLI 后端的幂等去重概率，这里在 v2 提交强制注入一次性 nonce
+  1043→        from time import time as _now
+  1044→        job_id, user_id, used_default, bazi = task_service.submit_bazi_task_v2(
+  1045→            {
+  1046→                "openid": req.openid,
+  1047→                "src": req.src,
+  1048→                "model": req.model,
+  1049→                "system_prompt": req.system_prompt,
+  1050→                **req.birth_data.dict(),
+  1051→            },
+  1052→            correlation_id=correlation_id,
+  1053→            backend_hint=backend,
+  1054→            force_nonce=str(int(_now())),
+  1055→        )
+  1056→        # 记录 prompt 历史（本地 user/prompts/openid_xxx/prompts.json），不写 gemini 表
+  1057→        try:
+  1058→            if req.system_prompt:
+  1059→                prompt_store.append_for_openid(req.openid, req.system_prompt, req.model)
+  1060→        except Exception as _:
+  1061→            pass
+  1062→        return {
+  1063→            "job_id": job_id,
+  1064→            "user_id": user_id,
+  1065→            "status": "processing",
+  1066→            "eta_seconds": 120,
+  1067→            "used_default_location": used_default,
+  1068→            "default_location": DEFAULT_LOCATION if used_default else None,
+  1069→            "bazi": {
+  1070→                "year_pillar": bazi.year_pillar,
+  1071→                "month_pillar": bazi.month_pillar,
+  1072→                "day_pillar": bazi.day_pillar,
+  1073→                "hour_pillar": bazi.hour_pillar,
+  1074→                "wuxing": bazi.wuxing,
+  1075→                "location": bazi.location,
+  1076→            },
+  1077→        }
+  1078→    except ValueError as ve:
+  1079→        logger.warning("v2 submit validation failed", extra={"operation": "api_v2_submit", "error": str(ve), "correlation_id": correlation_id})
+  1080→        raise HTTPException(status_code=400, detail=str(ve))
+  1081→    except Exception as e:
+  1082→        msg = str(e)
+  1083→        logger.error("v2 submit failed", extra={"operation": "api_v2_submit", "error": msg, "correlation_id": correlation_id})
+  1084→        if msg in ("empty_prompt", "no_tasks", "no_tasks_built"):
+  1085→            raise HTTPException(status_code=400, detail=msg)
+  1086→        raise HTTPException(status_code=500, detail="internal_error")
+  1087→
+  1088→
+  1089→@app.get("/api/v2/report/{job_id}")
+  1090→def v2_report(job_id: int, backend: str | None = None) -> Dict[str, Any]:
+  1091→    # Legacy v2 API - deprecated, use authenticated /api/chat endpoints instead
+  1092→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+  1093→    if os.getenv("DEMO_MODE") == "1":
+  1094→        # 极简演示：不再返回写库示例，仅提示处理中
+  1095→        return {"status": "processing", "progress": 0}
+  1096→
+  1097→    tasks = be.get_tasks_by_job_id(job_id, backend=backend)
+  1098→    if not tasks:
+  1099→        return {"status": "error", "message": "no_tasks"}
+  1100→
+  1101→    main_task = tasks[0]
+  1102→    status_val = int(main_task.get("status", 0) or 0)
+  1103→    if status_val < 10:
+  1104→        return {"status": "processing", "progress": status_val}
+  1105→
+  1106→    output_text = main_task.get("output_text")
+  1107→    output_url = main_task.get("output_url")
+  1108→    if not output_text:
+  1109→        # 兼容仅有文档链接（output_url）而无内嵌文本的情况
+  1110→        if output_url:
+  1111→            # best-effort: persist conversation output (url only)
+  1112→            try:
+  1113→                uid = find_user_by_job(job_id)
+  1114→                if uid is not None:
+  1115→                    append_output(uid, job_id, "", output_url)
+  1116→            except Exception:
+  1117→                pass
+  1118→            # best-effort: sync gemini_url when job is done
+  1119→            try:
+  1120→                sync_job_gemini_url_to_user(job_id)
+  1121→            except Exception:
+  1122→                pass
+  1123→            # 返回可阅读的占位 A2UI（Markdown 组件 + 下载链接）
+  1124→            md = f"报告已生成，但未返回内嵌文本。请点击下载文档：\n\n[下载报告]({output_url})"
+  1125→            return {"status": "completed", "a2ui_data": {"meta": {"summary": "报告已生成（文档链接）"}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": md}]}}
+  1126→        return {"status": "error", "message": "task_missing_output"}
+  1127→
+  1128→    try:
+  1129→        import json
+  1130→
+  1131→        a2ui = json.loads(output_text)
+  1132→        validate_a2ui(a2ui)
+  1133→        # persist conversation output for v2 as well
+  1134→        try:
+  1135→            uid = find_user_by_job(job_id)
+  1136→            if uid is not None:
+  1137→                append_output(uid, job_id, output_text)
+  1138→        except Exception:
+  1139→            pass
+  1140→        # best-effort: sync gemini_url to fortune_user when job is done or parsable
+  1141→        try:
+  1142→            sync_job_gemini_url_to_user(job_id)
+  1143→        except Exception:
+  1144→            pass
+  1145→        return {"status": "completed", "a2ui_data": a2ui}
+  1146→    except ValidationError as ve:
+  1147→        # 若为合法 JSON 但不符合 A2UI，按 Markdown 文本回退
+  1148→        return {"status": "completed", "a2ui_data": {"meta": {"summary": "模型返回非规范 A2UI，已按 Markdown 展示"}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": output_text}]}}
+  1149→    except Exception:
+  1150→        # 非 JSON：按 Markdown 文本回退
+  1151→        return {"status": "completed", "a2ui_data": {"meta": {"summary": output_text[:60]}, "ui_components": [{"type": "markdown_text", "title": "模型输出", "data": output_text}]}}
+  1152→
+  1153→
+  1154→# ------------------------------
+  1155→# Files API (CLI backend output streaming)
+  1156→# ------------------------------
+  1157→
+  1158→
+  1159→@app.get("/api/files/{job_id}")
+  1160→def api_files(job_id: int, backend: str | None = None, filename: str | None = None):
+  1161→    # Legacy API - disabled for security, use authenticated endpoints
+  1162→    raise HTTPException(status_code=410, detail="deprecated_use_new_api")
+  1163→    b = (backend or os.getenv("GEMINI_BACKEND", "gemini")).strip().lower()
+  1164→    if b != "cli":
+  1165→        raise HTTPException(status_code=400, detail="files_only_available_for_cli")
+  1166→    try:
+  1167→        from integrations.cli_worker_repo import fetch_output_file_content, list_output_files_by_job_id
+  1168→        fname, content = fetch_output_file_content(job_id, filename)
+  1169→        if content is None:
+  1170→            # return a lightweight index for UX when nothing inline
+  1171→            files = list_output_files_by_job_id(job_id)
+  1172→            return {"files": files}
+  1173→        media = "text/plain"
+  1174→        # simple heuristic: .md/.txt → text/plain; otherwise octet-stream
+  1175→        if fname and (str(fname).endswith(".md") or str(fname).endswith(".txt")):
+  1176→            media = "text/plain; charset=utf-8"
+  1177→        headers = {"Content-Disposition": f"inline; filename={fname or 'output.txt'}"}
+  1178→        return StreamingResponse(iter([content]), media_type=media, headers=headers)
+  1179→    except HTTPException:
+  1180→        raise
+  1181→    except Exception as e:
+  1182→        logger.error("files endpoint failed", extra={"operation": "api_files", "error": str(e)[:200]})
+  1183→        raise HTTPException(status_code=500, detail="files_error")
+  1184→
+  1185→
+  1186→# ------------------------------
+  1187→# WeCom OAuth (Tencent Cloud friendly)
+  1188→# ------------------------------
+  1189→
+  1190→
+  1191→@app.get("/qy/oauth/redirect")
+  1192→def qy_oauth_redirect():
+  1193→    corp_id = os.getenv("QY_CORP_ID")
+  1194→    agent_id = os.getenv("QY_AGENT_ID")
+  1195→    redirect_uri = os.getenv("QY_REDIRECT_URI")
+  1196→    if not (corp_id and agent_id and redirect_uri):
+  1197→        raise HTTPException(status_code=500, detail="missing_qy_env")
+  1198→    auth_url = (
+  1199→        "https://open.weixin.qq.com/connect/oauth2/authorize?"
+  1200→        + urllib.parse.urlencode(
+  1201→            {
+  1202→                "appid": corp_id,
+  1203→                "redirect_uri": redirect_uri,
+  1204→                "response_type": "code",
+  1205→                "scope": "snsapi_base",
+  1206→                "state": "a2ui",
+  1207→                "agentid": agent_id,
+  1208→            }
+  1209→        )
+  1210→        + "#wechat_redirect"
+  1211→    )
+  1212→    return {"auth_url": auth_url}
+  1213→
+  1214→
+  1215→@app.get("/qy/oauth/callback")
+  1216→def qy_oauth_callback(code: str, request: Request):
+  1217→    corp_id = os.getenv("QY_CORP_ID")
+  1218→    corp_secret = os.getenv("QY_CORP_SECRET")
+  1219→    if not (corp_id and corp_secret):
+  1220→        raise HTTPException(status_code=500, detail="missing_qy_env")
+  1221→
+  1222→    # 1) get access token
+  1223→    token_url = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+  1224→    user_url = "https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo"
+  1225→    with httpx.Client(timeout=10.0) as client:
+  1226→        r1 = client.get(token_url, params={"corpid": corp_id, "corpsecret": corp_secret})
+  1227→        r1.raise_for_status()
+  1228→        tok = r1.json()
+  1229→        access_token = tok.get("access_token")
+  1230→        if not access_token:
+  1231→            raise HTTPException(status_code=502, detail="qy_token_error")
+  1232→        r2 = client.get(user_url, params={"access_token": access_token, "code": code})
+  1233→        r2.raise_for_status()
+  1234→        info = r2.json()
+  1235→
+  1236→    userid = info.get("UserId") or info.get("userid") or info.get("external_userid")
+  1237→    if not userid:
+  1238→        raise HTTPException(status_code=400, detail="qy_no_user")
+  1239→
+  1240→    # Put userid in query and bounce to H5
+  1241→    h5_path = os.getenv("QY_H5_PATH", "/h5/a2ui")
+  1242→    target = f"{h5_path}?userid={urllib.parse.quote(userid)}"
+  1243→    return templates.TemplateResponse(
+  1244→        "redirect.html",
+  1245→        {"request": request, "target": target},
+  1246→    )
+  1247→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

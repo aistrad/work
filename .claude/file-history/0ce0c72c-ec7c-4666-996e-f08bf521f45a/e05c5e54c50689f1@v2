@@ -1,0 +1,635 @@
+"""
+TriggerEvaluator - Static-first + LLM Fallback Trigger Evaluation
+
+Design Principles:
+1. Static conditions (exists/==/!=/>/< etc.) evaluated by platform directly
+2. Complex conditions (no data_path, natural language) fall back to LLM
+3. Cron matching + timezone handling + idempotent key
+
+Benefits:
+- Lower latency and cost
+- Lower LLM misjudgment risk
+- Maintains config-driven flexibility
+"""
+
+from typing import Dict, Any, Tuple, Optional, List
+from datetime import datetime, date, timedelta
+import logging
+import json
+import re
+import os
+
+import croniter
+import pytz
+
+logger = logging.getLogger(__name__)
+
+# Operators that can be evaluated statically (no LLM needed)
+STATIC_OPERATORS = {"exists", "!exists", "==", "!=", ">", "<", ">=", "<=", "contains"}
+
+
+class TriggerEvaluator:
+    """Static-first + LLM fallback trigger evaluator"""
+
+    def __init__(self, llm_service=None):
+        """
+        Initialize evaluator.
+
+        Args:
+            llm_service: Optional LLM service for complex condition evaluation
+        """
+        self.llm_service = llm_service
+        if self.llm_service is None:
+            try:
+                from services.llm import get_llm_client
+                self.llm_service = get_llm_client()
+            except Exception as e:
+                logger.warning(f"Failed to initialize LLM client: {e}")
+                self.llm_service = None
+
+    async def evaluate(
+        self,
+        trigger_config: Dict[str, Any],
+        profile: Dict[str, Any],
+        conditions: Optional[List[Dict]] = None,
+        user_timezone: str = "Asia/Shanghai",
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Evaluate trigger conditions.
+
+        Args:
+            trigger_config: Trigger configuration from reminders.yaml
+            profile: User profile data
+            conditions: Optional list of conditions to evaluate
+            user_timezone: User's timezone string
+
+        Returns:
+            Tuple of (triggered: bool, event_info: Optional[Dict], idempotent_key: Optional[str])
+        """
+        trigger_type = trigger_config.get("type")
+
+        # 1. Time-based trigger: deterministic cron matching
+        if trigger_type == "time_based":
+            matched, bucket_key = self._evaluate_cron(
+                trigger_config.get("schedule"),
+                user_timezone
+            )
+            if not matched:
+                return False, None, None
+            # Continue to evaluate conditions
+            if conditions:
+                cond_result = await self._evaluate_conditions(conditions, profile, user_timezone)
+                return cond_result, None, bucket_key
+            return True, None, bucket_key
+
+        # 2. Event-based trigger: deterministic event detection
+        if trigger_type == "event_based":
+            triggered, event_info, bucket_key = await self._evaluate_event(
+                trigger_config, profile, conditions, user_timezone
+            )
+            if not triggered:
+                return False, None, None
+            if conditions:
+                cond_result = await self._evaluate_conditions(conditions, profile, user_timezone)
+                if not cond_result:
+                    return False, None, None
+            return True, event_info, bucket_key
+
+        # 3. Data condition trigger
+        if trigger_type == "data_condition":
+            result = await self._evaluate_conditions(conditions, profile, user_timezone)
+            return result, None, None
+
+        return False, None, None
+
+    def _evaluate_cron(
+        self,
+        schedule: str,
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Deterministic cron matching with timezone support.
+
+        Args:
+            schedule: Cron expression
+            user_timezone: User's timezone
+
+        Returns:
+            Tuple of (matched: bool, bucket_key: str) - bucket_key for idempotent deduplication
+        """
+        if not schedule:
+            return False, None
+
+        try:
+            tz = pytz.timezone(user_timezone)
+            now = datetime.now(tz)
+
+            cron = croniter.croniter(schedule, now)
+            prev_time = cron.get_prev(datetime)
+
+            # Calculate time bucket (minute-level precision)
+            bucket_key = prev_time.strftime("%Y-%m-%dT%H:%M")
+
+            # Error window aligned with scan frequency
+            scan_window_seconds = int(os.getenv("PROACTIVE_SCAN_WINDOW_SEC", "3600"))
+            matched = (now - prev_time).total_seconds() < scan_window_seconds
+
+            return matched, bucket_key
+        except Exception as e:
+            logger.warning(f"Cron evaluation failed: {e}")
+            return False, None
+
+    async def _evaluate_conditions(
+        self,
+        conditions: List[Dict],
+        profile: Dict[str, Any],
+        user_timezone: str,
+    ) -> bool:
+        """
+        Condition evaluation: static-first, LLM fallback.
+
+        Flow:
+        1. Preprocess placeholders ({today}, {now})
+        2. Evaluate static conditions directly
+        3. Fall back to LLM for complex conditions
+        4. All conditions use AND logic
+        """
+        if not conditions:
+            return True
+
+        static_conditions = []
+        complex_conditions = []
+
+        # Classify conditions
+        for cond in conditions:
+            cond = self._preprocess_condition(cond, user_timezone)  # Replace placeholders
+            if self._is_static_condition(cond):
+                static_conditions.append(cond)
+            else:
+                complex_conditions.append(cond)
+
+        # 1. Evaluate static conditions first (short-circuit optimization)
+        for cond in static_conditions:
+            if not self._static_eval(cond, profile):
+                return False  # Short-circuit: static condition not met
+
+        # 2. If static conditions pass, evaluate complex conditions
+        if complex_conditions:
+            if self.llm_service:
+                return await self._llm_eval_conditions(complex_conditions, profile, user_timezone)
+            logger.warning("Complex conditions present but LLM service unavailable")
+            return False
+
+        return True
+
+    def _is_static_condition(self, cond: Dict) -> bool:
+        """Check if condition can be evaluated statically"""
+        return (
+            "data_path" in cond and
+            cond.get("operator", "exists") in STATIC_OPERATORS
+        )
+
+    def _preprocess_condition(self, cond: Dict, user_timezone: str) -> Dict:
+        """Preprocess placeholders in condition"""
+        cond = cond.copy()
+        if "value" in cond:
+            value = str(cond["value"])
+            tz = self._get_timezone(user_timezone)
+            now = datetime.now(tz)
+            if "{today}" in value:
+                cond["value"] = value.replace("{today}", now.strftime("%Y-%m-%d"))
+            if "{now}" in value:
+                cond["value"] = value.replace("{now}", now.isoformat())
+        return cond
+
+    def _static_eval(self, cond: Dict, profile: Dict) -> bool:
+        """Evaluate static condition"""
+        data_path = self._normalize_data_path(cond.get("data_path", ""))
+        operator = cond.get("operator", "exists")
+        expected = cond.get("value")
+
+        # Get actual value from profile
+        actual = self._get_nested_value(profile, data_path)
+
+        # Evaluate based on operator
+        if operator == "exists":
+            return actual is not None
+        if operator == "!exists":
+            return actual is None
+        if operator == "==":
+            return str(actual) == str(expected)
+        if operator == "!=":
+            return str(actual) != str(expected)
+        if operator == ">":
+            return self._to_number(actual) > self._to_number(expected)
+        if operator == "<":
+            return self._to_number(actual) < self._to_number(expected)
+        if operator == ">=":
+            return self._to_number(actual) >= self._to_number(expected)
+        if operator == "<=":
+            return self._to_number(actual) <= self._to_number(expected)
+        if operator == "contains":
+            if isinstance(actual, list):
+                return expected in actual
+            return str(expected) in str(actual or "")
+
+        return False
+
+    def _get_nested_value(self, data: Dict, path: str) -> Any:
+        """Get value at nested path"""
+        if not path:
+            return None
+        # Computed lifecoach fields
+        if path.endswith("progress.weekly_checkins"):
+            lifecoach = self._get_nested_value(data, path.replace(".progress.weekly_checkins", ""))
+            if isinstance(lifecoach, dict):
+                progress = lifecoach.get("progress", {})
+                history = progress.get("checkin_history", [])
+                return self._count_recent_checkins(history, days=7)
+            return 0
+        if path.endswith("daily.pending_levers_count"):
+            lifecoach = self._get_nested_value(data, path.replace(".daily.pending_levers_count", ""))
+            if isinstance(lifecoach, dict):
+                current = lifecoach.get("current", {})
+                daily = current.get("daily", {})
+                levers = daily.get("levers", [])
+                if daily.get("date") != date.today().isoformat():
+                    return 0
+                return sum(1 for lever in levers if lever.get("status") != "completed")
+            return 0
+        if path.endswith("progress.previous_streak"):
+            lifecoach = self._get_nested_value(data, path.replace(".progress.previous_streak", ""))
+            if isinstance(lifecoach, dict):
+                progress = lifecoach.get("progress", {})
+                return max(progress.get("current_streak", 0), progress.get("longest_streak", 0))
+            return 0
+
+        keys = path.split(".")
+        for key in keys:
+            if isinstance(data, dict):
+                data = data.get(key)
+            else:
+                return None
+        return data
+
+    async def _llm_eval_conditions(
+        self,
+        conditions: List[Dict],
+        profile: Dict,
+        user_timezone: str,
+    ) -> bool:
+        """
+        LLM evaluation for complex conditions.
+
+        Only used for conditions that cannot be evaluated statically.
+        """
+        # Build simplified prompt with only relevant data
+        prompt = f"""判断用户是否满足以下条件（全部满足返回 true）：
+
+条件：
+{chr(10).join(f"- {c.get('description', c)}" for c in conditions)}
+
+用户相关数据：
+{self._extract_relevant_data(profile, conditions)}
+
+返回 JSON：{{"triggered": true/false, "reason": "..."}}"""
+
+        try:
+            result = await self._call_llm_json(prompt, user_timezone)
+            return bool(result.get("triggered", False))
+        except Exception as e:
+            logger.error(f"LLM condition evaluation failed: {e}")
+            return False
+
+    def _extract_relevant_data(self, profile: Dict, conditions: List[Dict]) -> str:
+        """Extract relevant profile data for LLM evaluation"""
+        # For now, return a simplified summary
+        relevant = {}
+        for cond in conditions:
+            if "data_path" in cond:
+                path = self._normalize_data_path(cond["data_path"])
+                value = self._get_nested_value(profile, path)
+                if value is not None:
+                    relevant[path] = value
+            else:
+                # For complex conditions without data_path, include lightweight skill summaries
+                skills = profile.get("skills", {})
+                if "lifecoach" in skills:
+                    relevant.setdefault("skills.lifecoach", skills.get("lifecoach"))
+                if "bazi" in skills:
+                    relevant.setdefault("skills.bazi", skills.get("bazi"))
+                if "zodiac" in skills:
+                    relevant.setdefault("skills.zodiac", skills.get("zodiac"))
+                identity = profile.get("identity", {})
+                if identity:
+                    relevant.setdefault("identity", identity)
+                preferences = profile.get("preferences", {})
+                if preferences:
+                    relevant.setdefault("preferences", preferences)
+
+        if relevant:
+            import json
+            return json.dumps(relevant, ensure_ascii=False, indent=2)
+        return "(无相关数据)"
+
+    async def _evaluate_event(
+        self,
+        trigger_config: Dict,
+        profile: Dict,
+        conditions: Optional[List[Dict]],
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Event-based trigger evaluation.
+
+        Prioritize deterministic calculation (birthday, new_year, streak_broken, etc.),
+        only fall back to LLM for ambiguous scenarios.
+        """
+        event_type = trigger_config.get("event")
+        advance_days = trigger_config.get("advance_days", [0])
+
+        # Deterministic event detection
+        if event_type == "birthday":
+            return self._detect_birthday(profile, advance_days, user_timezone)
+        if event_type == "new_year":
+            return self._detect_new_year(advance_days, user_timezone)
+        if event_type == "solar_term":
+            triggered, info, key = self._detect_solar_term(advance_days, user_timezone)
+            if triggered:
+                return triggered, info, key
+        if event_type == "streak_broken":
+            return self._detect_streak_broken(
+                profile,
+                advance_days,
+                trigger_config.get("delay_hours"),
+                user_timezone,
+            )
+
+        # Complex events fall back to LLM
+        if self.llm_service:
+            return await self._llm_detect_event(
+                event_type, profile, conditions, trigger_config, user_timezone
+            )
+
+        return False, None, None
+
+    def _detect_birthday(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """Deterministic birthday detection"""
+        birth_date_str = self._get_nested_value(profile, "identity.birth_info.date")
+        if not birth_date_str:
+            return False, None, None
+
+        try:
+            birth = datetime.strptime(birth_date_str, "%Y-%m-%d")
+            tz = self._get_timezone(user_timezone)
+            today = datetime.now(tz).date()
+            this_year_birthday = birth.replace(year=today.year).date()
+
+            # Handle case where birthday already passed this year
+            if this_year_birthday < today:
+                this_year_birthday = this_year_birthday.replace(year=today.year + 1)
+
+            days_until = (this_year_birthday - today).days
+
+            if days_until in advance_days:
+                return True, {
+                    "event_type": "birthday",
+                    "event_date": this_year_birthday.strftime("%Y-%m-%d"),
+                    "days_until": days_until,
+                }, f"birthday-{this_year_birthday.strftime('%Y-%m-%d')}"
+
+        except Exception as e:
+            logger.warning(f"Birthday detection failed: {e}")
+
+        return False, None, None
+
+    def _detect_new_year(
+        self,
+        advance_days: List[int],
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """Deterministic new year detection"""
+        tz = self._get_timezone(user_timezone)
+        today = datetime.now(tz).date()
+        new_year_date = date(today.year + 1, 1, 1)
+        days_until = (new_year_date - today).days
+        if days_until in advance_days:
+            return True, {
+                "event_type": "new_year",
+                "event_date": new_year_date.isoformat(),
+                "days_until": days_until,
+            }, f"new_year-{new_year_date.isoformat()}"
+        return False, None, None
+
+    def _detect_solar_term(
+        self,
+        advance_days: List[int],
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Deterministic solar term detection.
+
+        TODO: Implement actual solar term calculation using astronomical algorithms.
+        For now, returns False as a placeholder.
+        """
+        # Solar term detection requires astronomical calculation
+        # This would use a library like lunarcalendar or ephem
+        return False, None, None
+
+    def _detect_streak_broken(
+        self,
+        profile: Dict,
+        advance_days: List[int],
+        delay_hours: Optional[int],
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """Deterministic streak broken detection (lifecoach)"""
+        lifecoach = self._get_nested_value(profile, "skills.lifecoach") or {}
+        progress = lifecoach.get("progress", {})
+        last_checkin = progress.get("last_checkin_date")
+        previous_streak = progress.get("current_streak", 0)
+
+        if not last_checkin:
+            return False, None, None
+
+        try:
+            tz = self._get_timezone(user_timezone)
+            last_date = datetime.strptime(last_checkin, "%Y-%m-%d").date()
+            today = datetime.now(tz).date()
+            days_since = (today - last_date).days
+
+            if days_since >= 2 and previous_streak >= 3:
+                break_date = last_date + timedelta(days=1)
+                delay_ok = True
+                if delay_hours:
+                    delay_ok = datetime.now(tz) >= datetime.combine(
+                        break_date, datetime.min.time(), tzinfo=tz
+                    ) + timedelta(hours=delay_hours)
+                if delay_ok:
+                    return True, {
+                        "event_type": "streak_broken",
+                        "event_date": break_date.isoformat(),
+                        "days_since_checkin": days_since,
+                        "previous_streak": previous_streak,
+                    }, f"streak_broken-{break_date.isoformat()}"
+        except Exception as e:
+            logger.warning(f"Streak broken detection failed: {e}")
+
+        return False, None, None
+
+    async def _llm_detect_event(
+        self,
+        event_type: str,
+        profile: Dict,
+        conditions: Optional[List[Dict]],
+        trigger_config: Dict,
+        user_timezone: str,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """LLM-based event detection for complex events"""
+        # Build prompt for LLM to detect event
+        cond_text = ""
+        if conditions:
+            cond_text = "额外条件：\\n" + "\\n".join(f"- {c.get('description', c)}" for c in conditions)
+
+        prompt = f"""检测以下事件是否应该触发：
+
+事件类型：{event_type}
+提前触发天数：{trigger_config.get("advance_days", [0])}
+延迟触发小时：{trigger_config.get("delay_hours")}
+{cond_text}
+
+用户数据摘要：
+{self._build_profile_summary(profile)}
+
+返回 JSON：
+{{
+  "triggered": true/false,
+  "event_info": {{"event_type": "...", "event_date": "YYYY-MM-DD", ...}},
+  "reason": "..."
+}}"""
+
+        try:
+            result = await self._call_llm_json(prompt, user_timezone)
+            if result.get("triggered"):
+                event_info = result.get("event_info", {"event_type": event_type})
+                event_date = event_info.get("event_date") or datetime.now().strftime("%Y-%m-%d")
+                idempotent_key = f"{event_type}-{event_date}"
+                return True, event_info, idempotent_key
+        except Exception as e:
+            logger.error(f"LLM event detection failed: {e}")
+
+        return False, None, None
+
+    def _build_profile_summary(self, profile: Dict) -> str:
+        """Build profile summary for LLM context"""
+        lines = []
+        identity = profile.get("identity", {})
+        if birth := identity.get("birth_info"):
+            lines.append(f"- 生日: {birth.get('date')}")
+
+        vibe = profile.get("vibe", {})
+        target = vibe.get("target", {})
+        focus = target.get("focus") if isinstance(target, dict) else None
+        if focus:
+            if isinstance(focus, dict):
+                primary = focus.get("primary")
+                active_goal = focus.get("active_goal")
+                if primary:
+                    lines.append(f"- 关注领域: {primary}")
+                if active_goal:
+                    lines.append(f"- 当前目标: {active_goal}")
+            elif isinstance(focus, list):
+                lines.append(f"- 关注领域: {', '.join(focus)}")
+
+        skills = profile.get("skills", {})
+        if lifecoach := skills.get("lifecoach"):
+            progress = lifecoach.get("progress", {})
+            if progress.get("current_streak"):
+                lines.append(f"- 连续签到: {progress.get('current_streak')} 天")
+
+        preferences = profile.get("preferences", {})
+        if voice_mode := preferences.get("voice_mode"):
+            lines.append(f"- 语气偏好: {voice_mode}")
+
+        return "\n".join(lines) if lines else "（无画像信息）"
+
+    def _normalize_data_path(self, path: str) -> str:
+        """Normalize legacy data paths to v9 profile structure"""
+        if path.startswith("lifecoach."):
+            return "skills.lifecoach." + path[len("lifecoach."):]
+        if path.startswith("vibe.profile."):
+            return "identity." + path[len("vibe.profile."):]
+        if path.startswith("vibe.state."):
+            return "vibe.target." + path[len("vibe.state."):]
+        if path.startswith("vibe.preferences."):
+            return "preferences." + path[len("vibe.preferences."):]
+        return path
+
+    def _get_timezone(self, user_timezone: str):
+        try:
+            return pytz.timezone(user_timezone)
+        except Exception:
+            return pytz.UTC
+
+    def _to_number(self, value: Any) -> float:
+        try:
+            if value is None:
+                return 0.0
+            return float(value)
+        except Exception:
+            return 0.0
+
+    def _count_recent_checkins(self, history: List[Dict], days: int = 7) -> int:
+        cutoff = date.today() - timedelta(days=days)
+        count = 0
+        for item in history:
+            date_str = item.get("date")
+            if not date_str:
+                continue
+            try:
+                d = date.fromisoformat(date_str)
+                if d >= cutoff:
+                    count += 1
+            except Exception:
+                continue
+        return count
+
+    async def _call_llm_json(self, prompt: str, user_timezone: str) -> Dict[str, Any]:
+        """Call LLM and parse JSON response."""
+        if not self.llm_service:
+            return {}
+        try:
+            if hasattr(self.llm_service, "evaluate"):
+                result = await self.llm_service.evaluate(prompt=prompt)
+                return result if isinstance(result, dict) else {}
+            from services.llm import LLMMessage
+            messages = [
+                LLMMessage(role="system", content="你是严格的JSON生成器，只输出JSON对象。"),
+                LLMMessage(role="user", content=prompt),
+            ]
+            response = await self.llm_service.chat(messages=messages, task="proactive")
+            content = response.content or ""
+            return self._parse_json(content)
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return {}
+
+    def _parse_json(self, text: str) -> Dict[str, Any]:
+        """Parse JSON from model output."""
+        if not text:
+            return {}
+        try:
+            code_match = re.search(r"```json\\s*(.*?)\\s*```", text, re.DOTALL)
+            if code_match:
+                return json.loads(code_match.group(1))
+            obj_match = re.search(r"{.*}", text, re.DOTALL)
+            if obj_match:
+                return json.loads(obj_match.group(0))
+        except Exception:
+            return {}
+        return {}

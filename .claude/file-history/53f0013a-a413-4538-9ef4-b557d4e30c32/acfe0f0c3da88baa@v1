@@ -1,0 +1,541 @@
+"""
+Portrait Service - User Profile management
+Based on: vibelife spec v3.0, section 4.4
+
+Profile Structure (JSON Schema):
+- basic: 基础信息层 (硬数据，用户提供)
+- life_context: 生活上下文层 (软数据，AI采集/抽取)
+- ai_insights: AI洞察层 (LLM综合推断)
+- identity_prism: Identity Prism层 (心理学框架)
+- preferences: 用户偏好
+"""
+import json
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+from datetime import datetime
+from dataclasses import dataclass
+import logging
+
+from .llm import LLMService, get_llm_service, LLMMessage, create_user_message
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Profile Schema (按 spec 4.4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_PROFILE = {
+    "version": "1.0",
+    "updated_at": None,
+
+    # Layer 1: 基础信息层 (硬数据，用户提供)
+    "basic": {
+        "birth_datetime": None,
+        "birth_location": None,  # {city, country, timezone, coordinates}
+        "gender": None,
+        "name": None,
+        "occupation": None
+    },
+
+    # Layer 2: 生活上下文层 (软数据，AI采集/抽取)
+    "life_context": {
+        "career": {
+            "status": None,  # employed | unemployed | student | freelance
+            "industry": None,
+            "years_experience": None,
+            "concerns": []
+        },
+        "relationship": {
+            "status": None,  # single | in_relationship | married | divorced
+            "duration": None,
+            "concerns": []
+        },
+        "current_focus": [],  # 当前关注的领域
+        "life_stage": None,  # 人生阶段
+        "recent_events": []  # [{date, event, impact}]
+    },
+
+    # Layer 3: AI洞察层 (LLM综合推断)
+    "ai_insights": {
+        "personality_traits": [],  # [{trait, confidence}]
+        "communication_style": None,
+        "emotional_patterns": {
+            "triggers": [],
+            "coping": None
+        },
+        "relationship_patterns": {
+            "style": None,
+            "blind_spots": []
+        },
+        "growth_areas": []
+    },
+
+    # Layer 4: Identity Prism层 (心理学框架)
+    "identity_prism": {
+        "core": {
+            "keyword": None,
+            "description": None,
+            "data_source": None
+        },
+        "inner": {
+            "keyword": None,
+            "description": None,
+            "data_source": None
+        },
+        "outer": {
+            "keyword": None,
+            "description": None,
+            "data_source": None
+        }
+    },
+
+    # 用户偏好
+    "preferences": {
+        "voice_mode": "warm",  # warm | sarcastic
+        "language": "zh-CN",
+        "notification": False
+    }
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Profile Update Prompts
+# ═══════════════════════════════════════════════════════════════════════════
+
+PROFILE_UPDATE_PROMPT = """你是一个用户画像分析专家。请基于最近的对话，更新用户画像。
+
+## 当前画像
+```json
+{current_profile}
+```
+
+## 最近对话
+{recent_messages}
+
+## 任务
+请分析对话内容，抽取以下信息并输出 JSON 格式的更新：
+
+1. **life_context 更新**：
+   - career: 职业状态、行业、关注点
+   - relationship: 感情状态、关注点
+   - current_focus: 当前关注的领域
+   - recent_events: 最近发生的重要事件
+
+2. **ai_insights 更新**：
+   - personality_traits: 性格特点
+   - communication_style: 沟通风格
+   - emotional_patterns: 情绪模式
+   - relationship_patterns: 关系模式
+   - growth_areas: 成长方向
+
+## 输出格式
+只输出 JSON，不要其他内容：
+```json
+{{
+  "life_context": {{...只包含需要更新的字段}},
+  "ai_insights": {{...只包含需要更新的字段}}
+}}
+```
+
+如果没有新的信息需要更新，返回空对象 `{{}}`。
+"""
+
+IDENTITY_PRISM_PROMPT = """你是一个心理学和命理学专家。请基于用户的八字命盘和对话历史，生成 Identity Prism 三元身份视角。
+
+## 用户八字信息
+{bazi_info}
+
+## 用户画像
+{profile_summary}
+
+## Identity Prism 三元框架
+
+**Core (核心)**：真正稳定的驱动力
+- 来源：八字日主本性 + 格局 + 用神
+- 问题：「我本该是谁？」= 先天潜能
+
+**Inner (内在)**：内心最在意的
+- 来源：AI洞察 + 用户自述
+- 问题：「我如何看自己？」= 内心挣扎
+
+**Outer (外在)**：给人的感觉
+- 来源：八字十神结构 + 行为模式
+- 问题：「我展示什么？」= 社会面具
+
+## 任务
+请生成三元身份视角，每个维度包含：
+- keyword: 2-4字关键词
+- description: 1-2句解释，用第二人称「你」
+
+## 输出格式（只输出 JSON）
+```json
+{{
+  "core": {{
+    "keyword": "追求深度理解",
+    "description": "你天生对表象不满足，总想探究事物背后的本质。这让你在研究、分析、策略制定方面有独特优势。",
+    "data_source": "日主甲木 · 偏印格"
+  }},
+  "inner": {{
+    "keyword": "渴望被认可",
+    "description": "在你心里，其实最在意的是被看见和肯定。你习惯付出，却不善于表达自己的需求。",
+    "data_source": "对话分析 + 情绪模式"
+  }},
+  "outer": {{
+    "keyword": "冷静可靠",
+    "description": "你给人的感觉是理性、稳定、可依赖。别人遇到问题会想找你商量。",
+    "data_source": "十神结构：正官透干"
+  }}
+}}
+```
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Portrait Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ProfileUpdate:
+    """Profile update result"""
+    success: bool
+    updated_fields: List[str]
+    new_version: int
+    error: Optional[str] = None
+
+
+class PortraitService:
+    """
+    User Profile management service.
+
+    Features:
+    - Profile CRUD operations
+    - Automatic updates from conversations
+    - Identity Prism generation
+    - Version control
+    """
+
+    def __init__(self, llm_service: Optional[LLMService] = None):
+        self.llm = llm_service or get_llm_service()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Basic CRUD
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def create_default_profile() -> Dict[str, Any]:
+        """Create a new default profile"""
+        profile = json.loads(json.dumps(DEFAULT_PROFILE))  # Deep copy
+        profile["updated_at"] = datetime.utcnow().isoformat()
+        return profile
+
+    @staticmethod
+    def merge_profiles(
+        current: Dict[str, Any],
+        updates: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Merge updates into current profile.
+        Preserves existing data, only updates/adds new data.
+        """
+        def deep_merge(base: dict, update: dict) -> dict:
+            result = base.copy()
+            for key, value in update.items():
+                if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                    result[key] = deep_merge(result[key], value)
+                elif key in result and isinstance(result[key], list) and isinstance(value, list):
+                    # For lists, extend without duplicates
+                    existing = set(str(x) for x in result[key])
+                    for item in value:
+                        if str(item) not in existing:
+                            result[key].append(item)
+                else:
+                    if value is not None:  # Only update non-None values
+                        result[key] = value
+            return result
+
+        merged = deep_merge(current, updates)
+        merged["updated_at"] = datetime.utcnow().isoformat()
+        return merged
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Basic Info Updates
+    # ─────────────────────────────────────────────────────────────────────
+
+    def update_basic_info(
+        self,
+        profile: Dict[str, Any],
+        birth_datetime: Optional[str] = None,
+        birth_location: Optional[Dict] = None,
+        gender: Optional[str] = None,
+        name: Optional[str] = None,
+        occupation: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Update basic info layer"""
+        updates = {"basic": {}}
+
+        if birth_datetime:
+            updates["basic"]["birth_datetime"] = birth_datetime
+        if birth_location:
+            updates["basic"]["birth_location"] = birth_location
+        if gender:
+            updates["basic"]["gender"] = gender
+        if name:
+            updates["basic"]["name"] = name
+        if occupation:
+            updates["basic"]["occupation"] = occupation
+
+        return self.merge_profiles(profile, updates)
+
+    def update_preferences(
+        self,
+        profile: Dict[str, Any],
+        voice_mode: Optional[str] = None,
+        language: Optional[str] = None,
+        notification: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """Update user preferences"""
+        updates = {"preferences": {}}
+
+        if voice_mode:
+            updates["preferences"]["voice_mode"] = voice_mode
+        if language:
+            updates["preferences"]["language"] = language
+        if notification is not None:
+            updates["preferences"]["notification"] = notification
+
+        return self.merge_profiles(profile, updates)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # AI-Powered Updates
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def analyze_and_update(
+        self,
+        profile: Dict[str, Any],
+        recent_messages: List[Dict[str, str]],
+        force: bool = False
+    ) -> ProfileUpdate:
+        """
+        Analyze recent messages and update profile with AI insights.
+
+        Args:
+            profile: Current profile
+            recent_messages: Recent conversation messages
+            force: Force update even if not enough messages
+
+        Returns:
+            ProfileUpdate with success status and updated fields
+        """
+        # Check if we have enough messages
+        if len(recent_messages) < 5 and not force:
+            return ProfileUpdate(
+                success=False,
+                updated_fields=[],
+                new_version=profile.get("version", 1),
+                error="Not enough messages for analysis"
+            )
+
+        try:
+            # Format messages for prompt
+            messages_text = "\n".join([
+                f"[{msg['role']}]: {msg['content'][:200]}"
+                for msg in recent_messages[-20:]  # Last 20 messages
+            ])
+
+            # Build prompt
+            prompt = PROFILE_UPDATE_PROMPT.format(
+                current_profile=json.dumps(profile, ensure_ascii=False, indent=2),
+                recent_messages=messages_text
+            )
+
+            # Call LLM
+            response = await self.llm.chat(
+                [create_user_message(prompt)],
+                temperature=0.3,
+                max_tokens=2000
+            )
+
+            # Parse response
+            content = response.content.strip()
+            # Extract JSON from markdown code block if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            updates = json.loads(content)
+
+            if not updates:
+                return ProfileUpdate(
+                    success=True,
+                    updated_fields=[],
+                    new_version=profile.get("version", 1)
+                )
+
+            # Merge updates
+            updated_profile = self.merge_profiles(profile, updates)
+            updated_fields = list(updates.keys())
+
+            return ProfileUpdate(
+                success=True,
+                updated_fields=updated_fields,
+                new_version=profile.get("version", 1) + 1
+            )
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response: {e}")
+            return ProfileUpdate(
+                success=False,
+                updated_fields=[],
+                new_version=profile.get("version", 1),
+                error=f"JSON parse error: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Profile update failed: {e}")
+            return ProfileUpdate(
+                success=False,
+                updated_fields=[],
+                new_version=profile.get("version", 1),
+                error=str(e)
+            )
+
+    async def generate_identity_prism(
+        self,
+        profile: Dict[str, Any],
+        bazi_chart: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate Identity Prism (三元身份视角) using LLM.
+
+        Args:
+            profile: User profile
+            bazi_chart: Bazi chart data (optional)
+
+        Returns:
+            Identity Prism structure
+        """
+        try:
+            # Format bazi info
+            bazi_info = "未提供八字信息"
+            if bazi_chart:
+                bazi_info = json.dumps(bazi_chart, ensure_ascii=False, indent=2)
+
+            # Format profile summary
+            profile_summary = json.dumps({
+                "life_context": profile.get("life_context", {}),
+                "ai_insights": profile.get("ai_insights", {})
+            }, ensure_ascii=False, indent=2)
+
+            # Build prompt
+            prompt = IDENTITY_PRISM_PROMPT.format(
+                bazi_info=bazi_info,
+                profile_summary=profile_summary
+            )
+
+            # Call LLM
+            response = await self.llm.chat(
+                [create_user_message(prompt)],
+                temperature=0.5,
+                max_tokens=1500
+            )
+
+            # Parse response
+            content = response.content.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            prism = json.loads(content)
+            return prism
+
+        except Exception as e:
+            logger.error(f"Identity Prism generation failed: {e}")
+            # Return default structure
+            return {
+                "core": {
+                    "keyword": "待发现",
+                    "description": "需要更多信息来生成你的核心特质",
+                    "data_source": "信息不足"
+                },
+                "inner": {
+                    "keyword": "待发现",
+                    "description": "需要更多对话来了解你的内心世界",
+                    "data_source": "信息不足"
+                },
+                "outer": {
+                    "keyword": "待发现",
+                    "description": "需要更多信息来分析你的外在表现",
+                    "data_source": "信息不足"
+                }
+            }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Profile Extraction from Messages
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def extract_info_from_message(
+        self,
+        message: str,
+        message_type: str = "chat"
+    ) -> Dict[str, Any]:
+        """
+        Extract structured info from a single message.
+        Used for real-time profile enrichment.
+
+        Args:
+            message: User message
+            message_type: Type of message (chat, interview, upload)
+
+        Returns:
+            Extracted info that can be merged into profile
+        """
+        prompt = f"""从以下用户消息中提取可以加入用户画像的信息。
+
+消息: "{message}"
+消息类型: {message_type}
+
+如果有可提取的信息，以JSON格式返回：
+{{
+  "basic": {{...}},
+  "life_context": {{...}},
+  "ai_insights": {{...}}
+}}
+
+只返回有值的字段。如果没有可提取的信息，返回 {{}}。
+只输出JSON，不要其他内容。"""
+
+        try:
+            response = await self.llm.chat(
+                [create_user_message(prompt)],
+                temperature=0.2,
+                max_tokens=500
+            )
+
+            content = response.content.strip()
+            if "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+                if content.startswith("json"):
+                    content = content[4:].strip()
+
+            return json.loads(content)
+
+        except Exception as e:
+            logger.debug(f"Info extraction failed: {e}")
+            return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Global Instance
+# ═══════════════════════════════════════════════════════════════════════════
+
+_portrait_service: Optional[PortraitService] = None
+
+
+def get_portrait_service() -> PortraitService:
+    """Get or create global portrait service instance"""
+    global _portrait_service
+    if _portrait_service is None:
+        _portrait_service = PortraitService()
+    return _portrait_service

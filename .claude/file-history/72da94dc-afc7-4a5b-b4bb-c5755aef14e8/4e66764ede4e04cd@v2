@@ -1,0 +1,508 @@
+# VibeLife Knowledge System Optimization Plan
+
+## 目标
+基于 PostgreSQL + pgvector，设计**极简高效**的知识库系统：
+- 支持 PDF/TXT/MD 文本文档上传
+- 每个 skill module 指定知识源文件夹，每日凌晨 4:00 自动同步
+- 中英文混合查询优化 (70% 中文 / 30% 英文)
+- 极简架构：无 Redis、Celery、ES，纯 PostgreSQL Native
+
+---
+
+## 用户确认的设计决策
+
+| 决策项 | 选择 |
+|--------|------|
+| 向量维度 | **保持 Gemini 3072维** |
+| 文件删除策略 | **软删除/归档** (标记 archived, 保留数据) |
+| QA表处理 | **合并到 chunks 表** (content_type='qa') |
+| 扫描频率 | **每日凌晨 4:00** |
+
+---
+
+## 设计决策详解
+
+### 1. 文件目录简化
+每个 skill 一个知识源文件夹：
+
+```
+/home/aiscend/work/vibelife/knowledge/
+├── bazi/           # 八字技能知识库
+│   ├── 天干地支.md
+│   ├── 十神详解.pdf
+│   └── 案例分析.txt
+├── zodiac/         # 星座技能知识库
+└── mbti/           # MBTI技能知识库
+```
+
+### 2. QA 对简化
+- 从 Markdown 自动提取 `Q: ... A: ...` 格式
+- 作为 `content_type='qa'` 存入 `knowledge_chunks`
+- 删除 `knowledge_qa_pairs` 表
+
+### 3. 中英文混合搜索
+应用层 Jieba 分词 + PG `simple` 配置：
+```
+输入: "比肩代表独立能力strong independence"
+分词: "比肩 代表 独立 能力 strong independence"
+存储: search_text_preprocessed 列
+索引: to_tsvector('simple', ...) 自动生成
+```
+
+### 4. 软删除策略
+文件被删除时：
+- `status = 'archived'`
+- 保留数据用于审计/回滚
+- 不参与检索
+
+---
+
+## 数据库 Schema 设计
+
+```sql
+-- ===============================================
+-- 文件: migrations/002_knowledge_v2.sql
+-- ===============================================
+
+-- 文档表 (兼作任务队列)
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    skill_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    file_path TEXT NOT NULL,         -- 完整文件路径
+    file_hash TEXT NOT NULL,         -- MD5 用于检测变更
+    file_type TEXT NOT NULL,         -- pdf, md, txt
+    content_md TEXT,                 -- 转换后的 Markdown (归档)
+    status TEXT DEFAULT 'pending',   -- pending/processing/completed/failed/archived
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(skill_id, filename)
+);
+
+-- 新版知识块表 (合并 QA)
+CREATE TABLE IF NOT EXISTS knowledge_chunks_v2 (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID REFERENCES knowledge_documents(id) ON DELETE SET NULL,
+    skill_id TEXT NOT NULL,
+    chunk_index INT NOT NULL DEFAULT 0,
+    content TEXT NOT NULL,
+    content_type TEXT DEFAULT 'knowledge',  -- knowledge, qa, theory, pattern, case
+    source_section TEXT,
+    metadata JSONB DEFAULT '{}',
+
+    -- Jieba 分词后存入 (中英文混合)
+    search_text_preprocessed TEXT,
+
+    -- 自动生成全文索引 (GENERATED ALWAYS)
+    search_vector tsvector GENERATED ALWAYS AS (
+        to_tsvector('simple', COALESCE(search_text_preprocessed, ''))
+    ) STORED,
+
+    -- Gemini 3072维向量
+    embedding vector(3072),
+
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_docs_status ON knowledge_documents(status);
+CREATE INDEX IF NOT EXISTS idx_docs_skill ON knowledge_documents(skill_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_skill ON knowledge_chunks_v2(skill_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_doc ON knowledge_chunks_v2(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_type ON knowledge_chunks_v2(content_type);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_fts ON knowledge_chunks_v2 USING gin(search_vector);
+CREATE INDEX IF NOT EXISTS idx_chunks_v2_vec ON knowledge_chunks_v2 USING hnsw(embedding vector_cosine_ops);
+
+-- 迁移旧 QA 数据到 chunks_v2
+INSERT INTO knowledge_chunks_v2 (skill_id, content, content_type, search_text_preprocessed, embedding, created_at)
+SELECT
+    skill_id,
+    'Q: ' || question || E'\nA: ' || answer,
+    'qa',
+    question || ' ' || answer,
+    question_embedding,
+    created_at
+FROM knowledge_qa_pairs
+WHERE question_embedding IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+-- 迁移旧 knowledge_chunks 数据
+INSERT INTO knowledge_chunks_v2 (skill_id, content, content_type, source_section, metadata, embedding, created_at)
+SELECT
+    skill_id,
+    content,
+    COALESCE(content_type, 'knowledge'),
+    source_section,
+    metadata,
+    embedding,
+    created_at
+FROM knowledge_chunks
+WHERE embedding IS NOT NULL
+ON CONFLICT DO NOTHING;
+```
+
+---
+
+## 混合搜索 SQL 函数 (RRF 下沉到数据库)
+
+```sql
+-- ===============================================
+-- 文件: migrations/002_knowledge_v2.sql (续)
+-- ===============================================
+
+CREATE OR REPLACE FUNCTION hybrid_search_v2(
+    query_text_processed TEXT,    -- Jieba 分词后的查询
+    query_embedding vector(3072),
+    match_skill_id TEXT,
+    top_k INT DEFAULT 5,
+    rrf_k INT DEFAULT 60
+)
+RETURNS TABLE (
+    id UUID,
+    content TEXT,
+    content_type TEXT,
+    source_section TEXT,
+    score FLOAT,
+    match_type TEXT
+) LANGUAGE sql STABLE AS $$
+WITH semantic AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) as rank
+    FROM knowledge_chunks_v2
+    WHERE skill_id = match_skill_id AND embedding IS NOT NULL
+    ORDER BY embedding <=> query_embedding
+    LIMIT top_k * 2
+),
+keyword AS (
+    SELECT id, ROW_NUMBER() OVER (
+        ORDER BY ts_rank(search_vector, plainto_tsquery('simple', query_text_processed)) DESC
+    ) as rank
+    FROM knowledge_chunks_v2
+    WHERE skill_id = match_skill_id
+      AND search_vector @@ plainto_tsquery('simple', query_text_processed)
+    LIMIT top_k * 2
+)
+SELECT
+    COALESCE(s.id, k.id) as id,
+    c.content,
+    c.content_type,
+    c.source_section,
+    (COALESCE(1.0/(rrf_k + s.rank), 0.0) * 0.7 +
+     COALESCE(1.0/(rrf_k + k.rank), 0.0) * 0.3)::FLOAT as score,
+    CASE
+        WHEN s.id IS NOT NULL AND k.id IS NOT NULL THEN 'hybrid'
+        WHEN s.id IS NOT NULL THEN 'vector'
+        ELSE 'keyword'
+    END as match_type
+FROM semantic s
+FULL OUTER JOIN keyword k ON s.id = k.id
+JOIN knowledge_chunks_v2 c ON c.id = COALESCE(s.id, k.id)
+ORDER BY score DESC
+LIMIT top_k;
+$$;
+```
+
+---
+
+## 核心文件实现
+
+### 1. 后台 Worker (替代 Celery)
+
+**文件**: `apps/api/workers/ingestion.py`
+
+```python
+"""
+Knowledge Ingestion Worker - 基于 PG SKIP LOCKED 的任务队列
+"""
+import asyncio
+import hashlib
+import jieba
+import pymupdf4llm
+from pathlib import Path
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+
+class IngestionWorker:
+    def __init__(self, pool, embedding_service):
+        self.pool = pool
+        self.embedding_service = embedding_service
+
+    async def run_loop(self):
+        """后台循环：轮询 DB 队列，原子抢占任务"""
+        print("🚀 Knowledge Ingestion Worker Started...")
+        while True:
+            try:
+                async with self.pool.acquire() as conn:
+                    # 原子抢占任务 (SKIP LOCKED 防止并发冲突)
+                    task = await conn.fetchrow("""
+                        UPDATE knowledge_documents
+                        SET status = 'processing', updated_at = NOW()
+                        WHERE id = (
+                            SELECT id FROM knowledge_documents
+                            WHERE status = 'pending'
+                            ORDER BY created_at ASC
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING id, file_path, file_type, skill_id
+                    """)
+
+                if not task:
+                    await asyncio.sleep(2)  # 空闲等待
+                    continue
+
+                await self.process_document(task)
+
+            except Exception as e:
+                print(f"Worker Error: {e}")
+                await asyncio.sleep(5)
+
+    async def process_document(self, task):
+        """核心处理：转MD → 分块 → 分词 → 向量化 → 入库"""
+        try:
+            file_path = task['file_path']
+            md_content = ""
+
+            # A. 转换为 Markdown
+            if task['file_type'] == 'pdf':
+                md_content = pymupdf4llm.to_markdown(file_path, write_images=False)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    md_content = f.read()
+
+            # B. 智能分块
+            headers_split = MarkdownHeaderTextSplitter(
+                [("#", "H1"), ("##", "H2"), ("###", "H3")]
+            ).split_text(md_content)
+            splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+            chunks = splitter.split_documents(headers_split)
+            chunk_texts = [c.page_content for c in chunks]
+
+            # C. 批量向量化
+            embeddings = await self.embedding_service.embed_batch(chunk_texts)
+
+            # D. Jieba 分词 + 入库
+            insert_data = []
+            for i, (text, vec) in enumerate(zip(chunk_texts, embeddings)):
+                seg_text = " ".join(jieba.cut_for_search(text))
+                insert_data.append((
+                    task['id'], task['skill_id'], i, text, seg_text, str(vec)
+                ))
+
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.executemany("""
+                        INSERT INTO knowledge_chunks_v2
+                        (document_id, skill_id, chunk_index, content, search_text_preprocessed, embedding)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                    """, insert_data)
+
+                    await conn.execute("""
+                        UPDATE knowledge_documents
+                        SET status = 'completed', content_md = $1, updated_at = NOW()
+                        WHERE id = $2
+                    """, md_content, task['id'])
+
+        except Exception as e:
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE knowledge_documents
+                    SET status = 'failed', error_message = $1, updated_at = NOW()
+                    WHERE id = $2
+                """, str(e), task['id'])
+```
+
+### 2. 文件夹同步脚本
+
+**文件**: `apps/api/scripts/sync_knowledge.py`
+
+```python
+"""
+Knowledge Folder Sync - 每日凌晨 4:00 cron 触发
+Usage: python scripts/sync_knowledge.py
+"""
+import asyncio
+import hashlib
+from pathlib import Path
+
+SKILL_KNOWLEDGE_PATHS = {
+    "bazi": "/home/aiscend/work/vibelife/knowledge/bazi",
+    "zodiac": "/home/aiscend/work/vibelife/knowledge/zodiac",
+    "mbti": "/home/aiscend/work/vibelife/knowledge/mbti"
+}
+
+SUPPORTED_EXTENSIONS = {'.pdf', '.md', '.txt'}
+
+def compute_file_hash(filepath: str) -> str:
+    with open(filepath, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+async def sync_skill_folder(skill_id: str, folder_path: str, conn):
+    """同步单个技能的知识文件夹"""
+    path = Path(folder_path)
+    if not path.exists():
+        print(f"⚠️  Folder not found: {folder_path}")
+        return
+
+    # 1. 扫描文件系统
+    current_files = {}
+    for f in path.iterdir():
+        if f.suffix.lower() in SUPPORTED_EXTENSIONS:
+            current_files[f.name] = {
+                'path': str(f),
+                'hash': compute_file_hash(str(f)),
+                'type': f.suffix[1:].lower()
+            }
+
+    # 2. 查询数据库现有记录
+    db_records = await conn.fetch("""
+        SELECT filename, file_hash, status FROM knowledge_documents
+        WHERE skill_id = $1 AND status != 'archived'
+    """, skill_id)
+    db_files = {r['filename']: r for r in db_records}
+
+    # 3. 新增文件 (文件系统有，DB无)
+    for filename, info in current_files.items():
+        if filename not in db_files:
+            await conn.execute("""
+                INSERT INTO knowledge_documents
+                (skill_id, filename, file_path, file_hash, file_type, status)
+                VALUES ($1, $2, $3, $4, $5, 'pending')
+            """, skill_id, filename, info['path'], info['hash'], info['type'])
+            print(f"✅ New: {filename}")
+
+    # 4. 修改文件 (hash 变化)
+    for filename, info in current_files.items():
+        if filename in db_files and db_files[filename]['file_hash'] != info['hash']:
+            # 删除旧 chunks，重新入队
+            await conn.execute("""
+                DELETE FROM knowledge_chunks_v2
+                WHERE document_id = (SELECT id FROM knowledge_documents WHERE skill_id = $1 AND filename = $2)
+            """, skill_id, filename)
+            await conn.execute("""
+                UPDATE knowledge_documents
+                SET file_hash = $3, status = 'pending', updated_at = NOW()
+                WHERE skill_id = $1 AND filename = $2
+            """, skill_id, filename, info['hash'])
+            print(f"🔄 Modified: {filename}")
+
+    # 5. 删除文件 (DB有，文件系统无) → 软删除/归档
+    for filename, record in db_files.items():
+        if filename not in current_files and record['status'] != 'archived':
+            await conn.execute("""
+                UPDATE knowledge_documents
+                SET status = 'archived', updated_at = NOW()
+                WHERE skill_id = $1 AND filename = $2
+            """, skill_id, filename)
+            print(f"📦 Archived: {filename}")
+
+async def main():
+    from stores.db import get_db_pool, close_db_pool
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        for skill_id, folder in SKILL_KNOWLEDGE_PATHS.items():
+            print(f"\n📂 Syncing {skill_id}: {folder}")
+            await sync_skill_folder(skill_id, folder, conn)
+    await close_db_pool()
+    print("\n✅ Sync complete!")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 3. 更新 RetrievalService
+
+**文件**: `apps/api/services/knowledge/retrieval.py` (修改)
+
+```python
+# 移除 Python 层 RRF，改用 SQL 函数
+class RetrievalService:
+    @classmethod
+    async def search(cls, query: str, skill_id: str, top_k: int = 5) -> List[Dict]:
+        # 1. Jieba 分词
+        query_seg = " ".join(jieba.cut(query))
+
+        # 2. 生成 query embedding
+        query_embedding = await EmbeddingService.embed_query(query)
+
+        # 3. 调用 SQL 函数 (RRF 在数据库完成)
+        async with get_connection() as conn:
+            results = await conn.fetch("""
+                SELECT * FROM hybrid_search_v2($1, $2, $3, $4)
+            """, query_seg, str(query_embedding), skill_id, top_k)
+
+        return [dict(r) for r in results]
+```
+
+---
+
+## Crontab 配置
+
+```cron
+# 文件: apps/api/scripts/crontab.example (追加)
+
+# 知识库文件夹同步 - 每日凌晨 4:00
+0 4 * * * cd /home/aiscend/work/vibelife/apps/api && python3 scripts/sync_knowledge.py >> /var/log/vibelife/knowledge_sync.log 2>&1
+```
+
+---
+
+## 新增依赖
+
+**文件**: `apps/api/requirements.txt` (追加)
+
+```
+jieba>=0.42.1              # 中文分词
+pymupdf4llm>=0.0.17        # PDF → Markdown (保留表格)
+langchain-text-splitters>=0.0.1  # 智能分块
+```
+
+---
+
+## 实现任务清单 (按顺序)
+
+### Phase 1: 数据库迁移
+- [ ] 创建 `migrations/002_knowledge_v2.sql`
+- [ ] 执行迁移：创建 `knowledge_documents` 表
+- [ ] 执行迁移：创建 `knowledge_chunks_v2` 表
+- [ ] 执行迁移：迁移旧 QA 数据
+- [ ] 执行迁移：迁移旧 chunks 数据
+- [ ] 执行迁移：创建 `hybrid_search_v2` SQL 函数
+- [ ] 验证索引生效
+
+### Phase 2: Worker 实现
+- [ ] 安装依赖：`jieba`, `pymupdf4llm`, `langchain-text-splitters`
+- [ ] 创建 `apps/api/workers/__init__.py`
+- [ ] 创建 `apps/api/workers/ingestion.py`
+- [ ] 在 `main.py` lifespan 中启动 worker
+
+### Phase 3: 文件夹同步
+- [ ] 创建 `knowledge/` 目录结构
+- [ ] 创建 `scripts/sync_knowledge.py`
+- [ ] 添加到 crontab
+
+### Phase 4: 服务集成
+- [ ] 修改 `services/knowledge/retrieval.py` 使用 SQL 函数
+- [ ] 添加 jieba 分词到查询流程
+- [ ] 移除 Python 层 RRF 逻辑
+- [ ] 更新 `knowledge_repo.py` 适配新表
+
+### Phase 5: API 接口 (可选)
+- [ ] POST `/knowledge/upload` - 手动上传
+- [ ] GET `/knowledge/documents` - 文档列表
+- [ ] GET `/knowledge/documents/{id}/status` - 处理状态
+
+---
+
+## 待修改文件清单
+
+| 文件 | 操作 |
+|------|------|
+| `migrations/002_knowledge_v2.sql` | **新建** |
+| `apps/api/workers/__init__.py` | **新建** |
+| `apps/api/workers/ingestion.py` | **新建** |
+| `apps/api/scripts/sync_knowledge.py` | **新建** |
+| `apps/api/requirements.txt` | 修改 (追加依赖) |
+| `apps/api/main.py` | 修改 (启动 worker) |
+| `apps/api/services/knowledge/retrieval.py` | 修改 (使用 SQL 函数) |
+| `apps/api/stores/knowledge_repo.py` | 修改 (适配新表) |
+| `apps/api/scripts/crontab.example` | 修改 (追加 cron)

@@ -1,0 +1,462 @@
+"""
+VibeLife Interview Service Tests
+Tests for Interview Session Management, Answer Extraction, and Profile Scoring
+Based on: vibelife spec v3.0, section 4.2
+"""
+
+import pytest
+from uuid import uuid4
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from services.interview.interview_service import (
+    InterviewService,
+    InterviewSession,
+    InterviewQuestion,
+    InterviewState,
+    InterviewResult,
+    CORE_QUESTIONS,
+    INTERVIEW_INTRO,
+    get_interview_service,
+)
+
+
+class TestInterviewQuestion:
+    """Test InterviewQuestion dataclass"""
+
+    def test_create_question(self):
+        q = InterviewQuestion(
+            id="q1",
+            question_text="你现在最想解决的问题是什么？",
+            question_type="core",
+        )
+        assert q.id == "q1"
+        assert q.answer is None
+        assert q.extracted_info is None
+
+    def test_question_with_answer(self):
+        q = InterviewQuestion(
+            id="q1",
+            question_text="测试问题",
+            question_type="core",
+            answer="测试回答",
+            answered_at=datetime.utcnow(),
+        )
+        assert q.answer == "测试回答"
+        assert q.answered_at is not None
+
+
+class TestInterviewSession:
+    """Test InterviewSession dataclass"""
+
+    def test_create_session(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=uuid4(),
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        assert session.state == InterviewState.IN_PROGRESS
+        assert len(session.questions) == 1
+
+    def test_session_to_dict(self):
+        session_id = uuid4()
+        user_id = uuid4()
+        session = InterviewSession(
+            id=session_id,
+            user_id=user_id,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        data = session.to_dict()
+        assert data["id"] == str(session_id)
+        assert data["user_id"] == str(user_id)
+        assert data["skill"] == "bazi"
+        assert data["state"] == "in_progress"
+
+
+class TestInterviewState:
+    """Test InterviewState enum"""
+
+    def test_state_values(self):
+        assert InterviewState.NOT_STARTED.value == "not_started"
+        assert InterviewState.IN_PROGRESS.value == "in_progress"
+        assert InterviewState.COMPLETED.value == "completed"
+        assert InterviewState.SKIPPED.value == "skipped"
+
+
+class TestCoreQuestions:
+    """Test core interview questions"""
+
+    def test_core_questions_exist(self):
+        assert len(CORE_QUESTIONS) >= 2
+        assert len(CORE_QUESTIONS) <= 5
+
+    def test_core_questions_structure(self):
+        for q in CORE_QUESTIONS:
+            assert "id" in q
+            assert "question_text" in q
+            assert "question_type" in q
+            assert q["question_type"] == "core"
+
+    def test_interview_intro_exists(self):
+        assert INTERVIEW_INTRO
+        assert "报告" in INTERVIEW_INTRO or "了解" in INTERVIEW_INTRO
+
+
+class TestInterviewServiceBasic:
+    """Test InterviewService basic operations"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        self.service = InterviewService()
+
+    def test_get_intro(self):
+        intro = self.service.get_intro()
+        assert intro == INTERVIEW_INTRO
+
+    def test_get_current_question_not_started(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.NOT_STARTED,
+            questions=[],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        q = self.service.get_current_question(session)
+        assert q is None
+
+    def test_get_current_question_completed(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.COMPLETED,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        q = self.service.get_current_question(session)
+        assert q is None
+
+    def test_get_current_question_in_progress(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+                InterviewQuestion(id="q2", question_text="问题2", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        q = self.service.get_current_question(session)
+        assert q is not None
+        assert q.id == "q1"
+
+    def test_get_progress(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core", answer="回答1"),
+                InterviewQuestion(id="q2", question_text="问题2", question_type="core"),
+                InterviewQuestion(id="q3", question_text="问题3", question_type="core"),
+            ],
+            current_question_idx=1,
+            created_at=datetime.utcnow(),
+        )
+        answered, total = self.service.get_progress(session)
+        assert answered == 1
+        assert total == 3
+
+
+class TestInterviewServiceSession:
+    """Test InterviewService session management"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        self.service = InterviewService()
+
+    @pytest.mark.asyncio
+    async def test_start_session(self):
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            session = await self.service.start_session(skill="bazi")
+            assert session.id is not None
+            assert session.skill == "bazi"
+            assert session.state == InterviewState.IN_PROGRESS
+            assert len(session.questions) == len(CORE_QUESTIONS)
+
+    @pytest.mark.asyncio
+    async def test_start_session_with_user_id(self):
+        user_id = uuid4()
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            session = await self.service.start_session(skill="zodiac", user_id=user_id)
+            assert session.user_id == user_id
+            assert session.skill == "zodiac"
+
+    @pytest.mark.asyncio
+    async def test_start_session_custom_questions(self):
+        custom = [
+            {"id": "custom1", "question_text": "自定义问题", "question_type": "core"},
+        ]
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            session = await self.service.start_session(skill="bazi", custom_questions=custom)
+            assert len(session.questions) == 1
+            assert session.questions[0].id == "custom1"
+
+    @pytest.mark.asyncio
+    async def test_get_session_from_cache(self):
+        session_id = uuid4()
+        session = InterviewSession(
+            id=session_id,
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        self.service._cache[session_id] = session
+
+        result = await self.service.get_session(session_id)
+        assert result is session
+
+
+class TestInterviewServiceAnswers:
+    """Test InterviewService answer submission"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.content = '{"life_context": {}, "ai_insights": {}}'
+        self.mock_llm.chat = AsyncMock(return_value=mock_response)
+        self.service = InterviewService()
+
+    @pytest.mark.asyncio
+    async def test_submit_answer_advances_question(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+                InterviewQuestion(id="q2", question_text="问题2", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            next_q, is_complete = await self.service.submit_answer(session, "我的回答")
+
+        assert session.questions[0].answer == "我的回答"
+        assert session.current_question_idx == 1
+        assert next_q is not None
+        assert next_q.id == "q2"
+        assert is_complete is False
+
+    @pytest.mark.asyncio
+    async def test_submit_answer_completes_session(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            next_q, is_complete = await self.service.submit_answer(session, "最后的回答")
+
+        assert is_complete is True
+        assert next_q is None
+        assert session.state == InterviewState.COMPLETED
+        assert session.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_submit_answer_extracts_info(self):
+        mock_response = MagicMock()
+        mock_response.content = '{"life_context": {"career": {"status": "employed"}}, "ai_insights": {"current_concerns": ["工作压力"]}}'
+        self.mock_llm.chat = AsyncMock(return_value=mock_response)
+
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+                InterviewQuestion(id="q2", question_text="问题2", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            await self.service.submit_answer(session, "我在互联网公司工作，压力很大")
+
+        assert session.questions[0].extracted_info is not None
+
+
+class TestInterviewServiceSkip:
+    """Test InterviewService skip functionality"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        self.service = InterviewService()
+
+    @pytest.mark.asyncio
+    async def test_skip_session(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[
+                InterviewQuestion(id="q1", question_text="问题1", question_type="core"),
+            ],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+
+        with patch.object(self.service, '_save_session_to_db', new_callable=AsyncMock):
+            warning = await self.service.skip_session(session)
+
+        assert session.state == InterviewState.SKIPPED
+        assert session.completed_at is not None
+        assert "跳过" in warning
+
+
+class TestInterviewServiceResult:
+    """Test InterviewService result generation"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        self.service = InterviewService()
+
+    def test_get_result_incomplete(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.IN_PROGRESS,
+            questions=[],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+        )
+        result = self.service.get_result(session)
+        assert result.success is False
+        assert "尚未完成" in result.summary
+
+    def test_get_result_skipped(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.SKIPPED,
+            questions=[],
+            current_question_idx=0,
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        result = self.service.get_result(session)
+        assert "跳过" in result.summary
+
+    def test_get_result_completed_with_answers(self):
+        session = InterviewSession(
+            id=uuid4(),
+            user_id=None,
+            skill="bazi",
+            state=InterviewState.COMPLETED,
+            questions=[
+                InterviewQuestion(
+                    id="q1",
+                    question_text="问题1",
+                    question_type="core",
+                    answer="回答1",
+                    extracted_info={
+                        "ai_insights": {"current_concerns": ["工作压力"]},
+                        "life_context": {"career": {"status": "employed"}},
+                    },
+                ),
+            ],
+            current_question_idx=1,
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        result = self.service.get_result(session)
+        assert result.success is True
+        assert result.questions_answered == 1
+        assert "工作压力" in result.extracted_profile.get("ai_insights", {}).get("current_concerns", [])
+
+
+class TestInterviewNeededCheck:
+    """Test profile completeness check"""
+
+    def setup_method(self):
+        self.mock_llm = AsyncMock()
+        self.service = InterviewService()
+
+    def test_interview_needed_empty_profile(self):
+        assert self.service.check_interview_needed({}) is True
+        assert self.service.check_interview_needed(None) is True
+
+    def test_interview_needed_incomplete_profile(self):
+        profile = {
+            "basic": {"gender": "male"},  # Missing birth_datetime
+        }
+        assert self.service.check_interview_needed(profile) is True
+
+    def test_interview_not_needed_complete_profile(self):
+        profile = {
+            "basic": {"birth_datetime": "1990-05-15", "gender": "male"},
+            "life_context": {
+                "career": {"status": "employed"},
+                "relationship": {"status": "single"},
+                "current_focus": ["事业"],
+            },
+            "ai_insights": {
+                "current_concerns": ["职业发展"],
+                "personality_traits": ["独立"],
+            },
+        }
+        assert self.service.check_interview_needed(profile, threshold=0.5) is False
+
+
+class TestGlobalInstance:
+    """Test global interview service instance"""
+
+    def test_get_interview_service_singleton(self):
+        # Reset global instance
+        import services.interview.interview_service as module
+        module._interview_service = None
+
+        service1 = get_interview_service()
+        service2 = get_interview_service()
+        assert service1 is service2
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

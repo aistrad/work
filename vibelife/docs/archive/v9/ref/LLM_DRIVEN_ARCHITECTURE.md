@@ -1,0 +1,1391 @@
+# VibeLife LLM 驱动架构 - 完整设计文档
+
+> **版本**: 4.0 (v13)
+> **日期**: 2026-01-23
+> **状态**: 实施中
+> **架构原则**: 完全 LLM 驱动，配置即规则，代码只做 I/O
+> **v13 新增**: 配置驱动 + LLM 执行的 VibeProfile 提取架构
+
+---
+
+## 执行摘要
+
+**核心理念**：将所有流程控制交给 LLM，通过 Rule 文件和 Prompt 工程驱动行为，避免硬编码状态机。
+
+**架构转变**：
+```
+旧架构：独立页面 + 前端状态管理 + 后端步骤追踪
+新架构：Rule 文件 + LLM 自驱动 + 主 Chat 统一体验
+```
+
+**关键成果**：
+- ✅ Rule 文件架构已建立
+- ✅ 通用工具系统已完成
+- ✅ Dashboard 已整合到 Chat 空状态
+- ✅ **v13 新增**：配置驱动 + LLM 执行的 VibeProfile 提取
+- ✅ **v13 新增**：三层存储架构（current/profile/timeline）
+- ✅ **v13 新增**：vibe_extract.json 作为唯一规则来源
+- ✅ **v13 新增**：VibeExtractor 极简执行引擎（~100 行）
+
+---
+
+## 1. 核心架构
+
+### 1.1 整体架构图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         VibeLife 架构                            │
+└─────────────────────────────────────────────────────────────────┘
+
+用户输入
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 1: 意图路由（轻量上下文）                                  │
+│                                                                  │
+│  System Prompt: routing.yaml/phase1_prompt                      │
+│  工具集: [activate_skills, show, ask]                           │
+│  目的: LLM 理解意图 → 路由到正确 Skill                           │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼ activate_skills(skills, rule=?)
+    │
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 2: 专家执行（完整上下文）                                  │
+│                                                                  │
+│  System Prompt: SKILL.md + Rule.md + SOP + Cases + Profile      │
+│  工具集: [collect, compute, display] + 通用工具                  │
+│  数据上下文: profile.skills.{skill_id}                           │
+│  目的: LLM 执行专业任务 → 输出卡片/分析                          │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼ save_skill_data(data)
+    │
+┌─────────────────────────────────────────────────────────────────┐
+│ VibeProfile (PostgreSQL JSONB)                                  │
+│                                                                  │
+│  profile.skills.{skill_id}                                      │
+│    ├─ {业务数据} (north_star, goals, etc)                        │
+│    ├─ _state (运行时状态)                                        │
+│    └─ _meta (版本、时间戳)                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 分层职责
+
+| 层级 | 职责 | LLM 驱动 | 示例 |
+|------|------|----------|------|
+| **Phase 1 - 路由层** | 理解意图，选择 Skill | ✅ 完全 | "算命" → activate_skills(["bazi"]) |
+| **Phase 2 - 执行层** | 执行专业任务 | ✅ 完全 | LLM 根据 SKILL.md 引导对话 |
+| **Rule 层** | 定义流程结构 | ✅ Prompt | rules/dankoe.md 定义 6 个问题 |
+| **工具层** | 数据操作和卡片展示 | ❌ 声明式 | save_skill_data, show_card |
+| **存储层** | 持久化用户数据 | ❌ 基础设施 | profile.skills.{skill_id} |
+
+---
+
+## 2. Protocol 系统架构（方案 D：纯 Prompt 驱动）
+
+### 2.1 设计原理
+
+**核心思想**：Protocol 是一个由 LLM 驱动的结构化对话流程，通过 Rule 文件定义流程，LLM 从对话历史判断进度。
+
+```
+Protocol 实现 = Rule 文件 + LLM 记忆 + save_skill_data 工具
+
+不需要（已废弃）：
+├─ ❌ protocol.step（步骤计数器）
+├─ ❌ protocol.data（中间状态）
+├─ ❌ advance_protocol_step（步骤推进工具）
+├─ ❌ 独立 /protocol/[id] 页面
+├─ ❌ 前端步骤管理
+└─ ❌ SSE protocol_progress 事件
+
+需要（新架构）：
+├─ ✅ Rule 文件（定义流程结构）
+├─ ✅ LLM 对话历史（判断进度）
+├─ ✅ save_skill_data（完成后保存）
+└─ ✅ 主 Chat 中完成（统一体验）
+```
+
+### 2.2 Protocol 执行流程
+
+```
+用户："我想做人生重置"
+    │
+    ▼ Phase 1 LLM 识别意图
+    │
+activate_skills(skills=["lifecoach"], rule="dankoe")
+    │
+    ▼ Phase 2 上下文切换
+    │
+System Prompt 包含：
+├─ lifecoach/SKILL.md（专家人格）
+├─ lifecoach/rules/dankoe.md（6 个问题流程）
+└─ profile.skills.lifecoach（历史数据）
+    │
+    ▼ LLM 驱动对话（在主 Chat 中）
+    │
+LLM: "准备好开始 Dan Koe 快速重置了吗？这需要 10 分钟。"
+用户: "准备好了"
+LLM: "第一个问题：你持续忍受的不满是什么？"
+用户: "工作没意义，总是被打断"
+LLM: "第二个问题：如果不改变，3 年后会是什么样？"
+... (LLM 根据 Rule 自己推进 6 个问题)
+    │
+    ▼ 完成后
+    │
+LLM 调用: save_skill_data({
+  data: {
+    north_star: { vision: "...", anti_vision: "..." },
+    identity: { old: "...", new: "..." },
+    weekly: { actions: [...] }
+  }
+})
+    │
+    ▼ 数据持久化
+    │
+profile.skills.lifecoach.{north_star, identity, weekly}
+```
+
+**关键特性**：
+1. **无状态追踪**：LLM 从历史判断"已完成哪些问题"
+2. **无步骤计数器**：Rule 文件定义流程，LLM 自己推进
+3. **中断恢复**：用户切换话题后回来，LLM 识别未完成的问题
+4. **统一体验**：全程在主 Chat，无需跳转独立页面
+
+### 2.3 Rule 文件结构
+
+**核心模式**：
+```markdown
+# skills/lifecoach/rules/dankoe.md
+
+---
+id: dankoe
+name: Dan Koe 快速重置
+triggers: [人生重置, 快速重置, Dan Koe]
+estimated_time: 10分钟
+---
+
+## 流程
+
+按顺序完成 6 个问题：
+
+### Phase 1: 觉醒
+1. **持续的不满**：你忍受的痛苦是什么？
+2. **反愿景场景**：如果不改变，3 年后会怎样？
+3. **愿景场景**：理想的 3 年后是什么样？
+
+### Phase 2: 设计
+4. **放弃的身份**：你是什么样的人？
+5. **新身份宣言**：你想成为什么样的人？
+
+### Phase 3: 启动
+6. **本周行动**：具体的行动清单？
+
+## 完成后
+
+调用 save_skill_data 保存：
+- north_star: {vision, anti_vision}
+- identity: {old, new}
+- weekly: {actions}
+
+## 中断处理
+
+从对话历史判断进度：
+- 如果已回答问题 1-3，继续问题 4
+- 如果用户说"继续"，从未完成的问题开始
+```
+
+**Rule 文件的作用**：
+- ✅ 定义流程结构（不是控制流程执行）
+- ✅ 提供 LLM 指引（不是状态机）
+- ✅ 声明数据模型（不是数据存储）
+
+---
+
+## 3. 工具调用机制
+
+### 3.1 Phase 1 工具调用问题
+
+**问题现象**：
+```
+用户："我想聊聊"
+预期：recommend_skills 工具调用 + 卡片显示
+实际：纯文字回复，无卡片
+```
+
+**根本原因**：
+1. **Prompt 指令不够强**：LLM 将"必须调用工具"理解为"建议"
+2. **缺少对比学习**：没有展示"错误"vs"正确"示例
+3. **缺少动机解释**：没说明为什么必须调用（卡片 UI 依赖）
+4. **缺少强制机制**：未使用 Claude API tool_choice 参数
+
+### 3.2 解决方案架构
+
+**方案 A：Prompt 优化（LLM 驱动）**
+
+```yaml
+核心原则：
+├─ 强化指令："你必须使用工具，禁止纯文字回复"
+├─ 解释原因："用户使用卡片界面，纯文字无法触发卡片"
+├─ 对比学习：展示 ❌ 错误示例 vs ✅ 正确示例
+└─ 行为映射表：明确列出 [用户说 → 工具调用] 映射
+
+预期效果：
+├─ 工具调用率：60% → 90%+
+└─ 保持 LLM 驱动架构
+```
+
+**方案 B：tool_choice 参数（API 层强制）**
+
+```python
+核心机制：
+├─ Phase 1: tool_choice={"type": "any"}  # 必须调用任一工具
+└─ Phase 2: tool_choice={"type": "auto"} # 允许自由选择
+
+架构特点：
+├─ ✅ Claude SDK 原生支持
+├─ ✅ 100% 工具调用率
+├─ ✅ LLM 仍选择具体工具（仍是 LLM 驱动）
+└─ ✅ 无需 Python 硬编码兜底逻辑
+
+工作流程：
+Phase 1 → 强制工具调用 → LLM 选择最合适的工具
+Phase 2 → 自由选择 → LLM 可纯文字或工具调用
+```
+
+**方案对比**：
+
+| 方案 | 调用率 | 架构纯粹度 | 实施成本 | 推荐度 |
+|------|--------|-----------|---------|--------|
+| A (Prompt) | 90%+ | ⭐⭐⭐⭐⭐ | 低 | ⭐⭐⭐⭐ |
+| B (tool_choice) | 100% | ⭐⭐⭐⭐ | 中 | ⭐⭐⭐⭐⭐ |
+| A + B | 100% | ⭐⭐⭐⭐⭐ | 中 | ⭐⭐⭐⭐⭐ |
+
+**推荐**：先实施方案 A，如果调用率 < 90% 则补充方案 B。
+
+### 3.3 工具调用遥测
+
+**监控架构**：
+```
+CoreAgent._execute_tool()
+    │
+    ▼ 记录日志
+    │
+logger.info({
+  tool: "recommend_skills",
+  phase: "phase1",
+  skill: null,
+  timestamp: "..."
+})
+    │
+    ▼ 可选：发送遥测
+    │
+Grafana / Prometheus
+    │
+    ▼ 监控指标
+    │
+├─ 工具调用率（Phase 1 vs Phase 2）
+├─ 各工具调用频率分布
+└─ 工具调用失败率
+```
+
+---
+
+## 4. 通用工具系统
+
+### 4.1 设计原理
+
+**问题**：每个 Skill 都需要读写数据，导致重复实现 `read_lifecoach_state`、`read_bazi_state` 等。
+
+**解决方案**：通用工具 + 自动 skill_id 注入
+
+```
+通用工具系统架构：
+├─ read_state(sections?) → 读取 profile.skills.{当前skill_id}
+├─ write_state(section, data) → 写入 profile.skills.{当前skill_id}.{section}
+├─ append_to_list(path, entry) → 追加到列表（如 journal）
+└─ save_skill_data(data) → 深度合并保存（向后兼容）
+
+关键机制：
+├─ context.skill_id 自动注入 → LLM 无需传递 skill_id
+├─ 深度合并策略 → 不会覆盖未指定的字段
+└─ 自动时间戳 → _meta.updated_at 自动更新
+```
+
+### 4.2 数据流
+
+```
+LLM 调用: write_state(section="north_star", data={vision: "..."})
+    │
+    ▼ 工具处理器
+    │
+ToolContext: {user_id, skill_id="lifecoach"}
+    │
+    ▼ Repository 层
+    │
+update_skill_state(user_id, "lifecoach", "north_star", {vision: "..."})
+    │
+    ▼ PostgreSQL JSONB 操作
+    │
+jsonb_set(
+  profile,
+  '{skills, lifecoach, north_star}',
+  '{skills, lifecoach, north_star}' || {vision: "..."}
+)
+    │
+    ▼ 结果
+    │
+profile.skills.lifecoach.north_star = {
+  vision: "...",  # 新数据
+  anti_vision: "..."  # 保留旧数据（深度合并）
+}
+```
+
+---
+
+## 5. Dashboard 整合架构
+
+### 5.1 设计决策
+
+**核心理念**：Dashboard 不是独立页面，而是 Chat 空状态的增强展示。
+
+```
+旧架构（已废弃）：
+├─ 独立路由：/dashboard
+├─ 独立页面组件
+└─ 独立导航入口
+
+新架构（已实施）：
+├─ 整合到 Chat 空状态
+├─ /dashboard → 重定向到 /chat
+└─ 导航直接指向 /chat
+```
+
+### 5.2 组件层级
+
+```
+ChatPage
+  └─ ChatContent
+      ├─ useDashboard() → {dashboard, checkIn, toggleLever, ...}
+      └─ ChatContainer
+          └─ messages.length === 0 ?
+              ├─ ChatEmptyStateWithDashboard
+              │   ├─ DailyGreeting
+              │   ├─ VibeGlyph
+              │   ├─ AmbientStatusBar (简化版)
+              │   ├─ LifecoachQuickView (可展开卡片)
+              │   └─ MySkillsCarousel
+              └─ : null
+          └─ messages.map(msg => ChatMessage)
+```
+
+**设计优势**：
+- ✅ 用户无需切换 Tab
+- ✅ 对话开始后自动隐藏，不干扰
+- ✅ 组件复用 Dashboard 数据层
+- ✅ 统一体验，减少认知负担
+
+---
+
+## 6. 模块职责划分
+
+### 6.1 CoreAgent 模块
+
+**职责**：
+- ✅ Phase 1/2 上下文切换
+- ✅ System Prompt 构建
+- ✅ LLM 调用和工具执行
+- ✅ AgentEvent 流生成
+
+**不负责**：
+- ❌ Protocol 状态追踪（废弃）
+- ❌ 业务逻辑判断（交给 LLM）
+- ❌ 前端路由控制
+
+### 6.2 RoutingConfig 模块
+
+**职责**：
+- ✅ 加载 routing.yaml 配置
+- ✅ 提供 Phase 1 Prompt
+- ✅ 提供 Skill/Protocol 元数据
+- ✅ 动态生成工具描述
+
+**设计模式**：Single Source of Truth
+- 所有路由配置在 YAML 中定义
+- 代码从 YAML 加载，不硬编码
+
+### 6.3 Skill 模块
+
+**职责**：
+- ✅ 定义专家人格（SKILL.md）
+- ✅ 定义流程规则（rules/*.md）
+- ✅ 注册工具（tools/tools.yaml）
+- ✅ 实现工具处理器（tools/handlers.py）
+
+**Rule 文件职责**：
+- ✅ 定义流程结构
+- ✅ 提供 LLM 指引
+- ✅ 声明数据模型
+
+**不负责**：
+- ❌ 控制流程执行（交给 LLM）
+- ❌ 状态追踪（LLM 从历史判断）
+
+### 6.4 UnifiedProfile 模块
+
+**职责**：
+- ✅ 管理用户数据（account, birth_info, preferences）
+- ✅ 管理 Skill 数据（profile.skills.{skill_id}）
+- ✅ JSONB 深度合并操作
+- ✅ 缓存管理
+
+**数据结构**：
+```
+profile
+├─ account (账户信息)
+├─ birth_info (出生信息)
+├─ preferences (用户偏好)
+├─ state (当前状态)
+├─ skills.{skill_id} (Skill 数据)
+│   ├─ {业务数据}
+│   ├─ _state (运行时状态)
+│   └─ _meta (版本、时间戳)
+└─ extracted (AI 抽取的信息)
+```
+
+---
+
+## 7. 关键算法
+
+### 7.1 Phase 切换算法
+
+```
+输入：user_message, conversation_history
+输出：AgentEvent stream
+
+算法：
+1. 检测当前 Phase
+   IF conversation 中无 skill → Phase 1
+   ELSE → Phase 2
+
+2. Phase 1 流程
+   a. 构建轻量 System Prompt（routing.yaml）
+   b. 提供 4 个路由工具
+   c. LLM 选择工具
+   d. IF tool == activate_skills:
+      - 设置 self._active_skill
+      - 重新构建 System Prompt（同轮切换）
+      - 重新调用 LLM（Phase 2）
+
+3. Phase 2 流程
+   a. 构建完整 System Prompt（SKILL.md + Rule + SOP + Cases）
+   b. 加载 Skill 工具集
+   c. IF 需要收集信息 → 限制工具为 collect_tool
+      ELIF 需要计算 → 限制工具为 compute_tool
+      ELSE → 完整工具集
+   d. LLM 执行任务
+```
+
+**关键特性**：
+- ✅ 同轮切换：activate_skills 后立即重新构建上下文
+- ✅ 渐进式加载：Phase 1 轻量，Phase 2 完整
+- ✅ SOP 驱动：工具可用性由 SOP 状态决定
+
+### 7.2 Rule 驱动对话算法
+
+```
+输入：Rule 文件, 对话历史
+输出：下一步引导
+
+算法：
+1. LLM 读取 Rule 文件（在 System Prompt 中）
+2. LLM 分析对话历史
+   - 识别已完成的问题（通过用户回答）
+   - 识别未完成的问题
+3. LLM 决策
+   IF 所有问题已完成:
+     调用 save_skill_data
+   ELIF 用户切换话题:
+     正常回答，等待用户回来
+   ELSE:
+     提出下一个未完成的问题
+```
+
+**与传统状态机的区别**：
+
+| 特性 | 传统状态机 | Rule 驱动（LLM） |
+|------|-----------|-----------------|
+| 进度追踪 | step=3 (硬编码) | 从历史推断 |
+| 中断恢复 | 保存 step，恢复时读取 | LLM 自动识别未完成问题 |
+| 灵活性 | 严格按步骤 | 可跳跃、追问、澄清 |
+| 维护成本 | 每次改流程需改代码 | 只需改 Rule 文件 |
+
+### 7.3 工具可用性决策算法（SOP）- v2.1 更新
+
+> **重要变更 (v2.1)**：从"限制工具集"改为"指导 LLM 决策"，符合 CLAUDE.md 核心原则。
+
+**旧做法（已废弃）**：
+```python
+# ❌ 错误：限制 LLM 能看到的工具
+if phase == "P1_COLLECT":
+    allowed_tools = ["request_info"]  # LLM 看不到其他工具
+```
+
+**新做法（v2.1）**：
+```python
+# ✅ 正确：LLM 看到所有工具，通过 SOP 指导决策
+tools = ToolRegistry.get_tools_for_skill(skill_id)  # 完整工具集
+
+sop_rules = """
+## 当前状态：需要出生信息
+
+**推荐工具**：collect_bazi_info
+- 表单体验更好
+- 信息更完整
+
+**灵活处理**：
+如果用户在对话中直接提供了生日，可以解析并直接进入下一步。
+"""
+# LLM 有推荐但保留灵活性
+```
+
+**核心原则**：
+- ✅ 工具不受限：LLM 可以看到所有工具
+- ✅ SOP 提供指导：而非 if-else 限制
+- ✅ 保留灵活性：特殊情况可绕过
+
+### 7.4 Phase 2 边界意识（Context Continuity）- v2.1 新增
+
+**问题**：用户在 tarot skill 内说"今日指引"，LLM 调用 `recommend_skills` 让用户重新选择服务。
+
+**根本原因**：
+1. Phase 2 的 System Prompt 没有明确告知 LLM "你现在在哪个 skill 内"
+2. LLM 看到 `recommend_skills` 工具后可能误用
+3. 工具描述缺少 `when_to_call` 和 `when_not_to_call` 指导
+
+**解决方案**：通过 Prompt 和工具描述增强，而非工具集限制
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Phase 2 边界意识机制                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│ 1. SOP 模板增强 (routing.yaml)                                      │
+│    ready_for_analysis 模板添加：                                     │
+│    - "你现在是 {skill_id} 专家"                                     │
+│    - "用户请求应该用本 skill 的工具处理"                            │
+│    - "不推荐调用 recommend_skills（除非用户明确要求换服务）"         │
+│                                                                      │
+│ 2. 工具描述增强 (tools.yaml)                                        │
+│    recommend_skills 添加 when_not_to_call：                         │
+│    - "用户已在某个 Skill 内执行任务时不要调用"                       │
+│    - "用户请求可用当前 Skill 工具处理时不要调用"                     │
+│                                                                      │
+│ 3. SKILL.md 增强                                                    │
+│    每个 Skill 的工具调用规则表补全常见意图映射                      │
+│    添加边界意识指引                                                  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键原则**：
+
+| 原则 | 解释 | 实践 |
+|------|------|------|
+| **指导而非限制** | 告诉 LLM "推荐"和"不推荐"，而非禁止 | SOP 模板 |
+| **保留灵活性** | 用户明确要求换服务时可以切换 | 工具描述 |
+| **上下文意识** | LLM 知道"我现在在哪个 skill 内" | System Prompt |
+
+**判断原则（写入 SOP 模板）**：
+
+```markdown
+## 何时使用当前 Skill 工具
+- 用户请求与当前 Skill 直接相关
+- 用户说"今日指引"、"帮我看看"、"继续"等模糊请求
+
+## 何时切换 Skill（调用 activate_skills）
+- 用户明确说"我想看星座"（切换到 zodiac）
+- 用户明确说"帮我算八字"（切换到 bazi）
+- 用户说"换一个"、"退出"
+```
+
+**示例**：
+
+```
+场景：用户在 tarot skill 内
+
+用户："今日指引"
+❌ 错误：recommend_skills(skills=["tarot", "zodiac", "jungastro"])
+✅ 正确：draw_tarot_cards(spread_type="single", question="今日指引")
+
+用户："我想看星座"
+✅ 正确：activate_skills(skills=["zodiac"])  # 用户明确要求切换
+```
+
+---
+
+## 8. 架构对比
+
+### 8.1 旧 vs 新 Protocol 架构
+
+| 方面 | 旧架构 | 新架构（Rule 驱动） |
+|------|-------|-------------------|
+| **触发方式** | show_protocol_invitation → 跳转页面 | activate_skills + rule 参数 |
+| **状态管理** | 前端 ProtocolContainer 管理 step | LLM 从历史判断进度 |
+| **步骤推进** | advance_protocol_step 工具 | 无需工具，LLM 自驱动 |
+| **数据保存** | 每步调用工具保存 | 完成后一次性保存 |
+| **前端页面** | /protocol/dankoe 独立页面 | 主 Chat 中完成 |
+| **SSE 事件** | protocol_progress 事件 | 无需（普通对话流） |
+| **中断恢复** | 前端记录 currentStep | LLM 从历史判断 |
+| **代码量** | ~1500 行 | ~200 行 |
+| **维护成本** | 高（前后端复杂状态同步） | 低（只需维护 Rule 文件） |
+
+### 8.2 工具系统演进
+
+| 版本 | 模式 | 示例 | 问题 |
+|------|------|------|------|
+| V1 | Skill 专用工具 | read_lifecoach_state | 每个 Skill 需重复实现 |
+| V2 | 通用工具 + skill_id 参数 | read_state(skill_id="lifecoach") | LLM 需要知道 skill_id |
+| V3 | 通用工具 + 自动注入 | read_state() | ✅ LLM 无需传 skill_id |
+
+---
+
+## 9. 实施优先级
+
+### P0（最高优先级）- 卡片调用修复
+
+**目标**：工具调用率 60% → 90%+
+
+**模块**：
+- RoutingConfig (Phase 1 Prompt 优化)
+- CoreAgent (tool_choice 参数)
+- 监控遥测
+
+**时间**：2 天
+
+---
+
+### P1（重要）- 架构统一
+
+**目标**：完全移除旧 Protocol 系统
+
+**模块**：
+- 前端：删除 /protocol/* 页面和组件
+- 后端：删除 protocol 状态追踪逻辑
+- 工具：简化 show_protocol_invitation
+
+**时间**：3 天
+
+---
+
+### P1（重要）- Rule 驱动验证
+
+**目标**：确保新流程完整可用
+
+**测试**：
+- Dan Koe 完整流程
+- 中断恢复
+- 其他方法论（Covey, 王阳明, 了凡）
+
+**时间**：2 天
+
+---
+
+### P2（优化）- 监控和性能
+
+**目标**：系统稳定性和可观测性
+
+**模块**：
+- 工具调用遥测
+- Rule 文件缓存
+- Profile 查询优化
+- Grafana Dashboard
+
+**时间**：3 天
+
+---
+
+## 10. Profile 注入（三层架构 v3.0）
+
+### 10.1 设计原则
+
+**核心理念**：Identity + Skills + Vibe 三层架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Profile 注入架构                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Layer 1: Identity（所有 Skill 共享，~200 tokens）          │
+│  ───────────────────────────────────────────────────────    │
+│  • identity.birth_info（如有）                               │
+│  • identity.display_name                                    │
+│                                                             │
+│  Layer 2: Skills（当前 Skill 专属，~300 tokens）            │
+│  ───────────────────────────────────────────────────────    │
+│  • skills.{skill_id}                                        │
+│    - bazi → skills.bazi                                     │
+│    - zodiac → skills.zodiac                                 │
+│    - lifecoach → skills.lifecoach                           │
+│                                                             │
+│  Layer 3: Vibe（共享深度信息，~200 tokens）                  │
+│  ───────────────────────────────────────────────────────    │
+│  • vibe.insight（我是谁：本质+动态+规律）                    │
+│  • vibe.target（我要成为谁：目标+聚焦+里程碑）               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 实现
+
+**单一函数**：`ContextManager.get_profile_context(user_id, skill_id)`
+
+```python
+async def get_profile_context(self, user_id: str, skill_id: str) -> Dict:
+    """三层架构 Profile 注入"""
+    profile = await UnifiedProfileRepository.get_profile(UUID(user_id))
+    if not profile:
+        return {}
+
+    return {
+        # Layer 1: Identity（共享）
+        "user": {
+            "name": profile.get("identity", {}).get("display_name"),
+            "birth": profile.get("identity", {}).get("birth_info"),
+        },
+        # Layer 2: Skills（当前 Skill 专属）
+        "skill_data": profile.get("skills", {}).get(skill_id, {}),
+        # Layer 3: Vibe（共享深度信息）
+        "vibe": {
+            "insight": profile.get("vibe", {}).get("insight", {}),
+            "target": profile.get("vibe", {}).get("target", {}),
+        }
+    }
+```
+
+### 10.3 三层架构说明
+
+| 层级 | 内容 | 来源 | 所有 Skill 可读 |
+|------|------|------|----------------|
+| **Identity** | birth_info, display_name | 用户填写 | ✅ |
+| **Skills** | 各 Skill 原始数据 | Skill 实时写入 | ❌（仅当前 Skill） |
+| **Vibe** | insight + target | ProfileExtractor | ✅ |
+
+### 10.4 跨 Skill 数据配置
+
+**配置驱动**（在 SKILL.md frontmatter 中声明）：
+
+```yaml
+# skills/jungastro/SKILL.md
+---
+name: jungastro
+requires_skills: [bazi, zodiac]  # 声明需要的其他 Skill 数据
+---
+```
+
+**代码实现**：
+
+```python
+# skill_loader.py
+def get_skill_required_data(skill_id: str) -> List[str]:
+    """从 SKILL.md 配置读取需要的 skills"""
+    skill = load_skill(skill_id)
+    if skill and skill.requires_skills:
+        return skill.requires_skills
+    return [skill_id]  # 默认只需自身
+
+# prompt_builder.py - 使用配置
+skill_ids = get_skill_required_data(skill_id)  # 配置驱动，非硬编码
+for sid in skill_ids:
+    skill_data = profile.get("skills", {}).get(sid, {})
+```
+
+---
+
+## 11. 架构原则
+
+### 11.1 LLM 驱动
+
+**定义**：所有流程控制交给 LLM，通过 Prompt 引导行为。
+
+**实践**：
+- ✅ Rule 文件定义流程结构，不控制执行
+- ✅ LLM 从对话历史判断进度
+- ✅ 工具提供能力，LLM 决定何时调用
+- ❌ 不使用 if-elif 硬编码状态机
+
+### 11.2 声明式配置
+
+**定义**：配置驱动，而非代码驱动。
+
+**实践**：
+- ✅ routing.yaml 定义路由规则
+- ✅ tools.yaml 定义工具能力
+- ✅ Rule.md 定义流程结构
+- ❌ 不在代码中硬编码配置
+
+### 11.3 单一职责
+
+**定义**：每个模块只负责一件事。
+
+**实践**：
+- ✅ CoreAgent：执行 Agent 流程
+- ✅ RoutingConfig：加载配置
+- ✅ Skill：定义专家能力
+- ✅ UnifiedProfile：管理用户数据
+- ❌ 模块间不交叉职责
+
+### 11.4 渐进式加载
+
+**定义**：按需加载，避免初始上下文过大。
+
+**实践**：
+- ✅ Phase 1：轻量上下文（routing prompt + 4 工具）
+- ✅ Phase 2：完整上下文（SKILL + Rule + SOP + Cases + Profile）
+- ✅ SOP 驱动：按状态限制工具集
+
+---
+
+## 12. 风险与缓解
+
+| 风险 | 概率 | 影响 | 缓解措施 |
+|------|------|------|---------|
+| LLM 不遵守 Prompt | 中 | 高 | tool_choice 参数 + Prompt 优化 |
+| LLM 无法理解 Rule 流程 | 低 | 高 | Rule 文件添加示例对话 |
+| 中断恢复不准确 | 中 | 中 | 增加历史长度（10 → 20 条） |
+| 用户习惯旧 protocol 页面 | 低 | 低 | 引导语提示在对话中完成 |
+
+---
+
+## 13. 总结
+
+### 核心成果
+
+**架构转变**：
+```
+旧：复杂状态机 + 独立页面 + 前后端状态同步
+新：Rule 文件 + LLM 自驱动 + 主 Chat 统一体验
+```
+
+**代码简化**：
+- 旧架构：~1500 行（前端 800 + 后端 700）
+- 新架构：~200 行（Rule 文件 + 通用工具）
+- 减少：87% 代码量
+
+**维护成本**：
+- 旧：改流程需修改前后端代码 + 状态同步逻辑
+- 新：只需修改 Rule 文件（Markdown）
+
+**用户体验**：
+- 旧：跳转独立页面，中断对话流
+- 新：主 Chat 中完成，无缝体验
+
+### 关键洞察
+
+1. **LLM 是最好的状态机**：不需要硬编码 step=1,2,3，LLM 从历史自然推断
+2. **Prompt 是配置**：Rule 文件 = 可读性极高的配置文件
+3. **工具是能力**：提供工具，让 LLM 决定何时调用
+4. **卡片是交互**：工具调用 = 卡片展示，统一模式
+
+### 未来方向
+
+1. **多方法论并行**：支持同时进行多个 Protocol（Dankoe + Weekly Review）
+2. **协议版本控制**：Rule 文件版本化，支持升级
+3. **Proactive Engine**：LLM 生成个性化 Dashboard 内容
+4. **A/B 测试框架**：对比 Rule 文件变体效果
+
+---
+
+---
+
+## 14. Goal-Anchored History (v10.1 新增)
+
+### 14.1 问题背景
+
+**问题**：长对话（50+ 条消息）后，用户原始意图被挤出 LLM 注意力窗口，导致"目标遗忘"。
+
+**来源**：借鉴 [Planning-with-Files](https://github.com/OthmanAdi/planning-with-files) 的 Attention Manipulation 原则。
+
+> "After ~50 tool calls, models forget original goals ('lost in the middle' effect)."
+> — Manus Context Engineering
+
+### 14.2 解决方案
+
+**核心思路**：第一条消息 = 用户原始意图 = Goal，永远保留在 history 中。
+
+```
+旧策略：history[-15:]（最近 15 条）
+┌─────────────────────────────────────────────┐
+│ msg[35] msg[36] ... msg[49] msg[50]         │  ← 第一条消息丢失
+└─────────────────────────────────────────────┘
+
+新策略：history[0] + history[-14:]（第一条 + 最近 14 条）
+┌─────────────────────────────────────────────┐
+│ msg[1] + msg[37] msg[38] ... msg[49] msg[50]│  ← 目标锚定
+└─────────────────────────────────────────────┘
+```
+
+### 14.3 实现
+
+**数据库层** (`stores/message_repo.py`):
+
+```python
+async def get_messages_anchored(conversation_id: UUID, limit: int = 14) -> List[Dict]:
+    """Goal-Anchored History：第一条消息 + 最近 N 条"""
+    query = """
+        WITH first_msg AS (
+            SELECT * FROM messages WHERE conversation_id = $1
+            ORDER BY created_at ASC LIMIT 1
+        ),
+        recent_msgs AS (
+            SELECT * FROM messages WHERE conversation_id = $1
+            ORDER BY created_at DESC LIMIT $2
+        ),
+        combined AS (
+            SELECT * FROM first_msg UNION SELECT * FROM recent_msgs
+        )
+        SELECT * FROM combined ORDER BY created_at ASC
+    """
+    rows = await fetch(query, conversation_id, limit)
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
+```
+
+**路由层** (`routes/chat_v5.py`):
+
+```python
+async def get_conversation_history(conversation_id, skill=None):
+    limit = 4 if not skill else 14  # Phase 1: 5条, Phase 2: 15条
+    return await message_repo.get_messages_anchored(conversation_id, limit)
+```
+
+### 14.4 与 Planning-with-Files 对比
+
+| 维度 | PWF | VibeLife |
+|------|-----|----------|
+| 存储 | 3 个 markdown 文件 | PostgreSQL messages 表 |
+| Goal 持久化 | task_plan.md | 第一条消息 |
+| Findings | findings.md | _findings |
+| Progress | progress.md | messages 表 |
+| Attention | PreToolUse Hook 重读文件 | 第一条消息始终在 history |
+
+### 14.5 测试场景
+
+| 场景 | 验证点 |
+|------|--------|
+| 长对话目标保持 | 50+ 条消息后，LLM 仍能引用用户原始意图 |
+| 跨 Skill 连续性 | lifecoach → bazi → 回 lifecoach，目标不丢失 |
+| 短对话无影响 | <15 条消息时，行为与旧策略一致 |
+
+---
+
+---
+
+## 15. 配置驱动 + LLM 执行的 VibeProfile (v13 重大更新)
+
+### 15.1 设计原理
+
+**v11 问题**：虽然配置化了规则，但执行逻辑仍是硬编码的 Python 函数：
+- `transform_element_to_archetype()` - 硬编码的五行→原型映射
+- `merge_insight()` / `merge_target()` - 硬编码的合并算法
+- 添加新转换规则仍需改代码
+
+**v13 解决方案**：**配置即规则，LLM 即引擎，代码只做 I/O**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│               VibeProfile v13 架构                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   config/vibe_extract.json (唯一规则来源)                    │
+│   ├─ schema: Vibe 结构定义                                  │
+│   ├─ extractors: 提取规则                                   │
+│   │   ├─ realtime: 实时提取（每轮对话后）→ vibe.current    │
+│   │   ├─ daily: 定时提取（每日凌晨）→ vibe.profile         │
+│   │   ├─ event_detector: 事件检测 → vibe.timeline          │
+│   │   └─ skill_sync: Skill 数据同步 → vibe.profile         │
+│   ├─ transforms: 转换映射（bazi→原型, zodiac→原型）        │
+│   └─ context_injection: Context 注入模板                   │
+│                                                              │
+│   services/vibe/extractor.py (极简执行引擎，~100 行)        │
+│   ├─ _load_config() - 读取配置                             │
+│   ├─ _collect_input() - 收集数据                           │
+│   ├─ _build_prompt() - 构建 Prompt                         │
+│   ├─ _call_llm() - 调用 LLM                                │
+│   └─ _write_output() - 写入数据库                          │
+│                                                              │
+│   LLM 执行：                                                 │
+│   - 理解 schema 定义                                        │
+│   - 分析输入数据                                            │
+│   - 应用 transform mapping                                  │
+│   - 执行 merge_rules                                        │
+│   - 输出结构化 JSON                                         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 三层存储架构
+
+```
+vibe:
+├── current (Hot Layer)
+│   ├─ 更新：每轮对话后
+│   ├─ 内容：emotion, energy, focus, topics, context
+│   └─ 策略：覆盖写入
+│
+├── profile (Warm Layer)
+│   ├─ 更新：每日凌晨
+│   ├─ 内容：identity, goals, people, context, preferences
+│   └─ 策略：增量合并
+│
+└── timeline (Cold Layer)
+    ├─ 更新：检测到事件时
+    ├─ 内容：goal, relationship, decision, life_event
+    └─ 策略：追加存储（max 100）
+```
+
+### 15.3 配置文件结构
+
+**文件路径**: `apps/api/config/vibe_extract.json`
+
+```json
+{
+  "version": "13.0",
+  "schema": {
+    "vibe": {
+      "current": { "emotion": "enum", "energy": "enum", "focus": "array" },
+      "profile": { "identity": {...}, "goals": [...], "people": [...] },
+      "timeline": [{ "type": "enum", "event": "string", "data": "object" }]
+    }
+  },
+  "extractors": {
+    "realtime": {
+      "trigger": "on_conversation_turn",
+      "output": { "target": "vibe.current", "strategy": "overwrite" },
+      "instruction": "分析对话消息，提取用户当前状态..."
+    },
+    "skill_sync": {
+      "trigger": "on_skill_update",
+      "rules": [
+        {
+          "skill": "bazi",
+          "when": "chart.day_master exists",
+          "transform": {
+            "mapping": {
+              "wood": { "archetype": "成长者", "traits": ["创新", "进取"] }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+### 15.4 执行引擎
+
+**文件路径**: `apps/api/services/vibe/extractor.py`
+
+```python
+class VibeExtractor:
+    """配置驱动 + LLM 执行的提取引擎"""
+
+    async def execute(self, user_id: UUID, trigger: str, context: dict = None) -> dict:
+        # 1. 匹配 extractors
+        extractors = self._match_extractors(trigger)
+
+        for name, config in extractors.items():
+            # 2. 收集输入数据
+            input_data = await self._collect_input(user_id, config, context)
+
+            # 3. 构建 LLM Prompt（配置 + 数据 + 指令）
+            prompt = self._build_prompt(config, input_data)
+
+            # 4. 调用 LLM
+            output = await self._call_llm(prompt)
+
+            # 5. 写入数据库
+            await self._write_output(user_id, config, output)
+
+    async def build_context(self, user_id: UUID, skill_id: str = None) -> str:
+        """构建 Context 注入字符串（也由 LLM 执行）"""
+```
+
+### 15.5 v13 vs v11 对比
+
+| 维度 | v11（配置驱动同步） | v13（配置驱动 + LLM 执行） |
+|------|-------------------|--------------------------|
+| **规则来源** | vibe_sync.yaml + 硬编码函数 | 只有 vibe_extract.json |
+| **转换逻辑** | Python 函数 | 配置 mapping + LLM 执行 |
+| **合并逻辑** | Python 函数 | 配置 merge_rules + LLM 执行 |
+| **事件检测** | 无 | 配置 indicators + LLM 执行 |
+| **代码量** | ~750 行 | ~100 行 |
+| **扩展方式** | 改配置 + 改代码 | 只改配置 |
+
+---
+
+## 16. Phase 1 个性化路由 (v11 新增)
+
+### 16.1 设计原理
+
+**核心问题**：Phase 1 路由时不加载用户画像，导致：
+1. LLM 不知道用户是谁
+2. 无法区分已订阅/未订阅 Skill
+3. 路由决策无法个性化
+
+**解决方案**：Phase 1 也加载轻量画像 + 订阅信息。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│             Phase 1 个性化路由 (v11)                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  用户输入                                                     │
+│      │                                                       │
+│      ▼                                                       │
+│  chat_v5.py: get_user_context(skill=None)                   │
+│      │                                                       │
+│      ├─ 加载 identity (display_name, birth_info)            │
+│      ├─ 加载 vibe (insight, target)                          │
+│      └─ 加载 subscribed_skills                               │
+│      │                                                       │
+│      ▼                                                       │
+│  prompt_builder.py: _build_phase1_context()                  │
+│      │                                                       │
+│      ├─ {user_portrait} - 用户画像                           │
+│      ├─ {subscribed_skills} - 已订阅服务                     │
+│      ├─ {recommendable_skills} - 可推荐服务                  │
+│      └─ {personalization_hint} - 个性化提示                  │
+│      │                                                       │
+│      ▼                                                       │
+│  LLM 基于画像做智能路由                                       │
+│      │                                                       │
+│      ├─ 意图明确 + 匹配已订阅 → activate_skills              │
+│      ├─ 意图明确 + 匹配未订阅 → show(type=skill_list)        │
+│      └─ 意图模糊 → 基于画像推荐已订阅服务                     │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 16.2 路由决策矩阵
+
+| 用户意图 | 订阅状态 | LLM 行动 |
+|---------|---------|---------|
+| 明确（"算八字"） | 已订阅 bazi | `activate_skills(skills=["bazi"])` |
+| 明确（"算八字"） | 未订阅 bazi | `show(type="skill_list")` |
+| 模糊（"帮我看看"） | 有已订阅 + 有画像 | 基于画像选择已订阅服务 |
+| 模糊（"帮我看看"） | 无订阅 | `show(type="recommendation")` |
+
+### 16.3 Phase 1 Prompt 模板
+
+```yaml
+# routing.yaml
+
+phase1_prompt: |
+  # Vibe
+
+  你是 Vibe，生命对话者。
+
+  {user_portrait}
+
+  ## 已订阅服务（优先）
+  {subscribed_skills}
+
+  ## 可推荐服务
+  {recommendable_skills}
+
+  ## 路由规则
+
+  | 情况 | 行动 |
+  |-----|------|
+  | 意图明确 + 匹配已订阅 | `activate_skills` |
+  | 意图明确 + 匹配未订阅 | `show(type="skill_list")` |
+  | 意图模糊 + 有画像 | 基于画像推荐已订阅服务 |
+  | 意图模糊 + 无画像 | `show(type="recommendation")` |
+
+  {personalization_hint}
+```
+
+### 16.4 个性化提示生成
+
+```python
+def _build_personalization_hint(self, profile: Dict) -> str:
+    """根据用户画像生成个性化路由提示"""
+    hints = []
+
+    vibe = profile.get("vibe", {})
+    target = vibe.get("target", {})
+    insight = vibe.get("insight", {})
+
+    # 如果有北极星目标
+    if target.get("north_star", {}).get("vision_scene"):
+        hints.append("用户有明确的人生愿景，优先考虑 lifecoach")
+
+    # 如果有关注领域
+    focus = target.get("focus", {}).get("primary")
+    if focus == "career":
+        hints.append("用户关注职业发展，优先考虑 career/lifecoach")
+    elif focus == "relationship":
+        hints.append("用户关注关系，适合 bazi/zodiac 合盘分析")
+
+    # 如果有原型
+    archetype = insight.get("essence", {}).get("archetype", {}).get("primary")
+    if archetype == "成长者":
+        hints.append("用户是成长型人格，适合规划类服务")
+    elif archetype == "智慧者":
+        hints.append("用户是智慧型人格，适合深度分析服务")
+
+    if hints:
+        return "\n## 个性化提示\n\n" + "\n".join(f"- {h}" for h in hints)
+    return ""
+```
+
+---
+
+## 17. 统一 VibeProfile 注入 (v11 新增)
+
+### 17.1 设计变更
+
+**旧做法**：
+- Phase 1：不加载任何 Profile
+- Phase 2：加载完整 Profile
+
+**新做法**：
+- Phase 1：加载 identity + vibe + subscribed_skills（轻量，~150 tokens）
+- Phase 2：加载 identity + vibe + skill_data（完整）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│               统一 Profile 注入架构                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Phase 1 (路由)          Phase 2 (执行)                      │
+│  ─────────────           ──────────────                      │
+│  identity (~30 tokens)   identity (~30 tokens)               │
+│  vibe.insight (~50)      vibe.insight (~50)                  │
+│  vibe.target (~70)       vibe.target (~70)                   │
+│  subscribed_skills       skill_data (~300)                   │
+│                                                              │
+│  总计: ~150 tokens       总计: ~450 tokens                   │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 17.2 代码变更
+
+**chat_v5.py**:
+
+```python
+async def get_user_context(user_id, skill=None):
+    if not user_id:
+        return {}, {}
+
+    # v11: 所有阶段都加载基础画像
+    profile = await get_vibe_profile(user_id)
+
+    if not skill:
+        # Phase 1: 只返回基础画像 + 订阅信息
+        return profile, {}
+
+    # Phase 2: 额外加载 skill_data
+    result = await get_cached_profile_with_skill(user_id, skill)
+    return profile, result.get("skill_data", {})
+
+
+async def get_vibe_profile(user_id: UUID) -> Dict:
+    """获取 VibeProfile（所有阶段通用）"""
+    full_profile = await UnifiedProfileRepository.get_profile(user_id)
+    if not full_profile:
+        return {}
+
+    return {
+        "identity": full_profile.get("identity", {}),
+        "vibe": full_profile.get("vibe", {}),
+        "subscribed_skills": await get_subscribed_skill_ids(user_id),
+    }
+```
+
+**prompt_builder.py**:
+
+```python
+async def build(self, skill_id, rule_id, message, profile, skill_data, ...):
+    if skill_id:
+        # Phase 2: 现有逻辑
+        ...
+    else:
+        # Phase 1: 路由阶段 - v11 增强
+        core_prompt = get_phase1_prompt()
+
+        # 注入画像
+        core_prompt = self._inject_phase1_context(core_prompt, profile)
+        parts.append(core_prompt)
+
+    return "\n".join(parts)
+
+def _inject_phase1_context(self, prompt: str, profile: Dict) -> str:
+    """注入 Phase 1 上下文"""
+    # 用户画像
+    user_portrait = self._build_user_portrait(profile)
+    prompt = prompt.replace("{user_portrait}", user_portrait)
+
+    # 已订阅服务
+    subscribed = profile.get("subscribed_skills", [])
+    subscribed_text = self._build_subscribed_skills_text(subscribed)
+    prompt = prompt.replace("{subscribed_skills}", subscribed_text)
+
+    # 可推荐服务
+    recommendable = self._build_recommendable_skills_text(subscribed)
+    prompt = prompt.replace("{recommendable_skills}", recommendable)
+
+    # 个性化提示
+    hint = self._build_personalization_hint(profile)
+    prompt = prompt.replace("{personalization_hint}", hint)
+
+    return prompt
+```
+
+---
+
+## 18. 文件变更清单 (v13)
+
+### 新建文件
+
+| 文件 | 用途 |
+|------|------|
+| `apps/api/config/vibe_extract.json` | 唯一规则来源：提取/转换/合并/注入配置 |
+| `apps/api/services/vibe/extractor.py` | 配置驱动 + LLM 执行的提取引擎 |
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `apps/api/services/vibe/__init__.py` | 导出 VibeExtractor |
+| `apps/api/stores/unified_profile_repo.py` | 新增 vibe v13 API (current/profile/timeline) |
+| `apps/api/routes/chat_v5.py` | 对话结束后触发 VibeExtractor |
+| `apps/api/services/agent/prompt_builder.py` | 使用 `VibeExtractor.build_context()` |
+
+### 待删除文件（迁移完成后）
+
+| 文件 | 说明 |
+|------|------|
+| `apps/api/config/vibe_sync.yaml` | 被 vibe_extract.json 替代 |
+| `apps/api/services/vibe/sync.py` | 被 extractor.py 替代 |
+
+### 待删除代码（迁移完成后）
+
+| 文件 | 删除内容 |
+|------|---------|
+| `unified_profile_repo.py` | 旧版 `get_vibe_insight/target` 方法 |
+| `unified_profile_repo.py` | 旧版 `update_vibe_insight/target` 方法 |
+| `unified_profile_repo.py` | `sync_skill_to_vibe` 调用 |
+
+---
+
+**参考文档**：
+- `/docs/components/coreagent/SPEC.md` - 新架构设计（方案 D）
+- `/docs/components/coreagent/REFACTOR_PLAN.md` - 重构计划
+- `/docs/components/chat/README.md` - Chat 组件文档
+- `/apps/api/skills/lifecoach/rules/*.md` - Rule 文件示例
+- `CLAUDE.md` - Agent SDK 最佳实践
+- [Planning-with-Files](https://github.com/OthmanAdi/planning-with-files) - Manus 风格上下文工程

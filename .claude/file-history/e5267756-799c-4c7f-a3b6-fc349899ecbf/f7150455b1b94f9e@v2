@@ -1,0 +1,770 @@
+# VibeProfile v13 设计文档
+
+> 配置驱动的用户画像架构：从交互中提取，注入 Context，个性化服务
+
+## 一、设计原则
+
+```
+Vibe = 关于用户的结构化记忆
+
+输入：用户在系统中的所有交互（对话、工具调用、Skill 数据）
+输出：结构化画像 → 注入 Context → 个性化服务
+```
+
+**核心原则**：
+1. **配置驱动**：提取规则全部在 YAML 配置，新增规则无需改代码
+2. **三层存储**：Hot（实时）+ Warm（定时）+ Cold（事件）
+3. **单一数据流**：统一提取管道，不再多路径写入
+
+## 二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VibeProfile 配置驱动架构 v13                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   配置文件                                                                   │
+│   ────────                                                                  │
+│   config/vibe_extract.yaml                                                  │
+│   ├── sources: 数据源定义                                                   │
+│   ├── extractors: 提取器配置                                                │
+│   ├── schema: Vibe 结构定义                                                 │
+│   └── transforms: 转换函数                                                  │
+│                                                                             │
+│   ════════════════════════════════════════════════════════════════════════ │
+│                                                                             │
+│   数据源                          提取引擎                    存储          │
+│   ──────                          ────────                    ────          │
+│                                                                             │
+│   ┌─────────────────┐                                                       │
+│   │    messages     │────┐        ┌──────────────────────┐                  │
+│   │  对话消息        │    │        │                      │                  │
+│   └─────────────────┘    │        │   VibeExtractor      │                  │
+│                          │        │   ──────────────     │                  │
+│   ┌─────────────────┐    │        │                      │   ┌───────────┐ │
+│   │   tool_calls    │────┼───────▶│  根据 YAML 配置：    │──▶│  vibe.*   │ │
+│   │  工具调用结果    │    │        │  - 匹配数据源        │   │           │ │
+│   └─────────────────┘    │        │  - 执行提取规则      │   │  current  │ │
+│                          │        │  - 应用转换函数      │   │  profile  │ │
+│   ┌─────────────────┐    │        │  - 写入目标路径      │   │  timeline │ │
+│   │    skills.*     │────┤        │                      │   └───────────┘ │
+│   │  Skill 计算数据  │    │        └──────────────────────┘                  │
+│   └─────────────────┘    │                                                  │
+│                          │                                                  │
+│   ┌─────────────────┐    │                                                  │
+│   │  usage_events   │────┘                                                  │
+│   │  用户行为事件    │                                                       │
+│   └─────────────────┘                                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 三、配置文件设计
+
+### 3.1 完整配置文件 `config/vibe_extract.yaml`
+
+```yaml
+# ═══════════════════════════════════════════════════════════════
+# Vibe 提取配置 v13
+#
+# 配置驱动的用户画像提取系统
+# 修改此配置无需改代码，重启服务即可生效
+# ═══════════════════════════════════════════════════════════════
+
+version: "13.0"
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Vibe 结构定义（Schema）
+# ═══════════════════════════════════════════════════════════════
+schema:
+  vibe:
+    current:           # Hot Layer - 当前状态
+      emotion: string  # anxious|sad|neutral|content|excited|focused
+      energy: string   # low|medium|high
+      focus: list      # 当前关注领域
+      topics: list     # 进行中的话题（max 5）
+      context: string  # 当前对话上下文摘要
+      updated_at: datetime
+
+    profile:           # Warm Layer - 稳定画像
+      identity:
+        archetypes: list   # 人格原型
+        traits: list       # 核心特质（max 5）
+        style: string      # 沟通风格
+        sources: object    # 来源追溯
+      goals: list          # 目标列表
+      people: list         # 关键人物
+      context:
+        occupation: string
+        industry: string
+        life_stage: string
+        concerns: list
+        interests: list
+      preferences:
+        response_style: string
+        language: string
+        topics_to_avoid: list
+      updated_at: datetime
+
+    timeline: list     # Cold Layer - 事件时间线
+
+# ═══════════════════════════════════════════════════════════════
+# 2. 数据源定义
+# ═══════════════════════════════════════════════════════════════
+sources:
+  messages:
+    description: "对话消息"
+    table: messages
+    fields: [role, content, created_at, metadata]
+
+  tool_calls:
+    description: "工具调用结果"
+    from: messages.metadata.tool_calls
+    fields: [tool_name, arguments, result]
+
+  skills:
+    description: "Skill 计算数据"
+    from: unified_profiles.profile.skills
+    fields: ["*"]  # 动态字段
+
+  usage_events:
+    description: "用户行为事件"
+    table: usage_events
+    fields: [event_type, event_data, created_at]
+
+# ═══════════════════════════════════════════════════════════════
+# 3. 提取器配置
+# ═══════════════════════════════════════════════════════════════
+extractors:
+  # ─────────────────────────────────────────────────────────────
+  # 3.1 实时提取器（Hot Extractor）
+  # ─────────────────────────────────────────────────────────────
+  realtime:
+    trigger: on_conversation_turn  # 每轮对话后
+    target: vibe.current
+    write_strategy: overwrite      # 覆盖写入
+
+    input:
+      source: messages
+      filter: "conversation_id = :current AND created_at > :last_10"
+      limit: 10
+
+    extraction:
+      method: llm
+      model: fast          # 使用快速模型
+      prompt: |
+        分析对话，提取用户当前状态。只返回 JSON。
+
+        {
+          "emotion": "focused",
+          "energy": "high",
+          "focus": ["career"],
+          "topics": ["..."],
+          "context": "一句话总结"
+        }
+
+      output_mapping:
+        emotion: current.emotion
+        energy: current.energy
+        focus: current.focus
+        topics: current.topics
+        context: current.context
+
+  # ─────────────────────────────────────────────────────────────
+  # 3.2 定时提取器（Warm Extractor）
+  # ─────────────────────────────────────────────────────────────
+  daily:
+    trigger: cron("0 4 * * *")  # 每日 04:00
+    target: vibe.profile
+    write_strategy: merge       # 增量合并
+
+    input:
+      sources:
+        - source: messages
+          filter: "created_at > NOW() - INTERVAL '7 days'"
+          limit: 200
+        - source: skills
+          fields: [bazi.chart, zodiac.chart, lifecoach.goals]
+        - source: tool_calls
+          filter: "created_at > NOW() - INTERVAL '7 days'"
+
+    extraction:
+      method: llm
+      model: standard
+      prompt: |
+        分析用户过去一周的交互记录，更新用户画像。
+
+        ## 当前画像
+        {current_profile}
+
+        ## 交互记录
+        {interactions}
+
+        ## Skill 数据
+        {skill_data}
+
+        只返回需要新增或更新的字段（JSON）。
+
+      output_mapping:
+        identity.archetypes: profile.identity.archetypes
+        identity.traits: profile.identity.traits
+        identity.style: profile.identity.style
+        goals: profile.goals
+        people: profile.people
+        context: profile.context
+        preferences: profile.preferences
+
+    merge_rules:
+      profile.identity.archetypes:
+        strategy: append_unique
+        max_items: 3
+      profile.identity.traits:
+        strategy: append_unique
+        max_items: 5
+      profile.goals:
+        strategy: merge_by_id
+        id_field: title
+        max_items: 10
+      profile.people:
+        strategy: merge_by_id
+        id_field: name
+        max_items: 20
+      profile.context.concerns:
+        strategy: append_unique
+        max_items: 5
+      profile.context.interests:
+        strategy: append_unique
+        max_items: 10
+
+  # ─────────────────────────────────────────────────────────────
+  # 3.3 事件检测器（Cold Detector）
+  # ─────────────────────────────────────────────────────────────
+  event_detector:
+    trigger: on_conversation_turn  # 实时检测
+    target: vibe.timeline
+    write_strategy: append         # 追加存储
+    max_items: 100
+
+    detectors:
+      - name: goal_detector
+        description: "检测新目标设定"
+        patterns:
+          - "想要.*"
+          - "计划.*"
+          - "目标是.*"
+          - "打算.*"
+        extract:
+          type: "goal"
+          event: "设定新目标"
+          data:
+            title: "{extracted_goal}"
+
+      - name: person_detector
+        description: "检测关键人物提及"
+        patterns:
+          - "(我的)?(伴侣|老公|老婆|男朋友|女朋友|爸|妈|父亲|母亲).*叫?([\\u4e00-\\u9fa5]{2,4})"
+          - "(朋友|同事|老板).*([\\u4e00-\\u9fa5]{2,4})"
+        extract:
+          type: "relationship"
+          event: "提及关键人物"
+          data:
+            name: "{matched_name}"
+            relation: "{matched_relation}"
+
+      - name: decision_detector
+        description: "检测重要决策"
+        patterns:
+          - "(纠结|犹豫|考虑).*(要不要|是否|该不该)"
+          - "面临.*选择"
+          - "(offer|工作机会|跳槽)"
+        extract:
+          type: "decision"
+          event: "面临重要决策"
+          data:
+            title: "{extracted_decision}"
+
+      - name: life_event_detector
+        description: "检测人生事件"
+        patterns:
+          - "(结婚|订婚|分手|离婚)"
+          - "(买房|卖房|搬家)"
+          - "(怀孕|生孩子|生娃)"
+          - "(升职|降职|被裁|辞职)"
+          - "(生病|住院|手术)"
+        extract:
+          type: "life_event"
+          event: "{matched_event}"
+          data:
+            category: "{event_category}"
+
+  # ─────────────────────────────────────────────────────────────
+  # 3.4 Skill 数据同步器
+  # ─────────────────────────────────────────────────────────────
+  skill_sync:
+    trigger: on_skill_data_update  # Skill 数据更新时
+    target: vibe.profile.identity.sources
+    write_strategy: merge
+
+    rules:
+      - skill: bazi
+        when: chart.day_master
+        extract:
+          day_master: chart.day_master.stem
+          element: chart.day_master.element
+        transform: bazi_to_archetype
+        target: profile.identity
+
+      - skill: zodiac
+        when: chart.sun_sign
+        extract:
+          sun_sign: chart.sun_sign
+          moon_sign: chart.moon_sign
+          rising_sign: chart.rising_sign
+        transform: zodiac_to_archetype
+        target: profile.identity
+
+      - skill: lifecoach
+        when: goals
+        extract:
+          goals: goals
+        target: profile.goals
+        merge_strategy: merge_by_id
+
+# ═══════════════════════════════════════════════════════════════
+# 4. 转换函数定义
+# ═══════════════════════════════════════════════════════════════
+transforms:
+  bazi_to_archetype:
+    description: "五行元素 → 人格原型"
+    mapping:
+      wood: { archetype: "成长者", traits: ["创新", "进取", "仁慈"] }
+      fire: { archetype: "表达者", traits: ["热情", "领导", "直觉"] }
+      earth: { archetype: "稳定者", traits: ["务实", "包容", "信守"] }
+      metal: { archetype: "完善者", traits: ["精准", "公正", "坚韧"] }
+      water: { archetype: "智慧者", traits: ["灵活", "深思", "洞察"] }
+
+  zodiac_to_archetype:
+    description: "星座 → 人格原型"
+    mapping:
+      aries: { archetype: "开拓者", traits: ["勇敢", "主动"] }
+      taurus: { archetype: "稳定者", traits: ["稳定", "务实"] }
+      gemini: { archetype: "沟通者", traits: ["灵活", "好奇"] }
+      cancer: { archetype: "守护者", traits: ["敏感", "关怀"] }
+      leo: { archetype: "领袖者", traits: ["自信", "慷慨"] }
+      virgo: { archetype: "完善者", traits: ["细致", "分析"] }
+      libra: { archetype: "和谐者", traits: ["和谐", "公正"] }
+      scorpio: { archetype: "洞察者", traits: ["深度", "洞察"] }
+      sagittarius: { archetype: "探索者", traits: ["乐观", "探索"] }
+      capricorn: { archetype: "成就者", traits: ["务实", "责任"] }
+      aquarius: { archetype: "创新者", traits: ["创新", "独立"] }
+      pisces: { archetype: "直觉者", traits: ["直觉", "同情"] }
+
+# ═══════════════════════════════════════════════════════════════
+# 5. 合并策略定义
+# ═══════════════════════════════════════════════════════════════
+merge_strategies:
+  overwrite:
+    description: "完全覆盖"
+
+  merge:
+    description: "深度合并，新值覆盖旧值"
+
+  append_unique:
+    description: "追加并去重"
+    params:
+      max_items: 10  # 默认最大数量
+
+  merge_by_id:
+    description: "按 ID 字段合并"
+    params:
+      id_field: "id"  # 默认 ID 字段
+
+  append:
+    description: "直接追加"
+    params:
+      max_items: 100
+
+# ═══════════════════════════════════════════════════════════════
+# 6. Context 注入配置
+# ═══════════════════════════════════════════════════════════════
+context_injection:
+  template: |
+    {% if current.emotion or current.focus %}
+    【当前状态】情绪: {{ current.emotion | default('未知') }}, 关注: {{ current.focus | join(', ') }}
+    {% endif %}
+    {% if current.context %}
+    上下文: {{ current.context }}
+    {% endif %}
+    {% if profile.identity.archetypes %}
+    【人格原型】{{ profile.identity.archetypes | join(', ') }}
+    {% endif %}
+    {% if profile.identity.traits %}
+    【核心特质】{{ profile.identity.traits | join(', ') }}
+    {% endif %}
+    {% if active_goals %}
+    【当前目标】{% for g in active_goals[:3] %}{{ g.title }}({{ g.progress | default(0) }}%){% if not loop.last %}, {% endif %}{% endfor %}
+    {% endif %}
+    {% if profile.context.occupation %}
+    【职业】{{ profile.context.occupation }}
+    {% endif %}
+    {% if profile.context.concerns %}
+    【关注问题】{{ profile.context.concerns[:3] | join(', ') }}
+    {% endif %}
+
+  # 按 Skill 定制注入内容
+  skill_overrides:
+    lifecoach:
+      include: [current, profile.goals, profile.context]
+      exclude: [profile.identity.sources]
+    bazi:
+      include: [profile.identity.sources.bazi, current.focus]
+    zodiac:
+      include: [profile.identity.sources.zodiac, current.focus]
+```
+
+## 四、Vibe 层完整结构
+
+```yaml
+vibe:
+  # ═══════════════════════════════════════════════════════════════
+  # 1. current - 当前状态（Hot Layer）
+  # ═══════════════════════════════════════════════════════════════
+  current:
+    emotion: "focused"
+    energy: "high"
+    focus: ["career"]
+    topics:
+      - "职业转型考虑中"
+      - "和伴侣沟通问题"
+    context: "用户在考虑是否接受新工作offer"
+    updated_at: "2026-01-23T10:00:00Z"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. profile - 稳定画像（Warm Layer）
+  # ═══════════════════════════════════════════════════════════════
+  profile:
+    identity:
+      archetypes: ["成长者", "开拓者"]
+      traits: ["创新", "进取", "直觉"]
+      style: "理性分析型"
+      sources:
+        bazi: { day_master: "甲木", element: "wood" }
+        zodiac: { sun_sign: "aries", moon_sign: "cancer" }
+
+    goals:
+      - id: "g_001"
+        title: "完成副业项目第一版"
+        category: "career"
+        status: "active"
+        progress: 60
+        deadline: "2026-03-01"
+        mentioned_at: "2026-01-20"
+
+    people:
+      - id: "p_001"
+        name: "小明"
+        relation: "romantic"
+        birth_info:
+          date: "1992-05-15"
+          time: "14:30"
+          place: "上海"
+        notes: "伴侣"
+        mentioned_at: "2026-01-22"
+
+    context:
+      occupation: "产品经理"
+      industry: "互联网"
+      life_stage: "career_growth"
+      concerns: ["工作压力", "职业发展"]
+      interests: ["命理", "心理学", "创业"]
+
+    preferences:
+      response_style: "简洁直接"
+      language: "zh-CN"
+      topics_to_avoid: []
+
+    updated_at: "2026-01-23T04:00:00Z"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. timeline - 重要事件（Cold Layer）
+  # ═══════════════════════════════════════════════════════════════
+  timeline:
+    - id: "e_001"
+      date: "2026-01-22"
+      type: "relationship"
+      event: "添加伴侣信息进行合盘"
+      data: { person_id: "p_001" }
+    - id: "e_002"
+      date: "2026-01-20"
+      type: "goal"
+      event: "设定新目标：完成副业项目"
+      data: { goal_id: "g_001" }
+```
+
+## 五、提取引擎设计
+
+```python
+# services/vibe/extractor.py
+
+class VibeExtractor:
+    """
+    配置驱动的 Vibe 提取引擎
+
+    根据 vibe_extract.yaml 配置执行提取
+    """
+
+    def __init__(self, config_path: str = "config/vibe_extract.yaml"):
+        self.config = self._load_config(config_path)
+        self.transforms = self._load_transforms()
+
+    async def extract_realtime(self, user_id: UUID, messages: List[Dict]) -> Dict:
+        """
+        实时提取（每轮对话后调用）
+
+        读取 extractors.realtime 配置执行
+        """
+        config = self.config["extractors"]["realtime"]
+
+        # 1. 准备输入
+        input_data = self._prepare_input(messages, config["input"])
+
+        # 2. 执行 LLM 提取
+        result = await self._llm_extract(input_data, config["extraction"])
+
+        # 3. 映射输出
+        vibe_current = self._map_output(result, config["extraction"]["output_mapping"])
+
+        # 4. 写入（覆盖）
+        await self._write_vibe(user_id, "current", vibe_current, "overwrite")
+
+        # 5. 执行事件检测
+        events = await self._detect_events(user_id, messages)
+        if events:
+            await self._append_timeline(user_id, events)
+
+        return vibe_current
+
+    async def extract_daily(self, user_id: UUID) -> Dict:
+        """
+        定时提取（每日凌晨调用）
+
+        读取 extractors.daily 配置执行
+        """
+        config = self.config["extractors"]["daily"]
+
+        # 1. 收集多数据源输入
+        input_data = await self._collect_inputs(user_id, config["input"]["sources"])
+
+        # 2. 获取当前 profile
+        current_profile = await UnifiedProfileRepository.get_vibe_profile(user_id)
+
+        # 3. 执行 LLM 提取
+        result = await self._llm_extract(
+            {"interactions": input_data, "current_profile": current_profile},
+            config["extraction"]
+        )
+
+        # 4. 应用合并规则
+        merged = self._merge_with_rules(current_profile, result, config["merge_rules"])
+
+        # 5. 写入（合并）
+        await self._write_vibe(user_id, "profile", merged, "merge")
+
+        return merged
+
+    async def sync_skill_data(self, user_id: UUID, skill_id: str, skill_data: Dict) -> bool:
+        """
+        Skill 数据同步（Skill 数据更新时调用）
+
+        读取 extractors.skill_sync 配置执行
+        """
+        config = self.config["extractors"]["skill_sync"]
+        rules = [r for r in config["rules"] if r["skill"] == skill_id]
+
+        if not rules:
+            return False
+
+        for rule in rules:
+            # 检查触发条件
+            trigger_path = rule["when"]
+            if not self._get_nested(skill_data, trigger_path):
+                continue
+
+            # 提取字段
+            extracted = {}
+            for dest, source in rule["extract"].items():
+                value = self._get_nested(skill_data, source)
+                if value:
+                    extracted[dest] = value
+
+            # 应用转换
+            if "transform" in rule:
+                extracted = self._apply_transform(extracted, rule["transform"])
+
+            # 写入目标
+            await self._write_to_path(user_id, rule["target"], extracted)
+
+        return True
+
+    def build_context(self, vibe: Dict, skill_id: str = None) -> str:
+        """
+        构建 Context 注入字符串
+
+        读取 context_injection 配置，使用 Jinja2 模板
+        """
+        config = self.config["context_injection"]
+        template = config["template"]
+
+        # 检查 Skill 定制
+        if skill_id and skill_id in config.get("skill_overrides", {}):
+            override = config["skill_overrides"][skill_id]
+            # 过滤数据
+            vibe = self._filter_vibe(vibe, override.get("include"), override.get("exclude"))
+
+        # 渲染模板
+        return self._render_template(template, vibe)
+```
+
+## 六、数据流设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         配置驱动数据流                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   触发事件                      提取引擎                      存储          │
+│   ────────                      ────────                      ────          │
+│                                                                             │
+│   ┌─────────────────┐                                                       │
+│   │  对话结束        │     ┌──────────────────────────────┐                 │
+│   │  on_turn_end    │────▶│  VibeExtractor               │                 │
+│   └─────────────────┘     │                              │                 │
+│                           │  1. 读取 vibe_extract.yaml   │  ┌───────────┐ │
+│   ┌─────────────────┐     │  2. 匹配 extractors.realtime │  │           │ │
+│   │  定时任务        │────▶│  3. 准备输入数据             │──▶│  vibe.*   │ │
+│   │  cron 04:00     │     │  4. 执行 LLM 提取            │  │           │ │
+│   └─────────────────┘     │  5. 应用 output_mapping      │  │  current  │ │
+│                           │  6. 应用 merge_rules         │  │  profile  │ │
+│   ┌─────────────────┐     │  7. 写入目标路径             │  │  timeline │ │
+│   │  Skill 数据更新  │────▶│                              │  │           │ │
+│   │  on_skill_update│     │  配置即规则，无硬编码        │  └───────────┘ │
+│   └─────────────────┘     └──────────────────────────────┘                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 七、API 设计
+
+```python
+class UnifiedProfileRepository:
+    # ═══════════════════════════════════════════════════════════════
+    # Vibe 读取
+    # ═══════════════════════════════════════════════════════════════
+
+    async def get_vibe(user_id: UUID) -> Dict:
+        """获取完整 Vibe 数据"""
+
+    async def get_vibe_current(user_id: UUID) -> Dict:
+        """获取当前状态（Hot Layer）"""
+
+    async def get_vibe_profile(user_id: UUID) -> Dict:
+        """获取稳定画像（Warm Layer）"""
+
+    async def get_vibe_timeline(user_id: UUID, limit: int = 20) -> List[Dict]:
+        """获取事件时间线（Cold Layer）"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # Vibe 写入（供 VibeExtractor 调用）
+    # ═══════════════════════════════════════════════════════════════
+
+    async def update_vibe_current(user_id: UUID, current: Dict) -> None:
+        """更新当前状态（覆盖写入）"""
+
+    async def update_vibe_profile(user_id: UUID, updates: Dict, merge_rules: Dict = None) -> None:
+        """更新稳定画像（按规则合并）"""
+
+    async def append_vibe_timeline(user_id: UUID, event: Dict) -> str:
+        """追加事件到时间线"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # Context 注入
+    # ═══════════════════════════════════════════════════════════════
+
+    async def get_vibe_context(user_id: UUID, skill_id: str = None) -> str:
+        """
+        获取用于注入 System Prompt 的上下文字符串
+
+        读取 vibe_extract.yaml 的 context_injection 配置
+        """
+```
+
+## 八、配置扩展示例
+
+### 8.1 添加新的提取规则
+
+```yaml
+# 在 extractors 下添加新规则
+extractors:
+  # 新增：周报提取器
+  weekly_summary:
+    trigger: cron("0 20 * * 0")  # 每周日 20:00
+    target: vibe.profile.weekly_summary
+    write_strategy: overwrite
+
+    input:
+      source: messages
+      filter: "created_at > NOW() - INTERVAL '7 days'"
+
+    extraction:
+      method: llm
+      prompt: |
+        总结用户本周的对话主题和情绪变化...
+```
+
+### 8.2 添加新的事件检测器
+
+```yaml
+# 在 event_detector.detectors 下添加
+detectors:
+  - name: mood_shift_detector
+    description: "检测情绪剧烈变化"
+    method: sentiment_analysis
+    threshold: 0.5  # 情绪变化阈值
+    extract:
+      type: "mood_shift"
+      event: "情绪变化"
+      data:
+        from: "{previous_mood}"
+        to: "{current_mood}"
+```
+
+### 8.3 添加新的转换函数
+
+```yaml
+# 在 transforms 下添加
+transforms:
+  mbti_to_traits:
+    description: "MBTI → 特质"
+    mapping:
+      INTJ: { archetype: "策略师", traits: ["独立", "分析"] }
+      ENFP: { archetype: "探索者", traits: ["热情", "创意"] }
+      # ...
+```
+
+## 九、与 v12 的迁移映射
+
+| v12 结构 | v13 结构 | 配置位置 |
+|----------|----------|----------|
+| insight.essence.archetype | profile.identity.archetypes | transforms.bazi_to_archetype |
+| insight.essence.traits | profile.identity.traits | extractors.daily.merge_rules |
+| insight.dynamic.emotion | current.emotion | extractors.realtime |
+| target.goals | profile.goals | extractors.skill_sync |
+| relationship.partners | profile.people | extractors.event_detector |
+
+## 十、版本历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v13 | 2026-01-23 | 配置驱动架构：vibe_extract.yaml 定义所有提取规则 |
+| v12 | 2026-01-23 | 完整设计：insight/target/timing/relationship |
+| v11 | 2026-01-15 | vibe_sync.yaml 配置驱动同步 |

@@ -1,0 +1,631 @@
+"""
+Mentis OS v3.0 - Share Cards 服务
+
+核心功能:
+- 创建分享卡片 (moment/daily/milestone/insight)
+- 隐私脱敏 (模糊人名、移除地点)
+- 生成分享链接
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import secrets
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from stores import mentis_db
+from services import glm_service, prompts
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 数据类型定义
+# =============================================================================
+
+@dataclass
+class PrivacySettings:
+    """隐私设置"""
+    blur_names: bool = True
+    remove_places: bool = True
+    keep_original: bool = False
+
+
+@dataclass
+class ShareCard:
+    """分享卡片"""
+    id: Optional[str]
+    user_id: str
+    card_type: str  # moment, daily, milestone, insight
+    title: Optional[str]
+    content: Dict[str, Any]
+    template: str
+    style: Optional[Dict[str, Any]]
+    source_type: Optional[str]  # entry, digest, insight, achievement
+    source_id: Optional[str]
+    share_token: Optional[str]
+    is_public: bool
+    privacy_settings: PrivacySettings
+    image_url: Optional[str]
+    view_count: int
+    expires_at: Optional[datetime]
+    created_at: Optional[datetime]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "card_type": self.card_type,
+            "title": self.title,
+            "content": self.content,
+            "template": self.template,
+            "style": self.style,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "share_token": self.share_token,
+            "is_public": self.is_public,
+            "privacy_settings": {
+                "blur_names": self.privacy_settings.blur_names,
+                "remove_places": self.privacy_settings.remove_places,
+                "keep_original": self.privacy_settings.keep_original,
+            },
+            "image_url": self.image_url,
+            "view_count": self.view_count,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# 卡片模板
+# =============================================================================
+
+CARD_TEMPLATES = {
+    "default": {
+        "layout": "center",
+        "background": "gradient",
+        "font": "sans-serif",
+    },
+    "minimal": {
+        "layout": "left",
+        "background": "white",
+        "font": "serif",
+    },
+    "warm": {
+        "layout": "center",
+        "background": "warm-gradient",
+        "font": "rounded",
+    },
+    "dark": {
+        "layout": "center",
+        "background": "dark",
+        "font": "sans-serif",
+    },
+    "polaroid": {
+        "layout": "polaroid",
+        "background": "white",
+        "font": "handwriting",
+    },
+}
+
+# 常见人名模式 (中文)
+NAME_PATTERNS = [
+    r'(?<![一-龥])([一-龥]{2,4})(?=说|的|和|跟|给|让|被|把|是|在|去|来|到|想|要|会|能|可)',
+    r'(?<![一-龥])([A-Z][a-z]+)(?=\s|,|\.)',  # 英文名
+]
+
+# 常见地点模式
+PLACE_PATTERNS = [
+    r'在(.{2,10}(?:店|馆|厅|楼|中心|广场|公园|医院|学校|公司|银行|超市))',
+    r'去(.{2,10}(?:店|馆|厅|楼|中心|广场|公园|医院|学校|公司|银行|超市))',
+    r'到(.{2,10}(?:店|馆|厅|楼|中心|广场|公园|医院|学校|公司|银行|超市))',
+]
+
+
+# =============================================================================
+# Share Card 服务
+# =============================================================================
+
+class ShareCardService:
+    """Share Card 服务"""
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or "glm-4-flash"
+
+    # =========================================================================
+    # 创建卡片
+    # =========================================================================
+
+    async def create_card_from_entry(
+        self,
+        user_id: str,
+        entry_id: str,
+        template: str = "default",
+        privacy_settings: Optional[PrivacySettings] = None,
+    ) -> ShareCard:
+        """从日记条目创建 moment 卡片"""
+        # 获取条目
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, raw_content, emotion, tags, created_at
+            FROM stream_entry
+            WHERE id = %s AND user_id = %s
+            """,
+            (entry_id, user_id),
+        )
+
+        if not row:
+            raise ValueError(f"Entry not found: {entry_id}")
+
+        privacy = privacy_settings or PrivacySettings()
+        raw_content = row.get("raw_content") or ""
+        emotion_data = row.get("emotion") or {}
+        if isinstance(emotion_data, str):
+            emotion_data = json.loads(emotion_data)
+
+        # 应用隐私脱敏
+        processed_content, redacted = self._apply_privacy(raw_content, privacy)
+
+        # 生成分享文案
+        share_text = await self._generate_share_text(
+            processed_content,
+            emotion_data.get("primary", "calm"),
+            row.get("created_at"),
+        )
+
+        content = {
+            "original": processed_content,
+            "share_text": share_text,
+            "emotion": emotion_data.get("primary"),
+            "tags": row.get("tags") or [],
+            "date": row.get("created_at").strftime("%Y-%m-%d") if row.get("created_at") else None,
+            "redacted": redacted,
+        }
+
+        return self._save_card(ShareCard(
+            id=None,
+            user_id=user_id,
+            card_type="moment",
+            title=None,
+            content=content,
+            template=template,
+            style=CARD_TEMPLATES.get(template),
+            source_type="entry",
+            source_id=entry_id,
+            share_token=None,
+            is_public=False,
+            privacy_settings=privacy,
+            image_url=None,
+            view_count=0,
+            expires_at=None,
+            created_at=None,
+        ))
+
+    async def create_card_from_digest(
+        self,
+        user_id: str,
+        digest_id: str,
+        template: str = "default",
+        privacy_settings: Optional[PrivacySettings] = None,
+    ) -> ShareCard:
+        """从 Daily Digest 创建 daily 卡片"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, date, title, summary, prose, style, emotion_trajectory, key_tags
+            FROM daily_digest
+            WHERE id = %s AND user_id = %s
+            """,
+            (digest_id, user_id),
+        )
+
+        if not row:
+            raise ValueError(f"Digest not found: {digest_id}")
+
+        privacy = privacy_settings or PrivacySettings()
+        prose = row.get("prose") or ""
+
+        # 应用隐私脱敏
+        processed_prose, redacted = self._apply_privacy(prose, privacy)
+
+        # 生成简短的分享摘要
+        summary = row.get("summary") or processed_prose[:100]
+
+        content = {
+            "title": row.get("title"),
+            "summary": summary,
+            "prose": processed_prose,
+            "date": row.get("date").isoformat() if row.get("date") else None,
+            "style": row.get("style"),
+            "emotion_trajectory": row.get("emotion_trajectory"),
+            "key_tags": row.get("key_tags") or [],
+            "redacted": redacted,
+        }
+
+        return self._save_card(ShareCard(
+            id=None,
+            user_id=user_id,
+            card_type="daily",
+            title=row.get("title"),
+            content=content,
+            template=template,
+            style=CARD_TEMPLATES.get(template),
+            source_type="digest",
+            source_id=digest_id,
+            share_token=None,
+            is_public=False,
+            privacy_settings=privacy,
+            image_url=None,
+            view_count=0,
+            expires_at=None,
+            created_at=None,
+        ))
+
+    def create_milestone_card(
+        self,
+        user_id: str,
+        milestone_type: str,
+        data: Dict[str, Any],
+        template: str = "default",
+    ) -> ShareCard:
+        """创建成就/里程碑卡片"""
+        # 里程碑类型: streak (连续记录), energy_high (能量新高), etc.
+        titles = {
+            "streak": f"连续记录 {data.get('days', 0)} 天",
+            "energy_high": f"能量值达到 {data.get('score', 0)}",
+            "entries_count": f"累计记录 {data.get('count', 0)} 条",
+            "mood_improved": "心情好转中",
+        }
+
+        content = {
+            "milestone_type": milestone_type,
+            "title": titles.get(milestone_type, "新成就达成"),
+            "data": data,
+            "achieved_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        return self._save_card(ShareCard(
+            id=None,
+            user_id=user_id,
+            card_type="milestone",
+            title=content["title"],
+            content=content,
+            template=template,
+            style=CARD_TEMPLATES.get(template),
+            source_type="achievement",
+            source_id=None,
+            share_token=None,
+            is_public=False,
+            privacy_settings=PrivacySettings(keep_original=True),
+            image_url=None,
+            view_count=0,
+            expires_at=None,
+            created_at=None,
+        ))
+
+    # =========================================================================
+    # 查询卡片
+    # =========================================================================
+
+    def list_cards(
+        self,
+        user_id: str,
+        card_type: Optional[str] = None,
+        limit: int = 30,
+        offset: int = 0,
+    ) -> List[ShareCard]:
+        """列出用户的卡片"""
+        conditions = ["user_id = %s"]
+        params: List[Any] = [user_id]
+
+        if card_type:
+            conditions.append("card_type = %s")
+            params.append(card_type)
+
+        where_clause = " AND ".join(conditions)
+        params.extend([limit, offset])
+
+        rows = mentis_db.fetch_all(
+            f"""
+            SELECT id, user_id, card_type, title, content, template, style,
+                   source_type, source_id, share_token, is_public, privacy_settings,
+                   image_url, view_count, expires_at, created_at
+            FROM share_card
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+
+        return [self._row_to_card(row) for row in rows]
+
+    def get_card_by_id(self, card_id: str) -> Optional[ShareCard]:
+        """根据 ID 获取卡片"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, user_id, card_type, title, content, template, style,
+                   source_type, source_id, share_token, is_public, privacy_settings,
+                   image_url, view_count, expires_at, created_at
+            FROM share_card
+            WHERE id = %s
+            """,
+            (card_id,),
+        )
+        return self._row_to_card(row) if row else None
+
+    def get_public_card(self, share_token: str) -> Optional[ShareCard]:
+        """根据分享 token 获取公开卡片"""
+        row = mentis_db.fetch_one(
+            """
+            SELECT id, user_id, card_type, title, content, template, style,
+                   source_type, source_id, share_token, is_public, privacy_settings,
+                   image_url, view_count, expires_at, created_at
+            FROM share_card
+            WHERE share_token = %s AND is_public = TRUE
+              AND (expires_at IS NULL OR expires_at > NOW())
+            """,
+            (share_token,),
+        )
+
+        if row:
+            # 增加浏览计数
+            mentis_db.execute(
+                "UPDATE share_card SET view_count = view_count + 1 WHERE id = %s",
+                (row.get("id"),),
+            )
+
+        return self._row_to_card(row) if row else None
+
+    # =========================================================================
+    # 发布和分享
+    # =========================================================================
+
+    def publish_card(
+        self,
+        user_id: str,
+        card_id: str,
+        expires_days: Optional[int] = None,
+    ) -> ShareCard:
+        """发布卡片 (生成分享链接)"""
+        card = self.get_card_by_id(card_id)
+        if not card or card.user_id != user_id:
+            raise ValueError("Card not found or access denied")
+
+        # 生成唯一的分享 token
+        share_token = secrets.token_urlsafe(32)
+
+        # 设置过期时间
+        expires_at = None
+        if expires_days:
+            expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+
+        mentis_db.execute(
+            """
+            UPDATE share_card
+            SET share_token = %s, is_public = TRUE, expires_at = %s
+            WHERE id = %s
+            """,
+            (share_token, expires_at, card_id),
+        )
+
+        card.share_token = share_token
+        card.is_public = True
+        card.expires_at = expires_at
+
+        return card
+
+    def unpublish_card(self, user_id: str, card_id: str) -> bool:
+        """取消发布卡片"""
+        card = self.get_card_by_id(card_id)
+        if not card or card.user_id != user_id:
+            return False
+
+        mentis_db.execute(
+            """
+            UPDATE share_card
+            SET is_public = FALSE, share_token = NULL
+            WHERE id = %s
+            """,
+            (card_id,),
+        )
+        return True
+
+    def delete_card(self, user_id: str, card_id: str) -> bool:
+        """删除卡片"""
+        card = self.get_card_by_id(card_id)
+        if not card or card.user_id != user_id:
+            return False
+
+        mentis_db.execute(
+            "DELETE FROM share_card WHERE id = %s",
+            (card_id,),
+        )
+        return True
+
+    # =========================================================================
+    # 隐私处理
+    # =========================================================================
+
+    def _apply_privacy(
+        self,
+        text: str,
+        settings: PrivacySettings,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """应用隐私脱敏"""
+        if settings.keep_original:
+            return text, {"names_blurred": 0, "places_removed": 0}
+
+        result = text
+        names_blurred = 0
+        places_removed = 0
+
+        # 模糊人名
+        if settings.blur_names:
+            for pattern in NAME_PATTERNS:
+                matches = re.findall(pattern, result)
+                for name in set(matches):
+                    if len(name) >= 2:
+                        blurred = name[0] + "*" * (len(name) - 1)
+                        result = result.replace(name, blurred)
+                        names_blurred += 1
+
+        # 移除地点
+        if settings.remove_places:
+            for pattern in PLACE_PATTERNS:
+                matches = re.findall(pattern, result)
+                for place in set(matches):
+                    result = result.replace(place, "某处")
+                    places_removed += 1
+
+        return result, {
+            "names_blurred": names_blurred,
+            "places_removed": places_removed,
+        }
+
+    # =========================================================================
+    # LLM 文案生成
+    # =========================================================================
+
+    async def _generate_share_text(
+        self,
+        content: str,
+        emotion: str,
+        created_at: Optional[datetime],
+    ) -> str:
+        """生成分享文案"""
+        date_str = created_at.strftime("%Y年%m月%d日") if created_at else "今天"
+
+        prompt = prompts.build_share_card_prompt(
+            content=content,
+            emotion=emotion,
+            date_str=date_str,
+            card_type="moment",
+        )
+
+        try:
+            response = await glm_service.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.7,
+                max_tokens=200,
+            )
+            return response.strip()
+        except Exception as e:
+            logger.warning(f"Failed to generate share text: {e}")
+            return content[:100] + "..."
+
+    # =========================================================================
+    # 私有方法
+    # =========================================================================
+
+    def _save_card(self, card: ShareCard) -> ShareCard:
+        """保存卡片到数据库"""
+        result = mentis_db.execute_returning_one(
+            """
+            INSERT INTO share_card (
+                user_id, card_type, title, content, template, style,
+                source_type, source_id, is_public, privacy_settings
+            )
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
+            RETURNING id, created_at
+            """,
+            (
+                card.user_id,
+                card.card_type,
+                card.title,
+                json.dumps(card.content, ensure_ascii=False),
+                card.template,
+                json.dumps(card.style, ensure_ascii=False) if card.style else None,
+                card.source_type,
+                card.source_id,
+                card.is_public,
+                json.dumps({
+                    "blur_names": card.privacy_settings.blur_names,
+                    "remove_places": card.privacy_settings.remove_places,
+                    "keep_original": card.privacy_settings.keep_original,
+                }, ensure_ascii=False),
+            ),
+        )
+
+        if result:
+            card.id = str(result.get("id"))
+            card.created_at = result.get("created_at")
+
+        return card
+
+    def _row_to_card(self, row: Dict[str, Any]) -> ShareCard:
+        """将数据库行转换为 ShareCard"""
+        content = row.get("content") or {}
+        if isinstance(content, str):
+            content = json.loads(content)
+
+        style = row.get("style")
+        if isinstance(style, str):
+            style = json.loads(style)
+
+        privacy_data = row.get("privacy_settings") or {}
+        if isinstance(privacy_data, str):
+            privacy_data = json.loads(privacy_data)
+
+        return ShareCard(
+            id=str(row.get("id")),
+            user_id=str(row.get("user_id")),
+            card_type=row.get("card_type") or "moment",
+            title=row.get("title"),
+            content=content,
+            template=row.get("template") or "default",
+            style=style,
+            source_type=row.get("source_type"),
+            source_id=str(row.get("source_id")) if row.get("source_id") else None,
+            share_token=row.get("share_token"),
+            is_public=bool(row.get("is_public")),
+            privacy_settings=PrivacySettings(
+                blur_names=bool(privacy_data.get("blur_names", True)),
+                remove_places=bool(privacy_data.get("remove_places", True)),
+                keep_original=bool(privacy_data.get("keep_original", False)),
+            ),
+            image_url=row.get("image_url"),
+            view_count=int(row.get("view_count") or 0),
+            expires_at=row.get("expires_at"),
+            created_at=row.get("created_at"),
+        )
+
+
+# =============================================================================
+# 便捷函数
+# =============================================================================
+
+async def create_moment_card(
+    user_id: str,
+    entry_id: str,
+    template: str = "default",
+    blur_names: bool = True,
+    remove_places: bool = True,
+) -> ShareCard:
+    """创建 moment 卡片"""
+    service = ShareCardService()
+    privacy = PrivacySettings(
+        blur_names=blur_names,
+        remove_places=remove_places,
+    )
+    return await service.create_card_from_entry(user_id, entry_id, template, privacy)
+
+
+async def create_daily_card(
+    user_id: str,
+    digest_id: str,
+    template: str = "default",
+) -> ShareCard:
+    """创建 daily 卡片"""
+    service = ShareCardService()
+    return await service.create_card_from_digest(user_id, digest_id, template)
+
+
+def get_public_card(share_token: str) -> Optional[ShareCard]:
+    """获取公开卡片"""
+    service = ShareCardService()
+    return service.get_public_card(share_token)

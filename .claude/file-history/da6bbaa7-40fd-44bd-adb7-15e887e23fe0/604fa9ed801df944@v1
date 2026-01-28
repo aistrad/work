@@ -1,0 +1,83 @@
+# 修复计划：Skill 激活后无法获取已有出生信息
+
+## 问题描述
+
+用户在 Phase 1 成功回答"我的生日是哪天"，但激活 jungastro 后系统又要求收集出生信息。
+
+## 根因分析
+
+三层问题叠加：
+
+| 层级 | 文件 | 问题 |
+|-----|------|------|
+| 1. 缓存加载 | `profile_cache.py:219` | `deps = [skill]` 只加载自身，不加载依赖 |
+| 2. 配置缺失 | `jungastro/SKILL.md` | 缺少 `requires_skill_data: ["zodiac"]` |
+| 3. 状态错判 | `prompt_builder.py:278-313` | SOP 规则基于不完整数据生成"需要收集出生信息" |
+
+**数据流断裂点**：
+```
+Phase 2 激活 jungastro
+  → get_cached_profile_with_skill(user_id, "jungastro")
+  → deps = ["jungastro"]  ← 问题！应包含 zodiac
+  → skill_data 缺少 zodiac 数据
+  → _compute_sop_status: has_chart_data = False
+  → LLM 被提示"需要收集出生信息"
+```
+
+## 修复方案
+
+### 方案 A：配置驱动（推荐）
+
+**P0 修复：让 Skill 声明自己的数据依赖**
+
+1. **更新 `profile_cache.py:217-219`**：
+```python
+# 改前
+deps = [skill]
+
+# 改后
+from services.agent.skill_loader import get_skill_required_data
+deps = get_skill_required_data(skill) if skill else []
+if skill and skill not in deps:
+    deps.append(skill)
+```
+
+2. **更新各 Skill 的 SKILL.md**（添加 `requires_skill_data`）：
+   - `jungastro/SKILL.md`: `requires_skill_data: ["zodiac"]`
+   - `synastry/SKILL.md`: `requires_skill_data: ["zodiac", "bazi"]`（如需）
+
+### 方案 B：双来源检查
+
+**P1 优化：`_compute_sop_status` 同时检查 profile 和 skill_data**
+
+```python
+# core.py _compute_sop_status
+identity = context.profile.get("identity", {}) if context.profile else {}
+birth_info = identity.get("birth_info", {})
+has_birth = bool(birth_info.get("birth_date") or birth_info.get("date"))
+
+# 即使 skill_data 没有 chart，但 profile 有 birth_info 也算"有"
+```
+
+## 修改文件清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| `stores/profile_cache.py` | 使用 `get_skill_required_data` 加载依赖 |
+| `skills/jungastro/SKILL.md` | 添加 `requires_skill_data: ["zodiac"]` |
+| `skills/synastry/SKILL.md` | 检查并添加依赖声明 |
+| `services/agent/skill_loader.py` | 确保 `get_skill_required_data` 被正确导出 |
+
+## 验证步骤
+
+1. 启动测试环境
+2. 用户先说"我的生日是1990年1月15日下午2点30分"
+3. 确认 Phase 1 正确保存出生信息
+4. 用户说"帮我做荣格深度分析"
+5. 验证 jungastro 激活后**不再**要求收集出生信息
+6. 验证 jungastro 能正确调用 `calculate_zodiac` 进行计算
+
+## 待确认
+
+1. 是否需要同时更新其他依赖 zodiac 的 Skill（vibe_id、synastry）？
+2. 聊天记录中的出生信息是否应该作为备用来源？

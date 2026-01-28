@@ -1,0 +1,202 @@
+"""
+Digital Twin API Routes.
+
+TASK-1.3.1~1.3.3: 孪生路由实现
+REQ: REQ-TWIN-002, REQ-TWIN-005
+Design: §3.1.2, §3.1 (扩展)
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth
+from models.twin import TwinData, TwinHistoryResponse, TwinLayer
+from services import twin_service
+
+router = APIRouter(prefix="/api/twin", tags=["Digital Twin"])
+
+
+# =============================================================================
+# Response Models
+# =============================================================================
+
+class TwinResponse(BaseModel):
+    """Response for GET /api/twin"""
+    twin: Dict[str, Any]
+    last_updated: Optional[str] = None
+
+
+class TwinHistoryApiResponse(BaseModel):
+    """Response for GET /api/twin/history"""
+    entries: List[Dict[str, Any]]
+    total_count: int
+    limit: int
+    offset: int
+
+
+# =============================================================================
+# TASK-1.3.1: GET /api/twin
+# =============================================================================
+
+@router.get("", response_model=TwinResponse)
+async def get_twin(
+    request: Request,
+    layer: str = Query(default="all", description="Layer to retrieve: L1, L2, L3, or all"),
+    auth: Dict[str, Any] = Depends(require_auth),
+) -> TwinResponse:
+    """
+    Get current user's digital twin data.
+
+    REQ: REQ-TWIN-002
+    Design: §3.1.2
+
+    Args:
+        layer: Which layer(s) to retrieve. Options: L1, L2, L3, all
+
+    Returns:
+        TwinResponse with twin data and last_updated timestamp
+    """
+    user_id = auth["user_id"]
+
+    try:
+        twin = twin_service.get_twin(user_id, auto_create=True)
+    except twin_service.TwinServiceError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Get layer-specific data
+    if layer == "all":
+        twin_data = twin.model_dump()
+    elif layer in ("L1", "L2", "L3"):
+        twin_data = twin.get_layer(TwinLayer(layer))
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid layer: {layer}")
+
+    last_updated = None
+    if twin.updated_at:
+        last_updated = twin.updated_at.isoformat()
+
+    return TwinResponse(twin=twin_data, last_updated=last_updated)
+
+
+# =============================================================================
+# TASK-1.3.2: GET /api/twin/history
+# =============================================================================
+
+@router.get("/history", response_model=TwinHistoryApiResponse)
+async def get_twin_history(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100, description="Number of entries to return"),
+    offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+    trigger_type: Optional[str] = Query(default=None, description="Filter by trigger type"),
+    layer: Optional[str] = Query(default=None, description="Filter by layer: L1, L2, L3"),
+    auth: Dict[str, Any] = Depends(require_auth),
+) -> TwinHistoryApiResponse:
+    """
+    Get update history for current user's digital twin.
+
+    REQ: REQ-TWIN-005
+    Design: §3.1 (扩展)
+
+    Args:
+        limit: Number of entries to return (1-100)
+        offset: Offset for pagination
+        trigger_type: Optional filter by trigger type
+        layer: Optional filter by layer
+
+    Returns:
+        TwinHistoryApiResponse with entries and pagination info
+    """
+    user_id = auth["user_id"]
+
+    # Validate layer if provided
+    layer_enum = None
+    if layer:
+        if layer not in ("L1", "L2", "L3"):
+            raise HTTPException(status_code=400, detail=f"Invalid layer: {layer}")
+        layer_enum = TwinLayer(layer)
+
+    try:
+        history = twin_service.get_twin_history(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            trigger_type=trigger_type,
+            layer=layer_enum,
+        )
+    except twin_service.TwinServiceError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Convert entries to dicts
+    entries = []
+    for entry in history.entries:
+        entries.append({
+            "log_id": entry.log_id,
+            "trigger_type": entry.trigger_type,
+            "layer": entry.layer.value,
+            "path": entry.path,
+            "old_value": entry.old_value,
+            "new_value": entry.new_value,
+            "confidence": entry.confidence,
+            "source": entry.source,
+            "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        })
+
+    return TwinHistoryApiResponse(
+        entries=entries,
+        total_count=history.total_count,
+        limit=history.limit,
+        offset=history.offset,
+    )
+
+
+# =============================================================================
+# Additional endpoints
+# =============================================================================
+
+@router.get("/dimensions")
+async def get_dimensions(
+    request: Request,
+    auth: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Get current dimension scores for user's digital twin.
+
+    Returns only L3 dimension scores for quick access.
+    """
+    user_id = auth["user_id"]
+
+    try:
+        twin = twin_service.get_twin(user_id, auto_create=True)
+    except twin_service.TwinServiceError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "dimension_scores": twin.dimension_scores.model_dump(),
+        "overall_wellbeing": twin.overall_wellbeing,
+        "aura_points": twin.aura_points,
+        "growth_streak": twin.growth_streak,
+    }
+
+
+@router.post("/sync-bazi")
+async def sync_bazi(
+    request: Request,
+    auth: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Manually trigger sync of bazi data to twin's L1 metadata.
+
+    Called after bazi data is updated.
+    """
+    user_id = auth["user_id"]
+
+    try:
+        success = twin_service.sync_bazi_to_twin(user_id)
+    except twin_service.TwinServiceError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"synced": success}

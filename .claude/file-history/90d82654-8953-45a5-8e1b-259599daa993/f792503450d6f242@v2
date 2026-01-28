@@ -1,0 +1,311 @@
+"""
+File Processor - Preprocessing uploaded files
+Based on: vibelife spec v3.0, section 4.3
+
+Preprocessing Steps:
+1. Images: Compression + OCR (if needed)
+2. PDF: Text extraction + Image extraction
+3. Documents: Format conversion + Text extraction
+"""
+import io
+import base64
+import mimetypes
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class FileType(str, Enum):
+    """Supported file types"""
+    IMAGE = "image"
+    PDF = "pdf"
+    DOCUMENT = "document"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ProcessedFile:
+    """Result of file processing"""
+    file_type: FileType
+    original_filename: str
+    mime_type: str
+    size_bytes: int
+
+    # Extracted content
+    text_content: Optional[str] = None
+
+    # For images - base64 encoded for vision API
+    image_base64: Optional[str] = None
+    image_mime_type: Optional[str] = None
+
+    # Metadata
+    page_count: Optional[int] = None
+    error: Optional[str] = None
+
+    @property
+    def has_text(self) -> bool:
+        return bool(self.text_content and self.text_content.strip())
+
+    @property
+    def has_image(self) -> bool:
+        return bool(self.image_base64)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File Type Detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+IMAGE_MIMES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "image/heic", "image/heif"
+}
+
+PDF_MIMES = {"application/pdf"}
+
+DOCUMENT_MIMES = {
+    "text/plain",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/markdown",
+    "text/csv",
+}
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB for vision API
+
+
+def detect_file_type(mime_type: str) -> FileType:
+    """Detect file type from MIME type"""
+    if mime_type in IMAGE_MIMES:
+        return FileType.IMAGE
+    elif mime_type in PDF_MIMES:
+        return FileType.PDF
+    elif mime_type in DOCUMENT_MIMES:
+        return FileType.DOCUMENT
+    else:
+        return FileType.UNKNOWN
+
+
+def get_mime_type(filename: str) -> str:
+    """Get MIME type from filename"""
+    mime_type, _ = mimetypes.guess_type(filename)
+    return mime_type or "application/octet-stream"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File Processor
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FileProcessor:
+    """
+    Process uploaded files for AI extraction.
+
+    Features:
+    - Image compression and base64 encoding
+    - PDF text extraction
+    - Document text extraction
+    """
+
+    def __init__(self):
+        pass
+
+    async def process(
+        self,
+        file_data: bytes,
+        filename: str,
+        mime_type: Optional[str] = None
+    ) -> ProcessedFile:
+        """
+        Process an uploaded file.
+
+        Args:
+            file_data: Raw file bytes
+            filename: Original filename
+            mime_type: MIME type (auto-detected if not provided)
+
+        Returns:
+            ProcessedFile with extracted content
+        """
+        # Detect MIME type
+        if not mime_type:
+            mime_type = get_mime_type(filename)
+
+        file_type = detect_file_type(mime_type)
+
+        # Create base result
+        result = ProcessedFile(
+            file_type=file_type,
+            original_filename=filename,
+            mime_type=mime_type,
+            size_bytes=len(file_data)
+        )
+
+        # Check file size
+        if len(file_data) > MAX_FILE_SIZE:
+            result.error = f"文件过大，最大支持 {MAX_FILE_SIZE // 1024 // 1024}MB"
+            return result
+
+        # Process based on type
+        try:
+            if file_type == FileType.IMAGE:
+                await self._process_image(file_data, result)
+            elif file_type == FileType.PDF:
+                await self._process_pdf(file_data, result)
+            elif file_type == FileType.DOCUMENT:
+                await self._process_document(file_data, result, filename)
+            else:
+                result.error = f"不支持的文件类型: {mime_type}"
+
+        except Exception as e:
+            logger.error(f"File processing failed: {e}")
+            result.error = f"处理失败: {str(e)}"
+
+        return result
+
+    async def _process_image(
+        self,
+        file_data: bytes,
+        result: ProcessedFile
+    ) -> None:
+        """Process image file"""
+        # Compress if too large
+        if len(file_data) > MAX_IMAGE_SIZE:
+            file_data = self._compress_image(file_data, result.mime_type)
+
+        # Convert to base64 for vision API
+        result.image_base64 = base64.b64encode(file_data).decode("utf-8")
+        result.image_mime_type = result.mime_type
+
+    def _compress_image(
+        self,
+        image_data: bytes,
+        mime_type: str
+    ) -> bytes:
+        """Compress image if needed"""
+        try:
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(image_data))
+
+            # Resize if too large
+            max_dim = 2048
+            if max(img.size) > max_dim:
+                ratio = max_dim / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Save with compression
+            output = io.BytesIO()
+            if mime_type == "image/png":
+                img.save(output, format="PNG", optimize=True)
+            else:
+                # Convert to RGB if needed (for JPEG)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.save(output, format="JPEG", quality=85, optimize=True)
+
+            return output.getvalue()
+
+        except ImportError:
+            logger.warning("PIL not available, returning original image")
+            return image_data
+
+    async def _process_pdf(
+        self,
+        file_data: bytes,
+        result: ProcessedFile
+    ) -> None:
+        """Process PDF file"""
+        try:
+            import PyPDF2
+
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_data))
+            result.page_count = len(pdf_reader.pages)
+
+            # Extract text from all pages
+            text_parts = []
+            for page in pdf_reader.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text.strip())
+
+            result.text_content = "\n\n".join(text_parts)
+
+            # If no text, it might be a scanned PDF - try first page as image
+            if not result.text_content.strip():
+                logger.info("PDF has no extractable text, might be scanned")
+                # For scanned PDFs, we'd need to convert to image
+                # This requires additional libraries like pdf2image
+                result.text_content = "[扫描PDF，建议上传截图]"
+
+        except ImportError:
+            logger.warning("PyPDF2 not available")
+            result.error = "PDF处理库未安装"
+        except Exception as e:
+            logger.error(f"PDF processing error: {e}")
+            result.error = f"PDF处理失败: {str(e)}"
+
+    async def _process_document(
+        self,
+        file_data: bytes,
+        result: ProcessedFile,
+        filename: str
+    ) -> None:
+        """Process document file (txt, docx, etc.)"""
+        ext = Path(filename).suffix.lower()
+
+        if ext in (".txt", ".md", ".csv"):
+            # Plain text files
+            try:
+                result.text_content = file_data.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    result.text_content = file_data.decode("gbk")
+                except:
+                    result.error = "无法解析文件编码"
+
+        elif ext == ".docx":
+            # Word documents
+            try:
+                import docx
+
+                doc = docx.Document(io.BytesIO(file_data))
+                paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                result.text_content = "\n\n".join(paragraphs)
+
+            except ImportError:
+                logger.warning("python-docx not available")
+                result.error = "DOCX处理库未安装"
+            except Exception as e:
+                result.error = f"DOCX处理失败: {str(e)}"
+
+        else:
+            result.error = f"不支持的文档格式: {ext}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Convenience Function
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def process_upload(
+    file_data: bytes,
+    filename: str,
+    mime_type: Optional[str] = None
+) -> ProcessedFile:
+    """
+    Convenience function to process an uploaded file.
+
+    Args:
+        file_data: Raw file bytes
+        filename: Original filename
+        mime_type: Optional MIME type
+
+    Returns:
+        ProcessedFile with extracted content
+    """
+    processor = FileProcessor()
+    return await processor.process(file_data, filename, mime_type)

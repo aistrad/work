@@ -1,0 +1,239 @@
+# Email Authentication System
+
+## Overview
+
+Email-based registration with verification code flow, protected by Cloudflare Turnstile bot protection.
+
+## Features
+
+- Email/password registration with email verification
+- 6-digit verification code sent via Resend
+- Cloudflare Turnstile bot protection
+- Login with email/password
+- Resend verification code functionality
+
+## Registration Flow
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Email/Pass  │────►│ Turnstile   │────►│ Send Code   │
+│   Input     │     │  Verify     │     │  (Resend)   │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                              │
+                                              ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Return    │◄────│  Create     │◄────│ Enter Code  │
+│    JWT      │     │   User      │     │  & Verify   │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
+
+## API Endpoints
+
+### Step 1: Register (Send Code)
+
+```
+POST /api/auth/email/register
+```
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "password": "securepassword123",
+  "turnstile_token": "0.xxx..."
+}
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Verification code sent",
+  "expires_in": 600
+}
+```
+
+### Step 2: Verify Code
+
+```
+POST /api/auth/email/verify
+```
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "code": "123456"
+}
+```
+
+Response:
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user": {
+    "user_id": "uuid",
+    "vibe_id": "VB-XXXXXXXX"
+  }
+}
+```
+
+### Login
+
+```
+POST /api/auth/email/login
+```
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "password": "securepassword123",
+  "turnstile_token": "0.xxx..."
+}
+```
+
+Response: Same as verify endpoint
+
+### Resend Code
+
+```
+POST /api/auth/email/resend
+```
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "turnstile_token": "0.xxx..."
+}
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Verification code resent",
+  "expires_in": 600
+}
+```
+
+## Environment Variables
+
+### Backend (`apps/api/.env`)
+
+```env
+# Cloudflare Turnstile (Bot Protection)
+CF_SECRET_KEY=0x...
+
+# Resend (Email Service)
+RESEND_API_KEY=re_...
+RESEND_FROM=noreply@vibelife.app
+```
+
+### Frontend (`apps/web/.env.local`)
+
+```env
+# Cloudflare Turnstile (must match NEXT_PUBLIC_CF_SITE_KEY)
+NEXT_PUBLIC_CF_SITE_KEY=0x...
+```
+
+> **注意**：前端代码使用 `NEXT_PUBLIC_CF_SITE_KEY`，请确保环境变量名称正确。
+
+## Components
+
+### EmailAuthForm
+
+```tsx
+import { EmailAuthForm } from "@/components/auth/EmailAuthForm";
+
+<EmailAuthForm
+  onSuccess={() => router.push("/chat")}
+  onError={(error) => toast.error(error)}
+/>
+```
+
+Props:
+- `onSuccess?: () => void` - Called after successful login/registration
+- `onError?: (error: string) => void` - Called on error
+- `disabled?: boolean` - Disable form inputs
+
+### Full Auth Page Example
+
+```tsx
+import { AuthLayout, AuthCard, AuthDivider } from "@/components/auth/AuthLayout";
+import { EmailAuthForm } from "@/components/auth/EmailAuthForm";
+import { OAuthButtons } from "@/components/auth/OAuthButtons";
+
+export default function LoginPage() {
+  return (
+    <AuthLayout>
+      <AuthCard title="Welcome" subtitle="Sign in to your account">
+        <EmailAuthForm onSuccess={() => window.location.href = "/chat"} />
+
+        <AuthDivider text="or continue with" />
+
+        <OAuthButtons onSuccess={() => window.location.href = "/chat"} />
+      </AuthCard>
+    </AuthLayout>
+  );
+}
+```
+
+## Database Schema
+
+```sql
+CREATE TABLE email_verification_codes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) NOT NULL UNIQUE,
+    code VARCHAR(6) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    attempts INT DEFAULT 0,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+## Security Features
+
+1. **Bot Protection**: Cloudflare Turnstile prevents automated attacks
+2. **Rate Limiting**: Max 5 verification attempts per code
+3. **Code Expiry**: Codes expire after 10 minutes
+4. **Password Hashing**: Bcrypt with salt
+5. **Single Login Method**: Each email can only use one auth method
+
+## Setup Guide
+
+### 1. Cloudflare Turnstile
+
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/)
+2. Navigate to Turnstile > Add Site
+3. Copy Site Key (frontend) and Secret Key (backend)
+
+### 2. Resend
+
+1. Sign up at [Resend](https://resend.com) (free 100 emails/day)
+2. Add and verify your domain
+3. Create an API key
+
+### 3. Run Migration
+
+```bash
+psql -d vibelife -f migrations/026_email_verification.sql
+```
+
+## Error Handling
+
+| Error | HTTP Status | Message |
+|-------|------------|---------|
+| Invalid email format | 400 | "Invalid email address" |
+| Password too short | 400 | "Password must be at least 8 characters" |
+| Email already registered | 400 | "This email is already registered" |
+| Bot verification failed | 400 | "Bot verification failed" |
+| Invalid verification code | 400 | "Invalid code. N attempts remaining." |
+| Code expired | 400 | "Verification code expired. Please register again." |
+| Too many attempts | 400 | "Too many failed attempts. Please register again." |
+| Wrong password | 401 | "Invalid email or password" |

@@ -1,0 +1,500 @@
+     1→"""
+     2→Interview Service - Core interview logic
+     3→Based on: vibelife spec v3.0, section 4.2
+     4→
+     5→Trigger Conditions:
+     6→- User requests report generation
+     7→- User info is incomplete (Profile score < threshold)
+     8→- First-time user
+     9→
+    10→Required Questions (2-3):
+    11→1. Current concerns/pain points
+    12→2. Life status (career, relationship, etc.)
+    13→3. Expectations and goals
+    14→"""
+    15→import json
+    16→from typing import Optional, List, Dict, Any, Tuple
+    17→from uuid import UUID, uuid4
+    18→from datetime import datetime
+    19→from dataclasses import dataclass, field, asdict
+    20→from enum import Enum
+    21→import logging
+    22→
+    23→from services.vibe_engine.llm import get_llm_service, create_user_message, LLMService
+    24→
+    25→logger = logging.getLogger(__name__)
+    26→
+    27→
+    28→class InterviewState(str, Enum):
+    29→    """Interview session states"""
+    30→    NOT_STARTED = "not_started"
+    31→    IN_PROGRESS = "in_progress"
+    32→    COMPLETED = "completed"
+    33→    SKIPPED = "skipped"
+    34→
+    35→
+    36→@dataclass
+    37→class InterviewQuestion:
+    38→    """A single interview question"""
+    39→    id: str
+    40→    question_text: str
+    41→    question_type: str  # core | followup | optional
+    42→    answer: Optional[str] = None
+    43→    extracted_info: Optional[Dict[str, Any]] = None
+    44→    answered_at: Optional[datetime] = None
+    45→
+    46→
+    47→@dataclass
+    48→class InterviewSession:
+    49→    """Complete interview session"""
+    50→    id: UUID
+    51→    user_id: Optional[UUID]
+    52→    skill: str  # bazi | zodiac
+    53→    state: InterviewState
+    54→    questions: List[InterviewQuestion]
+    55→    current_question_idx: int
+    56→    created_at: datetime
+    57→    completed_at: Optional[datetime] = None
+    58→
+    59→    def to_dict(self) -> dict:
+    60→        return {
+    61→            "id": str(self.id),
+    62→            "user_id": str(self.user_id) if self.user_id else None,
+    63→            "skill": self.skill,
+    64→            "state": self.state.value,
+    65→            "questions": [
+    66→                {
+    67→                    "id": q.id,
+    68→                    "question_text": q.question_text,
+    69→                    "question_type": q.question_type,
+    70→                    "answer": q.answer,
+    71→                    "extracted_info": q.extracted_info,
+    72→                    "answered_at": q.answered_at.isoformat() if q.answered_at else None,
+    73→                }
+    74→                for q in self.questions
+    75→            ],
+    76→            "current_question_idx": self.current_question_idx,
+    77→            "created_at": self.created_at.isoformat(),
+    78→            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+    79→        }
+    80→
+    81→
+    82→@dataclass
+    83→class InterviewResult:
+    84→    """Final interview extraction result"""
+    85→    success: bool
+    86→    extracted_profile: Dict[str, Any]
+    87→    summary: str
+    88→    questions_answered: int
+    89→    total_questions: int
+    90→
+    91→
+    92→# ═══════════════════════════════════════════════════════════════════════════
+    93→# Core Questions (按 spec 4.2)
+    94→# ═══════════════════════════════════════════════════════════════════════════
+    95→
+    96→CORE_QUESTIONS = [
+    97→    {
+    98→        "id": "q1_concerns",
+    99→        "question_text": "你现在最想解决的问题是什么？或者，最困扰你的是什么？",
+   100→        "question_type": "core",
+   101→        "extract_fields": ["current_concerns", "pain_points"],
+   102→    },
+   103→    {
+   104→        "id": "q2_life_status",
+   105→        "question_text": "简单说说你现在的状态？工作、感情、还是其他方面？",
+   106→        "question_type": "core",
+   107→        "extract_fields": ["career_status", "relationship_status", "life_stage"],
+   108→    },
+   109→    {
+   110→        "id": "q3_expectations",
+   111→        "question_text": "你希望从这次分析中获得什么？",
+   112→        "question_type": "core",
+   113→        "extract_fields": ["expectations", "goals"],
+   114→    },
+   115→]
+   116→
+   117→INTERVIEW_INTRO = """🌟 在生成你的专属报告之前...
+   118→
+   119→我想更了解你一点。这样我才能给你真正有用的分析，而不是泛泛而谈。
+   120→
+   121→准备好了吗？只需要回答 2-3 个问题。"""
+   122→
+   123→INTERVIEW_SKIP_WARNING = """跳过访谈后，报告可能不够精准，只能基于基础信息进行分析。
+   124→
+   125→确定要跳过吗？"""
+   126→
+   127→
+   128→# ═══════════════════════════════════════════════════════════════════════════
+   129→# Answer Extraction Prompt
+   130→# ═══════════════════════════════════════════════════════════════════════════
+   131→
+   132→EXTRACT_ANSWER_PROMPT = """从用户回答中抽取结构化信息。
+   133→
+   134→问题: {question}
+   135→用户回答: {answer}
+   136→
+   137→请提取以下字段（如果能从回答中获取）：
+   138→{extract_fields}
+   139→
+   140→## 输出格式（只输出 JSON）
+   141→{{
+   142→  "life_context": {{
+   143→    "career": {{
+   144→      "status": "employed | unemployed | student | freelance | null",
+   145→      "industry": "行业 | null",
+   146→      "concerns": ["关注点1", "关注点2"]
+   147→    }},
+   148→    "relationship": {{
+   149→      "status": "single | in_relationship | married | divorced | null",
+   150→      "concerns": ["关注点1"]
+   151→    }},
+   152→    "current_focus": ["当前关注领域"],
+   153→    "life_stage": "描述 | null"
+   154→  }},
+   155→  "ai_insights": {{
+   156→    "current_concerns": ["困境1", "困境2"],
+   157→    "pain_points": ["痛点1"],
+   158→    "expectations": ["期望1"],
+   159→    "goals": ["目标1"]
+   160→  }}
+   161→}}
+   162→
+   163→如果某个字段无法从回答中获取，设为 null 或空数组。
+   164→只返回 JSON，不要其他内容。"""
+   165→
+   166→
+   167→# ═══════════════════════════════════════════════════════════════════════════
+   168→# Interview Service
+   169→# ═══════════════════════════════════════════════════════════════════════════
+   170→
+   171→class InterviewService:
+   172→    """
+   173→    AI Interview Service for collecting user context before report generation.
+   174→
+   175→    Features:
+   176→    - Start/continue/skip interview sessions
+   177→    - Extract structured info from answers
+   178→    - Generate follow-up questions
+   179→    - Merge results into user profile
+   180→    """
+   181→
+   182→    def __init__(self, llm: Optional[LLMService] = None):
+   183→        self.llm = llm or get_llm_service()
+   184→        self._sessions: Dict[UUID, InterviewSession] = {}  # In-memory for now
+   185→
+   186→    # ─────────────────────────────────────────────────────────────────────
+   187→    # Session Management
+   188→    # ─────────────────────────────────────────────────────────────────────
+   189→
+   190→    def start_session(
+   191→        self,
+   192→        skill: str,
+   193→        user_id: Optional[UUID] = None,
+   194→        custom_questions: Optional[List[Dict]] = None
+   195→    ) -> InterviewSession:
+   196→        """
+   197→        Start a new interview session.
+   198→
+   199→        Args:
+   200→            skill: bazi or zodiac
+   201→            user_id: Optional user ID
+   202→            custom_questions: Override default questions
+   203→
+   204→        Returns:
+   205→            New InterviewSession
+   206→        """
+   207→        session_id = uuid4()
+   208→
+   209→        # Build questions list
+   210→        questions_data = custom_questions or CORE_QUESTIONS
+   211→        questions = [
+   212→            InterviewQuestion(
+   213→                id=q["id"],
+   214→                question_text=q["question_text"],
+   215→                question_type=q.get("question_type", "core"),
+   216→            )
+   217→            for q in questions_data
+   218→        ]
+   219→
+   220→        session = InterviewSession(
+   221→            id=session_id,
+   222→            user_id=user_id,
+   223→            skill=skill,
+   224→            state=InterviewState.IN_PROGRESS,
+   225→            questions=questions,
+   226→            current_question_idx=0,
+   227→            created_at=datetime.utcnow(),
+   228→        )
+   229→
+   230→        self._sessions[session_id] = session
+   231→        return session
+   232→
+   233→    def get_session(self, session_id: UUID) -> Optional[InterviewSession]:
+   234→        """Get an existing session"""
+   235→        return self._sessions.get(session_id)
+   236→
+   237→    def get_intro(self) -> str:
+   238→        """Get interview introduction message"""
+   239→        return INTERVIEW_INTRO
+   240→
+   241→    def get_current_question(self, session: InterviewSession) -> Optional[InterviewQuestion]:
+   242→        """Get the current question to ask"""
+   243→        if session.state != InterviewState.IN_PROGRESS:
+   244→            return None
+   245→
+   246→        if session.current_question_idx >= len(session.questions):
+   247→            return None
+   248→
+   249→        return session.questions[session.current_question_idx]
+   250→
+   251→    def get_progress(self, session: InterviewSession) -> Tuple[int, int]:
+   252→        """Get current progress (answered, total)"""
+   253→        answered = sum(1 for q in session.questions if q.answer is not None)
+   254→        return answered, len(session.questions)
+   255→
+   256→    # ─────────────────────────────────────────────────────────────────────
+   257→    # Answer Processing
+   258→    # ─────────────────────────────────────────────────────────────────────
+   259→
+   260→    async def submit_answer(
+   261→        self,
+   262→        session: InterviewSession,
+   263→        answer: str
+   264→    ) -> Tuple[Optional[InterviewQuestion], bool]:
+   265→        """
+   266→        Submit an answer to the current question.
+   267→
+   268→        Args:
+   269→            session: Current interview session
+   270→            answer: User's answer
+   271→
+   272→        Returns:
+   273→            Tuple of (next_question or None, is_complete)
+   274→        """
+   275→        if session.state != InterviewState.IN_PROGRESS:
+   276→            return None, session.state == InterviewState.COMPLETED
+   277→
+   278→        current_idx = session.current_question_idx
+   279→        if current_idx >= len(session.questions):
+   280→            session.state = InterviewState.COMPLETED
+   281→            session.completed_at = datetime.utcnow()
+   282→            return None, True
+   283→
+   284→        # Save answer to current question
+   285→        current_question = session.questions[current_idx]
+   286→        current_question.answer = answer
+   287→        current_question.answered_at = datetime.utcnow()
+   288→
+   289→        # Extract structured info from answer
+   290→        try:
+   291→            extracted = await self._extract_answer_info(
+   292→                current_question.question_text,
+   293→                answer
+   294→            )
+   295→            current_question.extracted_info = extracted
+   296→        except Exception as e:
+   297→            logger.warning(f"Failed to extract info from answer: {e}")
+   298→            current_question.extracted_info = {}
+   299→
+   300→        # Move to next question
+   301→        session.current_question_idx += 1
+   302→
+   303→        # Check if complete
+   304→        if session.current_question_idx >= len(session.questions):
+   305→            session.state = InterviewState.COMPLETED
+   306→            session.completed_at = datetime.utcnow()
+   307→            return None, True
+   308→
+   309→        # Return next question
+   310→        next_question = session.questions[session.current_question_idx]
+   311→        return next_question, False
+   312→
+   313→    async def _extract_answer_info(
+   314→        self,
+   315→        question: str,
+   316→        answer: str
+   317→    ) -> Dict[str, Any]:
+   318→        """Extract structured info from an answer using LLM"""
+   319→        prompt = EXTRACT_ANSWER_PROMPT.format(
+   320→            question=question,
+   321→            answer=answer,
+   322→            extract_fields="career, relationship, concerns, expectations, goals"
+   323→        )
+   324→
+   325→        try:
+   326→            response = await self.llm.chat(
+   327→                [create_user_message(prompt)],
+   328→                temperature=0.2,
+   329→                max_tokens=800
+   330→            )
+   331→
+   332→            content = response.content.strip()
+   333→
+   334→            # Parse JSON from response
+   335→            if "```json" in content:
+   336→                content = content.split("```json")[1].split("```")[0].strip()
+   337→            elif "```" in content:
+   338→                content = content.split("```")[1].split("```")[0].strip()
+   339→
+   340→            return json.loads(content)
+   341→
+   342→        except Exception as e:
+   343→            logger.error(f"Answer extraction failed: {e}")
+   344→            return {}
+   345→
+   346→    # ─────────────────────────────────────────────────────────────────────
+   347→    # Skip / Complete
+   348→    # ─────────────────────────────────────────────────────────────────────
+   349→
+   350→    def skip_session(self, session: InterviewSession) -> str:
+   351→        """
+   352→        Skip the interview (user choice).
+   353→        Returns a warning message.
+   354→        """
+   355→        session.state = InterviewState.SKIPPED
+   356→        session.completed_at = datetime.utcnow()
+   357→        return INTERVIEW_SKIP_WARNING
+   358→
+   359→    def get_result(self, session: InterviewSession) -> InterviewResult:
+   360→        """
+   361→        Get final interview result with extracted profile data.
+   362→        """
+   363→        if session.state not in (InterviewState.COMPLETED, InterviewState.SKIPPED):
+   364→            return InterviewResult(
+   365→                success=False,
+   366→                extracted_profile={},
+   367→                summary="访谈尚未完成",
+   368→                questions_answered=0,
+   369→                total_questions=len(session.questions)
+   370→            )
+   371→
+   372→        # Merge all extracted info
+   373→        merged_profile: Dict[str, Any] = {
+   374→            "life_context": {
+   375→                "career": {"concerns": []},
+   376→                "relationship": {"concerns": []},
+   377→                "current_focus": [],
+   378→            },
+   379→            "ai_insights": {
+   380→                "current_concerns": [],
+   381→                "pain_points": [],
+   382→                "expectations": [],
+   383→                "goals": [],
+   384→            }
+   385→        }
+   386→
+   387→        questions_answered = 0
+   388→
+   389→        for q in session.questions:
+   390→            if q.answer and q.extracted_info:
+   391→                questions_answered += 1
+   392→                self._merge_extracted(merged_profile, q.extracted_info)
+   393→
+   394→        # Generate summary
+   395→        if session.state == InterviewState.SKIPPED:
+   396→            summary = "用户跳过了访谈"
+   397→        elif questions_answered == 0:
+   398→            summary = "未收集到有效信息"
+   399→        else:
+   400→            concerns = merged_profile.get("ai_insights", {}).get("current_concerns", [])
+   401→            focus = merged_profile.get("life_context", {}).get("current_focus", [])
+   402→            summary = f"已了解用户关注: {', '.join(concerns[:3] or focus[:3] or ['一般咨询'])}"
+   403→
+   404→        return InterviewResult(
+   405→            success=questions_answered > 0,
+   406→            extracted_profile=merged_profile,
+   407→            summary=summary,
+   408→            questions_answered=questions_answered,
+   409→            total_questions=len(session.questions)
+   410→        )
+   411→
+   412→    def _merge_extracted(
+   413→        self,
+   414→        target: Dict[str, Any],
+   415→        source: Dict[str, Any]
+   416→    ) -> None:
+   417→        """Merge extracted info into target profile"""
+   418→        for key, value in source.items():
+   419→            if key not in target:
+   420→                target[key] = value
+   421→                continue
+   422→
+   423→            if isinstance(value, dict) and isinstance(target[key], dict):
+   424→                self._merge_extracted(target[key], value)
+   425→            elif isinstance(value, list) and isinstance(target[key], list):
+   426→                # Extend list without duplicates
+   427→                existing = set(str(x) for x in target[key])
+   428→                for item in value:
+   429→                    if str(item) not in existing and item:
+   430→                        target[key].append(item)
+   431→            elif value is not None:
+   432→                target[key] = value
+   433→
+   434→    # ─────────────────────────────────────────────────────────────────────
+   435→    # Profile Score Check
+   436→    # ─────────────────────────────────────────────────────────────────────
+   437→
+   438→    def check_interview_needed(
+   439→        self,
+   440→        profile: Dict[str, Any],
+   441→        threshold: float = 0.3
+   442→    ) -> bool:
+   443→        """
+   444→        Check if interview is needed based on profile completeness.
+   445→
+   446→        Returns True if:
+   447→        - Profile is empty or missing key fields
+   448→        - Profile score is below threshold
+   449→        """
+   450→        if not profile:
+   451→            return True
+   452→
+   453→        # Calculate profile score
+   454→        score = 0.0
+   455→        max_score = 1.0
+   456→
+   457→        # Basic info (0.3)
+   458→        basic = profile.get("basic", {})
+   459→        if basic.get("birth_datetime"):
+   460→            score += 0.2
+   461→        if basic.get("gender"):
+   462→            score += 0.1
+   463→
+   464→        # Life context (0.4)
+   465→        life = profile.get("life_context", {})
+   466→        if life.get("career", {}).get("status"):
+   467→            score += 0.15
+   468→        if life.get("relationship", {}).get("status"):
+   469→            score += 0.15
+   470→        if life.get("current_focus"):
+   471→            score += 0.1
+   472→
+   473→        # AI insights (0.3)
+   474→        insights = profile.get("ai_insights", {})
+   475→        if insights.get("current_concerns"):
+   476→            score += 0.2
+   477→        if insights.get("personality_traits"):
+   478→            score += 0.1
+   479→
+   480→        return score < threshold
+   481→
+   482→
+   483→# ═══════════════════════════════════════════════════════════════════════════
+   484→# Global Instance
+   485→# ═══════════════════════════════════════════════════════════════════════════
+   486→
+   487→_interview_service: Optional[InterviewService] = None
+   488→
+   489→
+   490→def get_interview_service() -> InterviewService:
+   491→    """Get or create global interview service instance"""
+   492→    global _interview_service
+   493→    if _interview_service is None:
+   494→        _interview_service = InterviewService()
+   495→    return _interview_service
+   496→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

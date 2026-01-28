@@ -1,0 +1,333 @@
+"""
+Tests for Digital Twin Service.
+
+TASK-1.2.1~1.2.4: twin_service 实现
+REQ: REQ-TWIN-001 ~ REQ-TWIN-005
+"""
+
+import json
+import pytest
+from unittest.mock import MagicMock, patch
+
+from models.twin import DimensionScores, TwinData, TwinLayer, TwinUpdateEvent
+from services import twin_service
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+@pytest.fixture
+def mock_db():
+    """Mock fortune_db module."""
+    with patch.object(twin_service, "fortune_db") as mock:
+        yield mock
+
+
+@pytest.fixture
+def sample_twin_row():
+    """Sample database row for a twin."""
+    return {
+        "twin_id": 1,
+        "user_id": 100,
+        "metadata_astrology": {"bazi": {"day_master": "甲"}},
+        "metadata_psychology": {},
+        "metadata_memory": {},
+        "dynamic_astro": {},
+        "dynamic_bio": {"sleep_score": 70},
+        "dynamic_social": {"interactions_today": 3},
+        "dynamic_emotional": {"current_mood": "calm", "mood_intensity": 6},
+        "aura_points": 50,
+        "overall_wellbeing": 65.0,
+        "growth_streak": 5,
+        "dimension_scores": {"energy": 60, "clarity": 55, "connection": 50, "growth": 45, "balance": 50},
+        "compute_version": "v1.0",
+        "last_full_refresh": None,
+        "created_at": "2025-01-01T00:00:00Z",
+        "updated_at": "2025-01-01T00:00:00Z",
+    }
+
+
+# =============================================================================
+# Test create_twin (TASK-1.2.1)
+# =============================================================================
+
+class TestCreateTwin:
+    """Tests for twin_service.create_twin()"""
+
+    def test_create_twin_with_bazi(self, mock_db, sample_twin_row):
+        """Test creating twin with existing bazi data."""
+        # Setup: no existing twin, has bazi data
+        mock_db.fetch_one.side_effect = [
+            None,  # First call: check existing twin
+            {"facts": {"day_master": "甲"}, "facts_hash": "abc123", "compute_version": "v1"},  # bazi snapshot
+        ]
+        mock_db.execute_returning_one.return_value = sample_twin_row
+
+        twin = twin_service.create_twin(100)
+
+        assert twin.user_id == 100
+        assert twin.metadata_astrology != {}
+        mock_db.execute_returning_one.assert_called_once()
+
+    def test_create_twin_without_bazi(self, mock_db, sample_twin_row):
+        """Test creating twin without bazi data."""
+        # Setup: no existing twin, no bazi data
+        mock_db.fetch_one.side_effect = [
+            None,  # First call: check existing twin
+            None,  # Second call: bazi snapshot
+        ]
+        sample_twin_row["metadata_astrology"] = {}
+        mock_db.execute_returning_one.return_value = sample_twin_row
+
+        twin = twin_service.create_twin(100)
+
+        assert twin.user_id == 100
+        assert twin.metadata_astrology == {}
+
+    def test_create_twin_idempotent(self, mock_db, sample_twin_row):
+        """Test that create_twin is idempotent - returns existing twin."""
+        # Setup: twin already exists
+        mock_db.fetch_one.return_value = sample_twin_row
+
+        twin1 = twin_service.create_twin(100)
+        twin2 = twin_service.create_twin(100)
+
+        assert twin1.twin_id == twin2.twin_id
+        # execute_returning_one should not be called (no insert)
+        mock_db.execute_returning_one.assert_not_called()
+
+
+# =============================================================================
+# Test get_twin (TASK-1.2.2)
+# =============================================================================
+
+class TestGetTwin:
+    """Tests for twin_service.get_twin()"""
+
+    def test_get_twin_all_layers(self, mock_db, sample_twin_row):
+        """Test getting twin with all layers."""
+        mock_db.fetch_one.return_value = sample_twin_row
+
+        twin = twin_service.get_twin(100)
+
+        assert "metadata_astrology" in twin.model_dump()
+        assert "dynamic_emotional" in twin.model_dump()
+        assert "dimension_scores" in twin.model_dump()
+
+    def test_get_twin_l1_only(self, mock_db, sample_twin_row):
+        """Test getting only L1 layer data."""
+        mock_db.fetch_one.return_value = sample_twin_row
+
+        twin = twin_service.get_twin(100)
+        l1_data = twin.get_layer(TwinLayer.L1)
+
+        assert "metadata_astrology" in l1_data
+        assert "dynamic_emotional" not in l1_data
+
+    def test_get_twin_not_found_auto_create(self, mock_db, sample_twin_row):
+        """Test auto-creating twin when not found."""
+        # First call returns None (not found), subsequent calls return the created twin
+        mock_db.fetch_one.side_effect = [
+            None,  # get_twin: not found
+            None,  # create_twin: check existing
+            None,  # create_twin: bazi snapshot
+        ]
+        mock_db.execute_returning_one.return_value = sample_twin_row
+
+        twin = twin_service.get_twin(100, auto_create=True)
+
+        assert twin is not None
+        assert twin.user_id == 100
+
+    def test_get_twin_not_found_no_auto_create(self, mock_db):
+        """Test raising error when twin not found and auto_create=False."""
+        mock_db.fetch_one.return_value = None
+
+        with pytest.raises(twin_service.TwinNotFoundError):
+            twin_service.get_twin(100, auto_create=False)
+
+
+# =============================================================================
+# Test update_twin (TASK-1.2.3)
+# =============================================================================
+
+class TestUpdateTwin:
+    """Tests for twin_service.update_twin()"""
+
+    def test_update_twin_nested_path(self, mock_db, sample_twin_row):
+        """Test updating nested path in twin data."""
+        mock_db.fetch_one.return_value = sample_twin_row
+        mock_db.execute_returning_one.return_value = {"log_id": 1}
+
+        event = TwinUpdateEvent(
+            user_id=100,
+            layer=TwinLayer.L2,
+            path="dynamic_emotional.current_mood",
+            new_value="happy",
+            confidence=0.9,
+            trigger="chat_insight",
+        )
+
+        result = twin_service.update_twin(event)
+
+        assert result.updated is True
+        assert result.log_id == 1
+        assert result.new_value == "happy"
+        mock_db.execute.assert_called()  # UPDATE was called
+
+    def test_update_twin_creates_log(self, mock_db, sample_twin_row):
+        """Test that update creates a log entry."""
+        mock_db.fetch_one.return_value = sample_twin_row
+        mock_db.execute_returning_one.return_value = {"log_id": 123}
+
+        event = TwinUpdateEvent(
+            user_id=100,
+            layer=TwinLayer.L2,
+            path="dynamic_emotional.mood_intensity",
+            new_value=8,
+            confidence=0.85,
+        )
+
+        result = twin_service.update_twin(event)
+
+        assert result.log_id == 123
+        # Verify log insert was called
+        calls = mock_db.execute_returning_one.call_args_list
+        assert len(calls) >= 1
+        log_call = calls[-1]
+        assert "fortune_twin_update_log" in log_call[0][0]
+
+    def test_update_twin_triggers_dimension_recalc(self, mock_db, sample_twin_row):
+        """Test that L2 update triggers dimension recalculation."""
+        mock_db.fetch_one.return_value = sample_twin_row
+        mock_db.execute_returning_one.return_value = {"log_id": 1}
+
+        event = TwinUpdateEvent(
+            user_id=100,
+            layer=TwinLayer.L2,
+            path="dynamic_bio.sleep_score",
+            new_value=90,
+        )
+
+        result = twin_service.update_twin(event)
+
+        assert result.dimensions_recalculated is True
+
+    def test_update_twin_l1_no_dimension_recalc(self, mock_db, sample_twin_row):
+        """Test that L1 update does not trigger dimension recalculation."""
+        mock_db.fetch_one.return_value = sample_twin_row
+        mock_db.execute_returning_one.return_value = {"log_id": 1}
+
+        event = TwinUpdateEvent(
+            user_id=100,
+            layer=TwinLayer.L1,
+            path="metadata_memory.preferences",
+            new_value={"theme": "dark"},
+        )
+
+        result = twin_service.update_twin(event)
+
+        assert result.dimensions_recalculated is False
+
+
+# =============================================================================
+# Test recalculate_dimensions (TASK-1.2.4)
+# =============================================================================
+
+class TestRecalculateDimensions:
+    """Tests for twin_service.recalculate_dimensions()"""
+
+    def test_dimension_calculation_boundaries(self, mock_db):
+        """Test that dimension scores are clamped to [0, 100]."""
+        # Setup extreme values
+        mock_db.fetch_one.return_value = {
+            "dynamic_bio": {"sleep_score": 100, "activity_level": 100},
+            "dynamic_social": {"interactions_today": 100, "recent_buffs_received": 100},
+            "dynamic_emotional": {"mood_intensity": 10, "focus_score": 100, "stress_level": 0},
+            "aura_points": 1000,
+            "growth_streak": 100,
+        }
+
+        scores = twin_service.recalculate_dimensions(100)
+
+        # All scores should be in [0, 100]
+        assert 0 <= scores.energy <= 100
+        assert 0 <= scores.clarity <= 100
+        assert 0 <= scores.connection <= 100
+        assert 0 <= scores.growth <= 100
+        assert 0 <= scores.balance <= 100
+
+    def test_dimension_calculation_low_values(self, mock_db):
+        """Test dimension calculation with low input values."""
+        mock_db.fetch_one.return_value = {
+            "dynamic_bio": {"sleep_score": 0, "activity_level": 0},
+            "dynamic_social": {"interactions_today": 0, "recent_buffs_received": 0},
+            "dynamic_emotional": {"mood_intensity": 0, "focus_score": 0, "stress_level": 100},
+            "aura_points": 0,
+            "growth_streak": 0,
+        }
+
+        scores = twin_service.recalculate_dimensions(100)
+
+        # All scores should still be valid
+        assert 0 <= scores.energy <= 100
+        assert 0 <= scores.clarity <= 100
+        assert 0 <= scores.connection <= 100
+        assert 0 <= scores.growth <= 100
+        assert 0 <= scores.balance <= 100
+
+    def test_dimension_not_found_raises(self, mock_db):
+        """Test that recalculate raises error if twin not found."""
+        mock_db.fetch_one.return_value = None
+
+        with pytest.raises(twin_service.TwinNotFoundError):
+            twin_service.recalculate_dimensions(999)
+
+
+# =============================================================================
+# Test helper functions
+# =============================================================================
+
+class TestHelperFunctions:
+    """Tests for helper functions."""
+
+    def test_parse_json_path_simple(self):
+        """Test parsing simple JSON path."""
+        column, parts = twin_service._parse_json_path("dynamic_emotional.mood")
+        assert column == "dynamic_emotional"
+        assert parts == ["mood"]
+
+    def test_parse_json_path_nested(self):
+        """Test parsing nested JSON path."""
+        column, parts = twin_service._parse_json_path("metadata_astrology.bazi.day_master")
+        assert column == "metadata_astrology"
+        assert parts == ["bazi", "day_master"]
+
+    def test_parse_json_path_invalid_column(self):
+        """Test that invalid column raises error."""
+        with pytest.raises(ValueError):
+            twin_service._parse_json_path("invalid_column.field")
+
+    def test_set_nested_value(self):
+        """Test setting nested value in dict."""
+        data = {"a": {"b": 1}}
+        result = twin_service._set_nested_value(data, ["a", "c"], 2)
+        assert result["a"]["c"] == 2
+        assert result["a"]["b"] == 1
+
+    def test_get_nested_value(self):
+        """Test getting nested value from dict."""
+        data = {"a": {"b": {"c": 42}}}
+        value = twin_service._get_nested_value(data, ["a", "b", "c"])
+        assert value == 42
+
+    def test_get_nested_value_missing(self):
+        """Test getting missing nested value returns None."""
+        data = {"a": {"b": 1}}
+        value = twin_service._get_nested_value(data, ["a", "c", "d"])
+        assert value is None
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

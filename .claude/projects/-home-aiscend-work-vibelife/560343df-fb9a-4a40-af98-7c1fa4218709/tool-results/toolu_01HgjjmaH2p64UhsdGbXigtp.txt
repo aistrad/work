@@ -1,0 +1,578 @@
+     1→"""
+     2→Core Skill Tool Handlers - 全局工具执行器 (V7 重构版)
+     3→
+     4→所有 Skill 共享的工具执行器。
+     5→使用 @tool_handler 装饰器注册，自动被 ToolRegistry 发现。
+     6→
+     7→V7 变更:
+     8→- 删除: show_service_menu, show_skill_services, recommend_service
+     9→- 删除: show_insight, show_report, show_relationship
+    10→- 删除: show_goal_tree, show_daily_plan, show_checkin_form
+    11→- 删除: schedule_reminder, list_reminders, cancel_reminder
+    12→- 新增: create_trigger, list_triggers, cancel_trigger
+    13→- 新增: show_card (统一卡片展示)
+    14→"""
+    15→import logging
+    16→from datetime import datetime, timezone
+    17→from typing import Dict, Any
+    18→
+    19→from services.agent.tool_registry import tool_handler, ToolContext
+    20→
+    21→logger = logging.getLogger(__name__)
+    22→
+    23→
+    24→# ═══════════════════════════════════════════════════════════════════════════
+    25→# 搜索型工具
+    26→# ═══════════════════════════════════════════════════════════════════════════
+    27→
+    28→@tool_handler("search_db")
+    29→async def execute_search_db(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    30→    """从数据库检索知识或案例"""
+    31→    from services.knowledge.repository import get_knowledge_repository
+    32→
+    33→    table = args.get("table", "knowledge_chunks")
+    34→    query = args.get("query", "")
+    35→    filters = args.get("filters", {})
+    36→    top_k = args.get("top_k", 5)
+    37→
+    38→    # 自动添加当前 skill_id 到 filters
+    39→    if context.skill_id and "skill_id" not in filters:
+    40→        filters["skill_id"] = context.skill_id
+    41→    if context.scenario_id and "scenario_id" not in filters:
+    42→        filters["scenario_id"] = context.scenario_id
+    43→
+    44→    try:
+    45→        repo = get_knowledge_repository()
+    46→        results = await repo.search_db(
+    47→            table=table,
+    48→            query=query,
+    49→            filters=filters,
+    50→            top_k=top_k
+    51→        )
+    52→
+    53→        return {
+    54→            "status": "success",
+    55→            "table": table,
+    56→            "query": query,
+    57→            "count": len(results),
+    58→            "results": results
+    59→        }
+    60→    except Exception as e:
+    61→        logger.error(f"search_db failed: {e}")
+    62→        return {
+    63→            "status": "error",
+    64→            "error": str(e),
+    65→            "results": []
+    66→        }
+    67→
+    68→
+    69→# ═══════════════════════════════════════════════════════════════════════════
+    70→# 收集型工具
+    71→# ════════════════════════════════════════════════════��══════════════════════
+    72→
+    73→@tool_handler("ask_user_question")
+    74→async def execute_ask_user_question(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    75→    """主动向用户提问"""
+    76→    question = args.get("question", "")
+    77→    options = args.get("options", [])
+    78→
+    79→    return {
+    80→        "status": "asking",
+    81→        "cardType": "question_card",
+    82→        "question": question,
+    83→        "options": options[:4] if options else [],
+    84→    }
+    85→
+    86→
+    87→@tool_handler("request_info")
+    88→async def execute_request_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+    89→    """向用户请求信息"""
+    90→    info_type = args.get("info_type", "birth")
+    91→    question = args.get("question")
+    92→
+    93→    fields_map = {
+    94→        "birth": [
+    95→            {"id": "birthDate", "label": "出生日期", "type": "date", "required": True, "placeholder": ""},
+    96→            {"id": "birthTime", "label": "出生时间", "type": "time", "required": True, "placeholder": ""},
+    97→            {"id": "birthPlace", "label": "出生地点", "type": "text", "required": False, "placeholder": "城市名"},
+    98→            {"id": "gender", "label": "性别", "type": "select", "required": True, "options": [
+    99→                {"value": "male", "label": "男"},
+   100→                {"value": "female", "label": "女"},
+   101→            ]},
+   102→        ],
+   103→        "context": [
+   104→            {"id": "situation", "label": "当前情况", "type": "textarea", "required": True, "placeholder": "描述你目前面临的情况"},
+   105→        ],
+   106→        "goals": [
+   107→            {"id": "goals", "label": "你的目标", "type": "textarea", "required": True, "placeholder": "你想达成什么"},
+   108→        ],
+   109→        "concerns": [
+   110→            {"id": "concerns", "label": "你的困惑", "type": "textarea", "required": True, "placeholder": "最困扰你的是什么"},
+   111→        ],
+   112→    }
+   113→
+   114→    return {
+   115→        "status": "collecting",
+   116→        "cardType": "collect_form",
+   117→        "infoType": info_type,
+   118→        "question": question,
+   119→        "fields": fields_map.get(info_type, fields_map["birth"]),
+   120→    }
+   121→
+   122→
+   123→@tool_handler("save_birth_info")
+   124→async def execute_save_birth_info(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   125→    """
+   126→    保存用户的出生信息到个人档案。
+   127→
+   128→    此工具会修改用户的核心档案数据，必须在用户明确同意后才能调用。
+   129→    """
+   130→    from uuid import UUID
+   131→    from stores.unified_profile_repo import UnifiedProfileRepository
+   132→    from stores.profile_cache import invalidate_profile_cache
+   133→
+   134→    birth_date = args.get("birth_date")
+   135→    birth_time = args.get("birth_time")
+   136→    gender = args.get("gender")
+   137→    place = args.get("place")
+   138→
+   139→    # 验证必填参数
+   140→    if not birth_date:
+   141→        return {
+   142→            "status": "error",
+   143→            "error": "birth_date 是必填参数",
+   144→        }
+   145→
+   146→    # 验证用户身份
+   147→    if not context.user_id or context.user_id == "guest":
+   148→        return {
+   149→            "status": "error",
+   150→            "error": "需要登录才能保存出生信息",
+   151→        }
+   152→
+   153→    # 检查用户是否已有出生信息
+   154→    profile = context.profile or {}
+   155→    identity = profile.get("identity", {})
+   156→    existing_birth = identity.get("birth_info", {})
+   157→    if existing_birth.get("date"):
+   158→        return {
+   159→            "status": "error",
+   160→            "error": "用户已有出生信息，不能覆盖。如需修改，请使用设置页面。",
+   161→            "existing_birth_info": existing_birth,
+   162→        }
+   163→
+   164→    try:
+   165→        user_uuid = UUID(context.user_id) if isinstance(context.user_id, str) else context.user_id
+   166→
+   167→        # 保存出生信息
+   168→        await UnifiedProfileRepository.update_birth_info(user_uuid, {
+   169→            "date": birth_date,
+   170→            "time": birth_time,
+   171→            "gender": gender,
+   172→            "place": place,
+   173→        })
+   174→
+   175→        # 失效所有缓存
+   176→        await invalidate_profile_cache(user_uuid)
+   177→
+   178→        logger.info(f"[save_birth_info] Saved birth_info for user {context.user_id}: date={birth_date}")
+   179→
+   180→        return {
+   181→            "status": "success",
+   182→            "message": "出生信息已保存到您的个人档案",
+   183→            "birth_info": {
+   184→                "date": birth_date,
+   185→                "time": birth_time,
+   186→                "gender": gender,
+   187→                "place": place,
+   188→            }
+   189→        }
+   190→
+   191→    except Exception as e:
+   192→        logger.error(f"save_birth_info failed: {e}", exc_info=True)
+   193→        return {
+   194→            "status": "error",
+   195→            "error": f"保存失败: {str(e)}",
+   196→        }
+   197→
+   198→
+   199→# ═══════════════════════════════════════════════════════════════════════════
+   200→# Skill 数据工具 (V8 新增 - 统一 Skill Data 架构)
+   201→# ═══════════════════════════════════════════════════════════════════════════
+   202→
+   203→@tool_handler("save_skill_data")
+   204→async def execute_save_skill_data(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   205→    """
+   206→    保存当前 Skill 的数据到 VibeProfile.skill_data.{skill_id}
+   207→
+   208→    V8 统一 Skill Data 架构的核心工具。
+   209→    支持深度合并，自动管理 _meta 元数据。
+   210→    """
+   211→    from uuid import UUID
+   212→    from stores.unified_profile_repo import UnifiedProfileRepository, deep_merge
+   213→
+   214→    data = args.get("data", {})
+   215→    replace = args.get("replace", False)
+   216→    skill_id = context.skill_id
+   217→
+   218→    # 验证参数
+   219→    if not skill_id:
+   220→        return {
+   221→            "status": "error",
+   222→            "error": "No active skill. save_skill_data must be called within a skill context.",
+   223→        }
+   224→
+   225→    if not context.user_id or context.user_id == "guest":
+   226→        return {
+   227→            "status": "error",
+   228→            "error": "需要登录才能保存数据",
+   229→        }
+   230→
+   231→    if not data:
+   232→        return {
+   233→            "status": "error",
+   234→            "error": "data 参数不能为空",
+   235→        }
+   236→
+   237→    try:
+   238→        user_uuid = UUID(context.user_id)
+   239→
+   240→        # 获取现有数据
+   241→        current = await UnifiedProfileRepository.get_skill_data(user_uuid, skill_id) or {}
+   242→
+   243→        if replace:
+   244→            # 完全替换模式
+   245→            new_data = data
+   246→        else:
+   247→            # 深度合并模式（默认）
+   248→            new_data = deep_merge(current, data)
+   249→
+   250→        # 自动更新 _meta 元数据
+   251→        current_meta = current.get("_meta", {})
+   252→        now = datetime.now(timezone.utc).isoformat()
+   253→        new_data["_meta"] = {
+   254→            "version": current_meta.get("version", 0) + 1,
+   255→            "created_at": current_meta.get("created_at", now),
+   256→            "updated_at": now
+   257→        }
+   258→
+   259→        # 保存到 VibeProfile.skill_data.{skill_id}
+   260→        await UnifiedProfileRepository.update_skill_data(user_uuid, skill_id, new_data)
+   261→
+   262→        logger.info(f"[save_skill_data] Saved data for skill={skill_id}, user={context.user_id}, version={new_data['_meta']['version']}")
+   263→
+   264→        return {
+   265→            "status": "success",
+   266→            "skill_id": skill_id,
+   267→            "version": new_data["_meta"]["version"],
+   268→            "message": f"数据已保存到 skill_data.{skill_id}"
+   269→        }
+   270→
+   271→    except Exception as e:
+   272→        logger.error(f"save_skill_data failed: {e}", exc_info=True)
+   273→        return {
+   274→            "status": "error",
+   275→            "error": str(e),
+   276→        }
+   277→
+   278→
+   279→# ═══════════════════════════════════════════════════════════════════════════
+   280→# 触发器工具 (V7 新增)
+   281→# ═══════════════════════════════════════════════════════════════════════════
+   282→
+   283→@tool_handler("create_trigger")
+   284→async def execute_create_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   285→    """创建用户触发器"""
+   286→    from uuid import UUID
+   287→    from skills.core.services.trigger import get_trigger_service
+   288→
+   289→    trigger_type = args.get("trigger_type", "reminder")
+   290→    title = args.get("title", "")
+   291→    schedule = args.get("schedule")
+   292→    schedule_type = args.get("schedule_type", "daily")
+   293→    trigger_subtype = args.get("trigger_subtype", "custom")
+   294→    condition = args.get("condition")
+   295→    action = args.get("action")
+   296→    source_path = args.get("source_path")
+   297→
+   298→    if not context.user_id or context.user_id == "guest":
+   299→        return {
+   300→            "status": "error",
+   301→            "error": "需要登录才能创建触发器",
+   302→        }
+   303→
+   304→    if not title:
+   305→        return {
+   306→            "status": "error",
+   307→            "error": "title 参数不能为空",
+   308→        }
+   309→
+   310→    # 验证参数
+   311→    if trigger_type in ("reminder", "schedule") and not schedule:
+   312→        return {
+   313→            "status": "error",
+   314→            "error": f"{trigger_type} 类型需要提供 schedule 参数",
+   315→        }
+   316→
+   317→    if trigger_type == "condition" and not condition:
+   318→        return {
+   319→            "status": "error",
+   320→            "error": "condition 类型需要提供 condition 参数",
+   321→        }
+   322→
+   323→    try:
+   324→        service = get_trigger_service()
+   325→        user_uuid = UUID(context.user_id)
+   326→        trigger = await service.create(
+   327→            user_id=user_uuid,
+   328→            trigger_type=trigger_type,
+   329→            title=title,
+   330→            schedule=schedule,
+   331→            schedule_type=schedule_type,
+   332→            trigger_subtype=trigger_subtype,
+   333→            action=action,
+   334→            condition=condition,
+   335→            source_path=source_path,
+   336→        )
+   337→
+   338→        return {
+   339→            "status": "success",
+   340→            "trigger": trigger.to_dict(),
+   341→            "message": f"已创建触发器: {title}",
+   342→        }
+   343→    except Exception as e:
+   344→        logger.error(f"create_trigger failed: {e}")
+   345→        return {
+   346→            "status": "error",
+   347→            "error": str(e),
+   348→        }
+   349→
+   350→
+   351→@tool_handler("list_triggers")
+   352→async def execute_list_triggers(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   353→    """列出用户触发器"""
+   354→    from uuid import UUID
+   355→    from skills.core.services.trigger import get_trigger_service
+   356→
+   357→    trigger_type = args.get("trigger_type")
+   358→    status = args.get("status", "active")
+   359→
+   360→    if not context.user_id or context.user_id == "guest":
+   361→        return {
+   362→            "status": "error",
+   363→            "error": "需要登录才能查看触发器",
+   364→        }
+   365→
+   366→    try:
+   367→        service = get_trigger_service()
+   368→        user_uuid = UUID(context.user_id)
+   369→        triggers = await service.list(
+   370→            user_uuid,
+   371→            trigger_type=trigger_type,
+   372→            status=status,
+   373→        )
+   374→
+   375→        return {
+   376→            "status": "success",
+   377→            "count": len(triggers),
+   378→            "triggers": [t.to_dict() for t in triggers],
+   379→        }
+   380→    except Exception as e:
+   381→        logger.error(f"list_triggers failed: {e}")
+   382→        return {
+   383→            "status": "error",
+   384→            "error": str(e),
+   385→        }
+   386→
+   387→
+   388→@tool_handler("cancel_trigger")
+   389→async def execute_cancel_trigger(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   390→    """取消触发器"""
+   391→    from uuid import UUID
+   392→    from skills.core.services.trigger import get_trigger_service
+   393→
+   394→    trigger_id = args.get("trigger_id", "")
+   395→
+   396→    if not context.user_id or context.user_id == "guest":
+   397→        return {
+   398→            "status": "error",
+   399→            "error": "需要登录才能取消触发器",
+   400→        }
+   401→
+   402→    if not trigger_id:
+   403→        return {
+   404→            "status": "error",
+   405→            "error": "trigger_id 参数不能为空",
+   406→        }
+   407→
+   408→    try:
+   409→        service = get_trigger_service()
+   410→        user_uuid = UUID(context.user_id)
+   411→        trigger_uuid = UUID(trigger_id)
+   412→        cancelled = await service.cancel(user_uuid, trigger_uuid)
+   413→
+   414→        if cancelled:
+   415→            return {
+   416→                "status": "success",
+   417→                "message": "触发器已取消",
+   418→            }
+   419→        else:
+   420→            return {
+   421→                "status": "not_found",
+   422→                "message": "未找到该触发器或已取消",
+   423→            }
+   424→    except Exception as e:
+   425→        logger.error(f"cancel_trigger failed: {e}")
+   426→        return {
+   427→            "status": "error",
+   428→            "error": str(e),
+   429→        }
+   430→
+   431→
+   432→# ═══════════════════════════════════════════════════════════════════════════
+   433→# 向后兼容: 旧提醒工具映射到新触发器工具
+   434→# ═══════════════════════════════════════════════════════════════════════════
+   435→
+   436→@tool_handler("schedule_reminder")
+   437→async def execute_schedule_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   438→    """设置定时提醒 (向后兼容，映射到 create_trigger)"""
+   439→    # 转换参数
+   440→    new_args = {
+   441→        "trigger_type": "reminder",
+   442→        "title": args.get("title", ""),
+   443→        "schedule": args.get("schedule", ""),
+   444→        "schedule_type": args.get("schedule_type", "daily"),
+   445→        "trigger_subtype": args.get("reminder_type", "custom"),
+   446→    }
+   447→
+   448→    result = await execute_create_trigger(new_args, context)
+   449→
+   450→    # 转换返回格式以保持兼容
+   451→    if result.get("status") == "success" and "trigger" in result:
+   452→        result["reminder"] = result.pop("trigger")
+   453→
+   454→    return result
+   455→
+   456→
+   457→@tool_handler("list_reminders")
+   458→async def execute_list_reminders(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   459→    """列出用户提醒 (向后兼容，映射到 list_triggers)"""
+   460→    new_args = {
+   461→        "trigger_type": "reminder",
+   462→        "status": args.get("status", "active"),
+   463→    }
+   464→
+   465→    # 如果指定了 reminder_type，转换为 trigger_subtype 过滤
+   466→    if args.get("reminder_type"):
+   467→        # list_triggers 不直接支持 subtype 过滤，需要在结果中过滤
+   468→        pass
+   469→
+   470→    result = await execute_list_triggers(new_args, context)
+   471→
+   472→    # 转换返回格式
+   473→    if result.get("status") == "success" and "triggers" in result:
+   474→        result["reminders"] = result.pop("triggers")
+   475→
+   476→    return result
+   477→
+   478→
+   479→@tool_handler("cancel_reminder")
+   480→async def execute_cancel_reminder(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   481→    """取消提醒 (向后兼容，映射到 cancel_trigger)"""
+   482→    new_args = {
+   483→        "trigger_id": args.get("reminder_id", ""),
+   484→    }
+   485→    return await execute_cancel_trigger(new_args, context)
+   486→
+   487→
+   488→# ═══════════════════════════════════════════════════════════════════════════
+   489→# 展示型工具 (V7 统一)
+   490→# ═══════════════════════════════════════════════════════════════════════════
+   491→
+   492→@tool_handler("show_all_skills")
+   493→async def execute_show_all_skills(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   494→    """展示所有可用 Skill 的 IntroCard 列表（边界控制核心工具）"""
+   495→    from services.agent.skill_loader import get_all_skill_metadata
+   496→
+   497→    category = args.get("category")
+   498→    message = args.get("message", "以下是我能帮你的领域，看看有没有你需要的？")
+   499→
+   500→    try:
+   501→        all_skills = get_all_skill_metadata()
+   502→
+   503→        # 按分类过滤
+   504→        if category:
+   505→            all_skills = [s for s in all_skills if s.category == category]
+   506→
+   507→        # 排除 core skill（它是基础能力，不需要展示给用户选择）
+   508→        all_skills = [s for s in all_skills if s.id != "core"]
+   509→
+   510→        # 转换为 IntroCard 格式
+   511→        skill_cards = []
+   512→        for skill in all_skills:
+   513→            card = {
+   514→                "id": skill.id,
+   515→                "name": skill.name,
+   516→                "description": skill.description,
+   517→                "icon": skill.icon,
+   518→                "color": skill.color,
+   519→                "category": skill.category,
+   520→                "triggers": skill.triggers[:3] if skill.triggers else [],  # 只展示前3个触发词
+   521→                "tagline": skill.showcase.tagline if skill.showcase else "",
+   522→            }
+   523→            skill_cards.append(card)
+   524→
+   525→        # 按分类排序：default > professional
+   526→        category_order = {"default": 0, "professional": 1}
+   527→        skill_cards.sort(key=lambda x: category_order.get(x["category"], 2))
+   528→
+   529→        return {
+   530→            "status": "success",
+   531→            "cardType": "skill_list",
+   532→            "message": message,
+   533→            "skills": skill_cards,
+   534→            "count": len(skill_cards),
+   535→        }
+   536→    except Exception as e:
+   537→        logger.error(f"show_all_skills failed: {e}")
+   538→        return {
+   539→            "status": "error",
+   540→            "error": str(e),
+   541→        }
+   542→
+   543→
+   544→@tool_handler("show_card")
+   545→async def execute_show_card(args: Dict[str, Any], context: ToolContext) -> Dict[str, Any]:
+   546→    """统一卡片展示"""
+   547→    from skills.core.services.card import get_card_service
+   548→
+   549→    card_type = args.get("card_type", "list")
+   550→    data_source = args.get("data_source", {})
+   551→    options = args.get("options", {})
+   552→
+   553→    try:
+   554→        service = get_card_service()
+   555→        result = await service.render(
+   556→            card_type=card_type,
+   557→            data_source=data_source,
+   558→            options=options,
+   559→            context={
+   560→                "user_id": context.user_id,
+   561→                "skill_id": context.skill_id,
+   562→                "scenario_id": context.scenario_id,
+   563→            },
+   564→        )
+   565→        return result
+   566→    except Exception as e:
+   567→        logger.error(f"show_card failed: {e}")
+   568→        return {
+   569→            "status": "error",
+   570→            "error": str(e),
+   571→        }
+   572→
+   573→
+   574→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

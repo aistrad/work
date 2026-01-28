@@ -1,0 +1,851 @@
+"""
+Lifecoach Skill API Services - 人生仪表盘 API 服务
+
+使用 @skill_service 装饰器自动注册到 SkillServiceRegistry
+通过 /api/v1/skills/lifecoach/{action} 访问
+
+端点:
+- state_read: 读取人生地图状态
+- checkin: 每日签到
+- lever_complete: 完成每日杠杆
+- rock_complete: 完成周大石头
+- lever_skip: 跳过每日杠杆
+- journal_add: 添加日志
+- journal_list: 获取日志列表
+- weekly_review: 获取周复盘数据
+"""
+import logging
+from typing import Dict, Any, List, Optional
+from datetime import datetime, date, timezone
+from uuid import UUID
+
+from services.agent.skill_service_registry import skill_service, ServiceContext
+from stores.unified_profile_repo import UnifiedProfileRepository
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_lifecoach_data(user_id: str) -> Dict[str, Any]:
+    """从 unified_profile 获取 lifecoach 数据"""
+    user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+    data = await UnifiedProfileRepository.read_life_context_path(user_uuid, "lifecoach")
+    return data.content if data else {}
+
+
+async def save_lifecoach_data(user_id: str, data: Dict[str, Any]) -> None:
+    """保存 lifecoach 数据到 unified_profile"""
+    user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+    data["_last_updated"] = datetime.now(timezone.utc).isoformat()
+    await UnifiedProfileRepository.write_life_context_path(user_uuid, "lifecoach", data)
+
+
+def transform_to_frontend_format(data: Dict[str, Any]) -> Dict[str, Any]:
+    """将存储格式转换为前端期望的格式"""
+    result = {}
+
+    # north_star
+    if "north_star" in data:
+        result["north_star"] = data["north_star"]
+
+    # goals
+    if "goals" in data:
+        goals_data = data["goals"]
+        if isinstance(goals_data, dict):
+            result["goals"] = goals_data.get("items", [])
+        elif isinstance(goals_data, list):
+            result["goals"] = goals_data
+
+    # roles
+    if "roles" in data or "identity" in data:
+        identity = data.get("identity", {})
+        result["roles"] = identity.get("roles", [])
+
+    # identity
+    if "identity" in data:
+        result["identity"] = data["identity"]
+
+    # weekly_rocks -> current.week
+    current = data.get("current", {})
+    if "week" in current:
+        week_data = current["week"]
+        result["weekly_rocks"] = {
+            "week_start": week_data.get("week_start", date.today().isoformat()),
+            "rocks": week_data.get("rocks", []),
+            "theme": week_data.get("theme"),
+            "energy_budget": week_data.get("energy_budget"),
+            "stats": _calculate_rock_stats(week_data.get("rocks", []))
+        }
+
+    # daily_levers -> current.daily
+    if "daily" in current:
+        daily_data = current["daily"]
+        result["daily_levers"] = {
+            "date": daily_data.get("date", date.today().isoformat()),
+            "levers": daily_data.get("levers", []),
+            "energy_level": daily_data.get("energy_level"),
+            "intention": daily_data.get("intention"),
+            "stats": _calculate_lever_stats(daily_data.get("levers", []))
+        }
+
+    # monthly_boss -> current.month
+    if "month" in current:
+        result["monthly_boss"] = current["month"]
+
+    # progress
+    if "progress" in data:
+        progress = data["progress"]
+        today = date.today().isoformat()
+        result["progress"] = {
+            "current_streak": progress.get("current_streak", 0),
+            "longest_streak": progress.get("longest_streak", 0),
+            "total_checkins": progress.get("total_checkins", 0),
+            "weekly_completion_rate": _calculate_weekly_completion_rate(current),
+            "monthly_stats": progress.get("monthly_stats"),
+            "achievements": progress.get("achievements", []),
+            "last_checkin_date": progress.get("last_checkin_date"),
+            "today_checked_in": progress.get("last_checkin_date") == today,
+        }
+
+    return result
+
+
+def _calculate_rock_stats(rocks: List[Dict]) -> Dict[str, Any]:
+    """计算周大石头统计"""
+    total = len(rocks)
+    completed = sum(1 for r in rocks if r.get("status") == "completed")
+    in_progress = sum(1 for r in rocks if r.get("status") == "in_progress")
+    return {
+        "total": total,
+        "completed": completed,
+        "in_progress": in_progress,
+        "completion_rate": round(completed / total * 100) if total > 0 else 0
+    }
+
+
+def _calculate_lever_stats(levers: List[Dict]) -> Dict[str, Any]:
+    """计算每日杠杆统计"""
+    total = len(levers)
+    completed = sum(1 for l in levers if l.get("status") == "completed")
+    return {
+        "total": total,
+        "completed": completed,
+        "completion_rate": round(completed / total * 100) if total > 0 else 0
+    }
+
+
+def _calculate_weekly_completion_rate(current: Dict[str, Any]) -> int:
+    """计算本周完成率"""
+    week_data = current.get("week", {})
+    rocks = week_data.get("rocks", [])
+    if not rocks:
+        return 0
+    completed = sum(1 for r in rocks if r.get("status") == "completed")
+    return round(completed / len(rocks) * 100)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# State Read Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "state_read", description="读取人生地图状态", auth_required=True)
+async def read_state(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    读取用户的人生地图状态
+
+    Args:
+        sections: 要读取的数据部分，如 ["north_star", "identity", "current", "progress"]
+
+    Returns:
+        status: success/empty/error
+        data: LifecoachSkillData 格式的数据
+    """
+    sections = args.get("sections", ["system", "north_star", "identity", "current", "progress"])
+
+    if not context.user_id:
+        return {"status": "error", "message": "Authentication required", "data": {}}
+
+    try:
+        # 获取完整数据
+        raw_data = await get_lifecoach_data(context.user_id)
+
+        if not raw_data:
+            return {
+                "status": "empty",
+                "message": "尚未建立人生地图",
+                "data": {}
+            }
+
+        # 转换为前端期望的格式
+        result_data: Dict[str, Any] = {}
+
+        # north_star
+        if "north_star" in sections and "north_star" in raw_data:
+            result_data["north_star"] = raw_data["north_star"]
+
+        # identity
+        if "identity" in sections and "identity" in raw_data:
+            result_data["identity"] = raw_data["identity"]
+
+        # goals
+        if "goals" in sections and "goals" in raw_data:
+            result_data["goals"] = raw_data["goals"]
+
+        # focus (自动计算)
+        if "focus" in sections:
+            if "focus" in raw_data:
+                result_data["focus"] = raw_data["focus"]
+            else:
+                # 如果没有 focus 字段，自动计算
+                result_data["focus"] = _calculate_focus(
+                    raw_data.get("goals", []),
+                    raw_data.get("current", {})
+                )
+
+        # weekly (从 current.week 转换)
+        if "current" in sections:
+            current = raw_data.get("current", {})
+            if "week" in current:
+                week_data = current["week"]
+                result_data["weekly"] = {
+                    "week_start": week_data.get("week_start"),
+                    "rocks": week_data.get("rocks", []),
+                    "theme": week_data.get("theme"),
+                }
+
+        # progress
+        if "progress" in sections and "progress" in raw_data:
+            result_data["progress"] = raw_data["progress"]
+
+        # system state
+        if "system" in sections:
+            result_data["_state"] = raw_data.get("system", {})
+
+        return {
+            "status": "success",
+            "data": result_data
+        }
+
+    except Exception as e:
+        logger.error(f"Read lifecoach state failed: {e}")
+        return {"status": "error", "message": str(e), "data": {}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Checkin Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "checkin", description="每日签到", auth_required=True)
+async def daily_checkin(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    每日签到
+
+    Args:
+        energy_level: 能量等级 (1-10)
+        intention: 今日意图
+        mood: 心情
+
+    Returns:
+        success: 是否成功
+        streak: 当前连续天数
+        daily_levers: 今日杠杆行动
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    energy_level = args.get("energy_level")
+    intention = args.get("intention")
+    mood = args.get("mood")
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        progress = data.get("progress", {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "total_checkins": 0,
+            "last_checkin_date": None,
+            "checkin_history": []
+        })
+
+        today = date.today().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # 检查是否今天已签到
+        if progress.get("last_checkin_date") == today:
+            return {
+                "success": True,
+                "streak": progress["current_streak"],
+                "message": "今天已经签到过了",
+                "already_checked_in": True
+            }
+
+        # 计算连续签到
+        last_date = progress.get("last_checkin_date")
+        old_streak = progress.get("current_streak", 0)
+
+        if last_date:
+            days_since = (date.today() - date.fromisoformat(last_date)).days
+            new_streak = old_streak + 1 if days_since == 1 else 1
+        else:
+            new_streak = 1
+
+        # 更新进度
+        progress["current_streak"] = new_streak
+        progress["longest_streak"] = max(new_streak, progress.get("longest_streak", 0))
+        progress["total_checkins"] = progress.get("total_checkins", 0) + 1
+        progress["last_checkin_date"] = today
+
+        # 记录签到历史
+        history = progress.get("checkin_history", [])
+        history.append({
+            "date": today,
+            "time": now,
+            "energy_level": energy_level,
+            "mood": mood,
+            "intention": intention
+        })
+        progress["checkin_history"] = history[-30:]  # 保留最近30天
+
+        # 更新 current.daily 的 intention 和 energy_level
+        current = data.get("current", {})
+        daily = current.get("daily", {"date": today, "levers": []})
+        if daily.get("date") != today:
+            daily = {"date": today, "levers": daily.get("levers", [])}
+        daily["energy_level"] = energy_level
+        daily["intention"] = intention
+        current["daily"] = daily
+
+        data["progress"] = progress
+        data["current"] = current
+
+        await save_lifecoach_data(context.user_id, data)
+
+        # 准备返回的 daily_levers
+        daily_levers = {
+            "date": today,
+            "levers": daily.get("levers", []),
+            "energy_level": energy_level,
+            "intention": intention,
+            "stats": _calculate_lever_stats(daily.get("levers", []))
+        }
+
+        return {
+            "success": True,
+            "streak": new_streak,
+            "message": f"签到成功！连续 {new_streak} 天",
+            "daily_levers": daily_levers
+        }
+
+    except Exception as e:
+        logger.error(f"Checkin failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Lever Complete Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "lever_complete", description="完成每日杠杆", auth_required=True)
+async def complete_lever(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    完成每日杠杆行动
+
+    Args:
+        lever_id: 杠杆 ID
+        notes: 完成备注
+
+    Returns:
+        success: 是否成功
+        progress: 更新后的进度
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    lever_id = args.get("lever_id")
+    notes = args.get("notes")
+
+    if not lever_id:
+        return {"success": False, "error": "lever_id is required"}
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        current = data.get("current", {})
+        daily = current.get("daily", {"date": date.today().isoformat(), "levers": []})
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # 更新杠杆状态
+        levers = daily.get("levers", [])
+        lever_found = False
+        for lever in levers:
+            if lever.get("id") == lever_id:
+                lever["status"] = "completed"
+                lever["completed_at"] = now
+                if notes:
+                    lever["notes"] = notes
+                lever_found = True
+                break
+
+        if not lever_found:
+            return {"success": False, "error": f"Lever {lever_id} not found"}
+
+        daily["levers"] = levers
+        current["daily"] = daily
+
+        # 记录到 progress.completed_levers
+        progress = data.get("progress", {})
+        completed_levers = progress.get("completed_levers", [])
+        completed_levers.append({
+            "id": lever_id,
+            "completed_at": now,
+            "notes": notes
+        })
+        progress["completed_levers"] = completed_levers[-100:]  # 保留最近100条
+
+        data["current"] = current
+        data["progress"] = progress
+
+        await save_lifecoach_data(context.user_id, data)
+
+        # 转换返回格式
+        transformed = transform_to_frontend_format(data)
+
+        return {
+            "success": True,
+            "message": "杠杆已完成",
+            "progress": transformed.get("progress")
+        }
+
+    except Exception as e:
+        logger.error(f"Complete lever failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Rock Complete Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "rock_complete", description="完成周大石头", auth_required=True)
+async def complete_rock(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    完成周大石头
+
+    Args:
+        rock_id: 大石头 ID
+        reflection: 完成反思
+
+    Returns:
+        success: 是否成功
+        progress: 更新后的进度
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    rock_id = args.get("rock_id")
+    reflection = args.get("reflection")
+
+    if not rock_id:
+        return {"success": False, "error": "rock_id is required"}
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        current = data.get("current", {})
+        week = current.get("week", {"rocks": []})
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # 更新大石头状态
+        rocks = week.get("rocks", [])
+        rock_found = False
+        for rock in rocks:
+            if rock.get("id") == rock_id:
+                rock["status"] = "completed"
+                rock["progress"] = 100
+                rock["completed_at"] = now
+                if reflection:
+                    rock["reflection"] = reflection
+                rock_found = True
+                break
+
+        if not rock_found:
+            return {"success": False, "error": f"Rock {rock_id} not found"}
+
+        week["rocks"] = rocks
+        current["week"] = week
+
+        # 记录到 progress.completed_rocks
+        progress = data.get("progress", {})
+        completed_rocks = progress.get("completed_rocks", [])
+        completed_rocks.append({
+            "id": rock_id,
+            "completed_at": now,
+            "reflection": reflection
+        })
+        progress["completed_rocks"] = completed_rocks[-50:]
+
+        data["current"] = current
+        data["progress"] = progress
+
+        await save_lifecoach_data(context.user_id, data)
+
+        transformed = transform_to_frontend_format(data)
+
+        return {
+            "success": True,
+            "message": "大石头已完成！",
+            "progress": transformed.get("progress")
+        }
+
+    except Exception as e:
+        logger.error(f"Complete rock failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Lever Skip Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "lever_skip", description="跳过每日杠杆", auth_required=True)
+async def skip_lever(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    跳过每日杠杆
+
+    Args:
+        lever_id: 杠杆 ID
+        reason: 跳过原因
+
+    Returns:
+        success: 是否成功
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    lever_id = args.get("lever_id")
+    reason = args.get("reason")
+
+    if not lever_id:
+        return {"success": False, "error": "lever_id is required"}
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        current = data.get("current", {})
+        daily = current.get("daily", {"date": date.today().isoformat(), "levers": []})
+
+        # 更新杠杆状态
+        levers = daily.get("levers", [])
+        lever_found = False
+        for lever in levers:
+            if lever.get("id") == lever_id:
+                lever["status"] = "skipped"
+                if reason:
+                    lever["skip_reason"] = reason
+                lever_found = True
+                break
+
+        if not lever_found:
+            return {"success": False, "error": f"Lever {lever_id} not found"}
+
+        daily["levers"] = levers
+        current["daily"] = daily
+        data["current"] = current
+
+        await save_lifecoach_data(context.user_id, data)
+
+        return {
+            "success": True,
+            "message": "已跳过"
+        }
+
+    except Exception as e:
+        logger.error(f"Skip lever failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Journal Services
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "journal_add", description="添加日志条目", auth_required=True)
+async def add_journal_entry(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    添加复盘日志
+
+    Args:
+        type: 日志类型 (reflection, gratitude, insight, note)
+        content: 内容
+        mood: 心情
+        tags: 标签列表
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    entry_type = args.get("type", "note")
+    content = args.get("content")
+
+    if not content:
+        return {"success": False, "error": "content is required"}
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        journal = data.get("journal", [])
+
+        import uuid
+        entry = {
+            "id": str(uuid.uuid4()),
+            "date": date.today().isoformat(),
+            "type": entry_type,
+            "content": content,
+            "mood": args.get("mood"),
+            "tags": args.get("tags", []),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        journal = [entry] + journal[:99]  # 保留最近100条
+        data["journal"] = journal
+
+        await save_lifecoach_data(context.user_id, data)
+
+        return {
+            "success": True,
+            "entry": entry
+        }
+
+    except Exception as e:
+        logger.error(f"Add journal entry failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@skill_service("lifecoach", "journal_list", description="获取日志列表", auth_required=True)
+async def list_journal_entries(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取日志列表
+
+    Args:
+        limit: 返回数量，默认 10
+        offset: 偏移量，默认 0
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    limit = args.get("limit", 10)
+    offset = args.get("offset", 0)
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        journal = data.get("journal", [])
+
+        entries = journal[offset:offset + limit]
+
+        return {
+            "entries": entries,
+            "total": len(journal),
+            "limit": limit,
+            "offset": offset
+        }
+
+    except Exception as e:
+        logger.error(f"List journal entries failed: {e}")
+        return {"entries": [], "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Weekly Review Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+@skill_service("lifecoach", "weekly_review", description="获取周复盘数据", auth_required=True)
+async def get_weekly_review(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    获取周复盘数据
+
+    Args:
+        week_start: 周起始日期，默认本周
+    """
+    if not context.user_id:
+        return {"error": "Authentication required", "status": "error"}
+
+    try:
+        data = await get_lifecoach_data(context.user_id)
+        current = data.get("current", {})
+        week = current.get("week", {})
+        daily = current.get("daily", {})
+
+        rocks = week.get("rocks", [])
+        levers = daily.get("levers", [])
+
+        review = {
+            "week_start": week.get("week_start", date.today().isoformat()),
+            "rocks_completed": sum(1 for r in rocks if r.get("status") == "completed"),
+            "rocks_total": len(rocks),
+            "levers_completed": sum(1 for l in levers if l.get("status") == "completed"),
+            "levers_total": len(levers),
+            "theme": week.get("theme"),
+        }
+
+        # 从 journal 获取本周的洞察
+        journal = data.get("journal", [])
+        week_start = week.get("week_start", date.today().isoformat())
+        week_insights = [
+            j for j in journal
+            if j.get("date", "") >= week_start and j.get("type") in ["insight", "reflection"]
+        ]
+
+        if week_insights:
+            review["highlights"] = [j.get("content") for j in week_insights[:3]]
+
+        return review
+
+    except Exception as e:
+        logger.error(f"Get weekly review failed: {e}")
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# State Write Service
+# ═══════════════════════════════════════════════════════════════════════════
+
+def deep_merge(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif value is not None:
+            result[key] = value
+    return result
+
+
+def _enrich_goals(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """为 goals 补齐缺失字段"""
+    now = datetime.now(timezone.utc).isoformat()
+    enriched = []
+
+    for goal in goals:
+        enriched_goal = goal.copy()
+
+        # 补齐 source 字段
+        if "source" not in enriched_goal:
+            enriched_goal["source"] = "lifecoach"  # 默认来源
+
+        # 补齐 created_at 字段
+        if "created_at" not in enriched_goal:
+            enriched_goal["created_at"] = now
+
+        # 补齐 check_ins 字段
+        if "check_ins" not in enriched_goal:
+            enriched_goal["check_ins"] = []
+
+        enriched.append(enriched_goal)
+
+    return enriched
+
+
+def _calculate_focus(goals: List[Dict[str, Any]], current: Dict[str, Any]) -> Dict[str, Any]:
+    """计算聚焦领域热力图"""
+    if not goals:
+        return {
+            "primary": None,
+            "active_goal": None,
+            "heat_map": {}
+        }
+
+    # 统计各类别目标数量和活跃度
+    category_scores = {}
+    active_goal_id = None
+    max_activity = 0
+
+    for goal in goals:
+        category = goal.get("category", "other")
+        status = goal.get("status", "pending")
+        progress = goal.get("progress", 0)
+
+        # 计算活跃度分数
+        activity_score = 0
+        if status == "in_progress":
+            activity_score = 0.5 + (progress * 0.5)  # 进行中的目标，基础0.5 + 进度加成
+        elif status == "completed":
+            activity_score = 0.2  # 已完成的目标，低权重
+
+        if activity_score > max_activity:
+            max_activity = activity_score
+            active_goal_id = goal.get("id")
+
+        # 累加类别分数
+        category_scores[category] = category_scores.get(category, 0) + activity_score
+
+    # 归一化热力图（0-1范围）
+    max_score = max(category_scores.values()) if category_scores else 1
+    heat_map = {cat: round(score / max_score, 2) for cat, score in category_scores.items()}
+
+    # 找出主要聚焦领域
+    primary = max(category_scores, key=category_scores.get) if category_scores else None
+
+    return {
+        "primary": primary,
+        "active_goal": active_goal_id,
+        "heat_map": heat_map
+    }
+
+
+VALID_SECTIONS = ["system", "north_star", "goals", "roadmap", "current", "identity", "progress", "journal", "focus"]
+
+
+@skill_service("lifecoach", "state_write", description="写入人生地图状态", auth_required=True)
+async def write_state(args: Dict[str, Any], context: ServiceContext) -> Dict[str, Any]:
+    """
+    写入用户的人生地图状态
+
+    Args:
+        section: 要写入的部分 (system, north_star, goals, roadmap, current, identity, progress, journal)
+        data: 要写入的数据
+
+    Returns:
+        status: success/error
+        message: 结果消息
+    """
+    section = args.get("section")
+    write_data = args.get("data")
+
+    if not section or not write_data:
+        return {"status": "error", "message": "缺少必要参数: section 和 data"}
+
+    if section not in VALID_SECTIONS:
+        return {"status": "error", "message": f"无效的 section: {section}"}
+
+    if not context.user_id:
+        return {"status": "error", "message": "Authentication required"}
+
+    try:
+        # 获取现有数据
+        existing_data = await get_lifecoach_data(context.user_id)
+
+        # 特殊处理：为 goals 补齐缺失字段
+        if section == "goals" and isinstance(write_data, list):
+            write_data = _enrich_goals(write_data)
+
+        # 特殊处理：自动计算 focus
+        if section == "goals" or section == "current":
+            existing_data["focus"] = _calculate_focus(
+                existing_data.get("goals", []) if section != "goals" else write_data,
+                existing_data.get("current", {})
+            )
+
+        # 深度合并
+        if section in existing_data and isinstance(existing_data[section], dict) and isinstance(write_data, dict):
+            existing_data[section] = deep_merge(existing_data[section], write_data)
+        else:
+            existing_data[section] = write_data
+
+        existing_data["_last_updated"] = datetime.now(timezone.utc).isoformat()
+        existing_data["_last_section"] = section
+
+        # 保存
+        await save_lifecoach_data(context.user_id, existing_data)
+
+        return {"status": "success", "message": f"已保存 {section}"}
+
+    except Exception as e:
+        logger.error(f"Write lifecoach state failed: {e}")
+        return {"status": "error", "message": str(e)}

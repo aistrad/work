@@ -1,0 +1,343 @@
+"""
+VibeLife Content Generator
+内容生成器 - 生成个性化提醒内容
+"""
+
+from datetime import date
+from typing import Optional
+from pydantic import BaseModel
+import asyncpg
+
+from .scheduler import ReminderTask, ReminderType
+from ..vibe_engine.llm_orchestrator import LLMOrchestrator
+
+
+# 提醒内容模板
+REMINDER_TEMPLATES = {
+    ReminderType.BAZI_MONTH: {
+        "title": "月运交接提醒",
+        "template": """亲爱的{display_name}，
+
+{days_text}将迎来**{event_name}**的交接。
+
+{personalized_content}
+
+这个月份的能量转换，对你来说是一个很好的调整时机。记得关注自己的状态变化哦。
+
+💫 点击查看详细月运分析""",
+    },
+
+    ReminderType.BAZI_YEAR: {
+        "title": "流年交接提醒",
+        "template": """亲爱的{display_name}，
+
+{days_text}即将进入**{event_name}**！
+
+{personalized_content}
+
+新的流年意味着新的能量场域，这是一年中最重要的能量转换点之一。
+
+🎊 点击查看你的流年运势报告""",
+    },
+
+    ReminderType.MERCURY_RETROGRADE: {
+        "title": "水逆提醒",
+        "template": """亲爱的{display_name}，
+
+{days_text}**水星逆行**即将开始！
+
+📅 水逆时间：{start_date} - {end_date}
+♈ 发生星座：{sign}
+
+{personalized_content}
+
+水逆期间建议：
+• 重要文件多检查几遍
+• 电子设备做好备份
+• 沟通时多确认理解是否一致
+• 适合回顾和完成旧事
+
+不必过度担心，水逆也是反思和整理的好时机 ✨""",
+    },
+
+    ReminderType.NEW_MOON: {
+        "title": "新月许愿提醒",
+        "template": """亲爱的{display_name}，
+
+{days_text}迎来**{event_name}**！🌑
+
+{personalized_content}
+
+新月是播种愿望的最佳时机。试着在这个时间：
+• 写下你的新月愿望
+• 开始一个新计划
+• 设定接下来两周的小目标
+
+🌙 点击获取你的新月许愿指南""",
+    },
+
+    ReminderType.FULL_MOON: {
+        "title": "满月能量提醒",
+        "template": """亲爱的{display_name}，
+
+{days_text}迎来**{event_name}**！🌕
+
+{personalized_content}
+
+满月是收获和释放的时刻。这个时间适合：
+• 庆祝你的成就
+• 释放不再需要的能量
+• 进行满月冥想
+• 感恩你所拥有的
+
+✨ 点击查看满月对你的影响""",
+    },
+
+    ReminderType.WEEKLY_FORTUNE: {
+        "title": "本周运势",
+        "template": """亲爱的{display_name}，
+
+新的一周开始了！✨
+
+{personalized_content}
+
+祝你有美好的一周！
+
+📊 点击查看完整周运报告""",
+    },
+
+    ReminderType.BIRTHDAY: {
+        "title": "生日快乐",
+        "template": """亲爱的{display_name}，
+
+🎂 生日快乐！
+
+在这个特别的日子里，送上最真挚的祝福。
+
+{personalized_content}
+
+新的一岁，愿你：
+• 心想事成
+• 平安喜乐
+• 活出真我
+
+🎁 点击查看你的生日运势分析""",
+    },
+}
+
+
+class GeneratedContent(BaseModel):
+    """生成的提醒内容"""
+    title: str
+    content: str
+    short_content: str  # 用于推送通知的短内容
+
+
+class ContentGenerator:
+    """内容生成器"""
+
+    def __init__(self, db_pool: asyncpg.Pool, llm: LLMOrchestrator = None):
+        self.db = db_pool
+        self.llm = llm
+
+    async def generate_reminder_content(
+        self,
+        task: ReminderTask,
+        use_llm: bool = True
+    ) -> GeneratedContent:
+        """生成提醒内容"""
+        # 获取用户信息
+        user = await self._get_user_info(task.user_id)
+        display_name = user.get("display_name", "朋友") if user else "朋友"
+
+        # 获取模板
+        template_data = REMINDER_TEMPLATES.get(task.reminder_type)
+        if not template_data:
+            return GeneratedContent(
+                title="运势提醒",
+                content=f"您有一个关于 {task.event_name} 的提醒",
+                short_content=task.event_name
+            )
+
+        # 计算天数文本
+        days_diff = (task.event_date - date.today()).days
+        if days_diff == 0:
+            days_text = "今天"
+        elif days_diff == 1:
+            days_text = "明天"
+        elif days_diff == 2:
+            days_text = "后天"
+        else:
+            days_text = f"{days_diff}天后"
+
+        # 生成个性化内容
+        personalized_content = ""
+        if use_llm and self.llm:
+            personalized_content = await self._generate_personalized_content(
+                task, user
+            )
+
+        # 填充模板
+        content = template_data["template"].format(
+            display_name=display_name,
+            days_text=days_text,
+            event_name=task.event_name,
+            personalized_content=personalized_content,
+            # 水逆特殊字段
+            start_date=task.event_date.strftime("%m月%d日") if task.reminder_type == ReminderType.MERCURY_RETROGRADE else "",
+            end_date="",  # 需要从event_data获取
+            sign="",  # 需要从event_data获取
+        )
+
+        # 生成短内容
+        short_content = f"{days_text}{task.event_name}"
+
+        return GeneratedContent(
+            title=template_data["title"],
+            content=content,
+            short_content=short_content
+        )
+
+    async def _get_user_info(self, user_id: str) -> Optional[dict]:
+        """获取用户信息"""
+        row = await self.db.fetchrow("""
+            SELECT display_name, birth_datetime, timezone
+            FROM vibe_users
+            WHERE id = $1::uuid
+        """, user_id)
+
+        if row:
+            return dict(row)
+        return None
+
+    async def _generate_personalized_content(
+        self,
+        task: ReminderTask,
+        user: dict
+    ) -> str:
+        """使用LLM生成个性化内容"""
+        if not self.llm or not user:
+            return ""
+
+        # 获取用户的技能档案
+        skill_profile = await self._get_user_skill_profile(task.user_id, "bazi")
+
+        prompt = f"""基于以下信息，为用户生成一段简短的个性化运势提醒（2-3句话）：
+
+事件类型：{task.reminder_type.value}
+事件名称：{task.event_name}
+事件日期：{task.event_date}
+
+用户信息：
+- 出生时间：{user.get('birth_datetime', '未知')}
+
+要求：
+1. 语气温暖亲切，像一个懂你的朋友
+2. 结合事件特点给出具体的小建议
+3. 不要过度解读，保持积极正向
+4. 简洁有力，不超过100字"""
+
+        try:
+            response = await self.llm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200
+            )
+            return response.content
+        except Exception:
+            return ""
+
+    async def _get_user_skill_profile(
+        self,
+        user_id: str,
+        skill_id: str
+    ) -> Optional[dict]:
+        """获取用户技能档案"""
+        row = await self.db.fetchrow("""
+            SELECT profile_data FROM skill_profiles
+            WHERE user_id = $1::uuid AND skill_id = $2
+        """, user_id, skill_id)
+
+        if row:
+            return row["profile_data"]
+        return None
+
+    async def generate_weekly_fortune(self, user_id: str) -> GeneratedContent:
+        """生成周运内容"""
+        user = await self._get_user_info(user_id)
+        display_name = user.get("display_name", "朋友") if user else "朋友"
+
+        # 获取用户的八字和星座信息
+        bazi_profile = await self._get_user_skill_profile(user_id, "bazi")
+        zodiac_profile = await self._get_user_skill_profile(user_id, "zodiac")
+
+        personalized_content = ""
+        if self.llm:
+            prompt = f"""为用户生成本周运势概要（3-4句话）：
+
+用户信息：
+- 八字：{bazi_profile.get('chart', '未知') if bazi_profile else '未知'}
+- 星座：{zodiac_profile.get('sun_sign', '未知') if zodiac_profile else '未知'}
+
+要求：
+1. 综合八字和星座视角
+2. 给出本周整体能量建议
+3. 提醒一个需要注意的方面
+4. 鼓励正向的小行动"""
+
+            try:
+                response = await self.llm.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=300
+                )
+                personalized_content = response.content
+            except Exception:
+                personalized_content = "这一周的能量整体平稳，适合按部就班地推进计划。记得给自己留一些休息的时间。"
+
+        template = REMINDER_TEMPLATES[ReminderType.WEEKLY_FORTUNE]
+        content = template["template"].format(
+            display_name=display_name,
+            personalized_content=personalized_content
+        )
+
+        return GeneratedContent(
+            title=template["title"],
+            content=content,
+            short_content="新的一周，查看你的运势"
+        )
+
+    async def generate_birthday_greeting(self, user_id: str) -> GeneratedContent:
+        """生成生日祝福内容"""
+        user = await self._get_user_info(user_id)
+        display_name = user.get("display_name", "朋友") if user else "朋友"
+
+        personalized_content = ""
+        if self.llm:
+            prompt = f"""为用户生成生日祝福（2-3句话）：
+
+用户出生时间：{user.get('birth_datetime', '未知') if user else '未知'}
+
+要求：
+1. 温暖真挚
+2. 可以结合命理特点提及用户的优点
+3. 对新一岁的美好期许"""
+
+            try:
+                response = await self.llm.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=200
+                )
+                personalized_content = response.content
+            except Exception:
+                personalized_content = "又长大一岁的你，带着过去的智慧和经验，一定会在新的一年里绽放更耀眼的光芒。"
+
+        template = REMINDER_TEMPLATES[ReminderType.BIRTHDAY]
+        content = template["template"].format(
+            display_name=display_name,
+            personalized_content=personalized_content
+        )
+
+        return GeneratedContent(
+            title=template["title"],
+            content=content,
+            short_content=f"🎂 {display_name}，生日快乐！"
+        )

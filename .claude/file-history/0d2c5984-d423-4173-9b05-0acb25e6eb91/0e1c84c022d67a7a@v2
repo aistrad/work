@@ -1,0 +1,312 @@
+# VibeLife V9 系统架构文档
+
+> Version: 9.0 | 2026-01-24
+> 核心理念：遵循 Claude Agent SDK 的渐进式 Skill 架构
+
+---
+
+## 1. 架构升级核心
+
+### 1.1 从 V8 到 V9
+
+| 维度 | V8 | V9 |
+|------|----|----|
+| Skill 加载 | 全量加载 | 渐进式（frontmatter → 完整内容） |
+| Skill 激活 | 单一 | 多 Skill 并行 |
+| 工具调用 | Skill 隔离 | 跨 Skill 编排 |
+| 新场景 | 新建 Skill + 工具 | LLM 自主编排现有 Skill |
+
+### 1.2 Claude Agent SDK Skill 原则
+
+```
+启动时：
+  - Core Skill 全文加载（精简，全程激活）
+  - 其他 Skill 只加载 frontmatter
+       ↓
+Phase 1：LLM 看到 Core + Skill 列表，选择 Skill(s)
+       ↓
+Phase 2：加载已选 Skill(s) 的完整内容 + tools/rules
+```
+
+**核心理念**：
+1. **Core 全程激活**：Core Skill 全文 + 工具始终可用
+2. **Frontmatter 即摘要**：description 包含工具列表，无需额外字段
+3. **Skill 可叠加**：不是互斥的，可以同时激活多个
+4. **LLM 自主编排**：不需要为每个场景写新 Skill
+
+---
+
+## 2. Skill 系统
+
+### 2.1 两层架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Core Layer (全程激活，全文加载)                              │
+│  └─ core: 生命对话者 + 全局工具                              │
+├─────────────────────────────────────────────────────────────┤
+│  Skill Layer (按需激活，渐进加载)                            │
+│  ├─ bazi, zodiac, synastry, tarot                           │
+│  ├─ jungastro, career, lifecoach, mindfulness               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 目录结构
+
+```
+skills/{skill_id}/
+├── SKILL.md              # frontmatter + 专家身份
+├── rules/                # 规则文件（按需加载）
+├── tools/
+│   ├── tools.yaml        # 工具 Schema
+│   └── handlers.py       # 执行器
+└── services/
+    └── api.py
+```
+
+### 2.3 SKILL.md Frontmatter 规范
+
+```yaml
+---
+id: zodiac
+name: 西方占星
+version: 2.0.0
+description: |
+  星盘计算与解读。
+  工具：calculate_zodiac, show_zodiac_chart, show_zodiac_transit
+triggers:
+  - 星座
+  - 星盘
+  - 运势
+category: astrology
+---
+```
+
+**极简原则**：description 内嵌工具列表，无需额外 `tools_summary` 字段。
+
+### 2.4 Core Skill 特殊规则
+
+Core Skill 必须保持精简（<500 tokens），因为全程加载：
+
+```yaml
+# skills/core/SKILL.md
+---
+id: core
+name: Vibe
+description: 生命对话者
+---
+
+# Vibe
+
+温暖、智慧、不说教的 AI 伴侣。
+
+## 全局工具
+- ask_user_question: 向用户提问
+- request_info: 请求信息
+- save_birth_info: 保存出生信息
+- search_db: 知识检索
+- read_state / write_state: 状态读写
+- show_card: 通用卡片展示
+- activate_skills: 激活其他 Skill
+```
+
+---
+
+## 3. CoreAgent 架构
+
+### 3.1 两阶段执行
+
+```
+用户消息
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 1: Skill 选择                                         │
+│                                                              │
+│  System Prompt：                                             │
+│  - Core Skill 全文（精简）                                   │
+│  - 其他 Skill 的 frontmatter（id, name, description）        │
+│                                                              │
+│  可用工具：                                                  │
+│  - Core 全局工具（始终可用）                                  │
+│  - activate_skills(skills: List[str])                        │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ LLM: activate_skills(["zodiac", "bazi"])
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 2: Skill 执行                                         │
+│                                                              │
+│  System Prompt：                                             │
+│  - Core Skill 全文（始终存在）                               │
+│  - 已激活 Skill 的完整 SKILL.md                              │
+│  - 相关 rules/*.md                                          │
+│  - Profile + Skill Data                                     │
+│                                                              │
+│  可用工具：                                                  │
+│  - Core 全局工具（始终可用）                                  │
+│  - 已激活 Skill 的所有工具                                   │
+│  - activate_skills（支持动态切换）                           │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+流式输出
+```
+
+### 3.2 关键代码
+
+#### skill_loader.py
+
+```python
+@dataclass
+class SkillMeta:
+    """frontmatter（Phase 1 展示）"""
+    id: str
+    name: str
+    description: str  # 内含工具列表
+    triggers: List[str]
+    category: str
+
+@dataclass
+class SkillFull:
+    """完整内容（Phase 2 加载）"""
+    meta: SkillMeta
+    content: str
+    tools: List[ToolDef]
+    rules: Dict[str, str]
+
+# Core Skill 特殊处理：启动时全文加载
+_core_skill: SkillFull = None
+
+def get_core_skill() -> SkillFull:
+    """获取 Core Skill（全程可用）"""
+    global _core_skill
+    if not _core_skill:
+        _core_skill = load_skill_full("core")
+    return _core_skill
+
+def load_all_skill_metas() -> Dict[str, SkillMeta]:
+    """启动时加载所有非 Core Skill 的 frontmatter"""
+    pass
+
+def load_skill_full(skill_id: str) -> Optional[SkillFull]:
+    """按需加载完整内容"""
+    pass
+```
+
+#### core.py
+
+```python
+def _get_current_tools(self) -> List[Dict]:
+    """获取当前可用工具"""
+    tools = []
+
+    # 1. Core 工具始终可用
+    core_tools = ToolRegistry.get_tools_for_skill("core")
+    tools.extend(core_tools)
+
+    # 2. 已激活 Skill 的工具
+    for skill_id in self._active_skills:
+        skill_tools = ToolRegistry.get_tools_for_skill(skill_id)
+        tools.extend(skill_tools)
+
+    return tools
+```
+
+---
+
+## 4. 场景处理示例
+
+### 4.1 "今天和老公相处怎么样"
+
+**V8（错误）**：需要新建 relationship_weather Skill
+
+**V9（正确）**：
+```
+Phase 1：
+  - Core 工具已可用
+  - activate_skills(["zodiac"])
+
+Phase 2：
+  - Core 工具 + zodiac 工具
+  - calculate_zodiac(用户, today)
+  - calculate_zodiac(伴侣, today)
+  - 综合分析行运对关系的影响
+  - ✅ 无需新 Skill
+```
+
+### 4.2 "帮我看看职业运势"
+
+```
+Phase 1：activate_skills(["bazi", "career"])
+
+Phase 2：
+  - Core 工具 + bazi 工具 + career 工具
+  - calculate_bazi → 获取命盘
+  - show_career_analysis → 综合分析
+  - ✅ 无需 includes 配置
+```
+
+### 4.3 "我想看合盘"
+
+```
+Phase 1：activate_skills(["synastry"])
+
+Phase 2：
+  - Core 工具 + synastry 工具
+  - 使用 synastry 的完整 SOP
+  - ✅ 现有功能不变
+```
+
+---
+
+## 5. 数据模型（继承 V8）
+
+```yaml
+profile:
+  account: { vibe_id, display_name, tier }
+  identity:
+    birth_info: { date, time, place, timezone, gender }
+  state:
+    emotion: "neutral"
+    focus: ["career"]
+  preferences:
+    subscribed_skills: { bazi: {...}, zodiac: {...} }
+  skill_data:
+    bazi: { chart, features }
+    zodiac: { chart, current_transits }
+  extracted: { facts, goals, concerns }
+  life_context: { goals, tasks, reminders }
+```
+
+---
+
+## 6. 迁移路径
+
+| Step | 内容 |
+|------|------|
+| 1 | 精简 Core SKILL.md（<500 tokens） |
+| 2 | 每个 SKILL.md description 内嵌工具列表 |
+| 3 | skill_loader.py：Core 全文加载 + 其他 frontmatter |
+| 4 | core.py：Core 工具始终可用 + `activate_skills` |
+| 5 | 移除 routing.yaml 的 `includes` |
+
+---
+
+## 7. 关键文件
+
+| 文件 | 改动 |
+|------|------|
+| `apps/api/skills/core/SKILL.md` | 精简到 <500 tokens |
+| `apps/api/services/agent/skill_loader.py` | Core 全文 + 分层加载 |
+| `apps/api/services/agent/core.py` | Core 工具始终可用 |
+| `apps/api/services/agent/prompt_builder.py` | Phase 1 上下文 |
+| `apps/api/skills/*/SKILL.md` | description 内嵌工具列表 |
+
+---
+
+## 8. 版本历史
+
+- **V9.0** (2026-01-24): 两层架构 + Core 全程激活 + 多 Skill 编排
+- **V8.3** (2026-01-23): VibeProfile v13 + VibeExtractor
+- **V8.0** (2026-01-19): VibeProfile 整合 + Knowledge v2

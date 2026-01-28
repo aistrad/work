@@ -1,0 +1,1106 @@
+"""
+CoreAgent v9 - Agentic 架构重构
+
+v9 架构特性：
+- Phase 1 提供所有路由工具，LLM 一次性决策
+- 移除 Python 硬编码决策逻辑（confidence/birth_info 判断）
+- 工具即行为：activate_skill, show_protocol_invitation, show_skill_intro, recommend_skills
+- scenario → rule 概念统一（进行中）
+
+v8 架构特性（保留）：
+- 分阶段上下文加载：Phase 1 (Skill 选择) / Phase 2 (Skill 执行)
+- use_skill 同轮重载：激活 skill 后同一轮内重新构建上下文
+- 历史消息从数据库获取（不依赖前端传入）
+- Case 倒排索引匹配
+- LLM 驱动的 SOP 执行
+"""
+import json
+import logging
+import time
+from typing import Optional, List, Dict, Any, AsyncGenerator
+from dataclasses import dataclass
+from enum import Enum
+
+from services.llm import LLMClient, get_llm_client
+from services.llm.client import LLMMessage
+from .case_index import get_case_index, extract_features, CaseIndex
+from .skill_loader import (
+    load_skill, get_skill_triggers,
+    build_system_prompt,
+    get_available_skills, get_skill_scenarios,
+    skill_requires_birth_info,
+    skill_requires_compute,
+    get_skill_compute_type,
+    get_skill_compute_tool,
+    get_skill_collect_tool,
+    load_rule, get_skill_rules,
+)
+from .tool_registry import ToolRegistry, ToolContext
+from .routing_config import (
+    get_phase1_prompt,
+    get_all_protocols,
+    get_protocol_meta,
+    get_sop_template,
+    build_protocol_tool_description,
+    build_skill_tool_description,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class AgentState(str, Enum):
+    """Agent 执行状态"""
+    IDLE = "idle"
+    THINKING = "thinking"
+    TOOL_CALLING = "tool_calling"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+@dataclass
+class AgentEvent:
+    """Agent 执行事件"""
+    type: str  # thinking, content, tool_call, tool_result, done, error, sop_phase
+    data: Any = None
+
+
+@dataclass
+class AgentContext:
+    """Agent 执行上下文
+
+    v8 更新：
+    - 删除 portrait 和 recent_insights（已废弃，数据从 profile.extracted 获取）
+    - history 从数据库获取，不再依赖前端传入
+    - profile 和 skill_data 分阶段加载
+    - 新增 protocol_prompt 支持协议模式
+    """
+    user_id: str
+    user_tier: str = "free"
+    profile: Optional[Dict[str, Any]] = None      # Phase 2 才加载
+    skill_data: Optional[Dict[str, Any]] = None   # Phase 2 才加载，只含当前 skill
+    history: Optional[List[Dict[str, str]]] = None  # 从数据库获取
+    skill: Optional[str] = None
+    scenario: Optional[str] = None
+    conversation_id: Optional[str] = None
+    voice_mode: Optional[str] = "warm"
+    protocol_prompt: Optional[str] = None  # 协议模式专用 prompt
+
+
+def build_phase1_tools() -> List[Dict[str, Any]]:
+    """
+    构建 Phase 1 路由工具集 - v10: 配置驱动
+
+    v10 改进：
+    - 从 routing.yaml 加载元数据，避免硬编码
+    - 工具描述动态生成
+    - 协议元数据单一来源
+
+    工具列表：
+    1. activate_skill - 激活 skill 并切换上下文
+    2. show_protocol_invitation - 展示协议邀请卡片（lifecoach 专用）
+    3. show_skill_intro - 展示 skill 介绍卡片
+    4. recommend_skills - 推荐相关 skills
+    """
+    available_skills = [s for s in get_available_skills() if s != "core"]
+    protocols = get_all_protocols()
+    protocol_ids = list(protocols.keys()) if protocols else ["dankoe", "covey", "yangming", "liaofan"]
+
+    # 工具 1: activate_skill - 从配置动态生成描述
+    activate_skill_tool = {
+        "type": "function",
+        "function": {
+            "name": "activate_skill",
+            "description": build_skill_tool_description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "enum": available_skills,
+                        "description": "要激活的技能 ID"
+                    },
+                    "rule": {
+                        "type": "string",
+                        "description": "可选的规则 ID，用于指定具体场景"
+                    }
+                },
+                "required": ["skill"]
+            }
+        }
+    }
+
+    # 工具 2: show_protocol_invitation - 从配置动态生成描述
+    show_protocol_invitation_tool = {
+        "type": "function",
+        "function": {
+            "name": "show_protocol_invitation",
+            "description": build_protocol_tool_description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "protocol_id": {
+                        "type": "string",
+                        "enum": protocol_ids,
+                        "description": "协议 ID"
+                    }
+                },
+                "required": ["protocol_id"]
+            }
+        }
+    }
+
+    # 工具 3: show_skill_intro - 展示 skill 介绍卡片
+    show_skill_intro_tool = {
+        "type": "function",
+        "function": {
+            "name": "show_skill_intro",
+            "description": """展示 Skill 介绍卡片。
+
+## 何时调用
+- 用户问"这个能做什么"、"有什么功能"
+- 用户首次使用某个 Skill""",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "enum": available_skills,
+                        "description": "要介绍的技能 ID"
+                    }
+                },
+                "required": ["skill"]
+            }
+        }
+    }
+
+    # 工具 4: recommend_skills - 推荐相关 skills
+    recommend_skills_tool = {
+        "type": "function",
+        "function": {
+            "name": "recommend_skills",
+            "description": "推荐 Skills 给用户选择。\n\n## 何时调用\n- 用户打招呼（你好）→ 展示能力\n- 不确定用户想用哪个 skill\n- 用户说「帮帮我」、「有什么推荐」",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skills": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": available_skills},
+                        "description": "推荐的技能列表（2-3个）"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "简短的推荐理由或欢迎语"
+                    }
+                },
+                "required": ["skills", "reason"]
+            }
+        }
+    }
+
+    return [
+        activate_skill_tool,
+        show_protocol_invitation_tool,
+        show_skill_intro_tool,
+        recommend_skills_tool
+    ]
+
+
+# 缓存动态生成的工具定义
+_PHASE1_TOOLS_CACHE: Optional[List[Dict[str, Any]]] = None
+
+
+def get_phase1_tools() -> List[Dict[str, Any]]:
+    """获取 Phase 1 工具定义（带缓存）"""
+    global _PHASE1_TOOLS_CACHE
+    if _PHASE1_TOOLS_CACHE is None:
+        _PHASE1_TOOLS_CACHE = build_phase1_tools()
+    return _PHASE1_TOOLS_CACHE
+
+
+class CoreAgent:
+    """
+    CoreAgent v8 - 分阶段渐进式加载的智能体
+
+    Features:
+    - 分阶段上下文加载：Phase 1 轻量，Phase 2 完整
+    - use_skill 同轮重载：激活后立即重新构建上下文
+    - Case 倒排索引匹配（替代向量检索）
+    - LLM 驱动的 SOP 执行
+    - Tool-card mapping
+    """
+
+    def __init__(
+        self,
+        llm: Optional[LLMClient] = None,
+        max_iterations: int = 10,
+        case_index: Optional[CaseIndex] = None
+    ):
+        self.llm = llm or get_llm_client()
+        self.max_iterations = max_iterations
+        self.case_index = case_index or get_case_index()
+        self.state = AgentState.IDLE
+        self._active_skill: Optional[str] = None
+        self._active_scenario: Optional[str] = None
+        self._topic: Optional[str] = None
+        self._current_message: str = ""
+        # v8: 用于同轮重载
+        self._context: Optional[AgentContext] = None
+        self._messages: Optional[List[LLMMessage]] = None
+        self._perf_log: Dict[str, Any] = {}  # v8: 初始化性能日志，避免 AttributeError
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        """获取 LLM 使用统计"""
+        return self.llm.usage
+
+    async def run(
+        self,
+        message: str,
+        context: AgentContext
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """执行 Agent 循环"""
+        self.state = AgentState.IDLE
+        self._current_message = message
+        self._context = context  # v8: 保存引用用于同轮重载
+        self._perf_log = {"iterations": 0, "llm_calls": [], "phase": "phase1" if not context.skill else "phase2"}
+
+        # 使用前端指定的 skill/scenario，或让 LLM 决定
+        if context.skill:
+            self._active_skill = context.skill
+            self._active_scenario = context.scenario or await self._route_scenario(context.skill, message)
+        else:
+            self._active_skill = None
+            self._active_scenario = None
+
+        # v7.2: 移除 SOPEngine，改为 LLM 驱动
+        # SOP 规则和状态将通过 System Prompt 传达给 LLM
+        # LLM 自主决定是否需要收集信息或计算
+        if self._active_skill:
+            # 计算当前状态，用于前端显示和 Prompt 构建
+            sop_status = self._compute_sop_status(context)
+
+            yield AgentEvent(type="sop_phase", data={
+                "skill": self._active_skill,
+                "scenario": self._active_scenario,
+                "status": sop_status,
+                "message": "LLM 驱动模式"
+            })
+
+        # [PERF T6] 构建初始消息
+        t_prompt_start = time.time()
+        messages = await self._build_initial_messages(message, context)
+        self._messages = messages  # v8: 保存引用用于同轮重载
+        self._perf_log["prompt_build_ms"] = int((time.time() - t_prompt_start) * 1000)
+        self._perf_log["system_prompt_len"] = len(messages[0].content) if messages else 0
+        logger.info(f"[PERF Agent] Prompt built: {self._perf_log['prompt_build_ms']}ms, len={self._perf_log['system_prompt_len']}, phase={self._perf_log['phase']}")
+
+        for iteration in range(self.max_iterations):
+            self.state = AgentState.THINKING
+            yield AgentEvent(type="thinking", data={"iteration": iteration})
+            self._perf_log["iterations"] = iteration + 1
+
+            tools = self._get_current_tools(context)
+
+            try:
+                content_buffer = ""
+                tool_calls = []
+
+                # [PERF T7/T9] LLM 调用
+                t_llm_start = time.time()
+                first_token_time = None
+
+                async for chunk in self.llm.stream(
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=None,
+                    user_tier=context.user_tier
+                ):
+                    # 记录首 token 时间
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        ttft = int((first_token_time - t_llm_start) * 1000)
+                        logger.info(f"[PERF Agent] LLM #{iteration+1} TTFT: {ttft}ms")
+
+                    if chunk["type"] == "content":
+                        content_buffer += chunk["content"]
+                        yield AgentEvent(type="content", data={"content": chunk["content"]})
+                    elif chunk["type"] == "tool_call":
+                        tool_calls.append(chunk)
+
+                # [PERF] LLM 调用完成
+                llm_total = int((time.time() - t_llm_start) * 1000)
+                self._perf_log["llm_calls"].append({
+                    "iteration": iteration + 1,
+                    "ttft_ms": int((first_token_time - t_llm_start) * 1000) if first_token_time else 0,
+                    "total_ms": llm_total,
+                    "has_tools": len(tool_calls) > 0
+                })
+                logger.info(f"[PERF Agent] LLM #{iteration+1} total: {llm_total}ms, tools={len(tool_calls)}")
+
+                if tool_calls:
+                    self.state = AgentState.TOOL_CALLING
+
+                    assistant_tool_calls = []
+                    for tc in tool_calls:
+                        assistant_tool_calls.append({
+                            "id": tc["tool_call_id"],
+                            "function": {
+                                "name": tc["tool_name"],
+                                "arguments": tc["tool_args"]
+                            }
+                        })
+                    messages.append(LLMMessage(
+                        role="assistant",
+                        content=content_buffer or "",
+                        tool_calls=assistant_tool_calls
+                    ))
+                    content_buffer = ""
+
+                    # [PERF T8] 工具执行
+                    t_tools_start = time.time()
+                    tool_results = []
+                    for tc in tool_calls:
+                        tool_name = tc["tool_name"]
+                        tool_args = tc["tool_args"]
+                        tool_call_id = tc["tool_call_id"]
+
+                        yield AgentEvent(type="tool_call", data={
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "arguments": tool_args
+                        })
+
+                        t_tool_start = time.time()
+                        result = await self._execute_tool(tool_name, tool_args, context)
+                        tool_exec_ms = int((time.time() - t_tool_start) * 1000)
+                        logger.info(f"[PERF Agent] Tool {tool_name}: {tool_exec_ms}ms")
+
+                        tool_results.append({
+                            "tool_call_id": tool_call_id,
+                            "result": result
+                        })
+
+                        yield AgentEvent(type="tool_result", data={
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "result": result
+                        })
+
+                    tools_total = int((time.time() - t_tools_start) * 1000)
+                    logger.info(f"[PERF Agent] All tools: {tools_total}ms")
+
+                    for tr in tool_results:
+                        result_content = tr["result"]
+                        if isinstance(result_content, dict):
+                            result_content = json.dumps(result_content, ensure_ascii=False)
+                        messages.append(LLMMessage(
+                            role="tool",
+                            content=str(result_content),
+                            tool_call_id=tr["tool_call_id"]
+                        ))
+                else:
+                    self.state = AgentState.COMPLETED
+                    logger.info(f"[PERF Agent] Done: {self._perf_log}")
+                    yield AgentEvent(type="done", data={"content": content_buffer})
+                    return
+
+            except Exception as e:
+                self.state = AgentState.ERROR
+                logger.error(f"Agent error: {e}")
+                yield AgentEvent(type="error", data={"error": str(e)})
+                return
+
+        self.state = AgentState.COMPLETED
+        yield AgentEvent(type="done", data={"max_iterations_reached": True})
+
+    def _filter_valid_history(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        过滤历史消息，确保 tool 消息配对完整。
+
+        Anthropic API 要求每个 tool_result 必须有对应的 tool_use。
+        如果历史消息不完整（如只有 tool 消息没有对应的 assistant tool_calls），
+        需要过滤掉这些孤立的消息。
+        """
+        if not history:
+            return []
+
+        # 收集所有有效的 tool_call_ids（来自 assistant 的 tool_calls）
+        valid_tool_ids = set()
+        for msg in history:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        valid_tool_ids.add(tc_id)
+
+        # 过滤消息
+        filtered = []
+        for msg in history:
+            role = msg.get("role", "user")
+
+            # tool 消息需要检查是否有对应的 tool_use
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id and tool_call_id in valid_tool_ids:
+                    filtered.append(msg)
+                else:
+                    # 孤立的 tool 消息，跳过
+                    logger.warning(f"Skipping orphan tool message: {tool_call_id}")
+            else:
+                # user/assistant 消息直接保留
+                filtered.append(msg)
+
+        return filtered
+
+    async def _route_scenario(self, skill_id: str, message: str) -> Optional[str]:
+        """场景路由 - v10.1: 完全移除自动匹配，100% 由 LLM 决策
+
+        v10.1 改进：
+        - 移除 Python 硬编码的 tags 匹配逻辑
+        - LLM 在 activate_skill 时根据工具描述选择 rule
+
+        返回值：
+        - 如果有 rules：返回 None（让 LLM 选择）
+        - 如果没有 rules：返回默认 scenario
+        """
+        skill = load_skill(skill_id)
+        if not skill:
+            return None
+
+        # 获取所有 rules
+        rules = get_skill_rules(skill_id)
+        if not rules:
+            return skill.default_scenario
+
+        # 如果有 rules，返回 None（LLM 在 activate_skill 时选择）
+        return None
+
+    async def _build_initial_messages(
+        self,
+        message: str,
+        context: AgentContext
+    ) -> List[LLMMessage]:
+        """构建初始消息列表"""
+        system_prompt = await self._build_system_prompt(message, context)
+
+        messages = [LLMMessage(role="system", content=system_prompt)]
+
+        if context.history:
+            # 过滤并验证历史消息，确保 tool 消息配对完整
+            filtered_history = self._filter_valid_history(context.history[-10:])
+            for msg in filtered_history:
+                messages.append(LLMMessage(
+                    role=msg.get("role", "user"),
+                    content=msg.get("content", ""),
+                    tool_call_id=msg.get("tool_call_id"),
+                    tool_calls=msg.get("tool_calls")
+                ))
+
+        messages.append(LLMMessage(role="user", content=message))
+        return messages
+
+    def _compute_sop_status(self, context: AgentContext) -> Dict[str, Any]:
+        """
+        v7.2: 计算 SOP 状态（替代 SOPEngine）
+
+        返回当前状态信息，用于：
+        1. 前端显示
+        2. System Prompt 构建
+        """
+        skill_id = self._active_skill
+
+        # 检查是否需要出生信息
+        needs_birth = skill_requires_birth_info(skill_id) if skill_id else False
+        # v9.2: birth_info 在 profile.identity.birth_info 下
+        identity = context.profile.get("identity", {}) if context.profile else {}
+        birth_info = identity.get("birth_info", {})
+        has_birth = bool(
+            birth_info.get("birth_date") or birth_info.get("date")
+        )
+
+        # 检查是否需要计算
+        needs_compute = skill_requires_compute(skill_id) if skill_id else False
+        compute_type = get_skill_compute_type(skill_id) if skill_id else None
+        actual_compute_type = compute_type or skill_id
+
+        # 检查是否有命盘数据
+        has_chart = False
+        if context.skill_data and actual_compute_type:
+            skill_data = context.skill_data.get(actual_compute_type, {})
+            # 通用检查：chart 或 cards
+            has_chart = bool(skill_data.get("chart") or skill_data.get("cards"))
+
+        return {
+            "skill_id": skill_id,
+            "needs_birth_info": needs_birth,
+            "has_birth_info": has_birth,
+            "needs_compute": needs_compute,
+            "has_chart_data": has_chart,
+            "compute_type": actual_compute_type,
+            "ready_for_analysis": (not needs_birth or has_birth) and (not needs_compute or has_chart)
+        }
+
+    def _build_sop_rules(self, context: AgentContext) -> str:
+        """
+        v10.1: 构建 SOP 规则（自然语言版 - 增强版）
+
+        从配置文件加载模板，生成教练式指导而非程序化指令。
+        支持动态占位符（如 chart_summary）。
+        """
+        skill_id = self._active_skill
+        if not skill_id:
+            return ""
+
+        # 获取配置
+        needs_birth = skill_requires_birth_info(skill_id)
+        needs_compute = skill_requires_compute(skill_id)
+
+        # 计算当前状态
+        status = self._compute_sop_status(context)
+
+        # 如果已经可以分析，使用简洁的状态提示
+        if status["ready_for_analysis"]:
+            template = get_sop_template("ready_for_analysis")
+            if template:
+                # 提取 chart_summary
+                chart_summary = self._extract_chart_summary(context)
+                return template.format(chart_summary=chart_summary)
+            # fallback
+            return """## 当前状态
+
+用户信息已完整，命盘已生成。你可以开始分析了。
+
+**分析流程**：
+1. 快速扫描命盘中的关键特征
+2. 根据用户问题聚焦分析
+3. 用 `show_xxx` 工具展示分析结果
+4. 回答用户的追问
+"""
+
+        rules_parts = []
+
+        # P1: 需要收集信息
+        if needs_birth and not status["has_birth_info"]:
+            collect_tool = get_skill_collect_tool(skill_id) or "request_info"
+            template = get_sop_template("need_birth_info")
+            if template:
+                rules_parts.append(template.format(collect_tool=collect_tool))
+            else:
+                # fallback
+                rules_parts.append(f"""## 当前状态
+
+用户还没有告诉你出生信息。在深入分析之前，你需要先了解 Ta 的出生时间。
+
+**下一步**：调用 `{collect_tool}` 工具，让用户填写出生信息表单。
+不要用文字问"请问你的生日是？"——表单体验更好。
+""")
+
+        # P2: 需要计算
+        elif needs_compute and not status["has_chart_data"]:
+            compute_type = get_skill_compute_type(skill_id) or skill_id
+            compute_tool = get_skill_compute_tool(skill_id) or f"calculate_{compute_type}"
+
+            # v10.1: 提取数据摘要，让 LLM 能看到是否已有命盘
+            chart_summary = self._extract_chart_summary(context)
+            has_chart_display = "否" if chart_summary == "无命盘数据" else f"部分数据（{chart_summary}）"
+
+            template = get_sop_template("need_compute")
+            if template:
+                rules_parts.append(template.format(
+                    compute_tool=compute_tool,
+                    has_chart=has_chart_display
+                ))
+            else:
+                # fallback
+                rules_parts.append(f"""## 当前状态
+
+用户已提供出生信息，但还没有生成命盘。
+
+**下一步**：调用 `{compute_tool}` 工具生成命盘数据。
+计算完成后你就可以开始分析了。
+""")
+
+        return "\n".join(rules_parts)
+
+    def _extract_chart_summary(self, context: AgentContext) -> str:
+        """
+        v10.1: 从命盘数据中提取关键摘要
+
+        提取命盘中的关键特征（如日主、月令、格局等），
+        用于在 SOP Prompt 中提供上下文。
+        """
+        if not context.skill_data:
+            return "无命盘数据"
+
+        skill_id = self._active_skill
+        compute_type = get_skill_compute_type(skill_id) or skill_id
+        skill_data = context.skill_data.get(compute_type, {})
+
+        if not skill_data:
+            return "无命盘数据"
+
+        # 尝试提取关键特征
+        summary_parts = []
+
+        # 八字：日主、月令
+        if compute_type == "bazi" and "chart" in skill_data:
+            chart = skill_data["chart"]
+            if "pillars" in chart and len(chart["pillars"]) > 2:
+                day_pillar = chart["pillars"][2]
+                summary_parts.append(f"日主{day_pillar.get('day_stem', '')}{day_pillar.get('day_branch', '')}")
+            if "month_order" in chart:
+                summary_parts.append(f"月令{chart['month_order']}")
+
+        # 星盘：太阳、月亮、上升
+        elif compute_type == "zodiac" and "chart" in skill_data:
+            chart = skill_data["chart"]
+            planets = chart.get("planets", {})
+            if "sun" in planets:
+                summary_parts.append(f"太阳{planets['sun'].get('sign', '')}")
+            if "moon" in planets:
+                summary_parts.append(f"月亮{planets['moon'].get('sign', '')}")
+            if "ascendant" in chart:
+                summary_parts.append(f"上升{chart['ascendant'].get('sign', '')}")
+
+        # 塔罗：牌阵
+        elif compute_type == "tarot" and "cards" in skill_data:
+            cards = skill_data["cards"]
+            if isinstance(cards, list) and len(cards) > 0:
+                summary_parts.append(f"{len(cards)}张牌")
+
+        if summary_parts:
+            return "、".join(summary_parts)
+        else:
+            return "已生成命盘"
+
+    async def _build_system_prompt(self, message: str, context: AgentContext) -> str:
+        """
+        构建 System Prompt - v8: 分阶段加载
+
+        Phase 1 (无 skill): 轻量级 prompt，只包含 Core 人格和 use_skill 工具
+        Phase 2 (有 skill): 完整 prompt，包含专家身份、SOP、Cases、用户数据
+        Protocol Mode: 使用协议专用 prompt
+        """
+        parts = []
+
+        # ═══════════════════════════════════════════════════════════════
+        # 协议模式：使用协议专用 prompt
+        # ═══════════════════════════════════════════════════════════════
+        if context.protocol_prompt:
+            # 协议模式下，使用 chat_v5.py 构建的 protocol_prompt
+            # 加上基础的 lifecoach 人格
+            skill = load_skill("lifecoach")
+            if skill:
+                parts.append(f"# {skill.name}\n\n{skill.expert_persona}")
+            parts.append("\n---\n")
+            parts.append(context.protocol_prompt)
+            return "\n".join(parts)
+
+        if self._active_skill:
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 2: Skill 执行阶段 - 完整上下文
+            # ═══════════════════════════════════════════════════════════════
+
+            # 传递完整 profile，让 skill_loader 自动处理所有字段
+            user_ctx = dict(context.profile) if context.profile else {}
+            base_prompt = build_system_prompt(
+                self._active_skill,
+                self._active_scenario,
+                user_ctx
+            )
+            parts.append(base_prompt)
+
+            # v7.2: 添加 SOP 规则（替代 SOPEngine）
+            sop_rules = self._build_sop_rules(context)
+            if sop_rules:
+                parts.append(sop_rules)
+
+            # v7: 案例匹配 - 使用倒排索引（只在 Phase 2 执行）
+            try:
+                if context.skill_data:
+                    features = extract_features(context.skill_data)
+                    if features:
+                        cases = await self.case_index.get_matched_cases(
+                            self._active_skill,
+                            features,
+                            top_k=2
+                        )
+                        if cases:
+                            cases_text = "\n## 相关案例\n\n"
+                            for case in cases:
+                                cases_text += f"### {case.name}\n{case.content}\n\n"
+                            parts.append(cases_text)
+            except Exception as e:
+                logger.warning(f"Case matching failed: {e}")
+
+            # 用户数据（使用 compute_type 读取，支持跨 skill 复用）
+            if context.skill_data:
+                compute_type = get_skill_compute_type(self._active_skill) or self._active_skill
+                skill_data = context.skill_data.get(compute_type, {})
+                if skill_data:
+                    parts.append(f"\n## 用户数据\n{json.dumps(skill_data, ensure_ascii=False, indent=2)}")
+
+        else:
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 1: Skill 选择阶段 - v10 配置驱动 + 纯路由器
+            # ═══════════════════════════════════════════════════════════════
+
+            # 从配置文件加载 Phase 1 prompt
+            core_prompt = get_phase1_prompt()
+            if not core_prompt:
+                # fallback: 如果配置加载失败，使用内置精简版
+                core_prompt = """# Vibe
+
+你是 Vibe，生命对话者。你的任务是理解用户意图，引导 Ta 到合适的服务。
+
+## 行为准则
+
+1. **识别意图 → 调用工具**：不要只用文字回复，要调用工具
+2. **简短回应 + 工具**：调用工具时配合一句暖心的话
+3. **不确定 → 推荐**：调用 recommend_skills 让用户选择
+
+## 语气
+
+温暖、简洁、不啰嗦。像一个懂你的老朋友。
+
+示例：
+- "嗨～ 今天想聊点什么？"
+- "好的，让我来帮你看看～"
+- "迷茫的时候来找我就对了。"
+"""
+            parts.append(core_prompt)
+
+        return "\n".join(parts)
+
+    def _get_current_tools(self, context: AgentContext) -> List[Dict[str, Any]]:
+        """
+        获取当前可用工具 - v10: 完全 LLM 驱动
+
+        Phase 1 (无 skill): 返回所有路由工具
+        Phase 2 (有 skill): 始终返回完整工具集，LLM 根据 System Prompt 决策
+
+        v10 改进：移除 Python 硬编码的工具集限制，改为完全由 LLM 根据
+        System Prompt 中的 SOP 指引来决策使用哪个工具。
+        """
+        if not context.skill and not self._active_skill:
+            # Phase 1: 返回所有路由工具（LLM 一次性决策）
+            return get_phase1_tools()
+
+        # Phase 2: 始终返回完整工具集，LLM 根据 System Prompt 决策
+        skill_id = self._active_skill or context.skill
+        tools = ToolRegistry.get_tools_for_skill(skill_id)
+        return tools if tools else get_phase1_tools()
+
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        tool_args: str,
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """执行工具调用 - v9: 支持新的路由工具"""
+        try:
+            args = json.loads(tool_args) if tool_args else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        # ═══════════════════════════════════════════════════════════════
+        # v9: Phase 1 路由工具处理
+        # ═══════════════════════════════════════════════════════════════
+
+        # 工具 1: activate_skill - 激活 skill
+        if tool_name == "activate_skill":
+            return await self._handle_activate_skill(args, context)
+
+        # 工具 2: show_protocol_invitation - 展示协议邀请（直接返回卡片数据）
+        if tool_name == "show_protocol_invitation":
+            return await self._handle_show_protocol_invitation(args, context)
+
+        # 工具 3: show_skill_intro - 展示 skill 介绍（直接返回卡片数据）
+        if tool_name == "show_skill_intro":
+            return await self._handle_show_skill_intro(args, context)
+
+        # 工具 4: recommend_skills - 推荐 skills
+        if tool_name == "recommend_skills":
+            return await self._handle_recommend_skills(args, context)
+
+        # 兼容旧的 use_skill 工具（逐步废弃）
+        if tool_name == "use_skill":
+            return await self._handle_use_skill(args, context)
+
+        # 创建工具上下文
+        tool_context = ToolContext(
+            user_id=context.user_id,
+            user_tier=context.user_tier,
+            profile=context.profile or {},
+            skill_data=context.skill_data or {},
+            skill_id=self._active_skill,
+            scenario_id=self._active_scenario,
+            conversation_id=context.conversation_id
+        )
+
+        # 使用统一注册表执行工具
+        if ToolRegistry.has_handler(tool_name):
+            return await ToolRegistry.execute(tool_name, args, tool_context)
+
+        # 未找到处理器
+        logger.warning(f"No handler found for tool: {tool_name}")
+        return {"status": "unknown_tool", "tool": tool_name, "message": f"工具 {tool_name} 暂未实现"}
+
+    async def _handle_activate_skill(
+        self,
+        args: Dict[str, Any],
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """
+        v9: 激活 skill - 简化版，移除硬编码决策逻辑
+
+        只做一件事：切换上下文，让 LLM 继续决策
+        """
+        skill = args.get("skill")
+        rule = args.get("rule")  # v9: scenario → rule
+
+        if not skill:
+            return {"status": "error", "message": "No skill specified"}
+
+        self._active_skill = skill
+
+        # 如果没有指定 rule，尝试自动匹配
+        if not rule and self._current_message:
+            rule = await self._route_scenario(skill, self._current_message)
+            logger.info(f"[activate_skill] Auto-routed rule: {rule}")
+
+        self._active_scenario = rule  # 内部仍用 _active_scenario，后续统一替换
+
+        # 同步 skill 到数据库
+        if self._context and self._context.conversation_id:
+            try:
+                from stores.conversation_repo import update_conversation_skill
+                from uuid import UUID
+                conv_id = UUID(self._context.conversation_id)
+                await update_conversation_skill(conv_id, skill)
+            except Exception as e:
+                logger.warning(f"[activate_skill] Failed to sync skill to DB: {e}")
+
+        # 动态加载该 skill 需要的数据
+        if self._context and self._context.user_id != "guest":
+            try:
+                from stores.profile_cache import get_cached_profile_with_skill
+                from uuid import UUID
+
+                user_id = UUID(self._context.user_id)
+                result = await get_cached_profile_with_skill(user_id, skill)
+
+                self._context.profile = result.get("profile", {})
+                self._context.skill_data = result.get("skill_data", {})
+
+                logger.info(f"[activate_skill] Loaded profile for skill={skill}")
+            except Exception as e:
+                logger.warning(f"[activate_skill] Failed to load profile: {e}")
+
+        # 重新构建 System Prompt
+        if self._messages:
+            new_system_prompt = await self._build_system_prompt(
+                self._current_message,
+                self._context
+            )
+            self._messages[0] = LLMMessage(role="system", content=new_system_prompt)
+            self._perf_log["phase"] = "phase2"
+            self._perf_log["system_prompt_reloaded"] = True
+            logger.info(f"[activate_skill] System prompt reloaded, len={len(new_system_prompt)}")
+
+        return {
+            "status": "activated",
+            "skill": skill,
+            "rule": rule,
+            "message": f"已激活 {skill} 技能" + (f"，规则: {rule}" if rule else "")
+        }
+
+    async def _handle_show_protocol_invitation(
+        self,
+        args: Dict[str, Any],
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """
+        v10: 展示协议邀请卡片
+
+        从配置文件读取协议元数据，前端渲染 ProtocolInvitationCard
+        """
+        protocol_id = args.get("protocol_id")
+
+        if not protocol_id:
+            return {"status": "error", "message": "No protocol_id specified"}
+
+        # v10: 从配置文件读取协议元数据
+        meta = get_protocol_meta(protocol_id) or {}
+
+        logger.info(f"[show_protocol_invitation] protocol_id={protocol_id}")
+
+        return {
+            "status": "success",
+            "card_type": "protocol_invitation",
+            "protocol_id": protocol_id,
+            "title": meta.get("name", protocol_id),
+            "description": meta.get("description", ""),
+            "estimated_time": meta.get("estimated_time", "10分钟"),
+            "total_steps": meta.get("total_steps", 6),
+        }
+
+    async def _handle_show_skill_intro(
+        self,
+        args: Dict[str, Any],
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """
+        v9: 展示 Skill 介绍卡片
+        """
+        skill_id = args.get("skill")
+        reason = args.get("reason", "功能介绍")
+
+        if not skill_id:
+            return {"status": "error", "message": "No skill specified"}
+
+        skill = load_skill(skill_id)
+        if not skill:
+            return {"status": "error", "message": f"Skill {skill_id} not found"}
+
+        logger.info(f"[show_skill_intro] skill={skill_id}, reason={reason}")
+
+        return {
+            "status": "success",
+            "card_type": "skill_intro",
+            "skill_id": skill_id,
+            "name": skill.name,
+            "description": skill.description,
+            "triggers": skill.triggers[:5] if skill.triggers else [],
+            "reason": reason,
+            # v10: 添加点击动作，前端可渲染为可点击卡片
+            "action": {
+                "type": "activate_skill",
+                "skill": skill_id,
+                "label": "开始使用"
+            }
+        }
+
+    async def _handle_recommend_skills(
+        self,
+        args: Dict[str, Any],
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """
+        v9: 推荐相关 Skills
+        """
+        skills = args.get("skills", [])
+        reason = args.get("reason", "")
+
+        if not skills:
+            return {"status": "error", "message": "No skills specified"}
+
+        # 获取每个 skill 的信息
+        skill_infos = []
+        for skill_id in skills:
+            skill = load_skill(skill_id)
+            if skill:
+                desc = skill.description
+                if "触发词" in desc:
+                    desc = desc.split("触发词")[0].strip().rstrip("。")
+                skill_infos.append({
+                    "id": skill_id,
+                    "name": skill.name,
+                    "description": desc[:100] if len(desc) > 100 else desc,
+                    "icon": skill.icon if hasattr(skill, 'icon') else None,
+                    # v10: 添加点击动作
+                    "action": {
+                        "type": "activate_skill",
+                        "skill": skill_id
+                    }
+                })
+
+        logger.info(f"[recommend_skills] skills={skills}, reason={reason}")
+
+        return {
+            "status": "success",
+            "card_type": "skill_recommendations",
+            "skills": skill_infos,
+            "reason": reason,
+        }
+
+    async def _handle_use_skill(
+        self,
+        args: Dict[str, Any],
+        context: AgentContext
+    ) -> Dict[str, Any]:
+        """
+        v9: 兼容旧的 use_skill 工具（逐步废弃）
+
+        内部转发到 _handle_activate_skill
+        """
+        # 转换参数：scenario → rule
+        new_args = {
+            "skill": args.get("skill"),
+            "rule": args.get("scenario"),
+        }
+        return await self._handle_activate_skill(new_args, context)
+
+
+    def _extract_birth_info_from_history(self, history: List[Dict]) -> Optional[Dict]:
+        """
+        v10.2: 从历史对话中提取出生信息
+
+        返回值：
+        {
+            "birth_date": "1980-02-11",
+            "birth_time": "14:30",
+            "place": "beijing",
+            "gender": "male"
+        }
+        """
+        import re
+
+        if not history:
+            return None
+
+        # 只看最近 5 轮对话
+        recent_messages = history[-5:]
+
+        birth_info = {}
+
+        for msg in recent_messages:
+            if msg.get("role") != "user":
+                continue
+
+            content = msg.get("content", "")
+
+            # 提取日期（如 1980-02-11、1980/02/11、1980.02.11）
+            date_match = re.search(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', content)
+            if date_match:
+                birth_info["birth_date"] = f"{date_match.group(1)}-{date_match.group(2):0>2}-{date_match.group(3):0>2}"
+
+            # 提取时间（如 14:30）
+            time_match = re.search(r'(\d{1,2}):(\d{2})', content)
+            if time_match:
+                birth_info["birth_time"] = f"{time_match.group(1):0>2}:{time_match.group(2)}"
+
+            # 提取地点（简单检测）
+            place_match = re.search(r'(beijing|shanghai|guangzhou|shenzhen|[\u4e00-\u9fa5]{2,})', content, re.IGNORECASE)
+            if place_match:
+                birth_info["place"] = place_match.group(1)
+
+            # 提取性别
+            if re.search(r'\bmale\b|男', content, re.IGNORECASE):
+                birth_info["gender"] = "male"
+            elif re.search(r'\bfemale\b|女', content, re.IGNORECASE):
+                birth_info["gender"] = "female"
+
+        # 至少要有日期才返回
+        if "birth_date" in birth_info:
+            return birth_info
+
+        return None
+
+
+def create_agent(
+    llm: Optional[LLMClient] = None,
+    max_iterations: int = 10
+) -> CoreAgent:
+    """创建 CoreAgent 实例"""
+    return CoreAgent(llm=llm, max_iterations=max_iterations)

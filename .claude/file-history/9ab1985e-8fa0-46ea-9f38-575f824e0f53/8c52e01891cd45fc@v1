@@ -1,0 +1,399 @@
+"""
+Mentis OS v3.0 - Life Connect Entity API 路由
+
+端点:
+- GET  /v3/entities           - 列出实体
+- GET  /v3/entities/pending   - 获取待确认实体
+- GET  /v3/entities/stats     - 获取实体统计
+- GET  /v3/entities/{id}      - 获取单个实体
+- POST /v3/entities           - 创建实体
+- PUT  /v3/entities/{id}      - 更新实体
+- DELETE /v3/entities/{id}    - 删除实体
+- POST /v3/entities/{id}/confirm  - 确认实体
+- POST /v3/entities/{id}/dismiss  - 拒绝实体
+
+按类型:
+- GET  /v3/entities/people    - 人物列表
+- GET  /v3/entities/todos     - 待办列表
+- POST /v3/entities/todos/{id}/complete - 完成待办
+- GET  /v3/entities/goals     - 目标列表
+- PUT  /v3/entities/goals/{id}/progress - 更新目标进度
+- GET  /v3/entities/events    - 事件列表
+- GET  /v3/entities/places    - 地点列表
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from api.auth_routes import resolve_user_id
+from services import life_connect_service
+
+router = APIRouter(prefix="/v3/entities", tags=["entities"])
+
+
+# =============================================================================
+# 请求/响应模型
+# =============================================================================
+
+class EntityCreateRequest(BaseModel):
+    """创建实体请求"""
+    entity_type: str = Field(..., pattern="^(person|event|todo|goal|place)$")
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    due_date: Optional[datetime] = None
+    auto_confirm: bool = False
+
+
+class EntityUpdateRequest(BaseModel):
+    """更新实体请求"""
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    due_date: Optional[datetime] = None
+
+
+class GoalProgressRequest(BaseModel):
+    """目标进度请求"""
+    progress: float = Field(..., ge=0.0, le=1.0)
+
+
+class EntityResponse(BaseModel):
+    """实体响应"""
+    id: str
+    user_id: str
+    entity_type: str
+    name: str
+    description: Optional[str]
+    metadata: Dict[str, Any]
+    source_entries: List[str]
+    related_entities: List[str]
+    status: str
+    due_date: Optional[str]
+    confirmed: bool
+    mention_count: int
+    avg_energy_impact: Optional[float]
+    last_mentioned: Optional[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+class EntityListResponse(BaseModel):
+    """实体列表响应"""
+    entities: List[EntityResponse]
+    total: int
+
+
+class EntityStatsResponse(BaseModel):
+    """实体统计响应"""
+    people_count: int
+    event_count: int
+    pending_todo_count: int
+    done_todo_count: int
+    goal_count: int
+    place_count: int
+    pending_confirmation_count: int
+
+
+# =============================================================================
+# 通用路由
+# =============================================================================
+
+@router.get("", response_model=EntityListResponse)
+async def list_entities(
+    entity_type: Optional[str] = Query(None, pattern="^(person|event|todo|goal|place)$"),
+    status: Optional[str] = Query(None, pattern="^(pending|confirmed|done|dismissed|archived)$"),
+    confirmed: Optional[bool] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user_id: str = Depends(resolve_user_id),
+):
+    """
+    列出实体
+
+    - **entity_type**: 实体类型 (person/event/todo/goal/place)
+    - **status**: 状态 (pending/confirmed/done/dismissed/archived)
+    - **confirmed**: 是否已确认
+    """
+    service = life_connect_service.LifeConnectService()
+    entities = service.list_entities(
+        user_id=user_id,
+        entity_type=entity_type,
+        status=status,
+        confirmed=confirmed,
+        limit=limit,
+        offset=offset,
+    )
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.get("/pending", response_model=EntityListResponse)
+async def get_pending_entities(
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取待确认的实体"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_pending_entities(user_id)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.get("/stats", response_model=EntityStatsResponse)
+async def get_entity_stats(
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取实体统计"""
+    service = life_connect_service.LifeConnectService()
+    stats = service.get_entity_stats(user_id)
+    return EntityStatsResponse(**stats)
+
+
+@router.get("/{entity_id}", response_model=EntityResponse)
+async def get_entity(
+    entity_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取单个实体"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.get_entity_by_id(entity_id)
+
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+
+    if entity.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return _entity_to_response(entity)
+
+
+@router.post("", response_model=EntityResponse)
+async def create_entity(
+    request: EntityCreateRequest,
+    user_id: str = Depends(resolve_user_id),
+):
+    """创建实体"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.create_entity(
+        user_id=user_id,
+        entity_type=request.entity_type,
+        name=request.name,
+        description=request.description,
+        metadata=request.metadata,
+        due_date=request.due_date,
+        auto_confirm=request.auto_confirm,
+    )
+    return _entity_to_response(entity)
+
+
+@router.put("/{entity_id}", response_model=EntityResponse)
+async def update_entity(
+    entity_id: str,
+    request: EntityUpdateRequest,
+    user_id: str = Depends(resolve_user_id),
+):
+    """更新实体"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.update_entity(
+        user_id=user_id,
+        entity_id=entity_id,
+        name=request.name,
+        description=request.description,
+        metadata=request.metadata,
+        due_date=request.due_date,
+    )
+
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found or access denied")
+
+    return _entity_to_response(entity)
+
+
+@router.delete("/{entity_id}")
+async def delete_entity(
+    entity_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """删除实体"""
+    service = life_connect_service.LifeConnectService()
+    success = service.delete_entity(user_id, entity_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Entity not found or access denied")
+
+    return {"success": True}
+
+
+@router.post("/{entity_id}/confirm", response_model=EntityResponse)
+async def confirm_entity(
+    entity_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """确认实体"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.confirm_entity(user_id, entity_id)
+
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found or access denied")
+
+    return _entity_to_response(entity)
+
+
+@router.post("/{entity_id}/dismiss")
+async def dismiss_entity(
+    entity_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """拒绝/忽略实体"""
+    service = life_connect_service.LifeConnectService()
+    success = service.dismiss_entity(user_id, entity_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Entity not found or access denied")
+
+    return {"success": True}
+
+
+# =============================================================================
+# 按类型的路由
+# =============================================================================
+
+@router.get("/people", response_model=EntityListResponse)
+async def get_people(
+    confirmed_only: bool = Query(default=False),
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取人物列表"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_people(user_id, confirmed_only)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.get("/todos", response_model=EntityListResponse)
+async def get_todos(
+    status: Optional[str] = Query(None, pattern="^(pending|confirmed|done)$"),
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取待办列表"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_todos(user_id, status)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.post("/todos/{todo_id}/complete", response_model=EntityResponse)
+async def complete_todo(
+    todo_id: str,
+    user_id: str = Depends(resolve_user_id),
+):
+    """完成待办"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.complete_todo(user_id, todo_id)
+
+    if not entity:
+        raise HTTPException(status_code=404, detail="Todo not found or access denied")
+
+    return _entity_to_response(entity)
+
+
+@router.get("/goals", response_model=EntityListResponse)
+async def get_goals(
+    category: Optional[str] = Query(None),
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取目标列表"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_goals(user_id, category)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.put("/goals/{goal_id}/progress", response_model=EntityResponse)
+async def update_goal_progress(
+    goal_id: str,
+    request: GoalProgressRequest,
+    user_id: str = Depends(resolve_user_id),
+):
+    """更新目标进度"""
+    service = life_connect_service.LifeConnectService()
+    entity = service.update_goal_progress(user_id, goal_id, request.progress)
+
+    if not entity:
+        raise HTTPException(status_code=404, detail="Goal not found or access denied")
+
+    return _entity_to_response(entity)
+
+
+@router.get("/events", response_model=EntityListResponse)
+async def get_events(
+    future_only: bool = Query(default=False),
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取事件列表"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_events(user_id, future_only)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+@router.get("/places", response_model=EntityListResponse)
+async def get_places(
+    user_id: str = Depends(resolve_user_id),
+):
+    """获取地点列表"""
+    service = life_connect_service.LifeConnectService()
+    entities = service.get_places(user_id)
+
+    return EntityListResponse(
+        entities=[_entity_to_response(e) for e in entities],
+        total=len(entities),
+    )
+
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+def _entity_to_response(entity: life_connect_service.LifeEntity) -> EntityResponse:
+    """将 LifeEntity 转换为响应模型"""
+    return EntityResponse(
+        id=entity.id or "",
+        user_id=entity.user_id,
+        entity_type=entity.entity_type,
+        name=entity.name,
+        description=entity.description,
+        metadata=entity.metadata,
+        source_entries=entity.source_entries,
+        related_entities=entity.related_entities,
+        status=entity.status,
+        due_date=entity.due_date.isoformat() if entity.due_date else None,
+        confirmed=entity.confirmed,
+        mention_count=entity.mention_count,
+        avg_energy_impact=entity.avg_energy_impact,
+        last_mentioned=entity.last_mentioned.isoformat() if entity.last_mentioned else None,
+        created_at=entity.created_at.isoformat() if entity.created_at else None,
+        updated_at=entity.updated_at.isoformat() if entity.updated_at else None,
+    )

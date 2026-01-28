@@ -1,0 +1,394 @@
+"""
+Image Generator - AI-generated posters for reports
+Based on: vibelife spec v3.0
+
+Uses Google Gemini (default) via OpenAI-compatible API to create:
+- Report poster images
+- Relationship cards
+- Social sharing images
+
+Image Types:
+- Full resolution (for paid users)
+- Thumbnail with watermark (for lite/preview)
+
+Default Provider: Gemini (via DEFAULT_IMAGE_PROVIDER env var)
+API Endpoint: Configurable via GEMINI_BASE_URL
+"""
+
+import os
+import io
+import json
+import base64
+import logging
+import httpx
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+from enum import Enum
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+# Import LLM service for unified image generation
+from ..vibe_engine.llm import get_llm_service
+
+
+class PosterStyle(str, Enum):
+    MINIMAL = "minimal"      # 极简风格
+    ARTISTIC = "artistic"    # 艺术风格
+    VINTAGE = "vintage"      # 复古风格
+    MODERN = "modern"        # 现代风格
+
+
+@dataclass
+class GeneratedImage:
+    """Result of image generation"""
+    id: str
+    url: str
+    thumbnail_url: Optional[str] = None
+    width: int = 1080
+    height: int = 1920
+    style: PosterStyle = PosterStyle.MINIMAL
+    has_watermark: bool = False
+    prompt_used: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "url": self.url,
+            "thumbnail_url": self.thumbnail_url,
+            "width": self.width,
+            "height": self.height,
+            "style": self.style.value,
+            "has_watermark": self.has_watermark,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prompt Templates
+# ═══════════════════════════════════════════════════════════════════════════
+
+POSTER_PROMPT_TEMPLATES = {
+    "bazi": {
+        PosterStyle.MINIMAL: """Minimalist Chinese fortune telling poster,
+elegant calligraphy of "{element}" element symbol,
+soft watercolor wash background in {color} tones,
+subtle gold accent lines,
+negative space, zen aesthetic,
+high quality, 4k""",
+
+        PosterStyle.ARTISTIC: """Artistic Chinese Bazi destiny poster,
+flowing ink painting style,
+{element} element represented as {symbol},
+dreamy ethereal atmosphere in {color} palette,
+traditional meets modern aesthetic,
+high quality, detailed, 4k""",
+
+        PosterStyle.VINTAGE: """Vintage Chinese almanac style poster,
+aged paper texture,
+traditional {element} element iconography,
+muted {color} color scheme,
+subtle typography, classic composition,
+high quality, textured, 4k""",
+    },
+
+    "zodiac": {
+        PosterStyle.MINIMAL: """Minimalist astrology poster,
+elegant constellation of {sign},
+deep space background with subtle stars,
+{color} accent glow,
+clean lines, modern aesthetic,
+high quality, 4k""",
+
+        PosterStyle.ARTISTIC: """Artistic zodiac poster,
+ethereal {sign} constellation visualization,
+cosmic nebula swirls in {color} tones,
+mystical yet sophisticated,
+high quality, detailed, 4k""",
+
+        PosterStyle.MODERN: """Modern astrology poster design,
+geometric {sign} symbol,
+gradient background in {color} spectrum,
+bold typography elements,
+contemporary minimalist style,
+high quality, 4k""",
+    },
+}
+
+# Element to visual mapping (for bazi)
+ELEMENT_VISUALS = {
+    "wood": {"symbol": "bamboo forest", "color": "green and brown"},
+    "fire": {"symbol": "rising flames", "color": "red and orange"},
+    "earth": {"symbol": "mountain peaks", "color": "yellow and brown"},
+    "metal": {"symbol": "geometric crystals", "color": "white and silver"},
+    "water": {"symbol": "flowing waves", "color": "blue and black"},
+}
+
+# Zodiac to visual mapping
+ZODIAC_VISUALS = {
+    "aries": {"symbol": "ram horns", "color": "red"},
+    "taurus": {"symbol": "bull", "color": "green"},
+    "gemini": {"symbol": "twins", "color": "yellow"},
+    "cancer": {"symbol": "crab", "color": "silver"},
+    "leo": {"symbol": "lion", "color": "gold"},
+    "virgo": {"symbol": "maiden", "color": "brown"},
+    "libra": {"symbol": "scales", "color": "pink"},
+    "scorpio": {"symbol": "scorpion", "color": "crimson"},
+    "sagittarius": {"symbol": "archer", "color": "purple"},
+    "capricorn": {"symbol": "goat", "color": "dark green"},
+    "aquarius": {"symbol": "water bearer", "color": "electric blue"},
+    "pisces": {"symbol": "fish", "color": "sea green"},
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Image Generator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ImageGenerator:
+    """AI Image generation service using Google Gemini via OpenAI-compatible API"""
+
+    def __init__(self):
+        # Get API configuration from environment
+        self.storage_url = os.getenv("IMAGE_STORAGE_URL", "/static/generated")
+        self.storage_bucket = os.getenv("IMAGE_STORAGE_BUCKET", "")
+        self.default_provider = os.getenv("DEFAULT_IMAGE_PROVIDER", "gemini")
+
+        # Get LLM service for image generation
+        self._llm_service = get_llm_service()
+        logger.info(f"ImageGenerator initialized with provider: {self.default_provider}")
+
+    async def generate_poster(
+        self,
+        profile: Dict[str, Any],
+        skill: str,
+        prologue: str,
+        style: PosterStyle = PosterStyle.MINIMAL,
+        add_watermark: bool = False,
+    ) -> Optional[GeneratedImage]:
+        """
+        Generate a poster image for a report.
+
+        Args:
+            profile: User profile data
+            skill: "bazi" or "zodiac"
+            prologue: Report prologue text (for context)
+            style: Visual style for the poster
+            add_watermark: Whether to add VibeLife watermark
+
+        Returns:
+            GeneratedImage or None if generation fails
+        """
+        try:
+            # Build prompt based on skill and profile
+            prompt = self._build_prompt(profile, skill, style)
+
+            # Generate image using LLM service (defaults to Gemini)
+            image_url = await self._generate_with_llm_service(prompt, "1024x1792")
+
+            # Fallback to placeholder if generation fails
+            if not image_url:
+                logger.warning("Image generation failed, using placeholder")
+                image_url = self._get_placeholder_url(skill, style)
+
+            if not image_url:
+                return None
+
+            # Generate thumbnail
+            thumbnail_url = await self._generate_thumbnail(image_url, add_watermark)
+
+            return GeneratedImage(
+                id=str(uuid4()),
+                url=image_url,
+                thumbnail_url=thumbnail_url,
+                style=style,
+                has_watermark=add_watermark,
+                prompt_used=prompt,
+            )
+
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            return None
+
+    async def _generate_with_llm_service(
+        self,
+        prompt: str,
+        size: str = "1024x1024"
+    ) -> Optional[str]:
+        """Generate image using LLM service (Gemini by default)"""
+        try:
+            result = await self._llm_service.generate_image(
+                prompt=prompt,
+                provider=self.default_provider,
+                size=size,
+                n=1
+            )
+
+            if result and result.get("images"):
+                image_data = result["images"][0]
+
+                # Handle different response formats
+                if image_data["type"] == "url":
+                    return image_data["data"]
+                elif image_data["type"] == "base64":
+                    # Save base64 image and return URL
+                    return await self._save_base64_image(image_data["data"])
+
+            return None
+
+        except Exception as e:
+            logger.error(f"LLM service image generation failed: {e}")
+            return None
+
+    async def _save_base64_image(self, base64_data: str) -> Optional[str]:
+        """Save base64 encoded image and return URL"""
+        try:
+            image_id = str(uuid4())
+            filename = f"{image_id}.png"
+
+            # Decode base64
+            image_bytes = base64.b64decode(base64_data)
+
+            # Try to upload to cloud storage if configured
+            if self.storage_bucket:
+                url = await self._upload_to_cloud(image_bytes, filename)
+                if url:
+                    return url
+
+            # Fallback: save locally
+            local_dir = os.path.join(os.getcwd(), "static", "generated")
+            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, filename)
+
+            with open(local_path, "wb") as f:
+                f.write(image_bytes)
+
+            return f"{self.storage_url}/{filename}"
+
+        except Exception as e:
+            logger.error(f"Failed to save base64 image: {e}")
+            return None
+
+    async def _upload_to_cloud(self, image_bytes: bytes, filename: str) -> Optional[str]:
+        """Upload image to cloud storage (R2/S3/GCS)"""
+        # This is a placeholder - implement based on your cloud storage provider
+        # For now, return None to fall back to local storage
+        logger.warning("Cloud storage upload not implemented, using local storage")
+        return None
+
+    def _build_prompt(
+        self,
+        profile: Dict[str, Any],
+        skill: str,
+        style: PosterStyle,
+    ) -> str:
+        """Build image generation prompt based on profile"""
+
+        basic = profile.get("basic", {})
+
+        if skill == "bazi":
+            # Get day master element from profile
+            element = basic.get("day_master_element", "wood")
+            visuals = ELEMENT_VISUALS.get(element, ELEMENT_VISUALS["wood"])
+
+            template = POSTER_PROMPT_TEMPLATES["bazi"].get(
+                style,
+                POSTER_PROMPT_TEMPLATES["bazi"][PosterStyle.MINIMAL]
+            )
+
+            return template.format(
+                element=element,
+                symbol=visuals["symbol"],
+                color=visuals["color"],
+            )
+        else:
+            # Get zodiac sign from profile
+            sign = basic.get("zodiac_sign", "aries").lower()
+            visuals = ZODIAC_VISUALS.get(sign, ZODIAC_VISUALS["aries"])
+
+            template = POSTER_PROMPT_TEMPLATES["zodiac"].get(
+                style,
+                POSTER_PROMPT_TEMPLATES["zodiac"][PosterStyle.MINIMAL]
+            )
+
+            return template.format(
+                sign=sign,
+                symbol=visuals["symbol"],
+                color=visuals["color"],
+            )
+
+    def _get_placeholder_url(self, skill: str, style: PosterStyle) -> str:
+        """Get placeholder image URL for development"""
+        # Use a placeholder service or local static file
+        return f"{self.storage_url}/placeholder_{skill}_{style.value}.png"
+
+    async def _generate_thumbnail(
+        self,
+        image_url: str,
+        add_watermark: bool = False,
+    ) -> str:
+        """Generate thumbnail version of image"""
+        # In production, this would resize the image and add watermark
+        # For now, return the same URL with a thumbnail suffix
+        if image_url.endswith(".png"):
+            return image_url.replace(".png", "_thumb.png")
+        return f"{image_url}?thumb=true"
+
+    async def generate_relationship_card(
+        self,
+        user1_profile: Dict[str, Any],
+        user2_profile: Dict[str, Any],
+        relationship_summary: str,
+        style: PosterStyle = PosterStyle.MINIMAL,
+    ) -> Optional[GeneratedImage]:
+        """Generate a shareable relationship card image"""
+        # Build combined prompt for relationship
+        prompt = """Elegant relationship compatibility card,
+two intertwined abstract shapes representing connection,
+harmonious color palette,
+minimalist design, subtle patterns,
+high quality, 4k"""
+
+        # Generate square image for relationship cards
+        image_url = await self._generate_with_llm_service(prompt, "1024x1024")
+
+        if not image_url:
+            image_url = f"{self.storage_url}/placeholder_relationship.png"
+
+        return GeneratedImage(
+            id=str(uuid4()),
+            url=image_url,
+            thumbnail_url=await self._generate_thumbnail(image_url, True),
+            width=1080,
+            height=1080,  # Square for relationship cards
+            style=style,
+            prompt_used=prompt,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Convenience Function
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def generate_poster(
+    profile: Dict[str, Any],
+    skill: str,
+    prologue: str = "",
+    style: str = "minimal",
+    add_watermark: bool = False,
+) -> Optional[GeneratedImage]:
+    """
+    Convenience function to generate poster.
+
+    Args:
+        profile: User profile data
+        skill: "bazi" or "zodiac"
+        prologue: Report prologue text
+        style: "minimal", "artistic", "vintage", or "modern"
+        add_watermark: Whether to add watermark
+
+    Returns:
+        GeneratedImage or None
+    """
+    generator = ImageGenerator()
+    style_enum = PosterStyle(style)
+    return await generator.generate_poster(profile, skill, prologue, style_enum, add_watermark)

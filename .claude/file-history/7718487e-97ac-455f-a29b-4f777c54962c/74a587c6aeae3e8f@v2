@@ -1,0 +1,777 @@
+# Dashboard 数据流设计
+
+> **Version**: 1.0 | 2026-01-19
+> **关联文档**: DESIGN.md, COMPONENTS.md
+
+---
+
+## 数据源映射
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         Dashboard 数据源全景                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Dashboard                    数据源                       存储位置             │
+│   ═════════                    ═════                        ═════               │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Ambient     │────────────▶ 系统时间 + 节气 API ────────▶ 实时计算           │
+│   │ Header      │                                                               │
+│   └─────────────┘              用户设置 ────────────────────▶ preferences       │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Identity    │────────────▶ VibeProfile ─────────────────▶ unified_profiles  │
+│   │ Card        │              (archetypes)                   .profile.skill_data│
+│   └─────────────┘                                             .bazi/zodiac      │
+│                                                                                  │
+│                                Lifecoach State ──────────────▶ unified_profiles │
+│                                (identity.statement)           .profile          │
+│                                                               .life_context     │
+│                                                               ._paths.lifecoach │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Today       │────────────▶ Lifecoach State ──────────────▶ life_context     │
+│   │ Card        │              (current.daily)                ._paths.lifecoach │
+│   └─────────────┘                                             .current.daily    │
+│                                                                                  │
+│                                Progress Data ────────────────▶ life_context     │
+│                                (streak, checkins)             ._paths.lifecoach │
+│                                                               .progress         │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ NorthStar   │────────────▶ Lifecoach State ──────────────▶ life_context     │
+│   │ Card        │              (north_star, roadmap)          ._paths.lifecoach │
+│   └─────────────┘                                             .north_star       │
+│                                                               .roadmap          │
+│                                                               .current.month    │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Week        │────────────▶ Lifecoach State ──────────────▶ life_context     │
+│   │ Card        │              (current.week)                 ._paths.lifecoach │
+│   └─────────────┘                                             .current.week     │
+│                                                               .goals            │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Growth      │────────────▶ Lifecoach Journal ────────────▶ life_context     │
+│   │ Timeline    │              (journal entries)              ._paths.lifecoach │
+│   └─────────────┘                                             .journal          │
+│                                                                                  │
+│                                Roadmap Milestones ───────────▶ .roadmap         │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │ Proactive   │────────────▶ Notifications ────────────────▶ notifications    │
+│   │ Messages    │                                             table             │
+│   └─────────────┘                                                               │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 数据聚合策略
+
+### 策略 A: 聚合 API (推荐)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         聚合 API 模式                                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Frontend                    API                         Backend                │
+│   ═════════                   ═══                         ═══════                │
+│                                                                                  │
+│   ┌─────────────┐                                                               │
+│   │  Dashboard  │                                                               │
+│   │    Page     │                                                               │
+│   └──────┬──────┘                                                               │
+│          │                                                                       │
+│          │  GET /api/dashboard?user_id=xxx                                      │
+│          │                                                                       │
+│          ▼                                                                       │
+│   ┌──────────────────────────────────────────────────────────────────────────┐  │
+│   │                                                                          │  │
+│   │                    Dashboard Aggregation API                              │  │
+│   │                                                                          │  │
+│   │   async def get_dashboard(user_id: str) -> DashboardDTO:                 │  │
+│   │       # 并行获取所有数据                                                  │  │
+│   │       profile, lifecoach, notifications, stats = await asyncio.gather(   │  │
+│   │           vibe_profile_repo.get_profile(user_id),                        │  │
+│   │           lifecoach_service.get_state(user_id),                          │  │
+│   │           notification_repo.get_today(user_id),                          │  │
+│   │           stats_service.get_overview(user_id)                            │  │
+│   │       )                                                                  │  │
+│   │                                                                          │  │
+│   │       # 组装 DTO                                                          │  │
+│   │       return DashboardDTO(                                               │  │
+│   │           ambient=build_ambient(profile),                                │  │
+│   │           identity=build_identity(profile, lifecoach),                   │  │
+│   │           today=build_today(lifecoach),                                  │  │
+│   │           north_star=build_north_star(lifecoach),                        │  │
+│   │           week=build_week(lifecoach),                                    │  │
+│   │           growth=build_growth(lifecoach, stats),                         │  │
+│   │           proactive=notifications                                        │  │
+│   │       )                                                                  │  │
+│   │                                                                          │  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
+│          │                                                                       │
+│          │  单一响应，包含所有 Dashboard 数据                                    │
+│          ▼                                                                       │
+│   ┌─────────────┐                                                               │
+│   │  Dashboard  │                                                               │
+│   │  Rendered   │                                                               │
+│   └─────────────┘                                                               │
+│                                                                                  │
+│   优点:                                                                          │
+│   ✓ 单一请求，减少网络往返                                                      │
+│   ✓ 后端可以优化查询 (合并数据库查询)                                           │
+│   ✓ 缓存策略简单                                                                │
+│   ✓ 减少前端复杂度                                                              │
+│                                                                                  │
+│   缺点:                                                                          │
+│   ✗ 任一数据源失败会影响整个响应                                                │
+│   ✗ 部分更新需要重新获取全部数据                                                │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 策略 B: 分离 API + 并行获取
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         分离 API 模式                                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Frontend                                                                       │
+│   ═════════                                                                      │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                           useDashboard Hook                              │   │
+│   │                                                                          │   │
+│   │   // 并行获取，独立缓存                                                   │   │
+│   │   const { data: profile } = useSWR('/api/vibe-profile/xxx');            │   │
+│   │   const { data: lifecoach } = useSWR('/api/lifecoach/state/xxx');       │   │
+│   │   const { data: proactive } = useSWR('/api/proactive/today/xxx');       │   │
+│   │   const { data: stats } = useSWR('/api/stats/overview/xxx');            │   │
+│   │                                                                          │   │
+│   │   // 客户端聚合                                                           │   │
+│   │   const dashboard = useMemo(() => {                                      │   │
+│   │     if (!profile || !lifecoach || !proactive || !stats) return null;    │   │
+│   │     return aggregateDashboard(profile, lifecoach, proactive, stats);    │   │
+│   │   }, [profile, lifecoach, proactive, stats]);                           │   │
+│   │                                                                          │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│          │          │          │          │                                     │
+│          ▼          ▼          ▼          ▼                                     │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                          │
+│   │  /vibe-  │ │/lifecoach│ │/proactive│ │ /stats   │                          │
+│   │  profile │ │  /state  │ │  /today  │ │ /overview│                          │
+│   └──────────┘ └──────────┘ └──────────┘ └──────────┘                          │
+│                                                                                  │
+│   优点:                                                                          │
+│   ✓ 部分失败不影响其他数据展示                                                  │
+│   ✓ 独立缓存，部分更新只刷新相关数据                                            │
+│   ✓ API 可复用于其他页面                                                        │
+│                                                                                  │
+│   缺点:                                                                          │
+│   ✗ 多个请求，增加网络开销                                                      │
+│   ✗ 前端聚合逻辑复杂                                                            │
+│   ✗ 需要处理竞态条件                                                            │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 推荐: 混合策略
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         混合策略 (推荐)                                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   初始加载: 使用聚合 API                                                         │
+│   ═══════════════════════                                                        │
+│                                                                                  │
+│   GET /api/dashboard ──────▶ 返回完整 DashboardDTO                              │
+│                                                                                  │
+│   增量更新: 使用分离 API                                                         │
+│   ═══════════════════════                                                        │
+│                                                                                  │
+│   用户签到后:                                                                    │
+│   POST /api/dashboard/checkin ──────▶ 只刷新 Today 数据                         │
+│                                                                                  │
+│   用户勾选 lever 后:                                                             │
+│   PATCH /api/dashboard/lever/:id ──────▶ 只刷新相关 lever 状态                  │
+│                                                                                  │
+│   用户完成 rock 后:                                                              │
+│   PATCH /api/dashboard/rock/:id ──────▶ 只刷新 Week 数据                        │
+│                                                                                  │
+│   实现:                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   const { data, mutate } = useSWR('/api/dashboard');                    │   │
+│   │                                                                         │   │
+│   │   // 乐观更新 + 后台验证                                                 │   │
+│   │   async function handleCheckIn() {                                      │   │
+│   │     // 1. 乐观更新 UI                                                    │   │
+│   │     mutate({                                                            │   │
+│   │       ...data,                                                          │   │
+│   │       today: { ...data.today, checkedIn: true, streak: data.today.streak + 1 }│
+│   │     }, false);                                                          │   │
+│   │                                                                         │   │
+│   │     // 2. 后台请求                                                       │   │
+│   │     const result = await api.post('/api/dashboard/checkin');            │   │
+│   │                                                                         │   │
+│   │     // 3. 用服务端数据验证                                               │   │
+│   │     mutate({                                                            │   │
+│   │       ...data,                                                          │   │
+│   │       today: { ...data.today, ...result.today }                         │   │
+│   │     });                                                                 │   │
+│   │   }                                                                     │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## API 规格详细
+
+### GET /api/dashboard
+
+```typescript
+// 请求
+GET /api/dashboard
+Headers:
+  Authorization: Bearer {token}
+Query:
+  user_id: string (可选，默认当前用户)
+
+// 响应
+{
+  "success": true,
+  "data": {
+    "userId": "user_123",
+    "generatedAt": "2026-01-19T08:00:00Z",
+
+    "ambient": {
+      "greeting": "早安，小薇",
+      "message": "新的一周开始了，你的愿景正在等待你的行动。",
+      "date": "2026年1月19日 周日",
+      "solarTerm": "小寒第三候",
+      "suggestion": "宜静心规划"
+    },
+
+    "identity": {
+      "archetypes": {
+        "core": "creator",
+        "inner": "lover",
+        "outer": "explorer",
+        "shadow": "hero"
+      },
+      "statement": "我是一个每天都在创造的人",
+      "currentState": "专注创作",
+      "tags": ["创作中", "高能量"]
+    },
+
+    "northStar": {
+      "vision": "我想成为一个用文字帮助他人找到方向的创作者",
+      "monthlyProject": {
+        "name": "完成书籍第3章",
+        "progress": 40,
+        "daysRemaining": 12
+      },
+      "yearGoal": "出版第一本书"
+    },
+
+    "today": {
+      "levers": [
+        { "id": "lever_1", "text": "完成3.2节初稿", "completed": false },
+        { "id": "lever_2", "text": "回复小明的邮件", "completed": false },
+        { "id": "lever_3", "text": "30分钟阅读", "completed": false }
+      ],
+      "streak": 7,
+      "checkedIn": false,
+      "proactiveMessage": "今天是本周的最后一天，有什么想完成的吗？"
+    },
+
+    "week": {
+      "rocks": [
+        { "id": "rock_1", "text": "完成3.2节初稿", "role": "创作者", "completed": true },
+        { "id": "rock_2", "text": "周三带孩子去公园", "role": "父亲", "completed": false },
+        { "id": "rock_3", "text": "周六约会", "role": "丈夫", "completed": false },
+        { "id": "rock_4", "text": "跑步3次", "role": "个人", "completed": false }
+      ],
+      "roleBalance": {
+        "创作者": 80,
+        "父亲": 60,
+        "丈夫": 40,
+        "个人": 20
+      }
+    },
+
+    "growth": {
+      "milestones": [
+        { "date": "2026-01-01", "title": "设定年度愿景", "type": "past" },
+        { "date": "2026-01-07", "title": "完成第一周签到", "type": "past" },
+        { "date": "2026-01-15", "title": "第2章定稿", "type": "past" },
+        { "date": "2026-01-19", "title": "今天", "type": "today" },
+        { "date": "2026-01-31", "title": "月度目标: 第3章完成", "type": "future" }
+      ],
+      "stats": {
+        "totalDays": 19,
+        "goalsCompleted": 5,
+        "insightsGained": 12
+      }
+    }
+  },
+  "meta": {
+    "cached": false,
+    "cacheKey": "dashboard:user_123:20260119"
+  }
+}
+```
+
+### POST /api/dashboard/checkin
+
+```typescript
+// 请求
+POST /api/dashboard/checkin
+Headers:
+  Authorization: Bearer {token}
+Body:
+  {
+    "timestamp": "2026-01-19T08:30:00Z"
+  }
+
+// 响应
+{
+  "success": true,
+  "data": {
+    "streak": 8,
+    "message": "太棒了！连续第8天签到！",
+    "animation": "fire",
+    "today": {
+      "checkedIn": true,
+      "checkinTime": "2026-01-19T08:30:00Z",
+      "streak": 8
+    }
+  }
+}
+```
+
+### PATCH /api/dashboard/lever/{lever_id}
+
+```typescript
+// 请求
+PATCH /api/dashboard/lever/lever_1
+Headers:
+  Authorization: Bearer {token}
+Body:
+  {
+    "completed": true
+  }
+
+// 响应
+{
+  "success": true,
+  "data": {
+    "lever": {
+      "id": "lever_1",
+      "text": "完成3.2节初稿",
+      "completed": true,
+      "completedAt": "2026-01-19T10:30:00Z"
+    },
+    "todayProgress": {
+      "completed": 1,
+      "total": 3,
+      "percentage": 33
+    },
+    "allCompleted": false
+  }
+}
+
+// 全部完成时
+{
+  "success": true,
+  "data": {
+    "lever": { ... },
+    "todayProgress": {
+      "completed": 3,
+      "total": 3,
+      "percentage": 100
+    },
+    "allCompleted": true,
+    "celebration": {
+      "message": "今日目标全部完成！太棒了！",
+      "animation": "confetti"
+    }
+  }
+}
+```
+
+### PATCH /api/dashboard/rock/{rock_id}
+
+```typescript
+// 请求
+PATCH /api/dashboard/rock/rock_2
+Headers:
+  Authorization: Bearer {token}
+Body:
+  {
+    "completed": true
+  }
+
+// 响应
+{
+  "success": true,
+  "data": {
+    "rock": {
+      "id": "rock_2",
+      "text": "周三带孩子去公园",
+      "role": "父亲",
+      "completed": true,
+      "completedAt": "2026-01-19T15:00:00Z"
+    },
+    "weekProgress": {
+      "completed": 2,
+      "total": 4,
+      "percentage": 50
+    },
+    "roleBalance": {
+      "创作者": 80,
+      "父亲": 80,  // 更新
+      "丈夫": 40,
+      "个人": 20
+    }
+  }
+}
+```
+
+---
+
+## 缓存策略
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              缓存层级                                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Layer 1: 浏览器缓存 (SWR)                                                      │
+│   ═══════════════════════════                                                    │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   useSWR('/api/dashboard', fetcher, {                                   │   │
+│   │     revalidateOnFocus: false,      // 聚焦时不重新验证                   │   │
+│   │     revalidateOnReconnect: true,   // 重连时重新验证                     │   │
+│   │     dedupingInterval: 60000,       // 1分钟内去重                        │   │
+│   │     focusThrottleInterval: 5000,   // 聚焦节流                           │   │
+│   │     errorRetryCount: 3,            // 错误重试次数                       │   │
+│   │     fallbackData: cachedDashboard, // 离线降级数据                       │   │
+│   │   });                                                                   │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   TTL: 内存中保持，刷新页面后使用 fallbackData                                   │
+│                                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│   Layer 2: API 缓存 (Redis / Memory)                                            │
+│   ════════════════════════════════════                                           │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   # API 缓存策略                                                         │   │
+│   │   cache_key = f"dashboard:{user_id}:{date}"                             │   │
+│   │   ttl = 300  # 5 分钟                                                   │   │
+│   │                                                                         │   │
+│   │   # 缓存失效条件                                                         │   │
+│   │   - 用户签到 → 失效 today 部分                                           │   │
+│   │   - 用户更新 lever/rock → 失效对应部分                                   │   │
+│   │   - Proactive 推送 → 失效 proactive 部分                                 │   │
+│   │   - 每日 00:00 → 全部失效 (新的一天)                                     │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│   Layer 3: 数据库缓存 (VibeProfile)                                             │
+│   ════════════════════════════════════                                           │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   # VibeProfileRepository 内置缓存                                       │   │
+│   │   cache_ttl = 300  # 5 分钟                                             │   │
+│   │                                                                         │   │
+│   │   # 写入时自动失效                                                       │   │
+│   │   def update_profile(user_id, data):                                    │   │
+│   │       result = db.update(...)                                           │   │
+│   │       cache.delete(f"profile:{user_id}")  # 失效缓存                    │   │
+│   │       return result                                                     │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 实时更新机制
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              实时更新方案                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   方案 A: 轮询 (简单)                                                            │
+│   ════════════════════                                                           │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   useSWR('/api/dashboard', fetcher, {                                   │   │
+│   │     refreshInterval: 60000,  // 每分钟刷新                              │   │
+│   │   });                                                                   │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   适用: MVP 阶段，用户量小                                                       │
+│                                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│   方案 B: SSE (Server-Sent Events)                                              │
+│   ════════════════════════════════                                               │
+│                                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                         │   │
+│   │   // 前端                                                                │   │
+│   │   useEffect(() => {                                                     │   │
+│   │     const source = new EventSource('/api/dashboard/updates');           │   │
+│   │                                                                         │   │
+│   │     source.onmessage = (event) => {                                     │   │
+│   │       const update = JSON.parse(event.data);                            │   │
+│   │       mutate(current => ({ ...current, ...update }), false);            │   │
+│   │     };                                                                  │   │
+│   │                                                                         │   │
+│   │     return () => source.close();                                        │   │
+│   │   }, []);                                                               │   │
+│   │                                                                         │   │
+│   │   // 后端推送事件                                                        │   │
+│   │   - proactive_message: 主动推送消息                                      │   │
+│   │   - streak_update: 签到更新                                             │   │
+│   │   - milestone_achieved: 里程碑达成                                       │   │
+│   │                                                                         │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   适用: 需要实时推送主动消息                                                     │
+│                                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│   方案 C: WebSocket (高实时)                                                     │
+│   ════════════════════════                                                       │
+│                                                                                  │
+│   适用: 多端同步、协作场景                                                       │
+│   当前不需要，留作扩展                                                           │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 前端状态管理
+
+```typescript
+// src/stores/dashboardStore.ts
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import type { DashboardDTO } from '@/types/dashboard';
+
+interface DashboardState {
+  // 数据
+  dashboard: DashboardDTO | null;
+  isLoading: boolean;
+  error: Error | null;
+  lastUpdated: string | null;
+
+  // 操作
+  setDashboard: (data: DashboardDTO) => void;
+  updateToday: (updates: Partial<DashboardDTO['today']>) => void;
+  updateWeek: (updates: Partial<DashboardDTO['week']>) => void;
+  toggleLever: (leverId: string) => void;
+  toggleRock: (rockId: string) => void;
+  setCheckedIn: (streak: number) => void;
+
+  // 状态
+  isInitialized: boolean;
+  initialize: () => void;
+}
+
+export const useDashboardStore = create<DashboardState>()(
+  persist(
+    (set, get) => ({
+      dashboard: null,
+      isLoading: false,
+      error: null,
+      lastUpdated: null,
+      isInitialized: false,
+
+      setDashboard: (data) => set({
+        dashboard: data,
+        lastUpdated: new Date().toISOString(),
+        isLoading: false,
+        error: null
+      }),
+
+      updateToday: (updates) => set((state) => ({
+        dashboard: state.dashboard ? {
+          ...state.dashboard,
+          today: { ...state.dashboard.today, ...updates }
+        } : null
+      })),
+
+      updateWeek: (updates) => set((state) => ({
+        dashboard: state.dashboard ? {
+          ...state.dashboard,
+          week: { ...state.dashboard.week, ...updates }
+        } : null
+      })),
+
+      toggleLever: (leverId) => set((state) => {
+        if (!state.dashboard) return state;
+
+        const levers = state.dashboard.today.levers.map(lever =>
+          lever.id === leverId
+            ? { ...lever, completed: !lever.completed }
+            : lever
+        );
+
+        return {
+          dashboard: {
+            ...state.dashboard,
+            today: { ...state.dashboard.today, levers }
+          }
+        };
+      }),
+
+      toggleRock: (rockId) => set((state) => {
+        if (!state.dashboard) return state;
+
+        const rocks = state.dashboard.week.rocks.map(rock =>
+          rock.id === rockId
+            ? { ...rock, completed: !rock.completed }
+            : rock
+        );
+
+        // 重新计算角色平衡
+        const roleBalance = calculateRoleBalance(rocks);
+
+        return {
+          dashboard: {
+            ...state.dashboard,
+            week: { ...state.dashboard.week, rocks, roleBalance }
+          }
+        };
+      }),
+
+      setCheckedIn: (streak) => set((state) => ({
+        dashboard: state.dashboard ? {
+          ...state.dashboard,
+          today: { ...state.dashboard.today, checkedIn: true, streak }
+        } : null
+      })),
+
+      initialize: () => set({ isInitialized: true })
+    }),
+    {
+      name: 'vibelife-dashboard',
+      partialize: (state) => ({
+        dashboard: state.dashboard,
+        lastUpdated: state.lastUpdated
+      })
+    }
+  )
+);
+
+// 辅助函数
+function calculateRoleBalance(rocks: DashboardDTO['week']['rocks']) {
+  const roleCount: Record<string, { completed: number; total: number }> = {};
+
+  rocks.forEach(rock => {
+    if (!roleCount[rock.role]) {
+      roleCount[rock.role] = { completed: 0, total: 0 };
+    }
+    roleCount[rock.role].total++;
+    if (rock.completed) {
+      roleCount[rock.role].completed++;
+    }
+  });
+
+  const balance: Record<string, number> = {};
+  Object.entries(roleCount).forEach(([role, { completed, total }]) => {
+    balance[role] = Math.round((completed / total) * 100);
+  });
+
+  return balance;
+}
+```
+
+---
+
+## 数据同步时序图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           签到流程时序图                                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   User        Dashboard       Store        API          Backend       DB         │
+│     │            │             │            │              │           │         │
+│     │  点击签到  │             │            │              │           │         │
+│     │──────────▶│             │            │              │           │         │
+│     │            │             │            │              │           │         │
+│     │            │ 乐观更新    │            │              │           │         │
+│     │            │────────────▶│            │              │           │         │
+│     │            │             │ streak+1   │              │           │         │
+│     │            │             │ UI 更新    │              │           │         │
+│     │            │◀────────────│            │              │           │         │
+│     │  看到动画  │             │            │              │           │         │
+│     │◀───────────│             │            │              │           │         │
+│     │            │             │            │              │           │         │
+│     │            │             │  POST      │              │           │         │
+│     │            │             │───────────▶│              │           │         │
+│     │            │             │            │  check_in()  │           │         │
+│     │            │             │            │─────────────▶│           │         │
+│     │            │             │            │              │ UPDATE    │         │
+│     │            │             │            │              │──────────▶│         │
+│     │            │             │            │              │◀──────────│         │
+│     │            │             │            │◀─────────────│           │         │
+│     │            │             │            │  {streak: 8} │           │         │
+│     │            │             │◀───────────│              │           │         │
+│     │            │             │ 验证更新   │              │           │         │
+│     │            │◀────────────│ streak=8   │              │           │         │
+│     │  数据一致  │             │            │              │           │         │
+│     │◀───────────│             │            │              │           │         │
+│     │            │             │            │              │           │         │
+│                                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│   如果 API 失败:                                                                 │
+│     │            │             │            │              │           │         │
+│     │            │             │  POST      │              │           │         │
+│     │            │             │───────────▶│              │           │         │
+│     │            │             │            │  ✗ 错误      │           │         │
+│     │            │             │◀───────────│              │           │         │
+│     │            │             │ 回滚       │              │           │         │
+│     │            │◀────────────│ streak=7   │              │           │         │
+│     │  显示错误  │             │            │              │           │         │
+│     │◀───────────│             │            │              │           │         │
+│     │            │             │            │              │           │         │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+> **Version**: 1.0 | 2026-01-19

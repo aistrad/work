@@ -1,0 +1,162 @@
+# Landing Page 莫兰迪色系升级计划 (v11.0)
+
+## 决策确认
+- **PERMA 颜色**: 替换全局强调色系统
+- **旧调色板**: 全部移除 (vellum/gold/mystic/ink)
+- **字体**: Merriweather 全面替换 Fraunces
+
+---
+
+## 第一步: 更新 PRD 文档
+
+### 1.1 创建 v11.0 设计文档
+**文件**: `docs/prd/landingpage/LANDING_PAGE_DESIGN_v11.0.md`
+
+**核心变更**:
+| 维度 | v10.0 (暖阳神秘) | v11.0 (莫兰迪) |
+|------|-----------------|---------------|
+| 背景色 | #FDFCFA vellum | #FCFCFA 米灰 |
+| 文字色 | #1A1814 ink | #37352F Charcoal |
+| 强调色 | gold/mystic 系 | PERMA 五色系 |
+| 卡片风格 | 纸质感+暖色阴影 | 纸质感+中性阴影 |
+| 字体 | Fraunces 衬线 | Merriweather 衬线 |
+
+### 1.2 更新 README.md
+- 版本号: v10.0 → v11.0
+- 设计风格: 「暖阳神秘」→ 「莫兰迪简约」
+- 新增 v11.0 核心变更说明
+- 将 v10.0 移入历史文档
+
+### 1.3 归档 v10.0
+- 保留 `LANDING_PAGE_DESIGN_v10.0.md` 作为历史参考
+
+---
+
+## 第二步: 代码实施
+
+## 关键文件
+
+| 文件 | 修改内容 |
+|------|----------|
+| `apps/web/src/app/globals.css` | CSS 变量全面重构 |
+| `apps/web/tailwind.config.ts` | 移除旧调色板，添加 PERMA |
+| `apps/web/src/app/layout.tsx` | 替换 Fraunces 为 Merriweather |
+| `apps/web/src/components/landing/index.tsx` | 更新所有颜色引用 |
+| `apps/web/src/app/onboarding/steps/*.tsx` | 更新组件颜色 |
+
+## 实施步骤
+
+### 1. globals.css - CSS 变量重构
+
+**背景色 - 米灰/奶油色**
+```css
+--bg-primary: #FCFCFA;
+--bg-secondary: #F8F6F3;
+--bg-tertiary: #F2F0ED;
+--bg-card: #FFFFFF;
+--bg-elevated: #FFFFFF;
+```
+
+**文字色 - Charcoal**
+```css
+--text-primary: #37352F;
+--text-secondary: #5A5854;
+--text-tertiary: #787672;
+--text-disabled: #9B9A97;
+```
+
+**PERMA 强调色 (替换原 accent 系统)**
+```css
+--accent-primary: #786D8C;   /* Slate Purple (Achievement) */
+--accent-secondary: #8A9A5B; /* Sage Green (Positive) */
+--accent-hover: #5E5470;
+--accent-premium: #CCB464;   /* Mustard Yellow (Meaning) */
+
+/* PERMA 可视化专用 */
+--perma-p: 138 154 91;   /* Sage Green - 积极情绪 */
+--perma-e: 102 123 153;  /* Dusty Blue - 投入 */
+--perma-r: 194 123 103;  /* Terracotta - 关系 */
+--perma-m: 204 180 100;  /* Mustard Yellow - 意义 */
+--perma-a: 120 109 140;  /* Slate Purple - 成就 */
+```
+
+**边框与阴影 - 中性灰**
+```css
+--border-subtle: rgba(55, 53, 47, 0.06);
+--border-default: rgba(55, 53, 47, 0.08);
+--shadow-floating: 0 10px 30px -10px rgba(0,0,0,0.1);
+```
+
+**移除**: 所有 vellum-*, gold-*, mystic-*, ink-* 变量
+
+### 2. tailwind.config.ts - 主题重构
+
+**移除**:
+```typescript
+// 删除 vellum, gold, mystic, ink 调色板定义
+```
+
+**添加**:
+```typescript
+perma: {
+  p: "rgb(var(--perma-p) / <alpha-value>)",
+  e: "rgb(var(--perma-e) / <alpha-value>)",
+  r: "rgb(var(--perma-r) / <alpha-value>)",
+  m: "rgb(var(--perma-m) / <alpha-value>)",
+  a: "rgb(var(--perma-a) / <alpha-value>)",
+}
+```
+
+### 3. layout.tsx - 字体替换
+
+**移除 Fraunces，添加 Merriweather**:
+```tsx
+<link
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Merriweather:wght@400;700&display=swap"
+  rel="stylesheet"
+/>
+```
+
+**更新 font-serif 变量**:
+```css
+--font-serif: 'Merriweather', 'Georgia', serif;
+```
+
+### 4. 组件批量更新
+
+**全局替换** (所有组件):
+| 旧值 | 新值 |
+|------|------|
+| `vellum-*` | `bg-*` 语义色 |
+| `gold-*` | `perma-m` 或 `accent-premium` |
+| `mystic-*` | `perma-a` 或 `accent-primary` |
+| `ink-*` | `text-*` 语义色 |
+| `font-fraunces` | `font-serif` |
+
+**landing/index.tsx** 关键替换:
+- 渐变: `from-mystic-400 to-gold-500` → `from-perma-a to-perma-m`
+- 背景: `bg-vellum-100` → `bg-bg-secondary`
+
+**LandingStep.tsx** - 12色呼吸动画更新为 PERMA 衍生色
+
+### 5. 暗色模式同步
+
+```css
+[data-theme="dark"] {
+  --bg-primary: #1A1918;
+  --text-primary: #FCFCFA;
+  --perma-p: 158 174 111;  /* 亮度+20 */
+  --perma-e: 122 143 173;
+  --perma-r: 214 143 123;
+  --perma-m: 224 200 120;
+  --perma-a: 140 129 160;
+}
+```
+
+## 验证
+
+1. `npm run dev` 启动开发服务器
+2. 访问 `/onboarding` 检查 landing page
+3. 切换暗色模式测试
+4. 运行 Lighthouse 无障碍检查 (目标 ≥ 95)
+5. 检查所有组件无 vellum/gold/mystic/ink 残留引用

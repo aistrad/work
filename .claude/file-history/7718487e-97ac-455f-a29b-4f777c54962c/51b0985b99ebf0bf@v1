@@ -1,0 +1,259 @@
+"use client";
+
+/**
+ * useDashboard Hook - Dashboard v2.0 数据管理
+ *
+ * 使用 SWR 进行数据获取，支持乐观更新
+ * 遵循 React Best Practices: client-swr-dedup
+ */
+
+import useSWR from "swr";
+import { useCallback } from "react";
+import { apiClient } from "@/lib/api";
+import type {
+  DashboardDTO,
+  DashboardResponse,
+  CheckinResponse,
+  LeverToggleResponse,
+  SkillSubscribeResponse,
+  SkillCardData,
+} from "@/types/dashboard";
+
+const DASHBOARD_KEY = "/api/dashboard";
+
+// Fetcher function
+async function fetcher(url: string): Promise<DashboardDTO> {
+  const { data } = await apiClient.get<DashboardResponse>(url);
+  return data.data;
+}
+
+export function useDashboard() {
+  const { data, error, isLoading, mutate } = useSWR<DashboardDTO>(
+    DASHBOARD_KEY,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: true,
+      dedupingInterval: 60000, // 1 minute dedup
+      errorRetryCount: 3,
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Actions with optimistic updates
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 签到
+   */
+  const checkIn = useCallback(async () => {
+    if (!data) return;
+
+    const currentStreak = data.status.streak;
+
+    // 1. Optimistic update
+    await mutate(
+      {
+        ...data,
+        status: {
+          ...data.status,
+          checkedIn: true,
+          streak: currentStreak + 1,
+        },
+      },
+      false
+    );
+
+    try {
+      // 2. API call
+      const { data: result } = await apiClient.post<CheckinResponse>(
+        "/api/dashboard/checkin"
+      );
+
+      // 3. Update with server data
+      await mutate(
+        {
+          ...data,
+          status: {
+            ...data.status,
+            checkedIn: true,
+            streak: result.data.streak,
+          },
+        },
+        false
+      );
+
+      return result.data;
+    } catch (err) {
+      // 4. Rollback on error
+      await mutate(data, false);
+      throw err;
+    }
+  }, [data, mutate]);
+
+  /**
+   * 切换杠杆完成状态
+   */
+  const toggleLever = useCallback(
+    async (leverId: string) => {
+      if (!data) return;
+
+      const lever = data.lifecoach.todayLevers.find((l) => l.id === leverId);
+      if (!lever) return;
+
+      const newCompleted = !lever.completed;
+
+      // 1. Optimistic update
+      const optimisticData = {
+        ...data,
+        lifecoach: {
+          ...data.lifecoach,
+          todayLevers: data.lifecoach.todayLevers.map((l) =>
+            l.id === leverId ? { ...l, completed: newCompleted } : l
+          ),
+        },
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.patch<LeverToggleResponse>(
+          `/api/dashboard/lever/${leverId}`,
+          { completed: newCompleted }
+        );
+
+        // Keep optimistic data (server will confirm)
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 切换大石头完成状态
+   */
+  const toggleRock = useCallback(
+    async (rockId: string) => {
+      if (!data) return;
+
+      const rock = data.lifecoach.weekRocks.find((r) => r.id === rockId);
+      if (!rock) return;
+
+      const newCompleted = !rock.completed;
+
+      // 1. Optimistic update
+      const optimisticData = {
+        ...data,
+        lifecoach: {
+          ...data.lifecoach,
+          weekRocks: data.lifecoach.weekRocks.map((r) =>
+            r.id === rockId ? { ...r, completed: newCompleted } : r
+          ),
+        },
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        await apiClient.patch(`/api/dashboard/rock/${rockId}`, {
+          completed: newCompleted,
+        });
+      } catch (err) {
+        // 3. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 订阅 Skill
+   */
+  const subscribeSkill = useCallback(
+    async (skillId: string) => {
+      if (!data) return;
+
+      // Find the skill in discover
+      const targetSkill = data.discover.find((s) => s.skillId === skillId);
+      if (!targetSkill) return;
+
+      // 1. Optimistic update: move from discover to mySkills (with placeholder)
+      const placeholderCard: SkillCardData = {
+        skillId,
+        cardId: "loading",
+        title: targetSkill.title,
+        icon: targetSkill.icon,
+        content: {
+          headline: "加载中...",
+          insights: [],
+        },
+        computedAt: new Date().toISOString(),
+        actionLabel: "加载中...",
+        actionRoute: "",
+      };
+
+      const optimisticData = {
+        ...data,
+        mySkills: [...data.mySkills, placeholderCard],
+        discover: data.discover.filter((s) => s.skillId !== skillId),
+      };
+      await mutate(optimisticData, false);
+
+      try {
+        // 2. API call
+        const { data: result } = await apiClient.post<SkillSubscribeResponse>(
+          `/api/skills/${skillId}/subscribe`
+        );
+
+        // 3. Update with real card data
+        await mutate(
+          {
+            ...optimisticData,
+            mySkills: optimisticData.mySkills.map((s) =>
+              s.skillId === skillId ? result.data.card : s
+            ),
+          },
+          false
+        );
+
+        return result.data;
+      } catch (err) {
+        // 4. Rollback on error
+        await mutate(data, false);
+        throw err;
+      }
+    },
+    [data, mutate]
+  );
+
+  /**
+   * 刷新数据
+   */
+  const refresh = useCallback(() => {
+    return mutate();
+  }, [mutate]);
+
+  return {
+    // Data
+    dashboard: data,
+    isLoading,
+    error,
+
+    // Computed
+    isCheckedIn: data?.status.checkedIn ?? false,
+    streak: data?.status.streak ?? 0,
+
+    // Actions
+    checkIn,
+    toggleLever,
+    toggleRock,
+    subscribeSkill,
+    refresh,
+  };
+}
+
+export default useDashboard;

@@ -1,0 +1,461 @@
+"""
+Pairing Repository - Data access layer for privacy pairing system
+
+Tables:
+- pairing_requests: 配对请求记录
+- synastry_results: 隐私安全的合盘结果
+- invite_links: 邀请链接
+"""
+import json
+import secrets
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any
+from uuid import UUID
+
+from .db import get_connection
+
+logger = logging.getLogger(__name__)
+
+# Default expiration periods
+DEFAULT_REQUEST_EXPIRY_DAYS = 7
+DEFAULT_INVITE_EXPIRY_DAYS = 7
+
+
+def generate_invite_token() -> str:
+    """Generate a secure 32-character invite token"""
+    return secrets.token_urlsafe(24)[:32]
+
+
+class PairingRepository:
+    """Repository for pairing system operations"""
+
+    # ─────────────────────────────────────────────────────────────────
+    # Pairing Requests
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_request(
+        requester_id: UUID,
+        target_vibe_id: str,
+        relationship_type: str,
+        message: Optional[str] = None,
+        expiry_days: int = DEFAULT_REQUEST_EXPIRY_DAYS,
+    ) -> Dict[str, Any]:
+        """
+        Create a new pairing request
+
+        Args:
+            requester_id: ID of the user sending the request
+            target_vibe_id: Vibe ID of the target user (VB-XXXXXXXX)
+            relationship_type: Type of relationship
+            message: Optional message to include
+            expiry_days: Number of days until expiration
+
+        Returns:
+            Created request record
+        """
+        expires_at = datetime.now(timezone.utc) + timedelta(days=expiry_days)
+
+        async with get_connection() as conn:
+            # First, try to resolve target_vibe_id to target_user_id
+            target_user = await conn.fetchrow(
+                "SELECT id FROM vibe_users WHERE vibe_id = $1",
+                target_vibe_id.upper()
+            )
+
+            target_user_id = target_user['id'] if target_user else None
+
+            # Check for existing pending request
+            existing = await conn.fetchrow(
+                """
+                SELECT id FROM pairing_requests
+                WHERE requester_id = $1 AND target_vibe_id = $2 AND status = 'pending'
+                """,
+                requester_id, target_vibe_id.upper()
+            )
+
+            if existing:
+                raise ValueError("已有一个待处理的配对请求")
+
+            # Create the request
+            row = await conn.fetchrow(
+                """
+                INSERT INTO pairing_requests (
+                    requester_id, target_vibe_id, target_user_id,
+                    relationship_type, message, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+                """,
+                requester_id, target_vibe_id.upper(), target_user_id,
+                relationship_type, message, expires_at
+            )
+
+            return dict(row) if row else {}
+
+    @staticmethod
+    async def get_request_by_id(request_id: UUID) -> Optional[Dict[str, Any]]:
+        """Get a pairing request by ID"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM pairing_requests WHERE id = $1",
+                request_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def get_pending_requests_for_user(user_id: UUID) -> List[Dict[str, Any]]:
+        """
+        Get all pending pairing requests for a user (as target)
+
+        Returns requests where the user is the target
+        """
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pr.*, vu.vibe_id as requester_vibe_id,
+                       up.profile->>'account'->>'display_name' as requester_name
+                FROM pairing_requests pr
+                JOIN vibe_users vu ON pr.requester_id = vu.id
+                LEFT JOIN unified_profiles up ON pr.requester_id = up.user_id
+                WHERE pr.target_user_id = $1 AND pr.status = 'pending'
+                  AND pr.expires_at > NOW()
+                ORDER BY pr.created_at DESC
+                """,
+                user_id
+            )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def get_sent_requests(user_id: UUID) -> List[Dict[str, Any]]:
+        """Get all pairing requests sent by a user"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM pairing_requests
+                WHERE requester_id = $1
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                user_id
+            )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def accept_request(request_id: UUID, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """
+        Accept a pairing request
+
+        Args:
+            request_id: ID of the request to accept
+            user_id: ID of the user accepting (must be target)
+
+        Returns:
+            Updated request record
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE pairing_requests
+                SET status = 'accepted', responded_at = NOW()
+                WHERE id = $1 AND target_user_id = $2 AND status = 'pending'
+                RETURNING *
+                """,
+                request_id, user_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def reject_request(request_id: UUID, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """
+        Reject a pairing request
+
+        Args:
+            request_id: ID of the request to reject
+            user_id: ID of the user rejecting (must be target)
+
+        Returns:
+            Updated request record
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE pairing_requests
+                SET status = 'rejected', responded_at = NOW()
+                WHERE id = $1 AND target_user_id = $2 AND status = 'pending'
+                RETURNING *
+                """,
+                request_id, user_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def count_daily_requests(user_id: UUID) -> int:
+        """Count requests sent by user today (for rate limiting)"""
+        async with get_connection() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM pairing_requests
+                WHERE requester_id = $1 AND created_at > NOW() - INTERVAL '1 day'
+                """,
+                user_id
+            )
+            return count or 0
+
+    # ─────────────────────────────────────────────────────────────────
+    # Synastry Results
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def save_synastry_result(
+        owner_id: UUID,
+        partner_id: UUID,
+        relationship_type: str,
+        partner_display_name: str,
+        overall_score: int,
+        overall_label: str,
+        dimensions: List[Dict[str, Any]],
+        strengths: List[str],
+        challenges: List[str],
+        advice: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Save a synastry result (upsert)
+
+        This stores the privacy-safe result without birth data
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO synastry_results (
+                    owner_id, partner_id, relationship_type, partner_display_name,
+                    overall_score, overall_label, dimensions, strengths, challenges, advice
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (owner_id, partner_id)
+                DO UPDATE SET
+                    relationship_type = $3,
+                    partner_display_name = $4,
+                    overall_score = $5,
+                    overall_label = $6,
+                    dimensions = $7,
+                    strengths = $8,
+                    challenges = $9,
+                    advice = $10,
+                    calculated_at = NOW()
+                RETURNING *
+                """,
+                owner_id, partner_id, relationship_type, partner_display_name,
+                overall_score, overall_label,
+                json.dumps(dimensions), json.dumps(strengths),
+                json.dumps(challenges), json.dumps(advice)
+            )
+            return dict(row) if row else {}
+
+    @staticmethod
+    async def get_synastry_result(owner_id: UUID, partner_id: UUID) -> Optional[Dict[str, Any]]:
+        """Get a synastry result for a specific pair"""
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM synastry_results
+                WHERE owner_id = $1 AND partner_id = $2
+                """,
+                owner_id, partner_id
+            )
+            if row:
+                result = dict(row)
+                # Parse JSON fields
+                for field in ['dimensions', 'strengths', 'challenges', 'advice']:
+                    if result.get(field) and isinstance(result[field], str):
+                        result[field] = json.loads(result[field])
+                return result
+            return None
+
+    @staticmethod
+    async def get_user_synastry_results(user_id: UUID) -> List[Dict[str, Any]]:
+        """Get all synastry results for a user"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT sr.*, vu.vibe_id as partner_vibe_id
+                FROM synastry_results sr
+                LEFT JOIN vibe_users vu ON sr.partner_id = vu.id
+                WHERE sr.owner_id = $1
+                ORDER BY sr.calculated_at DESC
+                """,
+                user_id
+            )
+            results = []
+            for row in rows:
+                result = dict(row)
+                for field in ['dimensions', 'strengths', 'challenges', 'advice']:
+                    if result.get(field) and isinstance(result[field], str):
+                        result[field] = json.loads(result[field])
+                results.append(result)
+            return results
+
+    @staticmethod
+    async def delete_synastry_result(owner_id: UUID, partner_id: UUID) -> bool:
+        """Delete a synastry result"""
+        async with get_connection() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM synastry_results
+                WHERE owner_id = $1 AND partner_id = $2
+                """,
+                owner_id, partner_id
+            )
+            return "DELETE 1" in result
+
+    # ─────────────────────────────────────────────────────────────────
+    # Invite Links
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def create_invite_link(
+        creator_id: UUID,
+        relationship_type: str,
+        invite_message: Optional[str] = None,
+        expiry_days: int = DEFAULT_INVITE_EXPIRY_DAYS,
+    ) -> Dict[str, Any]:
+        """
+        Create a new invite link
+
+        Args:
+            creator_id: ID of the user creating the link
+            relationship_type: Type of relationship
+            invite_message: Optional message to include
+            expiry_days: Number of days until expiration
+
+        Returns:
+            Created invite link record
+        """
+        token = generate_invite_token()
+        expires_at = datetime.now(timezone.utc) + timedelta(days=expiry_days)
+
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO invite_links (
+                    creator_id, token, relationship_type, invite_message, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                creator_id, token, relationship_type, invite_message, expires_at
+            )
+            return dict(row) if row else {}
+
+    @staticmethod
+    async def get_invite_by_token(token: str) -> Optional[Dict[str, Any]]:
+        """
+        Get an invite link by token
+
+        Returns invite details including creator info
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT il.*,
+                       vu.vibe_id as creator_vibe_id,
+                       up.profile->'account'->>'display_name' as creator_name
+                FROM invite_links il
+                JOIN vibe_users vu ON il.creator_id = vu.id
+                LEFT JOIN unified_profiles up ON il.creator_id = up.user_id
+                WHERE il.token = $1
+                """,
+                token
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def use_invite_link(token: str, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """
+        Mark an invite link as used
+
+        Args:
+            token: The invite token
+            user_id: ID of the user accepting the invite
+
+        Returns:
+            Updated invite link record
+        """
+        async with get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE invite_links
+                SET status = 'used', used_by_id = $2, used_at = NOW()
+                WHERE token = $1 AND status = 'active' AND expires_at > NOW()
+                RETURNING *
+                """,
+                token, user_id
+            )
+            return dict(row) if row else None
+
+    @staticmethod
+    async def get_user_invite_links(user_id: UUID) -> List[Dict[str, Any]]:
+        """Get all invite links created by a user"""
+        async with get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM invite_links
+                WHERE creator_id = $1
+                ORDER BY created_at DESC
+                LIMIT 20
+                """,
+                user_id
+            )
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    async def count_daily_invites(user_id: UUID) -> int:
+        """Count invites created by user today (for rate limiting)"""
+        async with get_connection() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM invite_links
+                WHERE creator_id = $1 AND created_at > NOW() - INTERVAL '1 day'
+                """,
+                user_id
+            )
+            return count or 0
+
+    # ─────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def cleanup_expired() -> Dict[str, int]:
+        """Clean up expired requests and invites"""
+        async with get_connection() as conn:
+            # Cleanup requests
+            result1 = await conn.execute(
+                """
+                UPDATE pairing_requests
+                SET status = 'expired'
+                WHERE expires_at < NOW() AND status = 'pending'
+                """
+            )
+
+            # Cleanup invites
+            result2 = await conn.execute(
+                """
+                UPDATE invite_links
+                SET status = 'expired'
+                WHERE expires_at < NOW() AND status = 'active'
+                """
+            )
+
+            # Parse counts from result strings
+            def parse_count(result: str) -> int:
+                try:
+                    return int(result.split()[1]) if "UPDATE" in result else 0
+                except (IndexError, ValueError):
+                    return 0
+
+            return {
+                "requests": parse_count(result1),
+                "invites": parse_count(result2)
+            }

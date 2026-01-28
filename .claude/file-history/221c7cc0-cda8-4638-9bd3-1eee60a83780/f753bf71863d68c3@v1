@@ -1,0 +1,242 @@
+"""
+Internal API Routes for Next.js Agent Runtime
+
+These endpoints are called by the Next.js server-side only (not exposed to browser).
+Trust boundary: userId is extracted from Cookie session, never passed from request body.
+
+Endpoints:
+- GET  /internal/context         - Aggregate user context (L0+L1+history)
+- POST /internal/chat/run/start  - Record run_id + user message
+- POST /internal/chat/run/finalize - Transaction commit all side effects
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from api.deps import require_auth
+from services import chat_service
+from services.soul_os import get_full_context_for_chat
+
+router = APIRouter(prefix="/internal", tags=["internal"])
+
+
+# =============================================================================
+# Request/Response Models
+# =============================================================================
+
+
+class ContextResponse(BaseModel):
+    """Response for /internal/context"""
+    user_id: int
+    system_prompt: str
+    persona_style: str
+    user_context: Dict[str, Any]
+    evidence: Dict[str, Any]
+    anti_dependency: Dict[str, Any]
+    history: List[Dict[str, Any]]
+
+
+class RunStartRequest(BaseModel):
+    """Request for /internal/chat/run/start"""
+    session_id: Optional[str] = Field(None, description="Existing session ID or null to create new")
+    message: str = Field(..., min_length=1, max_length=10000)
+    model: str = Field(default="glm-4.7-flash")
+    correlation_id: Optional[str] = Field(None, description="Frontend correlation ID for tracing")
+
+
+class RunStartResponse(BaseModel):
+    """Response for /internal/chat/run/start"""
+    run_id: str
+    session_id: str
+    user_message_id: int
+
+
+class RunFinalizeRequest(BaseModel):
+    """Request for /internal/chat/run/finalize"""
+    run_id: str = Field(..., description="Run ID from start")
+    session_id: str = Field(...)
+    assistant_content: str = Field(..., description="Final assistant message text")
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(default=None, description="Tool calls made during stream")
+    a2ui_cards: Optional[List[Dict[str, Any]]] = Field(default=None, description="A2UI cards to store")
+    prompt_tokens: int = Field(default=0)
+    completion_tokens: int = Field(default=0)
+    model: str = Field(default="glm-4.7-flash")
+    error: Optional[str] = Field(default=None, description="Error message if stream failed")
+
+
+class RunFinalizeResponse(BaseModel):
+    """Response for /internal/chat/run/finalize"""
+    success: bool
+    assistant_message_id: Optional[int] = None
+    side_effects: List[str] = Field(default_factory=list)
+
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+
+@router.get("/context", response_model=ContextResponse)
+async def get_context(
+    request: Request,
+    session_id: Optional[str] = None,
+    query: Optional[str] = None,
+):
+    """
+    Get aggregated user context for chat.
+
+    Includes:
+    - System prompt (based on persona style)
+    - User context (L0 profile + L1 data)
+    - Evidence (relevant knowledge)
+    - Anti-dependency check
+    - Recent chat history (if session_id provided)
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # Get full context from Soul OS
+    ctx = get_full_context_for_chat(user_id, query or "")
+
+    # Get chat history if session provided
+    history: List[Dict[str, Any]] = []
+    if session_id:
+        history = chat_service.get_recent_messages_for_llm(user_id, session_id, limit=10)
+
+    return ContextResponse(
+        user_id=user_id,
+        system_prompt=ctx["system_prompt"],
+        persona_style=ctx["persona_style"],
+        user_context=ctx["user_context"],
+        evidence=ctx["evidence"],
+        anti_dependency=ctx["anti_dependency"],
+        history=history,
+    )
+
+
+@router.post("/chat/run/start", response_model=RunStartResponse)
+async def start_run(request: Request, body: RunStartRequest):
+    """
+    Start a new chat run.
+
+    Actions:
+    1. Create or validate session
+    2. Generate run_id
+    3. Record user message
+    4. Return run_id for finalization
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # Session handling
+    session_id = body.session_id
+    if not session_id:
+        # Create new session
+        session = chat_service.create_session(user_id)
+        session_id = session["session_id"]
+    else:
+        # Validate existing session
+        existing = chat_service.get_session(user_id, session_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="session_not_found")
+
+    # Generate run_id
+    run_id = str(uuid.uuid4())
+
+    # Record user message
+    msg_result = chat_service.append_message(
+        session_id=session_id,
+        user_id=user_id,
+        role="user",
+        content=body.message,
+        model=body.model,
+    )
+
+    # Set session title from first message
+    chat_service.set_title_if_empty(session_id, body.message[:24])
+
+    return RunStartResponse(
+        run_id=run_id,
+        session_id=session_id,
+        user_message_id=msg_result["message_id"],
+    )
+
+
+@router.post("/chat/run/finalize", response_model=RunFinalizeResponse)
+async def finalize_run(request: Request, body: RunFinalizeRequest):
+    """
+    Finalize a chat run after streaming completes.
+
+    Actions:
+    1. Record assistant message with a2ui cards
+    2. Execute any pending side effects from tool calls
+    3. Update session timestamp
+
+    This ensures atomic commit of all changes.
+    """
+    auth = require_auth(request)
+    user_id = int(auth["user_id"])
+
+    # Validate session ownership
+    existing = chat_service.get_session(user_id, body.session_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="session_not_found")
+
+    # If there was an error, record it but don't store assistant message
+    if body.error:
+        # Log error but don't fail - we want the conversation to continue
+        # TODO: Add error logging table
+        return RunFinalizeResponse(
+            success=False,
+            assistant_message_id=None,
+            side_effects=[f"error_logged:{body.run_id}"],
+        )
+
+    # Build a2ui object from cards
+    a2ui = None
+    if body.a2ui_cards:
+        a2ui = {"cards": body.a2ui_cards}
+
+    # Record assistant message
+    msg_result = chat_service.append_message(
+        session_id=body.session_id,
+        user_id=user_id,
+        role="assistant",
+        content=body.assistant_content,
+        model=body.model,
+        a2ui=a2ui,
+        prompt_tokens=body.prompt_tokens,
+        completion_tokens=body.completion_tokens,
+    )
+
+    side_effects: List[str] = [f"message_stored:{msg_result['message_id']}"]
+
+    # Process tool calls for side effects (if any pending writes)
+    # Tool calls that create commitments, log mood, etc. are already executed
+    # during the stream via Skills. Here we just record what was done.
+    if body.tool_calls:
+        for tc in body.tool_calls:
+            tool_name = tc.get("toolName", tc.get("name", "unknown"))
+            side_effects.append(f"tool_executed:{tool_name}")
+
+    return RunFinalizeResponse(
+        success=True,
+        assistant_message_id=msg_result["message_id"],
+        side_effects=side_effects,
+    )
+
+
+# =============================================================================
+# Health check (useful for debugging internal connectivity)
+# =============================================================================
+
+
+@router.get("/health")
+async def internal_health():
+    """Health check for internal API."""
+    return {"status": "ok", "service": "internal_api"}

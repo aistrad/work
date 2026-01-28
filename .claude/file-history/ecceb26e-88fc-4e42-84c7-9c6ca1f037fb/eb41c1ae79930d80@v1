@@ -1,0 +1,375 @@
+"""
+VibeLife API - The Living Companion Backend
+
+v6.8 重构版本:
+- 统一 Skill Gateway (/api/v1/skills/*)
+- 统一 Account 路由 (/api/v1/account/*)
+- 统一 Commerce 路由 (/api/v1/commerce/*)
+"""
+import os
+import time
+import logging
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# NOTE: Avoid importing asyncpg-backed DB layer at module import time.
+# In tests (VIBELIFE_ENV=test), we lazy-import in lifespan to avoid requiring asyncpg.
+
+# ─────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────
+
+# 配置 root logger 输出 INFO 级别日志到控制台
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+log_dir = Path(os.environ.get("VIBELIFE_LOGS_ROOT", "/tmp/vibelife/logs"))
+log_dir.mkdir(parents=True, exist_ok=True)
+
+request_logger = logging.getLogger("vibelife.requests")
+request_logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler(log_dir / "api_requests.log")
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+request_logger.addHandler(file_handler)
+
+# ─────────────────────────────────────────────────────────────────
+# Load environment (.env at repo root)
+# ─────────────────────────────────────────────────────────────────
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+# ─────────────────────────��───────────────────────────────────────
+# Lifespan (startup/shutdown)
+# ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler"""
+    # Startup
+    print("Starting VibeLife API v7.0...")
+
+    TEST_MODE = os.getenv("VIBELIFE_ENV") == "test"
+
+    # Lazy import DB only when not running tests to avoid asyncpg requirement
+    if not TEST_MODE:
+        from stores.db import init_db  # type: ignore
+        await init_db()
+        print("Database connected")
+    else:
+        print("Test mode: skipping DB initialization")
+
+    # Initialize Tool Registry (v6.0)
+    if not TEST_MODE:
+        try:
+            from services.agent import ToolRegistry
+            import services.agent.global_handlers  # noqa: F401
+            ToolRegistry.initialize()
+            print(f"ToolRegistry initialized: {len(ToolRegistry._handlers)} handlers")
+        except Exception as e:
+            print(f"ToolRegistry init skipped/failed: {e}")
+
+    # Initialize Skill Service Registry (v6.8)
+    if not TEST_MODE:
+        try:
+            from services.agent.skill_service_registry import SkillServiceRegistry
+            SkillServiceRegistry.initialize()
+            print(f"SkillServiceRegistry initialized: {len(SkillServiceRegistry._services)} services")
+        except Exception as e:
+            print(f"SkillServiceRegistry init skipped/failed: {e}")
+
+    yield
+
+    # Shutdown
+    print("Shutting down VibeLife API...")
+
+    if not TEST_MODE:
+        try:
+            from stores.db import close_db  # type: ignore
+            await close_db()
+            print("Database closed")
+        except Exception as e:
+            print(f"DB close skipped/failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# App Creation
+# ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="VibeLife API",
+    description="The Living Companion - AI-powered personal growth platform",
+    version="7.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
+
+# ─────────────────────────────────────────────────────────────────
+# Rate Limiting (slowapi)
+# ─────────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ─────────────────────────────────────────────────────────────────
+# CORS Middleware
+# ─────────────────────────────────────────────────────────────────
+
+# CORS 配置:
+# - VIBELIFE_CORS_ORIGINS: 逗号分隔的允许来源列表
+# - VIBELIFE_CORS_ALLOW_ALL: 设为 "1" 允许所有来源（仅用于开发）
+_cors_allow_all = os.getenv("VIBELIFE_CORS_ALLOW_ALL", "0") == "1"
+_cors_origins_env = os.getenv("VIBELIFE_CORS_ORIGINS", "http://localhost:3000,http://localhost:3001")
+cors_origins = ["*"] if _cors_allow_all else [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=not _cors_allow_all,  # 通配符时不能使用 credentials
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-Conversation-ID"],  # 暴露自定义响应头
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request Logging Middleware
+# ─────────────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有 HTTP 请求的详细信息"""
+    start_time = time.time()
+
+    client_ip = request.client.host if request.client else "unknown"
+    xff = request.headers.get("x-forwarded-for", "-")
+    x_real_ip = request.headers.get("x-real-ip", "-")
+    cf_ip = request.headers.get("cf-connecting-ip", "-")
+
+    response = await call_next(request)
+
+    process_time = (time.time() - start_time) * 1000
+
+    request_logger.info(
+        f'{client_ip} "{request.method} {request.url.path}" '
+        f'{response.status_code} {process_time:.2f}ms '
+        f'xff="{xff}" xrealip="{x_real_ip}" cf_ip="{cf_ip}" '
+        f'ua="{request.headers.get("user-agent", "-")}"'
+    )
+
+    return response
+
+
+# ─────────────────────────────────────────────────────────────────
+# Routes Import (v6.8 Simplified)
+# ─────────────────────────────────────────────────────────────────
+
+# Router imports
+# In test mode, import only the minimal routers to reduce heavy deps.
+from routes.health import router as health_router
+from routes.account import router as account_router
+
+TEST_MODE = os.getenv("VIBELIFE_ENV") == "test"
+
+if not TEST_MODE:
+    try:
+        from routes.chat_v5 import router as chat_v5_router  # type: ignore
+    except Exception as e:
+        chat_v5_router = None  # type: ignore
+        print(f"chat_v5 router import skipped: {e}")
+    try:
+        from routes.tools import router as tools_router  # type: ignore
+    except Exception as e:
+        tools_router = None  # type: ignore
+        print(f"tools router import skipped: {e}")
+    try:
+        from routes.skills import router as skills_router  # type: ignore
+    except Exception as e:
+        skills_router = None  # type: ignore
+        print(f"skills router import skipped: {e}")
+    try:
+        from routes.commerce import router as commerce_router  # type: ignore
+    except Exception as e:
+        commerce_router = None  # type: ignore
+        print(f"commerce router import skipped: {e}")
+    try:
+        from routes.notifications import router as notifications_router  # type: ignore
+    except Exception as e:
+        notifications_router = None  # type: ignore
+        print(f"notifications router import skipped: {e}")
+    try:
+        from routes.conversations import router as conversations_router  # type: ignore
+    except Exception as e:
+        conversations_router = None  # type: ignore
+        print(f"conversations router import skipped: {e}")
+    try:
+        from routes.pairing import router as pairing_router  # type: ignore
+    except Exception as e:
+        pairing_router = None  # type: ignore
+        print(f"pairing router import skipped: {e}")
+    try:
+        from routes.dashboard import router as dashboard_router  # type: ignore
+    except Exception as e:
+        dashboard_router = None  # type: ignore
+        print(f"dashboard router import skipped: {e}")
+
+# ─────────────────────────────────────────────────────────────────
+# Register Routers (v6.8 Simplified - 7 routers total)
+# ─────────────────────────────────────────────────────────────────
+
+# Health check (no prefix)
+app.include_router(health_router, tags=["Health"])
+
+# Minimal routes for TEST_MODE
+if TEST_MODE:
+    app.include_router(account_router, prefix="/api/v1", tags=["Account"])
+    try:
+        from routes.chat_v5 import router as chat_v5_router  # type: ignore
+        app.include_router(chat_v5_router, prefix="/api/v1", tags=["Chat"])  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"chat_v5 router import skipped in test: {e}")
+    try:
+        from routes.tools import router as tools_router  # type: ignore
+        app.include_router(tools_router, prefix="/api/v1", tags=["Tools"])  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"tools router import skipped in test: {e}")
+    try:
+        from routes.skills import router as skills_router  # type: ignore
+        app.include_router(skills_router, prefix="/api/v1", tags=["Skills"])  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"skills router import skipped in test: {e}")
+    try:
+        from routes.notifications import router as notifications_router  # type: ignore
+        app.include_router(notifications_router, prefix="/api/v1", tags=["Notifications"])  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"notifications router import skipped in test: {e}")
+    try:
+        from routes.conversations import router as conversations_router  # type: ignore
+        app.include_router(conversations_router, prefix="/api/v1", tags=["Conversations"])  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"conversations router import skipped in test: {e}")
+else:
+    # Core API
+    if chat_v5_router:
+        app.include_router(chat_v5_router, prefix="/api/v1", tags=["Chat"])  # type: ignore[arg-type]
+    if tools_router:
+        app.include_router(tools_router, prefix="/api/v1", tags=["Tools"])  # type: ignore[arg-type]
+
+    # v6.8 Unified routes
+    if skills_router:
+        app.include_router(skills_router, prefix="/api/v1", tags=["Skills"])  # type: ignore[arg-type]
+    app.include_router(account_router, prefix="/api/v1", tags=["Account"])
+    if commerce_router:
+        app.include_router(commerce_router, prefix="/api/v1", tags=["Commerce"])  # type: ignore[arg-type]
+
+    # Platform routes
+    if notifications_router:
+        app.include_router(notifications_router, prefix="/api/v1", tags=["Notifications"])  # type: ignore[arg-type]
+    if conversations_router:
+        app.include_router(conversations_router, prefix="/api/v1", tags=["Conversations"])  # type: ignore[arg-type]
+    if pairing_router:
+        app.include_router(pairing_router, prefix="/api/v1", tags=["Pairing"])  # type: ignore[arg-type]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Config Reload Endpoint
+# ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/config/reload")
+async def reload_config_endpoint():
+    """热重载 LLM 模型配置 (无需重启服务)"""
+    try:
+        from services.model_router import reload_config, get_model_config
+        config = reload_config()
+        return {
+            "status": "ok",
+            "message": "配置已重新加载",
+            "providers": list(config.providers.keys()),
+            "models": list(config.models.keys()),
+            "defaults": {
+                cap: {"primary": route.primary, "fallback": route.fallback}
+                for cap, route in config.defaults.items()
+            },
+            "global_fallback": config.global_fallback,
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"配置重载失败: {str(e)}")
+
+
+@app.get("/api/v1/config/current")
+async def get_current_config():
+    """获取当前 LLM 模型配置"""
+    try:
+        from services.model_router import get_model_config
+        config = get_model_config()
+        return {
+            "providers": {
+                pid: {"name": p.name, "enabled": p.enabled}
+                for pid, p in config.providers.items()
+            },
+            "models": {
+                mid: {"provider": m.provider, "model_name": m.model_name}
+                for mid, m in config.models.items()
+            },
+            "defaults": {
+                cap: {"primary": route.primary, "fallback": route.fallback}
+                for cap, route in config.defaults.items()
+            },
+            "global_fallback": config.global_fallback,
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Root Endpoint
+# ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    """Root endpoint - return 404 to hide API info"""
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Run with uvicorn (for development)
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("VIBELIFE_API_PORT", 8000))
+    host = os.getenv("VIBELIFE_API_HOST", "0.0.0.0")
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=os.getenv("VIBELIFE_DEV", "0") == "1",
+    )

@@ -1,0 +1,282 @@
+"""
+Report Repository - Data access layer for reports
+Based on: vibelife spec v3.0, section 4.6
+"""
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+import json
+
+from .db import get_connection
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Report CRUD Operations
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def create_report(
+    user_id: Optional[UUID],
+    skill: str,
+    report_type: str = "lite",
+    content: Optional[Dict[str, Any]] = None,
+    prologue: Optional[str] = None,
+    interview_data: Optional[Dict[str, Any]] = None,
+    generation_metadata: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Create a new report record"""
+    async with get_connection() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reports (
+                user_id, skill, report_type, content, prologue,
+                interview_data, generation_metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+            """,
+            user_id,
+            skill,
+            report_type,
+            json.dumps(content or {}),
+            prologue,
+            json.dumps(interview_data) if interview_data else None,
+            json.dumps(generation_metadata) if generation_metadata else None,
+        )
+        return _row_to_dict(row) if row else None
+
+
+async def get_report(report_id: UUID) -> Optional[dict]:
+    """Get report by ID"""
+    async with get_connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM reports WHERE id = $1",
+            report_id
+        )
+        return _row_to_dict(row) if row else None
+
+
+async def get_report_by_id(report_id: UUID, user_id: Optional[UUID] = None) -> Optional[dict]:
+    """Get report by ID with optional user verification"""
+    async with get_connection() as conn:
+        if user_id:
+            row = await conn.fetchrow(
+                "SELECT * FROM reports WHERE id = $1 AND user_id = $2",
+                report_id, user_id
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM reports WHERE id = $1",
+                report_id
+            )
+        return _row_to_dict(row) if row else None
+
+
+async def update_report(
+    report_id: UUID,
+    content: Optional[Dict[str, Any]] = None,
+    prologue: Optional[str] = None,
+    image_url: Optional[str] = None,
+    image_thumbnail_url: Optional[str] = None,
+    is_paid: Optional[bool] = None,
+) -> Optional[dict]:
+    """Update report content"""
+    updates = []
+    values = []
+    param_idx = 1
+
+    if content is not None:
+        updates.append(f"content = ${param_idx}")
+        values.append(json.dumps(content))
+        param_idx += 1
+
+    if prologue is not None:
+        updates.append(f"prologue = ${param_idx}")
+        values.append(prologue)
+        param_idx += 1
+
+    if image_url is not None:
+        updates.append(f"image_url = ${param_idx}")
+        values.append(image_url)
+        param_idx += 1
+
+    if image_thumbnail_url is not None:
+        updates.append(f"image_thumbnail_url = ${param_idx}")
+        values.append(image_thumbnail_url)
+        param_idx += 1
+
+    if is_paid is not None:
+        updates.append(f"is_paid = ${param_idx}")
+        values.append(is_paid)
+        param_idx += 1
+
+    if not updates:
+        return await get_report(report_id)
+
+    updates.append("updated_at = NOW()")
+    values.append(report_id)
+
+    query = f"""
+        UPDATE reports
+        SET {', '.join(updates)}
+        WHERE id = ${param_idx}
+        RETURNING *
+    """
+
+    async with get_connection() as conn:
+        row = await conn.fetchrow(query, *values)
+        return _row_to_dict(row) if row else None
+
+
+async def update_report_status(
+    report_id: UUID,
+    is_paid: bool,
+    report_type: Optional[str] = None,
+) -> Optional[dict]:
+    """Update report payment status and optionally upgrade type"""
+    async with get_connection() as conn:
+        if report_type:
+            row = await conn.fetchrow(
+                """
+                UPDATE reports
+                SET is_paid = $2, report_type = $3, updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                """,
+                report_id, is_paid, report_type
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE reports
+                SET is_paid = $2, updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                """,
+                report_id, is_paid
+            )
+        return _row_to_dict(row) if row else None
+
+
+async def list_user_reports(
+    user_id: UUID,
+    skill: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> List[dict]:
+    """List reports for a user"""
+    async with get_connection() as conn:
+        if skill:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, skill, report_type, is_paid,
+                       image_thumbnail_url, created_at, updated_at
+                FROM reports
+                WHERE user_id = $1 AND skill = $2
+                ORDER BY created_at DESC
+                LIMIT $3 OFFSET $4
+                """,
+                user_id, skill, limit, offset
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, skill, report_type, is_paid,
+                       image_thumbnail_url, created_at, updated_at
+                FROM reports
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3
+                """,
+                user_id, limit, offset
+            )
+        return [_row_to_summary(row) for row in rows]
+
+
+async def count_user_reports(user_id: UUID, skill: Optional[str] = None) -> int:
+    """Count reports for a user"""
+    async with get_connection() as conn:
+        if skill:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM reports WHERE user_id = $1 AND skill = $2",
+                user_id, skill
+            )
+        else:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM reports WHERE user_id = $1",
+                user_id
+            )
+
+
+async def delete_report(report_id: UUID, user_id: UUID) -> bool:
+    """Delete a report (user must own it)"""
+    async with get_connection() as conn:
+        result = await conn.execute(
+            "DELETE FROM reports WHERE id = $1 AND user_id = $2",
+            report_id, user_id
+        )
+        return result == "DELETE 1"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _row_to_dict(row) -> dict:
+    """Convert database row to dictionary with proper JSON parsing"""
+    if not row:
+        return None
+
+    result = dict(row)
+
+    # Parse JSON fields
+    if result.get("content"):
+        if isinstance(result["content"], str):
+            result["content"] = json.loads(result["content"])
+
+    if result.get("interview_data"):
+        if isinstance(result["interview_data"], str):
+            result["interview_data"] = json.loads(result["interview_data"])
+
+    if result.get("generation_metadata"):
+        if isinstance(result["generation_metadata"], str):
+            result["generation_metadata"] = json.loads(result["generation_metadata"])
+
+    # Convert UUID to string for JSON serialization
+    if result.get("id"):
+        result["id"] = str(result["id"])
+    if result.get("user_id"):
+        result["user_id"] = str(result["user_id"])
+
+    # Convert datetime to ISO string
+    if result.get("created_at"):
+        result["created_at"] = result["created_at"].isoformat()
+    if result.get("updated_at"):
+        result["updated_at"] = result["updated_at"].isoformat()
+
+    return result
+
+
+def _row_to_summary(row) -> dict:
+    """Convert database row to summary dictionary (for list views)"""
+    if not row:
+        return None
+
+    result = dict(row)
+
+    # Convert UUID to string
+    if result.get("id"):
+        result["id"] = str(result["id"])
+    if result.get("user_id"):
+        result["user_id"] = str(result["user_id"])
+
+    # Convert datetime to ISO string
+    if result.get("created_at"):
+        result["created_at"] = result["created_at"].isoformat()
+    if result.get("updated_at"):
+        result["updated_at"] = result["updated_at"].isoformat()
+
+    # Add computed fields for frontend
+    result["status"] = "completed"  # All persisted reports are completed
+    result["title"] = f"{'八字' if result.get('skill') == 'bazi' else '星座'}分析报告"
+
+    return result

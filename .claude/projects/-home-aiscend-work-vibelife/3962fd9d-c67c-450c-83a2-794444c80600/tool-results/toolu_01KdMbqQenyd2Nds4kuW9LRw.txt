@@ -1,0 +1,852 @@
+     1→# 订阅系统设计
+     2→
+     3→## 概述
+     4→
+     5→将现有的一次性购买模式升级为 L0-L3 四层订阅模型，实现"关系订阅"而非"功能订阅"。
+     6→
+     7→---
+     8→
+     9→## 1. 订阅层级设计
+    10→
+    11→### 1.1 层级定义
+    12→
+    13→| 层级 | 名称 | 价格 | 定位 |
+    14→|------|------|------|------|
+    15→| L0 | Free | ¥0 | 体验层 - 让用户感受价值 |
+    16→| L1 | The Letter | ¥29 一次性 | 入门层 - 获得完整报告 |
+    17→| L2 | The Companion | ¥39/月 | 陪伴层 - 日常陪伴 |
+    18→| L3 | The Sanctuary | ¥299/年 | 深度层 - 全方位支持 |
+    19→
+    20→### 1.2 权益对比
+    21→
+    22→| 功能 | L0 | L1 | L2 | L3 |
+    23→|------|----|----|----|----|
+    24→| 完整信件 | ✅ | ✅ | ✅ | ✅ |
+    25→| PDF 报告 | ❌ | ✅ | ✅ | ✅ |
+    26→| Identity Prism | ❌ | ✅ | ✅ | ✅ |
+    27→| 每日对话次数 | 3次 | 10次 | 无限 | 无限 |
+    28→| 每日仪式 | ❌ | ❌ | ✅ | ✅ |
+    29→| 周运势 | ❌ | ❌ | ✅ | ✅ |
+    30→| 关系分析 | ❌ | ❌ | 1次/月 | 无限 |
+    31→| 季度报告 | ❌ | ❌ | ❌ | ✅ |
+    32→| 年度回顾 | ❌ | ❌ | ❌ | ✅ |
+    33→| 维度数量 | 1 | 2 | 4 | 全部 |
+    34→
+    35→---
+    36→
+    37→## 2. 数据模型
+    38→
+    39→### 2.1 订阅计划表
+    40→
+    41→```sql
+    42→-- 更新 subscription_plans 表
+    43→CREATE TABLE subscription_plans (
+    44→    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    45→    name VARCHAR(50) NOT NULL,
+    46→    tier VARCHAR(10) NOT NULL,  -- L0, L1, L2, L3
+    47→    plan_type VARCHAR(20) NOT NULL,  -- free, one_time, monthly, yearly
+    48→
+    49→    -- 价格
+    50→    price DECIMAL(10, 2) NOT NULL,
+    51→    currency VARCHAR(3) DEFAULT 'CNY',
+    52→    stripe_price_id VARCHAR(100),
+    53→
+    54→    -- 权益配置
+    55→    features JSONB NOT NULL,
+    56→    -- {
+    57→    --   "daily_conversations": 3,
+    58→    --   "dimensions": ["bazi"],
+    59→    --   "rituals": false,
+    60→    --   "relationship_analyses": 0,
+    61→    --   "pdf_report": false,
+    62→    --   "identity_prism": false
+    63→    -- }
+    64→
+    65→    -- 状态
+    66→    is_active BOOLEAN DEFAULT true,
+    67→    display_order INTEGER DEFAULT 0,
+    68→
+    69→    created_at TIMESTAMP DEFAULT NOW(),
+    70→    updated_at TIMESTAMP DEFAULT NOW()
+    71→);
+    72→
+    73→-- 初始化计划数据
+    74→INSERT INTO subscription_plans (name, tier, plan_type, price, features) VALUES
+    75→('免费体验', 'L0', 'free', 0, '{
+    76→    "daily_conversations": 3,
+    77→    "dimensions": ["bazi"],
+    78→    "rituals": false,
+    79→    "relationship_analyses": 0,
+    80→    "pdf_report": false,
+    81→    "identity_prism": false,
+    82→    "weekly_fortune": false
+    83→}'),
+    84→('The Letter', 'L1', 'one_time', 29, '{
+    85→    "daily_conversations": 10,
+    86→    "dimensions": ["bazi", "zodiac"],
+    87→    "rituals": false,
+    88→    "relationship_analyses": 0,
+    89→    "pdf_report": true,
+    90→    "identity_prism": true,
+    91→    "weekly_fortune": false
+    92→}'),
+    93→('The Companion', 'L2', 'monthly', 39, '{
+    94→    "daily_conversations": -1,
+    95→    "dimensions": ["bazi", "zodiac", "mbti", "tarot"],
+    96→    "rituals": true,
+    97→    "relationship_analyses": 1,
+    98→    "pdf_report": true,
+    99→    "identity_prism": true,
+   100→    "weekly_fortune": true
+   101→}'),
+   102→('The Sanctuary', 'L3', 'yearly', 299, '{
+   103→    "daily_conversations": -1,
+   104→    "dimensions": "all",
+   105→    "rituals": true,
+   106→    "relationship_analyses": -1,
+   107→    "pdf_report": true,
+   108→    "identity_prism": true,
+   109→    "weekly_fortune": true,
+   110→    "quarterly_report": true,
+   111→    "annual_review": true
+   112→}');
+   113→```
+   114→
+   115→### 2.2 用户权益表
+   116→
+   117→```sql
+   118→-- 用户当前权益 (实时计算)
+   119→CREATE TABLE user_entitlements (
+   120→    user_id UUID PRIMARY KEY REFERENCES vibe_users(vibe_id),
+   121→
+   122→    -- 当前层级
+   123→    current_tier VARCHAR(10) DEFAULT 'L0',
+   124→    subscription_id UUID REFERENCES subscriptions(id),
+   125→
+   126→    -- 使用量追踪
+   127→    daily_conversations_used INTEGER DEFAULT 0,
+   128→    daily_conversations_reset_at DATE DEFAULT CURRENT_DATE,
+   129→    monthly_relationship_analyses_used INTEGER DEFAULT 0,
+   130→    monthly_reset_at DATE DEFAULT DATE_TRUNC('month', CURRENT_DATE),
+   131→
+   132→    -- 解锁的维度
+   133→    unlocked_dimensions TEXT[] DEFAULT ARRAY['bazi'],
+   134→
+   135→    -- 特殊权益
+   136→    has_pdf_report BOOLEAN DEFAULT false,
+   137→    has_identity_prism BOOLEAN DEFAULT false,
+   138→    has_rituals BOOLEAN DEFAULT false,
+   139→
+   140→    -- 有效期
+   141→    tier_expires_at TIMESTAMP,
+   142→
+   143→    updated_at TIMESTAMP DEFAULT NOW()
+   144→);
+   145→
+   146→-- 每日重置触发器
+   147→CREATE OR REPLACE FUNCTION reset_daily_usage()
+   148→RETURNS TRIGGER AS $$
+   149→BEGIN
+   150→    IF NEW.daily_conversations_reset_at < CURRENT_DATE THEN
+   151→        NEW.daily_conversations_used := 0;
+   152→        NEW.daily_conversations_reset_at := CURRENT_DATE;
+   153→    END IF;
+   154→    RETURN NEW;
+   155→END;
+   156→$$ LANGUAGE plpgsql;
+   157→
+   158→CREATE TRIGGER trigger_reset_daily_usage
+   159→    BEFORE UPDATE ON user_entitlements
+   160→    FOR EACH ROW
+   161→    EXECUTE FUNCTION reset_daily_usage();
+   162→```
+   163→
+   164→### 2.3 订阅记录表
+   165→
+   166→```sql
+   167→-- 升级现有 subscriptions 表
+   168→ALTER TABLE subscriptions ADD COLUMN tier VARCHAR(10);
+   169→ALTER TABLE subscriptions ADD COLUMN auto_renew BOOLEAN DEFAULT true;
+   170→ALTER TABLE subscriptions ADD COLUMN cancelled_at TIMESTAMP;
+   171→ALTER TABLE subscriptions ADD COLUMN cancel_reason TEXT;
+   172→
+   173→-- 订阅历史表 (用于分析)
+   174→CREATE TABLE subscription_history (
+   175→    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+   176→    user_id UUID NOT NULL REFERENCES vibe_users(vibe_id),
+   177→
+   178→    event_type VARCHAR(20) NOT NULL,
+   179→    -- subscribe, upgrade, downgrade, cancel, renew, expire
+   180→
+   181→    from_tier VARCHAR(10),
+   182→    to_tier VARCHAR(10),
+   183→
+   184→    -- 关联数据
+   185→    subscription_id UUID,
+   186→    payment_id UUID,
+   187→
+   188→    -- 元数据
+   189→    metadata JSONB,
+   190→
+   191→    created_at TIMESTAMP DEFAULT NOW()
+   192→);
+   193→
+   194→CREATE INDEX idx_sub_history_user ON subscription_history(user_id);
+   195→CREATE INDEX idx_sub_history_event ON subscription_history(event_type);
+   196→```
+   197→
+   198→---
+   199→
+   200→## 3. 后端服务
+   201→
+   202→### 3.1 权益服务
+   203→
+   204→```python
+   205→# services/entitlement/service.py
+   206→
+   207→class EntitlementService:
+   208→    """用户权益服务"""
+   209→
+   210→    async def get_entitlements(self, user_id: str) -> UserEntitlements:
+   211→        """获取用户当前权益"""
+   212→
+   213→        entitlements = await self.entitlement_repo.get(user_id)
+   214→
+   215→        if not entitlements:
+   216→            # 新用户，创建默认权益
+   217→            entitlements = await self._create_default_entitlements(user_id)
+   218→
+   219→        # 检查是否需要重置每日使用量
+   220→        entitlements = await self._check_and_reset_usage(entitlements)
+   221→
+   222→        return entitlements
+   223→
+   224→    async def check_can_chat(self, user_id: str) -> tuple[bool, str]:
+   225→        """检查用户是否可以对话"""
+   226→
+   227→        entitlements = await self.get_entitlements(user_id)
+   228→
+   229→        # 无限对话
+   230→        if entitlements.current_tier in ['L2', 'L3']:
+   231→            return True, ""
+   232→
+   233→        # 检查每日限额
+   234→        plan = await self._get_plan(entitlements.current_tier)
+   235→        daily_limit = plan.features.get('daily_conversations', 3)
+   236→
+   237→        if entitlements.daily_conversations_used >= daily_limit:
+   238→            return False, f"今日对话次数已用完 ({daily_limit}次)，升级解锁无限对话"
+   239→
+   240→        return True, ""
+   241→
+   242→    async def consume_conversation(self, user_id: str):
+   243→        """消耗一次对话次数"""
+   244→
+   245→        entitlements = await self.get_entitlements(user_id)
+   246→
+   247→        if entitlements.current_tier not in ['L2', 'L3']:
+   248→            await self.entitlement_repo.increment_daily_conversations(user_id)
+   249→
+   250→    async def check_can_use_dimension(self, user_id: str, dimension: str) -> bool:
+   251→        """检查用户是否可以使用某个维度"""
+   252→
+   253→        entitlements = await self.get_entitlements(user_id)
+   254→
+   255→        if entitlements.current_tier == 'L3':
+   256→            return True  # L3 解锁所有维度
+   257→
+   258→        return dimension in entitlements.unlocked_dimensions
+   259→
+   260→    async def upgrade_tier(self, user_id: str, new_tier: str, subscription_id: str):
+   261→        """升级用户层级"""
+   262→
+   263→        old_entitlements = await self.get_entitlements(user_id)
+   264→        plan = await self._get_plan(new_tier)
+   265→
+   266→        # 更新权益
+   267→        await self.entitlement_repo.update(user_id, {
+   268→            'current_tier': new_tier,
+   269→            'subscription_id': subscription_id,
+   270→            'unlocked_dimensions': plan.features.get('dimensions', ['bazi']),
+   271→            'has_pdf_report': plan.features.get('pdf_report', False),
+   272→            'has_identity_prism': plan.features.get('identity_prism', False),
+   273→            'has_rituals': plan.features.get('rituals', False),
+   274→            'tier_expires_at': self._calculate_expiry(plan)
+   275→        })
+   276→
+   277→        # 记录历史
+   278→        await self._record_history(user_id, 'upgrade', old_entitlements.current_tier, new_tier)
+   279→
+   280→        # 触发升级事件
+   281→        await self.event_bus.publish('tier_upgraded', {
+   282→            'user_id': user_id,
+   283→            'from_tier': old_entitlements.current_tier,
+   284→            'to_tier': new_tier
+   285→        })
+   286→```
+   287→
+   288→### 3.2 订阅服务
+   289→
+   290→```python
+   291→# services/subscription/service.py
+   292→
+   293→class SubscriptionService:
+   294→    """订阅服务"""
+   295→
+   296→    async def create_subscription(
+   297→        self,
+   298→        user_id: str,
+   299→        plan_id: str,
+   300→        payment_method: str
+   301→    ) -> Subscription:
+   302→        """创建订阅"""
+   303→
+   304→        plan = await self.plan_repo.get(plan_id)
+   305→
+   306→        # 创建 Stripe 订阅 (如果是周期性订阅)
+   307→        if plan.plan_type in ['monthly', 'yearly']:
+   308→            stripe_sub = await self._create_stripe_subscription(
+   309→                user_id, plan, payment_method
+   310→            )
+   311→            stripe_subscription_id = stripe_sub.id
+   312→        else:
+   313→            stripe_subscription_id = None
+   314→
+   315→        # 创建本地订阅记录
+   316→        subscription = await self.subscription_repo.create({
+   317→            'user_id': user_id,
+   318→            'plan_id': plan_id,
+   319→            'tier': plan.tier,
+   320→            'status': 'active',
+   321→            'stripe_subscription_id': stripe_subscription_id,
+   322→            'current_period_start': datetime.utcnow(),
+   323→            'current_period_end': self._calculate_period_end(plan),
+   324→            'auto_renew': plan.plan_type != 'one_time'
+   325→        })
+   326→
+   327→        # 更新用户权益
+   328→        await self.entitlement_service.upgrade_tier(
+   329→            user_id, plan.tier, subscription.id
+   330→        )
+   331→
+   332→        return subscription
+   333→
+   334→    async def cancel_subscription(self, user_id: str, reason: str = None):
+   335→        """取消订阅"""
+   336→
+   337→        subscription = await self.subscription_repo.get_active(user_id)
+   338→
+   339→        if not subscription:
+   340→            raise ValueError("No active subscription")
+   341→
+   342→        # 取消 Stripe 订阅
+   343→        if subscription.stripe_subscription_id:
+   344→            await self._cancel_stripe_subscription(subscription.stripe_subscription_id)
+   345→
+   346→        # 更新本地记录
+   347→        await self.subscription_repo.update(subscription.id, {
+   348→            'status': 'cancelled',
+   349→            'cancelled_at': datetime.utcnow(),
+   350→            'cancel_reason': reason,
+   351→            'auto_renew': False
+   352→        })
+   353→
+   354→        # 记录历史
+   355→        await self._record_history(user_id, 'cancel', subscription.tier, None)
+   356→
+   357→    async def handle_webhook(self, event: dict):
+   358→        """处理 Stripe Webhook"""
+   359→
+   360→        event_type = event['type']
+   361→
+   362→        if event_type == 'invoice.paid':
+   363→            await self._handle_invoice_paid(event['data']['object'])
+   364→
+   365→        elif event_type == 'invoice.payment_failed':
+   366→            await self._handle_payment_failed(event['data']['object'])
+   367→
+   368→        elif event_type == 'customer.subscription.deleted':
+   369→            await self._handle_subscription_deleted(event['data']['object'])
+   370→
+   371→    async def _handle_invoice_paid(self, invoice: dict):
+   372→        """处理发票支付成功"""
+   373→
+   374→        subscription_id = invoice['subscription']
+   375→        subscription = await self.subscription_repo.get_by_stripe_id(subscription_id)
+   376→
+   377→        if subscription:
+   378→            # 更新订阅周期
+   379→            await self.subscription_repo.update(subscription.id, {
+   380→                'current_period_start': datetime.fromtimestamp(invoice['period_start']),
+   381→                'current_period_end': datetime.fromtimestamp(invoice['period_end']),
+   382→                'status': 'active'
+   383→            })
+   384→
+   385→            # 记录续费
+   386→            await self._record_history(subscription.user_id, 'renew', subscription.tier, subscription.tier)
+   387→```
+   388→
+   389→### 3.3 支付服务
+   390→
+   391→```python
+   392→# services/payment/service.py
+   393→
+   394→class PaymentService:
+   395→    """支付服务"""
+   396→
+   397→    async def create_checkout_session(
+   398→        self,
+   399→        user_id: str,
+   400→        plan_id: str,
+   401→        success_url: str,
+   402→        cancel_url: str
+   403→    ) -> str:
+   404→        """创建 Stripe Checkout Session"""
+   405→
+   406→        plan = await self.plan_repo.get(plan_id)
+   407→        user = await self.user_repo.get(user_id)
+   408→
+   409→        # 获取或创建 Stripe Customer
+   410→        customer_id = await self._get_or_create_customer(user)
+   411→
+   412→        # 创建 Checkout Session
+   413→        session = stripe.checkout.Session.create(
+   414→            customer=customer_id,
+   415→            payment_method_types=['card', 'alipay', 'wechat_pay'],
+   416→            line_items=[{
+   417→                'price': plan.stripe_price_id,
+   418→                'quantity': 1
+   419→            }],
+   420→            mode='subscription' if plan.plan_type in ['monthly', 'yearly'] else 'payment',
+   421→            success_url=success_url,
+   422→            cancel_url=cancel_url,
+   423→            metadata={
+   424→                'user_id': user_id,
+   425→                'plan_id': plan_id
+   426→            }
+   427→        )
+   428→
+   429→        return session.url
+   430→
+   431→    async def create_one_time_payment(
+   432→        self,
+   433→        user_id: str,
+   434→        plan_id: str
+   435→    ) -> dict:
+   436→        """创建一次性支付"""
+   437→
+   438→        plan = await self.plan_repo.get(plan_id)
+   439→
+   440→        # 创建支付意图
+   441→        intent = stripe.PaymentIntent.create(
+   442→            amount=int(plan.price * 100),
+   443→            currency=plan.currency.lower(),
+   444→            metadata={
+   445→                'user_id': user_id,
+   446→                'plan_id': plan_id
+   447→            }
+   448→        )
+   449→
+   450→        return {
+   451→            'client_secret': intent.client_secret,
+   452→            'payment_intent_id': intent.id
+   453→        }
+   454→```
+   455→
+   456→---
+   457→
+   458→## 4. API 路由
+   459→
+   460→### 4.1 订阅路由
+   461→
+   462→```python
+   463→# routes/subscription.py
+   464→
+   465→@router.get("/plans")
+   466→async def get_plans():
+   467→    """获取所有订阅计划"""
+   468→    plans = await plan_service.get_active_plans()
+   469→    return {"plans": plans}
+   470→
+   471→@router.get("/current")
+   472→async def get_current_subscription(user: VibeUser = Depends(get_current_user)):
+   473→    """获取当前订阅状态"""
+   474→    subscription = await subscription_service.get_active(user.vibe_id)
+   475→    entitlements = await entitlement_service.get_entitlements(user.vibe_id)
+   476→
+   477→    return {
+   478→        "subscription": subscription,
+   479→        "entitlements": entitlements
+   480→    }
+   481→
+   482→@router.post("/checkout")
+   483→async def create_checkout(
+   484→    request: CheckoutRequest,
+   485→    user: VibeUser = Depends(get_current_user)
+   486→):
+   487→    """创建结账会话"""
+   488→    checkout_url = await payment_service.create_checkout_session(
+   489→        user_id=user.vibe_id,
+   490→        plan_id=request.plan_id,
+   491→        success_url=request.success_url,
+   492→        cancel_url=request.cancel_url
+   493→    )
+   494→    return {"checkout_url": checkout_url}
+   495→
+   496→@router.post("/cancel")
+   497→async def cancel_subscription(
+   498→    request: CancelRequest,
+   499→    user: VibeUser = Depends(get_current_user)
+   500→):
+   501→    """取消订阅"""
+   502→    await subscription_service.cancel_subscription(
+   503→        user.vibe_id,
+   504→        reason=request.reason
+   505→    )
+   506→    return {"status": "cancelled"}
+   507→
+   508→@router.post("/webhook")
+   509→async def stripe_webhook(request: Request):
+   510→    """Stripe Webhook"""
+   511→    payload = await request.body()
+   512→    sig_header = request.headers.get('stripe-signature')
+   513→
+   514→    try:
+   515→        event = stripe.Webhook.construct_event(
+   516→            payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
+   517→        )
+   518→    except ValueError:
+   519→        raise HTTPException(400, "Invalid payload")
+   520→    except stripe.error.SignatureVerificationError:
+   521→        raise HTTPException(400, "Invalid signature")
+   522→
+   523→    await subscription_service.handle_webhook(event)
+   524→    return {"received": True}
+   525→```
+   526→
+   527→### 4.2 权益检查中间件
+   528→
+   529→```python
+   530→# middleware/entitlement.py
+   531→
+   532→class EntitlementMiddleware:
+   533→    """权益检查中间件"""
+   534→
+   535→    async def check_chat_entitlement(
+   536→        self,
+   537→        user: VibeUser = Depends(get_current_user)
+   538→    ):
+   539→        """检查对话权益"""
+   540→        can_chat, message = await entitlement_service.check_can_chat(user.vibe_id)
+   541→
+   542→        if not can_chat:
+   543→            raise HTTPException(
+   544→                status_code=402,
+   545→                detail={
+   546→                    "error": "conversation_limit_reached",
+   547→                    "message": message,
+   548→                    "upgrade_url": "/subscription/plans"
+   549→                }
+   550→            )
+   551→
+   552→        return user
+   553→
+   554→    async def check_dimension_entitlement(
+   555→        self,
+   556→        dimension: str,
+   557→        user: VibeUser = Depends(get_current_user)
+   558→    ):
+   559→        """检查维度权益"""
+   560→        can_use = await entitlement_service.check_can_use_dimension(
+   561→            user.vibe_id, dimension
+   562→        )
+   563→
+   564→        if not can_use:
+   565→            raise HTTPException(
+   566→                status_code=402,
+   567→                detail={
+   568→                    "error": "dimension_locked",
+   569→                    "message": f"升级解锁 {dimension} 维度",
+   570→                    "upgrade_url": "/subscription/plans"
+   571→                }
+   572→            )
+   573→
+   574→        return user
+   575→```
+   576→
+   577→---
+   578→
+   579→## 5. 前端组件
+   580→
+   581→### 5.1 订阅页面
+   582→
+   583→```tsx
+   584→// app/subscription/page.tsx
+   585→
+   586→export default function SubscriptionPage() {
+   587→  const { plans } = usePlans()
+   588→  const { subscription, entitlements } = useSubscription()
+   589→
+   590→  return (
+   591→    <div className="min-h-screen bg-slate-900 p-4">
+   592→      <header className="mb-8 text-center">
+   593→        <h1 className="text-2xl font-bold text-white">选择你的旅程</h1>
+   594→        <p className="text-slate-400 mt-2">
+   595→          不是购买功能，而是开启一段关系
+   596→        </p>
+   597→      </header>
+   598→
+   599→      {/* 当前状态 */}
+   600→      {subscription && (
+   601→        <CurrentSubscriptionCard
+   602→          subscription={subscription}
+   603→          entitlements={entitlements}
+   604→        />
+   605→      )}
+   606→
+   607→      {/* 计划列表 */}
+   608→      <div className="space-y-4 mt-6">
+   609→        {plans.map((plan) => (
+   610→          <PlanCard
+   611→            key={plan.id}
+   612→            plan={plan}
+   613→            isCurrentPlan={subscription?.tier === plan.tier}
+   614→            onSelect={() => handleSelectPlan(plan)}
+   615→          />
+   616→        ))}
+   617→      </div>
+   618→
+   619→      {/* FAQ */}
+   620→      <SubscriptionFAQ />
+   621→    </div>
+   622→  )
+   623→}
+   624→```
+   625→
+   626→### 5.2 计划卡片
+   627→
+   628→```tsx
+   629→// components/subscription/PlanCard.tsx
+   630→
+   631→interface PlanCardProps {
+   632→  plan: SubscriptionPlan
+   633→  isCurrentPlan: boolean
+   634→  onSelect: () => void
+   635→}
+   636→
+   637→export function PlanCard({ plan, isCurrentPlan, onSelect }: PlanCardProps) {
+   638→  const tierColors = {
+   639→    L0: 'from-slate-600 to-slate-700',
+   640→    L1: 'from-blue-600 to-blue-700',
+   641→    L2: 'from-purple-600 to-purple-700',
+   642→    L3: 'from-amber-600 to-amber-700'
+   643→  }
+   644→
+   645→  return (
+   646→    <motion.div
+   647→      className={`rounded-2xl p-6 bg-gradient-to-br ${tierColors[plan.tier]}`}
+   648→      whileHover={{ scale: 1.02 }}
+   649→    >
+   650→      <div className="flex justify-between items-start">
+   651→        <div>
+   652→          <span className="text-white/60 text-sm">{plan.tier}</span>
+   653→          <h3 className="text-xl font-bold text-white">{plan.name}</h3>
+   654→        </div>
+   655→        <div className="text-right">
+   656→          <span className="text-2xl font-bold text-white">¥{plan.price}</span>
+   657→          {plan.plan_type === 'monthly' && (
+   658→            <span className="text-white/60 text-sm">/月</span>
+   659→          )}
+   660→          {plan.plan_type === 'yearly' && (
+   661→            <span className="text-white/60 text-sm">/年</span>
+   662→          )}
+   663→        </div>
+   664→      </div>
+   665→
+   666→      {/* 权益列表 */}
+   667→      <ul className="mt-4 space-y-2">
+   668→        {Object.entries(FEATURE_LABELS).map(([key, label]) => {
+   669→          const hasFeature = plan.features[key]
+   670→          return (
+   671→            <li
+   672→              key={key}
+   673→              className={`flex items-center gap-2 text-sm ${
+   674→                hasFeature ? 'text-white' : 'text-white/40'
+   675→              }`}
+   676→            >
+   677→              {hasFeature ? (
+   678→                <CheckIcon className="h-4 w-4" />
+   679→              ) : (
+   680→                <XIcon className="h-4 w-4" />
+   681→              )}
+   682→              {label}
+   683→            </li>
+   684→          )
+   685→        })}
+   686→      </ul>
+   687→
+   688→      {/* 操作按钮 */}
+   689→      <button
+   690→        onClick={onSelect}
+   691→        disabled={isCurrentPlan}
+   692→        className={`w-full mt-6 py-3 rounded-lg font-medium ${
+   693→          isCurrentPlan
+   694→            ? 'bg-white/20 text-white/60 cursor-not-allowed'
+   695→            : 'bg-white text-slate-900 hover:bg-white/90'
+   696→        }`}
+   697→      >
+   698→        {isCurrentPlan ? '当前计划' : '选择此计划'}
+   699→      </button>
+   700→    </motion.div>
+   701→  )
+   702→}
+   703→```
+   704→
+   705→### 5.3 升级提示组件
+   706→
+   707→```tsx
+   708→// components/subscription/UpgradePrompt.tsx
+   709→
+   710→interface UpgradePromptProps {
+   711→  feature: string
+   712→  currentTier: string
+   713→  requiredTier: string
+   714→}
+   715→
+   716→export function UpgradePrompt({
+   717→  feature,
+   718→  currentTier,
+   719→  requiredTier
+   720→}: UpgradePromptProps) {
+   721→  const router = useRouter()
+   722→
+   723→  return (
+   724→    <motion.div
+   725→      className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50"
+   726→      initial={{ opacity: 0 }}
+   727→      animate={{ opacity: 1 }}
+   728→    >
+   729→      <motion.div
+   730→        className="bg-slate-800 rounded-2xl p-6 max-w-sm w-full"
+   731→        initial={{ scale: 0.9 }}
+   732→        animate={{ scale: 1 }}
+   733→      >
+   734→        <div className="text-center">
+   735→          <LockIcon className="h-12 w-12 text-amber-500 mx-auto" />
+   736→          <h3 className="text-xl font-bold text-white mt-4">
+   737→            解锁 {feature}
+   738→          </h3>
+   739→          <p className="text-slate-400 mt-2">
+   740→            升级到 {requiredTier} 即可使用此功能
+   741→          </p>
+   742→        </div>
+   743→
+   744→        <div className="mt-6 space-y-3">
+   745→          <button
+   746→            onClick={() => router.push('/subscription')}
+   747→            className="w-full py-3 bg-indigo-600 text-white rounded-lg font-medium"
+   748→          >
+   749→            查看升级选项
+   750→          </button>
+   751→          <button
+   752→            onClick={() => router.back()}
+   753→            className="w-full py-3 text-slate-400"
+   754→          >
+   755→            稍后再说
+   756→          </button>
+   757→        </div>
+   758→      </motion.div>
+   759→    </motion.div>
+   760→  )
+   761→}
+   762→```
+   763→
+   764→---
+   765→
+   766→## 6. 转化优化
+   767→
+   768→### 6.1 付费时机设计
+   769→
+   770→```
+   771→用户旅程中的付费触发点:
+   772→
+   773→1. 完整信件阅读后 (L0 → L1)
+   774→   - 展示 PDF 报告预览
+   775→   - "保存你的完整分析"
+   776→
+   777→2. 第3次对话后 (L0 → L1/L2)
+   778→   - 展示对话次数限制
+   779→   - "继续深入了解自己"
+   780→
+   781→3. 尝试使用高级维度 (L0/L1 → L2)
+   782→   - 展示维度锁定
+   783→   - "解锁更多维度"
+   784→
+   785→4. 连续活跃3天后 (L1 → L2)
+   786→   - 展示每日仪式预览
+   787→   - "让我每天陪伴你"
+   788→
+   789→5. 关系分析需求 (L1/L2 → L2/L3)
+   790→   - 展示关系分析功能
+   791→   - "了解你们的关系"
+   792→```
+   793→
+   794→### 6.2 转化追踪
+   795→
+   796→```python
+   797→# services/analytics/conversion.py
+   798→
+   799→class ConversionTracker:
+   800→    """转化追踪服务"""
+   801→
+   802→    async def track_event(self, user_id: str, event: str, metadata: dict = None):
+   803→        """追踪转化事件"""
+   804→
+   805→        await self.event_repo.create({
+   806→            'user_id': user_id,
+   807→            'event_type': event,
+   808→            'metadata': metadata,
+   809→            'timestamp': datetime.utcnow()
+   810→        })
+   811→
+   812→    async def get_conversion_funnel(self, start_date: date, end_date: date) -> dict:
+   813→        """获取转化漏斗数据"""
+   814→
+   815→        return {
+   816→            'signup': await self._count_events('signup', start_date, end_date),
+   817→            'first_chat': await self._count_events('first_chat', start_date, end_date),
+   818→            'letter_read': await self._count_events('letter_read', start_date, end_date),
+   819→            'l1_purchase': await self._count_events('l1_purchase', start_date, end_date),
+   820→            'l2_subscribe': await self._count_events('l2_subscribe', start_date, end_date),
+   821→            'l3_subscribe': await self._count_events('l3_subscribe', start_date, end_date)
+   822→        }
+   823→```
+   824→
+   825→---
+   826→
+   827→## 7. 实施检查清单
+   828→
+   829→- [ ] 更新 subscription_plans 表结构
+   830→- [ ] 创建 user_entitlements 表
+   831→- [ ] 创建 subscription_history 表
+   832→- [ ] 实现 EntitlementService
+   833→- [ ] 实现 SubscriptionService
+   834→- [ ] 实现 PaymentService
+   835→- [ ] 配置 Stripe 产品和价格
+   836→- [ ] 实现订阅 API 路由
+   837→- [ ] 实现权益检查中间件
+   838→- [ ] 创建订阅页面
+   839→- [ ] 实现 PlanCard 组件
+   840→- [ ] 实现 UpgradePrompt ���件
+   841→- [ ] 配置 Stripe Webhook
+   842→- [ ] 实现转化追踪
+   843→- [ ] 测试完整订阅流程
+   844→
+   845→---
+   846→
+   847→*下一步: [06-推送与仪式系统](./06-推送与仪式系统.md)*
+   848→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

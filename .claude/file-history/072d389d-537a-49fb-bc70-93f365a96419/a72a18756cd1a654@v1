@@ -1,0 +1,438 @@
+"""
+ProactiveOrchestrator - Main Proactive Push Orchestrator
+
+Responsibilities:
+1. Load Skill-level reminders.yaml configurations
+2. Schedule trigger evaluation (static-first + LLM fallback)
+3. Call CoreAgent for content generation
+4. Deliver notifications
+
+Platform-level hard constraints:
+- Quiet hours checking
+- Daily push limit
+- Idempotent deduplication (bucket_key based)
+- Cooldown time checking
+"""
+
+from typing import Dict, List, Optional, Any
+from uuid import UUID
+from datetime import datetime, timedelta
+import logging
+import yaml
+from pathlib import Path
+
+import pytz
+
+from .trigger_evaluator import TriggerEvaluator
+from .models import ReminderContent
+
+logger = logging.getLogger(__name__)
+
+
+class ProactiveOrchestrator:
+    """Main proactive push orchestrator"""
+
+    # Default configuration values
+    DEFAULT_MAX_DAILY_PUSHES = 5
+    DEFAULT_QUIET_START = 22
+    DEFAULT_QUIET_END = 7
+    IDEMPOTENT_TTL_HOURS = 48
+
+    def __init__(
+        self,
+        trigger_evaluator: TriggerEvaluator,
+        agent_adapter: Any,  # ProactiveAgentAdapter
+        notification_service: Any,  # NotificationService
+    ):
+        """
+        Initialize orchestrator.
+
+        Args:
+            trigger_evaluator: TriggerEvaluator instance for trigger detection
+            agent_adapter: ProactiveAgentAdapter instance for content generation
+            notification_service: NotificationService for saving/sending notifications
+        """
+        self.trigger_evaluator = trigger_evaluator
+        self.agent_adapter = agent_adapter
+        self.notification_service = notification_service
+        self._skill_configs: Dict[str, Dict] = {}
+        self._idempotent_cache: Dict[str, datetime] = {}  # Idempotent cache
+        self._load_skill_configs()
+
+    def _load_skill_configs(self):
+        """Load all Skill reminders.yaml configurations"""
+        skills_dir = Path(__file__).parent.parent.parent / "skills"
+
+        if not skills_dir.exists():
+            logger.warning(f"Skills directory not found: {skills_dir}")
+            return
+
+        for skill_dir in skills_dir.iterdir():
+            if skill_dir.is_dir():
+                reminders_file = skill_dir / "reminders.yaml"
+                if reminders_file.exists():
+                    try:
+                        with open(reminders_file, encoding="utf-8") as f:
+                            config = yaml.safe_load(f)
+                            if config and "skill_id" in config:
+                                self._skill_configs[config["skill_id"]] = config
+                                logger.info(f"Loaded reminders config for skill: {config['skill_id']}")
+                    except Exception as e:
+                        logger.error(f"Failed to load {reminders_file}: {e}")
+
+        logger.info(f"Loaded {len(self._skill_configs)} skill reminder configs")
+
+    def _get_global_config(self, skill_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get global config with defaults.
+
+        Args:
+            skill_id: Optional skill ID to get skill-specific config
+
+        Returns:
+            Global configuration dictionary
+        """
+        # Default config
+        config = {
+            "max_daily_pushes": self.DEFAULT_MAX_DAILY_PUSHES,
+            "quiet_hours": {
+                "start": self.DEFAULT_QUIET_START,
+                "end": self.DEFAULT_QUIET_END,
+            },
+            "cooldown_hours": 24,
+        }
+
+        # Merge skill-specific config if available
+        if skill_id and skill_id in self._skill_configs:
+            skill_global = self._skill_configs[skill_id].get("global_config", {})
+            config.update(skill_global)
+
+        return config
+
+    async def run_scheduled_scan(self, dry_run: bool = False) -> List[Dict]:
+        """
+        Scheduled scan entry point.
+
+        Args:
+            dry_run: If True, don't save notifications
+
+        Returns:
+            List of generated notifications
+        """
+        results = []
+        users = await self._get_users_for_current_hour()
+
+        for user_id, profile in users:
+            try:
+                user_notifications = await self._process_user(user_id, profile, dry_run)
+                results.extend(user_notifications)
+            except Exception as e:
+                logger.error(f"Failed to process user {user_id}: {e}")
+
+        return results
+
+    async def _get_users_for_current_hour(self) -> List[tuple]:
+        """
+        Get users that should receive notifications this hour.
+
+        Returns:
+            List of (user_id, profile) tuples
+        """
+        # This would query the database for active users
+        # For now, return empty list - actual implementation would use UnifiedProfileRepository
+        from stores.db import get_connection
+        from stores.unified_profile_repo import UnifiedProfileRepository
+
+        now_utc = datetime.now(pytz.UTC)
+        users = []
+
+        try:
+            async with get_connection() as conn:
+                query = """
+                    SELECT
+                        u.id as user_id,
+                        up.profile
+                    FROM vibe_users u
+                    JOIN unified_profiles up ON up.user_id = u.id
+                    WHERE u.subscription_status = 'active'
+                """
+                rows = await conn.fetch(query)
+
+            for row in rows:
+                profile = row["profile"] if isinstance(row["profile"], dict) else {}
+                users.append((row["user_id"], profile))
+        except Exception as e:
+            logger.error(f"Failed to get users: {e}")
+
+        return users
+
+    async def _process_user(
+        self,
+        user_id: UUID,
+        profile: Dict,
+        dry_run: bool = False,
+    ) -> List[Dict]:
+        """
+        Process a single user for all potential notifications.
+
+        Args:
+            user_id: User ID
+            profile: User profile data
+            dry_run: If True, don't save notifications
+
+        Returns:
+            List of generated notification info
+        """
+        notifications = []
+        # Timezone 可能在 preferences.timezone 或 vibe.preferences.timezone
+        user_timezone = (
+            profile.get("preferences", {}).get("timezone") or
+            profile.get("vibe", {}).get("preferences", {}).get("timezone") or
+            "Asia/Shanghai"
+        )
+
+        push_settings = profile.get("preferences", {}).get("push_settings", {})
+
+        # 0. Quiet hours check (platform constraint)
+        if self._is_quiet_hours(user_timezone, push_settings):
+            logger.debug(f"User {user_id} in quiet hours, skipping")
+            return []
+
+        # 0.1 Daily push limit check
+        daily_count = await self._get_daily_push_count(user_id)
+        max_daily = push_settings.get("max_daily_pushes") or self._get_global_config().get(
+            "max_daily_pushes", self.DEFAULT_MAX_DAILY_PUSHES
+        )
+        if daily_count >= max_daily:
+            logger.debug(f"User {user_id} reached daily limit ({max_daily})")
+            return []
+
+        for skill_id, config in self._skill_configs.items():
+            # Skip disabled skills
+            if not config.get("enabled", True):
+                continue
+
+            # 1. Subscription status check
+            if not await self._should_send_to_user(user_id, skill_id):
+                continue
+
+            for reminder in config.get("reminders", []):
+                try:
+                    if not reminder.get("enabled", True):
+                        continue
+                    # 2. Trigger evaluation (static-first + LLM fallback)
+                    triggered, event_info, bucket_key = await self.trigger_evaluator.evaluate(
+                        trigger_config=reminder.get("trigger", {}),
+                        profile=profile,
+                        conditions=reminder.get("conditions"),
+                        user_timezone=user_timezone,
+                    )
+
+                    if not triggered:
+                        continue
+
+                    # 3. Idempotent check (bucket_key based)
+                    bucket = bucket_key or (event_info or {}).get("event_date") or datetime.now().strftime("%Y-%m-%d")
+                    idempotent_key = f"{user_id}-{skill_id}-{reminder['id']}-{bucket}"
+                    if self._is_duplicate(idempotent_key):
+                        logger.debug(f"Duplicate: {idempotent_key}")
+                        continue
+
+                    # 4. Cooldown check
+                    cooldown_override = reminder.get("trigger", {}).get("cooldown_hours")
+                    if not await self._check_cooldown(user_id, skill_id, reminder["id"], cooldown_override):
+                        continue
+
+                    # 5. Generate content (call Agent)
+                    content = await self.agent_adapter.generate_content(
+                        user_id=str(user_id),
+                        profile=profile,
+                        skill_id=skill_id,
+                        reminder=reminder,
+                        event_info=event_info,
+                    )
+
+                    # 6. Save notification
+                    if not dry_run:
+                        await self.notification_service.save(
+                            user_id=user_id,
+                            notification_type=f"{skill_id}_{reminder['id']}",
+                            title=content.title,
+                            content=content.to_dict(),
+                        )
+                        self._mark_sent(idempotent_key)
+
+                    notifications.append({
+                        "user_id": str(user_id),
+                        "skill_id": skill_id,
+                        "reminder_id": reminder["id"],
+                        "title": content.title,
+                        "triggered_reason": event_info,
+                    })
+
+                except Exception as e:
+                    logger.error(f"Failed to process reminder {reminder.get('id')} for user {user_id}: {e}")
+
+        return notifications
+
+    def _is_quiet_hours(self, user_timezone: str, push_settings: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Check if current time is in quiet hours.
+
+        Args:
+            user_timezone: User's timezone string
+
+        Returns:
+            True if in quiet hours
+        """
+        try:
+            tz = pytz.timezone(user_timezone)
+            now = datetime.now(tz)
+            hour = now.hour
+
+            global_config = self._get_global_config()
+            quiet_start = (
+                (push_settings or {}).get("quiet_start_hour")
+                or global_config.get("quiet_hours", {}).get("start", self.DEFAULT_QUIET_START)
+            )
+            quiet_end = (
+                (push_settings or {}).get("quiet_end_hour")
+                or global_config.get("quiet_hours", {}).get("end", self.DEFAULT_QUIET_END)
+            )
+
+            if quiet_start > quiet_end:  # Crosses midnight
+                return hour >= quiet_start or hour < quiet_end
+            return quiet_start <= hour < quiet_end
+        except Exception:
+            # Default to not quiet if timezone parsing fails
+            return False
+
+    def _is_duplicate(self, idempotent_key: str) -> bool:
+        """
+        Check if this is a duplicate send.
+
+        Args:
+            idempotent_key: Key for deduplication
+
+        Returns:
+            True if duplicate
+        """
+        self._prune_idempotent_cache()
+        return idempotent_key in self._idempotent_cache
+
+    def _mark_sent(self, idempotent_key: str):
+        """
+        Mark a notification as sent.
+
+        Args:
+            idempotent_key: Key to mark as sent
+        """
+        self._idempotent_cache[idempotent_key] = datetime.now()
+        self._prune_idempotent_cache()
+
+    def _prune_idempotent_cache(self):
+        """Prune old idempotent keys"""
+        if not self._idempotent_cache:
+            return
+        threshold = datetime.now() - timedelta(hours=self.IDEMPOTENT_TTL_HOURS)
+        to_delete = [k for k, v in self._idempotent_cache.items() if v < threshold]
+        for k in to_delete:
+            self._idempotent_cache.pop(k, None)
+
+    async def _get_daily_push_count(self, user_id: UUID) -> int:
+        """
+        Get the number of pushes sent to user today.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            Number of pushes today
+        """
+        try:
+            if hasattr(self.notification_service, "count_today"):
+                return await self.notification_service.count_today(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to count daily pushes: {e}")
+        return 0
+
+    async def _should_send_to_user(self, user_id: UUID, skill_id: str) -> bool:
+        """
+        Check if we should send to this user for this skill.
+
+        Based on subscription status and push preferences.
+
+        Args:
+            user_id: User ID
+            skill_id: Skill ID
+
+        Returns:
+            True if should send
+        """
+        # This would check skill subscription and push preferences
+        # For now, return True - actual implementation would check user preferences
+        try:
+            from services.agent.skill_loader import load_skill_metadata_async
+            from stores.unified_profile_repo import UnifiedProfileRepository
+
+            skill_meta = await load_skill_metadata_async(skill_id)
+            category = skill_meta.category if skill_meta else "professional"
+
+            # Core skills always send
+            if category == "core":
+                return True
+
+            # Check subscription
+            subscription = await UnifiedProfileRepository.get_skill_subscription(user_id, skill_id)
+
+            if category == "default":
+                if subscription and subscription.status == "unsubscribed":
+                    return False
+                if subscription and not subscription.push_enabled:
+                    return False
+                return True
+
+            # Professional skills require subscription
+            if not subscription or subscription.status != "subscribed":
+                return False
+
+            return subscription.push_enabled
+        except Exception as e:
+            # Fail closed: don't send on error to prevent unexpected notifications
+            logger.warning(f"Error checking subscription for user {user_id}, skill {skill_id}: {e}")
+            return False
+
+    async def _check_cooldown(
+        self,
+        user_id: UUID,
+        skill_id: str,
+        reminder_id: str,
+        cooldown_override: Optional[int] = None,
+    ) -> bool:
+        """
+        Check if cooldown period has passed.
+
+        Args:
+            user_id: User ID
+            skill_id: Skill ID
+            reminder_id: Reminder ID
+
+        Returns:
+            True if cooldown has passed
+        """
+        try:
+            notification_type = f"{skill_id}_{reminder_id}"
+            global_config = self._get_global_config(skill_id)
+            cooldown_hours = cooldown_override if cooldown_override is not None else global_config.get("cooldown_hours", 24)
+
+            return await self.notification_service.check_cooldown(
+                user_id=user_id,
+                notification_type=notification_type,
+                cooldown_hours=cooldown_hours,
+            )
+        except Exception:
+            return True
+
+    def get_skill_configs(self) -> Dict[str, Dict]:
+        """Get all skill configurations (for debugging)"""
+        return self._skill_configs

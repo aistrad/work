@@ -1,0 +1,111 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Migration 019: Authentication System Refactor
+-- ═══════════════════════════════════════════════════════════════════════════
+-- - Add WeChat QR code login sessions table
+-- - Add account deletion fields to vibe_users
+-- - Add status column if not exists
+-- Created: 2026-01-17
+
+-- ─────────────────────────────────────────────────────────────────
+-- WeChat QR Code Login Sessions
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS wechat_login_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scene_id VARCHAR(64) UNIQUE NOT NULL,  -- QR code scene ID
+    status VARCHAR(20) DEFAULT 'pending',  -- pending | scanned | confirmed | expired
+    openid VARCHAR(64),                    -- WeChat OpenID (after scan)
+    unionid VARCHAR(64),                   -- WeChat UnionID (if available)
+    user_info JSONB,                       -- WeChat user info (nickname, avatar, etc.)
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL        -- QR code expires (typically 5 minutes)
+);
+
+COMMENT ON TABLE wechat_login_sessions IS 'WeChat QR code login session tracking';
+COMMENT ON COLUMN wechat_login_sessions.scene_id IS 'Unique scene ID embedded in QR code';
+COMMENT ON COLUMN wechat_login_sessions.status IS 'Session status: pending (waiting for scan), scanned (user scanned), confirmed (login complete), expired';
+
+-- Index for fast lookup by scene_id
+CREATE INDEX IF NOT EXISTS idx_wechat_sessions_scene ON wechat_login_sessions(scene_id);
+
+-- Index for cleanup of expired sessions
+CREATE INDEX IF NOT EXISTS idx_wechat_sessions_expires ON wechat_login_sessions(expires_at)
+WHERE status = 'pending';
+
+-- ─────────────────────────────────────────────────────────────────
+-- Account Deletion Support
+-- ─────────────────────────────────────────────────────────────────
+-- Add status column if not exists (supports: active, pending_deletion, deleted)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'vibe_users' AND column_name = 'status'
+    ) THEN
+        ALTER TABLE vibe_users ADD COLUMN status VARCHAR(20) DEFAULT 'active';
+    END IF;
+END $$;
+
+-- Add deletion tracking fields
+ALTER TABLE vibe_users
+ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMPTZ;
+
+COMMENT ON COLUMN vibe_users.status IS 'Account status: active, pending_deletion, deleted';
+COMMENT ON COLUMN vibe_users.deletion_requested_at IS 'When user requested account deletion';
+COMMENT ON COLUMN vibe_users.deletion_scheduled_at IS 'When account will be hard-deleted (30 days after request)';
+
+-- Index for finding accounts pending deletion
+CREATE INDEX IF NOT EXISTS idx_users_pending_deletion ON vibe_users(status, deletion_scheduled_at)
+WHERE status = 'pending_deletion';
+
+-- ─────────────────────────────────────────────────────────────────
+-- Ensure vibe_user_auth table exists (rename from user_auth if needed)
+-- ─────────────────────────────────────────────────────────────────
+DO $$
+BEGIN
+    -- Check if user_auth exists but vibe_user_auth doesn't
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'user_auth')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'vibe_user_auth') THEN
+        ALTER TABLE user_auth RENAME TO vibe_user_auth;
+    END IF;
+
+    -- Create vibe_user_auth if neither exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'vibe_user_auth')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'user_auth') THEN
+        CREATE TABLE vibe_user_auth (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES vibe_users(id) ON DELETE CASCADE,
+            auth_type VARCHAR(20) NOT NULL,      -- email | phone | wechat | apple | google
+            auth_identifier VARCHAR(255) NOT NULL,
+            auth_credential VARCHAR(255),        -- bcrypt hash for password, null for OAuth
+            metadata JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(auth_type, auth_identifier)
+        );
+
+        CREATE INDEX idx_vibe_user_auth_user ON vibe_user_auth(user_id);
+    END IF;
+END $$;
+
+-- ─────────────────────────────────────────────────────────────────
+-- Function to clean up expired WeChat sessions
+-- ─────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION cleanup_expired_wechat_sessions()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    DELETE FROM wechat_login_sessions
+    WHERE expires_at < NOW() AND status = 'pending';
+
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION cleanup_expired_wechat_sessions IS 'Clean up expired WeChat login sessions';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- DONE
+-- ═══════════════════════════════════════════════════════════════════════════
+SELECT 'Migration 019: Auth refactor completed' as status;

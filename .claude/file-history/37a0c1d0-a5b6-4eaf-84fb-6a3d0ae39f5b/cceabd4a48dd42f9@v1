@@ -1,0 +1,349 @@
+# VibeProfile Extractor LLM-First 重构计划
+
+## 目标
+
+将 VibeProfile Extractor 从独立服务模式转型为 **Agent-Native 架构**，完全符合 LLM-First 原则。
+
+## 核心变更
+
+| 维度 | Before | After |
+|------|--------|-------|
+| **触发方式** | cron/hook | LLM 自主调用 save 工具 |
+| **配置位置** | vibe_extract.json | core/rules/profile.md |
+| **Merge 逻辑** | Python 硬编码 | LLM 自主决定 |
+| **数据结构** | 混乱的多层结构 | 统一的 vibe schema |
+
+---
+
+## P0 风险修复
+
+### 1. Timeline 追加语义
+
+**问题**：Handler 对 vibe.* 统一用 `update_by_path` 会将 timeline 的"追加"降为"覆盖"。
+
+**修复**：Handler 中对 `vibe.timeline` 单独分支：
+```python
+elif path == "vibe.timeline":
+    # 单条/多条事件 → 追加
+    if isinstance(data, dict):
+        await UnifiedProfileRepository.append_vibe_timeline(user_uuid, data)
+    elif isinstance(data, list):
+        for event in data:
+            await UnifiedProfileRepository.append_vibe_timeline(user_uuid, event)
+    return {"status": "success", "path": path}
+```
+
+### 2. SQL 参数类型
+
+**问题**：`jsonb_set` 路径参数未显式 `::text[]`，跨驱动易出类型推断问题。
+
+**修复**：
+- SQL 中路径参数改为 `$2::text[]`
+- 删除未使用的 `pg_path` 变量
+
+### 3. 白名单补全
+
+**问题**：Schema 有 `life_stage`、`interests`，但 save 路径白名单未覆盖。
+
+**修复**：白名单增加：
+```python
+r"^vibe\.profile\.context\.(occupation|life_stage|interests)$",
+r"^vibe\.state\.(emotion|energy|focus)$",
+```
+
+---
+
+## Phase 1: 定义新的 Vibe Schema
+
+### 1.1 创建 `apps/api/services/agent/schemas/vibe.yaml`
+
+```yaml
+# Vibe Profile Schema v2.0
+# Agent-Native，LLM 可读的结构定义
+
+version: "2.0"
+description: "用户画像数据结构，由 LLM 通过 save 工具写入"
+
+schema:
+  vibe:
+    profile:
+      description: "稳定画像（变化缓慢）"
+      fields:
+        identity:
+          archetypes: ["string"]     # 人格原型，最多 3 个
+          traits: ["string"]          # 核心特质，最多 5 个
+          style: "string"             # 沟通风格
+        context:
+          occupation: "string"
+          life_stage: "enum:student|early_career|growth|peak|transition"
+          interests: ["string"]
+
+    state:
+      description: "当前状态（实时变化）"
+      fields:
+        emotion: "enum:anxious|sad|neutral|content|excited|focused"
+        energy: "enum:low|medium|high"
+        focus: ["string"]            # 当前关注话题
+
+    goals:
+      description: "目标列表"
+      type: "array"
+      max_items: 10
+      item:
+        title: "string"
+        category: "enum:career|health|relationship|wealth|growth"
+        status: "enum:active|paused|completed"
+
+    timeline:
+      description: "重要事件（追加存储）"
+      type: "array"
+      max_items: 100
+      item:
+        date: "date"
+        type: "enum:goal|decision|milestone|life_event"
+        event: "string"
+```
+
+### 1.2 创建 `apps/api/skills/core/rules/profile.md`
+
+定义 LLM 的信息保存规则（替代硬编码逻辑）。
+
+---
+
+## Phase 2: 重构 save/read 工具
+
+### 2.1 修改 `apps/api/skills/core/tools/tools.yaml`
+
+增加 profile 相关的 save path 支持：
+
+```yaml
+action:
+  - name: save
+    description: |
+      保存用户信息到 Profile。
+
+      ## 保存规则（LLM 自主执行）
+
+      1. **识别用户信息**：当用户主动提供个人信息时
+         - "我是1990年出生" → 用户自己的信息 → 保存
+         - "帮我朋友测" → 第三方信息 → 不保存
+
+      2. **读取现有数据**：先调用 read 获取当前值
+
+      3. **决定合并方式**：
+         - 覆盖：新值替换旧值
+         - 追加：添加到数组（如 goals、traits）
+         - 更新：部分字段更新
+
+      4. **调用 save**：写入最终结果
+
+    parameters:
+      - name: path
+        type: string
+        required: true
+        description: |
+          支持的路径：
+          - vibe.profile.identity.archetypes
+          - vibe.profile.identity.traits
+          - vibe.profile.identity.style
+          - vibe.profile.context.occupation
+          - vibe.state.emotion
+          - vibe.state.energy
+          - vibe.state.focus
+          - vibe.goals
+          - vibe.timeline
+
+      - name: data
+        type: any
+        required: true
+```
+
+### 2.2 修改 `apps/api/skills/core/tools/handlers.py`
+
+简化 save handler，移除复杂的 merge 逻辑：
+
+```python
+async def handle_save(path: str, data: Any, user_id: UUID) -> dict:
+    """
+    Save handler - 极简实现
+
+    LLM 已完成合并决策，这里只做：
+    1. 路径白名单校验
+    2. 数据类型校验
+    3. 写入数据库
+    """
+    # 1. 白名单校验
+    if not validate_save_path(path):
+        return {"success": False, "error": f"Invalid path: {path}"}
+
+    # 2. 写入（使用 jsonb_set）
+    await UnifiedProfileRepository.update_by_path(user_id, path, data)
+
+    return {"success": True, "path": path}
+```
+
+---
+
+## Phase 3: 编写 Profile 规则文档
+
+### 3.1 创建 `apps/api/skills/core/rules/profile.md`
+
+```markdown
+# 用户信息保存规则
+
+## 何时保存
+
+当用户在对话中**主动提供**以下信息时，调用 save 保存：
+
+| 用户说 | 保存路径 | 示例数据 |
+|-------|---------|---------|
+| "我是设计师" | vibe.profile.context.occupation | "设计师" |
+| "我现在很焦虑" | vibe.state.emotion | "anxious" |
+| "我的目标是..." | vibe.goals | {title, status: "active"} |
+
+## 保存流程
+
+1. **识别信息类型**：判断是稳定特质还是临时状态
+2. **读取现有数据**：`read(path="vibe.xxx")`
+3. **决定合并方式**：
+   - 单值字段（emotion）：直接覆盖
+   - 数组字段（goals）：追加或更新
+4. **写入数据**：`save(path, merged_data)`
+
+## 不保存的情况
+
+- 第三方信息（"帮我朋友测"）
+- 假设性问题（"如果我是..."）
+- 临时测试（"试试看"）
+```
+
+---
+
+## Phase 4: 删除旧代码
+
+### 4.1 删除文件
+
+- [ ] `apps/api/services/vibe/extractor.py`
+- [ ] `apps/api/workers/profile_extractor.py`
+- [ ] `apps/api/config/vibe_extract.json`
+
+### 4.2 清理引用
+
+- [ ] `apps/api/services/vibe/__init__.py` - 移除 extractor 导出
+- [ ] `apps/api/stores/unified_profile_repo.py` - 移除 extractor 专用方法
+
+---
+
+## Phase 5: 数据迁移
+
+### 5.1 创建迁移脚本
+
+```python
+# scripts/migrate_vibe_v2.py
+
+async def migrate_vibe_structure(user_id: UUID):
+    """
+    将旧的 vibe 结构迁移到新结构
+
+    旧结构：
+    - vibe.current, vibe.profile, vibe.timeline
+    - vibe.insight, vibe.target
+
+    新结构：
+    - vibe.profile (identity, context)
+    - vibe.state (emotion, energy, focus)
+    - vibe.goals
+    - vibe.timeline
+    """
+    old_profile = await get_profile(user_id)
+
+    # 提取数据
+    old_vibe = old_profile.get("vibe", {})
+
+    new_vibe = {
+        "profile": {
+            "identity": {
+                "archetypes": extract_archetypes(old_vibe),
+                "traits": extract_traits(old_vibe),
+                "style": old_vibe.get("insight", {}).get("essence", {}).get("communication_style")
+            },
+            "context": {
+                "occupation": old_vibe.get("profile", {}).get("context", {}).get("occupation"),
+                "interests": old_vibe.get("profile", {}).get("context", {}).get("interests", [])
+            }
+        },
+        "state": {
+            "emotion": old_vibe.get("current", {}).get("emotion"),
+            "energy": old_vibe.get("current", {}).get("energy"),
+            "focus": old_vibe.get("current", {}).get("focus", [])
+        },
+        "goals": merge_goals(old_vibe),
+        "timeline": old_vibe.get("timeline", [])
+    }
+
+    await update_vibe(user_id, new_vibe)
+```
+
+---
+
+## 验证清单
+
+- [ ] LLM 能正确识别用户信息并调用 save
+- [ ] save 工具正确写入新的 vibe 结构
+- [ ] read 工具能读取任意 vibe 路径
+- [ ] 旧数据成功迁移
+- [ ] 无 extractor worker 残留
+
+---
+
+## 设计决策（已确认）
+
+| 决策点 | 选择 | 说明 |
+|--------|------|------|
+| 深度分析 | **移除** | 只保存用户主动提供的信息 |
+| Skill 同步 | **移除** | Skill 数据独立存储在 skills.{id} |
+| Schema 校验 | **轻量** | 路径白名单 + 基本类型检查 |
+| 事件检测 | **移除** | 事件由用户明确表达时保存 |
+
+---
+
+## 实施文件清单
+
+### 新建文件
+
+| 文件 | 说明 |
+|------|------|
+| `services/agent/schemas/vibe.yaml` | Vibe 数据结构定义 |
+| `skills/core/rules/profile.md` | LLM 信息保存规则 |
+| `services/agent/validators.py` | 路径白名单 + 类型校验 |
+| `scripts/migrate_vibe_v2.py` | 数据迁移脚本 |
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `skills/core/tools/tools.yaml` | 增强 save/read 工具定义 |
+| `skills/core/tools/handlers.py` | 简化 save handler |
+| `stores/unified_profile_repo.py` | 增加 `update_by_path` 方法 |
+
+### 删除文件
+
+| 文件 | 说明 |
+|------|------|
+| `services/vibe/extractor.py` | 旧 VibeExtractor |
+| `workers/profile_extractor.py` | 旧 ProfileExtractor |
+| `config/vibe_extract.json` | 旧配置文件 |
+
+---
+
+## 预估工作量
+
+| Phase | 内容 | 估计 |
+|-------|------|------|
+| Phase 1 | Schema + 规则文件 | 2 文件 |
+| Phase 2 | 工具重构 | 3 文件 |
+| Phase 3 | 删除旧代码 | 3 文件 |
+| Phase 4 | 数据迁移 | 1 脚本 |
+| Phase 5 | 测试验证 | - |
+
+**总计**：约 9 个文件变更

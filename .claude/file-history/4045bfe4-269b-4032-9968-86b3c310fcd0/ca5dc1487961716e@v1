@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, Generator, List, Optional
+
+from stores import mentis_db
+from services import behavior_matcher, emotion_engine, intervention_agent
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _format_ts(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return _now_iso()
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+def extract_context(text: str) -> Dict[str, Any]:
+    scene = "general"
+    trigger = None
+    target = None
+    content = text or ""
+    if any(k in content for k in ["老板", "会议", "工作", "项目", "同事"]):
+        scene = "work"
+        if "会议" in content:
+            trigger = "meeting"
+        if "老板" in content:
+            target = "boss"
+    elif any(k in content for k in ["家", "伴侣", "恋人", "朋友", "父母"]):
+        scene = "relationship"
+    return {
+        "scene": scene,
+        "trigger": trigger,
+        "target": target,
+        "time_of_day": None,
+    }
+
+
+def extract_tags(emotion: emotion_engine.EmotionResult, context: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    scene = context.get("scene")
+    if scene == "work":
+        tags.append("#Work")
+    elif scene == "relationship":
+        tags.append("#Relations")
+    tags.append(f"#{emotion.primary.capitalize()}")
+    return tags
+
+
+def get_aura_state(emotion: str, energy_score: int) -> str:
+    if emotion == "anger" or energy_score < 30:
+        return "alert"
+    if emotion == "joy" and energy_score > 80:
+        return "happy"
+    if emotion == "anxiety":
+        return "anxious"
+    if energy_score > 70:
+        return "flow"
+    return "calm"
+
+
+def ensure_user_state(user_id: str) -> Dict[str, Any]:
+    row = mentis_db.fetch_one(
+        "SELECT user_id, energy_score, momentum, streak_days, aura_state FROM user_state WHERE user_id = %s",
+        (user_id,),
+    )
+    if row:
+        return row
+    mentis_db.execute(
+        """
+        INSERT INTO user_state (user_id, energy_score, momentum, streak_days, aura_state)
+        VALUES (%s, 50, 0, 0, 'calm')
+        """,
+        (user_id,),
+    )
+    return {
+        "user_id": user_id,
+        "energy_score": 50,
+        "momentum": 0,
+        "streak_days": 0,
+        "aura_state": "calm",
+    }
+
+
+def create_stream_entry(
+    *,
+    user_id: str,
+    stream_type: str,
+    raw_content: str,
+    media_urls: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return mentis_db.execute_returning_one(
+        """
+        INSERT INTO stream_entry (user_id, type, raw_content, media_urls)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id, type, raw_content, created_at
+        """,
+        (user_id, stream_type, raw_content, media_urls),
+    ) or {}
+
+
+def update_stream_entry_extraction(
+    *,
+    stream_id: str,
+    emotion: emotion_engine.EmotionResult,
+    context: Dict[str, Any],
+    tags: List[str],
+    energy_delta: int,
+) -> None:
+    mentis_db.execute(
+        """
+        UPDATE stream_entry
+        SET emotion = %s::jsonb,
+            context = %s::jsonb,
+            tags = %s,
+            energy_delta = %s
+        WHERE id = %s
+        """,
+        (
+            json.dumps(
+                {
+                    "primary": emotion.primary,
+                    "intensity": emotion.intensity,
+                    "secondary": emotion.secondary,
+                    "confidence": emotion.confidence,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(context, ensure_ascii=False),
+            tags,
+            int(energy_delta),
+            stream_id,
+        ),
+    )
+
+
+def update_user_state(
+    *,
+    user_id: str,
+    emotion: emotion_engine.EmotionResult,
+    energy_delta: int,
+) -> Dict[str, Any]:
+    current = ensure_user_state(user_id)
+    next_energy = _clamp(int(current.get("energy_score") or 50) + int(energy_delta), 0, 100)
+    aura_state = get_aura_state(emotion.primary, next_energy)
+
+    mentis_db.execute(
+        """
+        UPDATE user_state
+        SET energy_score = %s,
+            current_mood = %s,
+            mood_intensity = %s,
+            aura_state = %s,
+            last_active_at = NOW(),
+            updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (next_energy, emotion.primary, int(emotion.intensity), aura_state, user_id),
+    )
+
+    return {
+        "energy_score": next_energy,
+        "momentum": int(current.get("momentum") or 0),
+        "streak_days": int(current.get("streak_days") or 0),
+        "aura_state": aura_state,
+    }
+
+
+def apply_checkin(
+    *,
+    user_id: str,
+    stream_id: str,
+    behavior: behavior_matcher.BehaviorMatch,
+) -> None:
+    if not behavior.matched or not behavior.auto_checkin or not behavior.behavior:
+        return
+
+    now = datetime.now(timezone.utc)
+    row = mentis_db.fetch_one(
+        "SELECT momentum, streak_days, last_checkin_at FROM user_state WHERE user_id = %s",
+        (user_id,),
+    ) or {}
+    streak_days = int(row.get("streak_days") or 0)
+    last_checkin_at = row.get("last_checkin_at")
+    if last_checkin_at is None or getattr(last_checkin_at, "date", lambda: None)() != now.date():
+        streak_days += 1
+
+    momentum = int(row.get("momentum") or 0) + int(behavior.momentum_delta)
+
+    mentis_db.execute(
+        """
+        UPDATE user_state
+        SET momentum = %s,
+            streak_days = %s,
+            last_checkin_at = %s,
+            updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (momentum, streak_days, now, user_id),
+    )
+
+    mentis_db.execute(
+        """
+        INSERT INTO checkin_log (user_id, stream_id, behavior_type, source, momentum_delta)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (user_id, stream_id, behavior.behavior, "auto", int(behavior.momentum_delta)),
+    )
+
+
+def process_stream(
+    *,
+    user_id: str,
+    stream_type: str,
+    content: str,
+    media_urls: Optional[List[str]] = None,
+) -> Generator[Dict[str, Any], None, None]:
+    safe_type = stream_type if stream_type in {"vibe_diary", "chat", "action_log"} else "vibe_diary"
+
+    entry = create_stream_entry(
+        user_id=user_id,
+        stream_type=safe_type,
+        raw_content=content,
+        media_urls=media_urls,
+    )
+
+    yield {
+        "event": "stream_created",
+        "data": {
+            "id": entry.get("id"),
+            "type": entry.get("type") or safe_type,
+            "raw_content": entry.get("raw_content") or content,
+            "created_at": _format_ts(entry.get("created_at")),
+        },
+    }
+
+    emotion = emotion_engine.detect_emotion(content)
+    context = extract_context(content)
+    tags = extract_tags(emotion, context)
+    update_stream_entry_extraction(
+        stream_id=str(entry.get("id")),
+        emotion=emotion,
+        context=context,
+        tags=tags,
+        energy_delta=emotion.energy_delta,
+    )
+
+    yield {
+        "event": "extraction_complete",
+        "data": {
+            "emotion": {
+                "primary": emotion.primary,
+                "intensity": emotion.intensity,
+                "secondary": emotion.secondary,
+            },
+            "context": context,
+            "tags": tags,
+            "energy_delta": emotion.energy_delta,
+        },
+    }
+
+    behavior = behavior_matcher.match_behavior(content)
+    behavior_matcher.update_stream_entry_behavior(stream_id=str(entry.get("id")), behavior=behavior)
+
+    if behavior.matched:
+        yield {
+            "event": "behavior_match",
+            "data": {
+                "matched": True,
+                "behavior": behavior.behavior,
+                "confidence": behavior.confidence,
+                "auto_checkin": behavior.auto_checkin,
+                "momentum_delta": behavior.momentum_delta,
+            },
+        }
+
+    if behavior.auto_checkin:
+        apply_checkin(
+            user_id=user_id,
+            stream_id=str(entry.get("id")),
+            behavior=behavior,
+        )
+
+    update_user_state(
+        user_id=user_id,
+        emotion=emotion,
+        energy_delta=emotion.energy_delta,
+    )
+
+    state = mentis_db.fetch_one(
+        "SELECT energy_score, momentum, streak_days, aura_state FROM user_state WHERE user_id = %s",
+        (user_id,),
+    ) or {}
+
+    intervention = intervention_agent.evaluate_intervention(
+        user_id=user_id,
+        emotion=emotion,
+        energy_score=int(state.get("energy_score") or 0),
+    )
+    if intervention:
+        yield {
+            "event": "agent_response",
+            "data": {
+                "type": "action_card",
+                "card": intervention,
+            },
+        }
+
+    yield {
+        "event": "state_update",
+        "data": {
+            "energy_score": int(state.get("energy_score") or 0),
+            "momentum": int(state.get("momentum") or 0),
+            "aura_state": state.get("aura_state") or "calm",
+        },
+    }
+
+    yield {"event": "done"}

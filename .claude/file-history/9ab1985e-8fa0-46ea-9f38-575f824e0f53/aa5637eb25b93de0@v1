@@ -1,0 +1,201 @@
+-- Mentis OS v3 - Vibe Diary Features Migration
+-- Adds: Daily Digest, Life Connect, Share Cards
+-- Idempotent: safe to re-run.
+
+-- =============================================================================
+-- Phase 1: LLM Emotion Engine 扩展
+-- =============================================================================
+
+-- 扩展 stream_entry 表
+ALTER TABLE stream_entry ADD COLUMN IF NOT EXISTS llm_emotion JSONB;
+ALTER TABLE stream_entry ADD COLUMN IF NOT EXISTS extracted_entities UUID[];
+ALTER TABLE stream_entry ADD COLUMN IF NOT EXISTS auto_checkin BOOLEAN DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_stream_llm_emotion ON stream_entry USING GIN(llm_emotion);
+CREATE INDEX IF NOT EXISTS idx_stream_extracted_entities ON stream_entry USING GIN(extracted_entities);
+
+COMMENT ON COLUMN stream_entry.llm_emotion IS 'LLM 深度情绪分析结果';
+COMMENT ON COLUMN stream_entry.extracted_entities IS '从内容中抽取的生活实体 ID 列表';
+
+
+-- =============================================================================
+-- Phase 2: Daily Digest (每日精美日记)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS daily_digest (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES mentis_user(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+
+    -- 内容
+    title TEXT,
+    summary TEXT,
+    prose TEXT NOT NULL,
+    style VARCHAR(20) DEFAULT 'minimal' CHECK (style IN ('minimal', 'artistic', 'magazine', 'warm')),
+
+    -- 统计数据
+    entry_count INTEGER DEFAULT 0,
+    emotion_trajectory JSONB,  -- [{time, emotion, intensity}]
+    energy_curve JSONB,        -- [{time, energy}]
+    key_tags TEXT[],
+
+    -- 关联
+    source_entries UUID[],
+
+    -- 分享
+    is_shared BOOLEAN DEFAULT FALSE,
+    share_url TEXT,
+    share_settings JSONB,      -- {blur_names, remove_places}
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT uq_digest_user_date UNIQUE(user_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_user_date ON daily_digest(user_id, date DESC);
+CREATE INDEX IF NOT EXISTS idx_digest_shared ON daily_digest(is_shared) WHERE is_shared = TRUE;
+
+COMMENT ON TABLE daily_digest IS 'Daily Digest - AI 生成的每日精美日记';
+
+
+-- =============================================================================
+-- Phase 3: Life Connect (生活信息连接)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS life_entity (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES mentis_user(id) ON DELETE CASCADE,
+
+    -- 实体类型和基本信息
+    entity_type VARCHAR(20) NOT NULL CHECK (entity_type IN ('person', 'event', 'todo', 'goal', 'place')),
+    name TEXT NOT NULL,
+    description TEXT,
+    metadata JSONB DEFAULT '{}',
+
+    -- 关联
+    source_entries UUID[],           -- 来源日记条目
+    related_entities UUID[],         -- 关联实体
+
+    -- 状态 (主要用于 todo/goal)
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'done', 'dismissed', 'archived')),
+    due_date TIMESTAMPTZ,
+
+    -- 用户确认
+    confirmed BOOLEAN DEFAULT FALSE,
+
+    -- 统计
+    mention_count INTEGER DEFAULT 1,
+    avg_energy_impact FLOAT,
+    last_mentioned TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_user_type ON life_entity(user_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_entity_user_status ON life_entity(user_id, status) WHERE entity_type IN ('todo', 'goal');
+CREATE INDEX IF NOT EXISTS idx_entity_pending ON life_entity(user_id) WHERE confirmed = FALSE;
+CREATE INDEX IF NOT EXISTS idx_entity_name_trgm ON life_entity USING GIN(name gin_trgm_ops);
+
+COMMENT ON TABLE life_entity IS 'Life Connect - 从日记中抽取的生活实体 (人物/事件/待办/目标/地点)';
+
+
+-- =============================================================================
+-- Phase 4: Share Cards (社交分享卡)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS share_card (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES mentis_user(id) ON DELETE CASCADE,
+
+    -- 卡片类型和内容
+    card_type VARCHAR(20) NOT NULL CHECK (card_type IN ('moment', 'daily', 'milestone', 'insight')),
+    title TEXT,
+    content JSONB NOT NULL,
+    template VARCHAR(30) DEFAULT 'default',
+    style JSONB,
+
+    -- 来源关联
+    source_type VARCHAR(20) CHECK (source_type IN ('entry', 'digest', 'insight', 'achievement')),
+    source_id UUID,
+
+    -- 分享设置
+    share_token VARCHAR(64) UNIQUE,
+    is_public BOOLEAN DEFAULT FALSE,
+    privacy_settings JSONB DEFAULT '{}',  -- {blur_names, remove_places, keep_original}
+    image_url TEXT,
+
+    -- 统计
+    view_count INTEGER DEFAULT 0,
+    expires_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_share_user ON share_card(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_share_token ON share_card(share_token) WHERE is_public = TRUE;
+CREATE INDEX IF NOT EXISTS idx_share_source ON share_card(source_type, source_id);
+
+COMMENT ON TABLE share_card IS 'Share Cards - 可分享的社交卡片';
+
+
+-- =============================================================================
+-- 触发器: 自动更新 updated_at
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+DROP TRIGGER IF EXISTS trg_daily_digest_updated ON daily_digest;
+CREATE TRIGGER trg_daily_digest_updated
+    BEFORE UPDATE ON daily_digest
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS trg_life_entity_updated ON life_entity;
+CREATE TRIGGER trg_life_entity_updated
+    BEFORE UPDATE ON life_entity
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+-- =============================================================================
+-- 视图: 用户今日摘要
+-- =============================================================================
+
+CREATE OR REPLACE VIEW v_user_today_summary AS
+SELECT
+    u.id AS user_id,
+    us.energy_score,
+    us.momentum,
+    us.streak_days,
+    us.aura_state,
+    COUNT(se.id) AS entry_count,
+    ARRAY_AGG(DISTINCT se.emotion->>'primary') FILTER (WHERE se.emotion IS NOT NULL) AS emotions_today,
+    SUM(COALESCE(se.energy_delta, 0)) AS total_energy_delta
+FROM mentis_user u
+LEFT JOIN user_state us ON u.id = us.user_id
+LEFT JOIN stream_entry se ON u.id = se.user_id AND DATE(se.created_at) = CURRENT_DATE
+GROUP BY u.id, us.energy_score, us.momentum, us.streak_days, us.aura_state;
+
+COMMENT ON VIEW v_user_today_summary IS '用户今日摘要视图';
+
+
+-- =============================================================================
+-- 视图: 待确认实体
+-- =============================================================================
+
+CREATE OR REPLACE VIEW v_pending_entities AS
+SELECT
+    le.*,
+    se.raw_content AS source_content
+FROM life_entity le
+LEFT JOIN stream_entry se ON se.id = ANY(le.source_entries)
+WHERE le.confirmed = FALSE AND le.status = 'pending'
+ORDER BY le.created_at DESC;
+
+COMMENT ON VIEW v_pending_entities IS '待用户确认的生活实体';

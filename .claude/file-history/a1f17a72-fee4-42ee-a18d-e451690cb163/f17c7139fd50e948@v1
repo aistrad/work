@@ -1,0 +1,485 @@
+"""
+海报生成服务
+- 使用 gemini_create_job 调用图片模型生成海报
+- 支持多种海报类型：性格吐槽、情绪吐槽、运势吐槽等
+- 异步任务模式，前端轮询获取结果
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from common.logging import get_logger
+from integrations import gemini_repo
+from services import bazi_facts, glm_client
+from stores import fortune_db
+
+logger = get_logger(__name__)
+
+
+class PosterType(Enum):
+    PERSONALITY = "personality"    # 性格吐槽
+    MOOD = "mood"                  # 情绪吐槽
+    FORTUNE = "fortune"            # 运势吐槽
+    PAIRING = "pairing"            # 合盘吐槽
+    ACHIEVEMENT = "achievement"    # 成就打卡
+    HELP = "help"                  # 求助呼唤
+
+
+@dataclass
+class PosterRequest:
+    user_id: int
+    poster_type: PosterType
+    context: Optional[Dict[str, Any]] = None
+    style: str = "modern"  # modern | vintage | playful
+
+
+@dataclass
+class PosterResult:
+    poster_id: str
+    job_id: Optional[int]
+    status: str  # queued | processing | completed | error
+    text_content: Optional[str] = None
+    image_url: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "poster_id": self.poster_id,
+            "job_id": self.job_id,
+            "status": self.status,
+            "text_content": self.text_content,
+            "image_url": self.image_url,
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+# =============================================================================
+# Text Templates for Different Poster Types
+# =============================================================================
+
+POSTER_TEXT_PROMPTS = {
+    PosterType.PERSONALITY: """你是一个幽默毒舌的命理文案师。根据用户的八字性格特点，写一段风趣的自嘲/吐槽文案（2-3句话，共约30-50字），用于社交海报分享。
+
+要求：
+1. 口语化、有梗、适合年轻人分享
+2. 自嘲风格，不是攻击性的
+3. 要有"哈哈没错这就是我"的共鸣感
+4. 结尾可以有emoji
+
+用户八字特点：
+{personality_traits}
+
+输出格式：直接输出文案内容，不要有多余的说明。""",
+
+    PosterType.MOOD: """你是一个共情能力超强的文案师。根据用户当前的情绪状态和八字特点，写一段表达当下心情的文案（2-3句话，共约30-50字）。
+
+要求：
+1. 真实、有温度、不装
+2. 适合发朋友圈的风格
+3. 根据情绪可以是感慨/吐槽/自我鼓励
+4. 结尾可以有emoji
+
+当前情绪：{mood}
+八字特点：{personality_traits}
+
+输出格式：直接输出文案内容，不要有多余的说明。""",
+
+    PosterType.FORTUNE: """你是一个幽默的运势播报员。根据用户今日运势，写一段有趣的运势吐槽文案（2-3句话，共约30-50字）。
+
+要求：
+1. 调侃风格，不是严肃的运势预测
+2. 可以自嘲或吐槽命运
+3. 结尾要有点正能量或自我调侃
+4. 适合分享的风格
+
+今日运势关键词：{fortune_keywords}
+运势评分：{fortune_score}/100
+
+输出格式：直接输出文案内容，不要有多余的说明。""",
+
+    PosterType.ACHIEVEMENT: """你是一个夸夸群群主。根据用户完成的成就，写一段打卡分享文案（2-3句话，共约30-50字）。
+
+要求：
+1. 自我表扬但不显得装
+2. 可以带点小骄傲
+3. 适合分享的风格
+4. 结尾可以有emoji
+
+完成的成就：{achievement}
+
+输出格式：直接输出文案内容，不要有多余的说明。""",
+
+    PosterType.HELP: """你是一个可怜巴巴求助的文案师。根据用户的困境，写一段求助文案（2-3句话，共约30-50字）。
+
+要求：
+1. 可爱的求助风格
+2. 让人想要帮忙
+3. 不是真的很严肃的求助
+4. 结尾可以有emoji
+
+需要帮助的事情：{help_topic}
+八字特点：{personality_traits}
+
+输出格式：直接输出文案内容，不要有多余的说明。""",
+}
+
+POSTER_IMAGE_PROMPT_TEMPLATE = """生成一张社交分享海报图片。
+
+风格：{style_desc}
+类型：{type_desc}
+文案内容："{text_content}"
+
+设计要求：
+1. 尺寸：9:16 竖版（适合手机壁纸/社交分享）
+2. 文案放在图片上合适的位置，清晰可读
+3. 背景要有设计感，与文案风格匹配
+4. 可以有装饰性元素但不要过于花哨
+5. 整体风格现代、年轻、有质感
+
+请直接生成图片。"""
+
+STYLE_DESCRIPTIONS = {
+    "modern": "简约现代风格，使用几何图形和渐变色，干净利落",
+    "vintage": "复古文艺风格，使用暖色调和怀旧元素",
+    "playful": "活泼可爱风格，使用明亮色彩和有趣的图形",
+}
+
+TYPE_DESCRIPTIONS = {
+    PosterType.PERSONALITY: "性格测试结果分享海报",
+    PosterType.MOOD: "心情分享海报",
+    PosterType.FORTUNE: "每日运势分享海报",
+    PosterType.ACHIEVEMENT: "成就打卡海报",
+    PosterType.HELP: "求助呼唤海报",
+    PosterType.PAIRING: "合盘匹配结果海报",
+}
+
+
+class PosterService:
+    """海报生成服务"""
+
+    def generate_poster(self, request: PosterRequest) -> PosterResult:
+        """
+        生成海报
+
+        流程：
+        1. 获取用户八字事实
+        2. 生成文案内容（GLM）
+        3. 创建图片生成任务（Gemini）
+        4. 返回任务ID，前端轮询获取结果
+        """
+        poster_id = str(uuid.uuid4())
+        user_id = request.user_id
+        poster_type = request.poster_type
+        context = request.context or {}
+        style = request.style
+
+        try:
+            # 1. 获取用户八字事实
+            snapshot = bazi_facts.ensure_snapshot_for_user(user_id)
+            facts = snapshot["facts"]
+
+            # 2. 获取性格特点描述
+            personality_traits = self._extract_personality_traits(facts)
+
+            # 3. 生成文案
+            text_content = self._generate_text_content(
+                poster_type=poster_type,
+                personality_traits=personality_traits,
+                context=context,
+            )
+
+            # 4. 创建图片生成任务
+            job_id = self._create_image_job(
+                poster_id=poster_id,
+                poster_type=poster_type,
+                text_content=text_content,
+                style=style,
+            )
+
+            # 5. 保存海报记录
+            self._save_poster_record(
+                poster_id=poster_id,
+                user_id=user_id,
+                poster_type=poster_type.value,
+                job_id=job_id,
+                text_content=text_content,
+                style=style,
+                context=context,
+            )
+
+            logger.info(
+                "poster generation started",
+                extra={
+                    "operation": "poster_generate",
+                    "user_id": user_id,
+                    "poster_id": poster_id,
+                    "job_id": job_id,
+                    "poster_type": poster_type.value,
+                },
+            )
+
+            return PosterResult(
+                poster_id=poster_id,
+                job_id=job_id,
+                status="processing",
+                text_content=text_content,
+                created_at=datetime.utcnow(),
+            )
+
+        except Exception as e:
+            logger.error(f"poster generation failed: {e}")
+            return PosterResult(
+                poster_id=poster_id,
+                job_id=None,
+                status="error",
+                error_message=str(e),
+                created_at=datetime.utcnow(),
+            )
+
+    def get_poster_status(self, poster_id: str, user_id: int) -> Optional[PosterResult]:
+        """获取海报生成状态"""
+        row = fortune_db.fetch_one(
+            """
+            SELECT poster_id, job_id, status, text_content, image_url, error_message,
+                   created_at, completed_at
+            FROM fortune_poster
+            WHERE poster_id = %s AND user_id = %s
+            """,
+            (poster_id, user_id),
+        )
+
+        if not row:
+            return None
+
+        # 如果还在处理中，检查gemini job状态
+        if row["status"] == "processing" and row.get("job_id"):
+            self._check_and_update_job_status(poster_id, row["job_id"])
+            # 重新获取更新后的记录
+            row = fortune_db.fetch_one(
+                """
+                SELECT poster_id, job_id, status, text_content, image_url, error_message,
+                       created_at, completed_at
+                FROM fortune_poster
+                WHERE poster_id = %s AND user_id = %s
+                """,
+                (poster_id, user_id),
+            )
+
+        return PosterResult(
+            poster_id=row["poster_id"],
+            job_id=row.get("job_id"),
+            status=row["status"],
+            text_content=row.get("text_content"),
+            image_url=row.get("image_url"),
+            error_message=row.get("error_message"),
+            created_at=row.get("created_at"),
+            completed_at=row.get("completed_at"),
+        )
+
+    def list_posters(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """列出用户的海报历史"""
+        rows = fortune_db.fetch_all(
+            """
+            SELECT poster_id, poster_type, status, text_content, image_url, created_at
+            FROM fortune_poster
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+
+        return [
+            {
+                "poster_id": r["poster_id"],
+                "poster_type": r["poster_type"],
+                "status": r["status"],
+                "text_content": r.get("text_content", ""),
+                "image_url": r.get("image_url"),
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            }
+            for r in rows
+        ]
+
+    # =========================================================================
+    # Helper Methods
+    # =========================================================================
+
+    def _extract_personality_traits(self, facts: Dict[str, Any]) -> str:
+        """从八字事实中提取性格特点描述"""
+        bazi = facts.get("bazi", {})
+        day_master = bazi.get("day_master", {})
+        strength = bazi.get("strength", {})
+        wuxing_count = bazi.get("wuxing_count", {})
+
+        gan = day_master.get("gan", "")
+        element = day_master.get("element", "")
+        status = strength.get("status", "") if isinstance(strength, dict) else str(strength)
+
+        # 五行分布
+        dominant = max(wuxing_count.items(), key=lambda x: x[1])[0] if wuxing_count else ""
+        lacking = min(wuxing_count.items(), key=lambda x: x[1])[0] if wuxing_count else ""
+
+        traits = f"日主{gan}属{element}，{status}。五行{dominant}旺{lacking}弱。"
+        return traits
+
+    def _generate_text_content(
+        self,
+        poster_type: PosterType,
+        personality_traits: str,
+        context: Dict[str, Any],
+    ) -> str:
+        """使用GLM生成文案内容"""
+        prompt_template = POSTER_TEXT_PROMPTS.get(poster_type, POSTER_TEXT_PROMPTS[PosterType.PERSONALITY])
+
+        # 填充模板变量
+        prompt = prompt_template.format(
+            personality_traits=personality_traits,
+            mood=context.get("mood", "一般般"),
+            fortune_keywords=context.get("fortune_keywords", "平稳"),
+            fortune_score=context.get("fortune_score", 70),
+            achievement=context.get("achievement", "完成了一个小目标"),
+            help_topic=context.get("help_topic", "需要一点帮助"),
+        )
+
+        try:
+            text, _ = glm_client.call_chat_completions(
+                messages=[{"role": "user", "content": prompt}],
+                model="glm-4.7",
+                max_tokens=200,
+                temperature=0.9,
+                timeout_s=30.0,
+            )
+            return text.strip()
+        except Exception as e:
+            logger.warning(f"GLM text generation failed: {e}")
+            # 返回默认文案
+            return self._get_fallback_text(poster_type)
+
+    def _get_fallback_text(self, poster_type: PosterType) -> str:
+        """获取后备文案"""
+        fallbacks = {
+            PosterType.PERSONALITY: "我就是我，是颜色不一样的烟火",
+            PosterType.MOOD: "今天的心情，复杂得像命盘一样",
+            PosterType.FORTUNE: "运势这东西，信则有，不信...还是信一下吧",
+            PosterType.ACHIEVEMENT: "又完成了一个小目标，给自己比个心",
+            PosterType.HELP: "有没有人来帮帮我呀~",
+            PosterType.PAIRING: "缘分这东西，还挺神奇的",
+        }
+        return fallbacks.get(poster_type, "Fortune AI 海报")
+
+    def _create_image_job(
+        self,
+        poster_id: str,
+        poster_type: PosterType,
+        text_content: str,
+        style: str,
+    ) -> Optional[int]:
+        """创建Gemini图片生成任务"""
+        style_desc = STYLE_DESCRIPTIONS.get(style, STYLE_DESCRIPTIONS["modern"])
+        type_desc = TYPE_DESCRIPTIONS.get(poster_type, "社交分享海报")
+
+        image_prompt = POSTER_IMAGE_PROMPT_TEMPLATE.format(
+            style_desc=style_desc,
+            type_desc=type_desc,
+            text_content=text_content,
+        )
+
+        job_title = f"fortune_poster_{poster_id[:8]}"
+        tasks = [{"prompt": image_prompt}]
+
+        try:
+            error, job_id, task_ids = gemini_repo.create_gemini_job(
+                title=job_title,
+                tasks=tasks,
+            )
+
+            if error:
+                logger.error(f"create_gemini_job error: {error}")
+                return None
+
+            return job_id
+
+        except Exception as e:
+            logger.error(f"create_gemini_job exception: {e}")
+            return None
+
+    def _save_poster_record(
+        self,
+        poster_id: str,
+        user_id: int,
+        poster_type: str,
+        job_id: Optional[int],
+        text_content: str,
+        style: str,
+        context: Dict,
+    ) -> None:
+        """保存海报记录到数据库"""
+        fortune_db.execute(
+            """
+            INSERT INTO fortune_poster (
+                poster_id, user_id, poster_type, job_id, status,
+                text_content, style, context
+            ) VALUES (
+                %s, %s, %s, %s, 'processing',
+                %s, %s, %s::jsonb
+            )
+            """,
+            (
+                poster_id, user_id, poster_type, job_id,
+                text_content, style, json.dumps(context, ensure_ascii=False),
+            ),
+        )
+
+    def _check_and_update_job_status(self, poster_id: str, job_id: int) -> None:
+        """检查并更新gemini任务状态"""
+        try:
+            tasks = gemini_repo.get_tasks_by_job_id(job_id)
+
+            if not tasks:
+                return
+
+            # 检查第一个任务的状态
+            task = tasks[0]
+            status = task.get("status", 0)
+            output_url = task.get("output_url", "")
+
+            if status == 2:  # 完成
+                fortune_db.execute(
+                    """
+                    UPDATE fortune_poster
+                    SET status = 'completed', image_url = %s, completed_at = NOW()
+                    WHERE poster_id = %s
+                    """,
+                    (output_url, poster_id),
+                )
+            elif status == -1:  # 失败
+                error_msg = task.get("error_message", "图片生成失败")
+                fortune_db.execute(
+                    """
+                    UPDATE fortune_poster
+                    SET status = 'error', error_message = %s, completed_at = NOW()
+                    WHERE poster_id = %s
+                    """,
+                    (error_msg, poster_id),
+                )
+
+        except Exception as e:
+            logger.warning(f"check job status failed: {e}")
+
+
+# =============================================================================
+# Module-level instance
+# =============================================================================
+
+poster_service = PosterService()

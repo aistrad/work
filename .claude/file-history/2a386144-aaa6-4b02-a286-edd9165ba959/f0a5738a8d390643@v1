@@ -1,0 +1,571 @@
+# VibeLife v9 - 统一设计文档
+
+> Version: 9.0 | 2026-01-21
+> 设计原则：极简框架 + 现有资源 + LLM 驱动
+
+---
+
+## 一、设计哲学
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              v9 设计哲学                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   原则 1: 极简框架                                                          │
+│   ─────────────────                                                         │
+│   • 不新增独立模块，复用现有架构                                             │
+│   • 不新增数据表，扩展现有 unified_profiles.profile.extracted               │
+│   • 不新增 Worker，扩展现有 profile_extractor                               │
+│                                                                             │
+│   原则 2: 基于现有资源                                                       │
+│   ─────────────────                                                         │
+│   • CoreAgent: 对话入口，调用 Extractor                                     │
+│   • Proactive: 推送引擎，消费 extracted 数据                                │
+│   • Skills: 提供领域知识，贡献抽取规则                                       │
+│   • VibeProfile: 统一数据存储，唯一真源                                      │
+│                                                                             │
+│   原则 3: 完全 LLM 驱动                                                      │
+│   ─────────────────                                                         │
+│   • 抽取逻辑: LLM Prompt，非规则引擎                                        │
+│   • 触发判断: LLM 评估，非 if-else                                          │
+│   • 内容生成: LLM 融合，非模板拼接                                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           v9 极简架构                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   用户对话 ──▶ CoreAgent ──▶ Skill 执行 ──▶ 响应生成                        │
+│                                         │                                   │
+│                                         │ (保存到 conversations)            │
+│                                         ▼                                   │
+│                                   对话历史存储                              │
+│                                         │                                   │
+│              ┌──────────────────────────┴────────────────┐                 │
+│              │                                            │                 │
+│      Cron: 每日凌晨3点                          Cron: 每日早8点             │
+│              │                                            │                 │
+│              ▼                                            ▼                 │
+│      ProfileExtractor (LLM)                   ProactiveEngine (LLM)         │
+│              │                                            │                 │
+│              │ 分析最近7天对话                             │ 评估推送需求    │
+│              ▼                                            ▼                 │
+│   unified_profiles.profile.extracted          生成推送 → 发送通知          │
+│              │                                                              │
+│        ┌────┴─────────┐                                                    │
+│        ▼              ▼                                                    │
+│     Me 页        Journey 页                                                │
+│    (读取)          (读取)                                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点：无新模块，仅扩展现有组件。**
+
+---
+
+## 三、数据存储设计
+
+### 3.1 扩展 extracted 字段
+
+现有 `unified_profiles.profile.extracted` 结构：
+```json
+{
+  "topics": [],
+  "personality_traits": [],
+  "life_events": [],
+  "preferences": {}
+}
+```
+
+v9 扩展为：
+```json
+{
+  // === 现有字段保留 ===
+  "topics": [],
+  "personality_traits": [],
+  "life_events": [],
+  "preferences": {},
+
+  // === v9 新增字段 ===
+  "emotion": {
+    "current": "calm",
+    "intensity": 0.6,
+    "history": [
+      {"date": "2026-01-21", "avg": 0.7, "dominant": "calm"}
+    ]
+  },
+  "behavior": {
+    "dominant": "problem_solving",
+    "patterns": ["exploring", "planning"]
+  },
+  "archetype": {
+    "weights": {"creator": 0.3, "healer": 0.4, "pioneer": 0.2, "sage": 0.1},
+    "trend": {"rising": "pioneer", "delta": 0.05}
+  },
+  "topic_heat": {
+    "career": 0.8,
+    "health": 0.1,
+    "relationship": 0.1
+  },
+  "insights": [
+    {
+      "type": "fusion",
+      "content": "你的命盘显示表达力强，而你最近频繁讨论写作...",
+      "sources": ["bazi", "behavior"],
+      "generated_at": "2026-01-21"
+    }
+  ]
+}
+```
+
+**无需新表，仅扩展 JSONB 字段。**
+
+---
+
+## 四、ProfileExtractor 扩展
+
+### 4.1 现有实现回顾
+
+```python
+# apps/api/workers/profile_extractor.py (现有)
+EXTRACTION_PROMPT = """你是一个用户画像分析专家。分析用户的对话记录，提取：
+1. topics: 讨论的话题
+2. personality_traits: 性格特征
+3. life_events: 生活事件
+4. preferences: 偏好
+"""
+```
+
+### 4.2 v9 扩展 Prompt
+
+```python
+# apps/api/workers/profile_extractor.py (v9 扩展)
+
+EXTRACTION_PROMPT_V9 = """你是一个用户画像分析专家。分析用户的对话记录，提取以下信息：
+
+## 基础信息（保留）
+1. topics: 讨论的话题列表
+2. personality_traits: 性格特征列表
+3. life_events: 生活事件列表
+4. preferences: 偏好对象
+
+## 情绪分析（v9 新增）
+5. emotion:
+   - current: 当前主要情绪 (calm/anxious/excited/sad/angry/neutral)
+   - intensity: 情绪强度 0-1
+
+## 行为模式（v9 新增）
+6. behavior:
+   - dominant: 主要行为模式 (problem_solving/seeking_validation/venting/exploring/planning)
+   - patterns: 次要模式列表
+
+## 话题热度（v9 新增）
+7. topic_heat: 各话题占比
+   - career: 0-1
+   - health: 0-1
+   - relationship: 0-1
+   - growth: 0-1
+   - finance: 0-1
+
+## 原型演化（v9 新增）
+8. archetype_signals: 与哪个原型相关的行为
+   - creator: 创造、表达、写作相关
+   - healer: 帮助、关怀、倾听相关
+   - pioneer: 领导、开拓、影响相关
+   - sage: 学习、智慧、思考相关
+
+输出 JSON 格式。
+"""
+```
+
+### 4.3 实现代码
+
+```python
+# apps/api/workers/profile_extractor.py
+
+class ProfileExtractor:
+    """v9 扩展：多维度抽取"""
+
+    async def extract_and_update(self, user_id: str, messages: List[Dict]) -> None:
+        """
+        从对话中抽取信息并更新 Profile
+        """
+        # 1. LLM 抽取
+        extracted = await self._llm_extract(messages)
+
+        # 2. 获取现有 Profile
+        profile = await self.profile_repo.get_extracted(user_id)
+
+        # 3. 增量更新
+        updated = self._merge_extracted(profile, extracted)
+
+        # 4. 更新原型权重
+        updated["archetype"] = self._update_archetype_weights(
+            profile.get("archetype", {}),
+            extracted.get("archetype_signals", {})
+        )
+
+        # 5. 更新情绪历史
+        updated["emotion"]["history"] = self._append_emotion_history(
+            profile.get("emotion", {}).get("history", []),
+            extracted["emotion"]
+        )
+
+        # 6. 生成融合洞察（如果需要）
+        if self._should_generate_insight(profile, updated):
+            insight = await self._generate_fusion_insight(user_id, updated)
+            updated["insights"] = [insight] + profile.get("insights", [])[:4]
+
+        # 7. 写入 DB
+        await self.profile_repo.update_extracted(user_id, updated)
+
+    async def _llm_extract(self, messages: List[Dict]) -> Dict:
+        """LLM 驱动的抽取"""
+        response = await chat(
+            model="deepseek",  # 使用现有模型配置
+            messages=[
+                {"role": "system", "content": EXTRACTION_PROMPT_V9},
+                {"role": "user", "content": self._format_messages(messages)}
+            ],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.content)
+
+    def _update_archetype_weights(
+        self,
+        current: Dict,
+        signals: Dict
+    ) -> Dict:
+        """基于行为信号更新原型权重"""
+        weights = current.get("weights", {
+            "creator": 0.25, "healer": 0.25, "pioneer": 0.25, "sage": 0.25
+        })
+
+        # 平滑更新
+        for archetype, signal_strength in signals.items():
+            if archetype in weights:
+                weights[archetype] = weights[archetype] * 0.9 + signal_strength * 0.1
+
+        # 归一化
+        total = sum(weights.values())
+        weights = {k: v / total for k, v in weights.items()}
+
+        # 计算趋势
+        old_weights = current.get("weights", {})
+        trend = self._calculate_trend(old_weights, weights)
+
+        return {"weights": weights, "trend": trend}
+
+    async def _generate_fusion_insight(self, user_id: str, extracted: Dict) -> Dict:
+        """LLM 生成融合洞察"""
+        # 获取八字/星座数据
+        profile = await self.profile_repo.get_full_profile(user_id)
+        bazi = profile.get("birth_charts", {}).get("bazi", {})
+
+        prompt = f"""
+        用户八字特质：{bazi.get("key_traits", [])}
+        用户近期行为模式：{extracted.get("behavior", {}).get("dominant", "")}
+        用户近期热点话题：{extracted.get("topic_heat", {})}
+        用户原型分布：{extracted.get("archetype", {}).get("weights", {})}
+
+        请用一段话（50字以内）融合这些维度，生成关于用户当前状态的洞察。
+        要求：自然融合，不要分开描述各维度。
+        """
+
+        response = await chat(
+            model="deepseek",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return {
+            "type": "fusion",
+            "content": response.content,
+            "sources": ["bazi", "behavior", "archetype"],
+            "generated_at": datetime.now().isoformat()
+        }
+```
+
+---
+
+## 五、Proactive 智能化
+
+### 5.1 现有实现回顾
+
+```python
+# apps/api/services/proactive/engine.py (现有)
+class ProactiveEngine:
+    """基于 reminders.yaml 配置的推送引擎"""
+
+    async def process_user(self, user_id: str) -> List[PushCandidate]:
+        # 加载 Skill 级提醒配置
+        # 检测触发条件
+        # 生成推送内容
+```
+
+### 5.2 v9 扩展：LLM 触发评估
+
+```python
+# apps/api/services/proactive/engine.py (v9 扩展)
+
+class ProactiveEngine:
+    """v9: 增加 LLM 驱动的智能触发"""
+
+    async def process_user(self, user_id: str) -> List[PushCandidate]:
+        # === 现有逻辑保留 ===
+        rule_based_candidates = await self._process_rule_based(user_id)
+
+        # === v9 新增：LLM 智能触发 ===
+        intelligent_candidates = await self._process_intelligent(user_id)
+
+        # 合并 + 去重 + 排序
+        all_candidates = rule_based_candidates + intelligent_candidates
+        return self._prioritize_and_dedupe(all_candidates)
+
+    async def _process_intelligent(self, user_id: str) -> List[PushCandidate]:
+        """LLM 驱动的智能触发"""
+        profile = await self.profile_repo.get_profile(user_id)
+        extracted = profile.get("extracted", {})
+
+        # LLM 评估是否需要主动触达
+        evaluation = await self._llm_evaluate_triggers(extracted)
+
+        candidates = []
+        for trigger in evaluation.get("triggers", []):
+            if trigger["should_send"]:
+                content = await self._generate_push_content(
+                    user_id,
+                    trigger["type"],
+                    trigger["context"]
+                )
+                candidates.append(PushCandidate(
+                    type=trigger["type"],
+                    priority=trigger["priority"],
+                    content=content
+                ))
+
+        return candidates
+
+    async def _llm_evaluate_triggers(self, extracted: Dict) -> Dict:
+        """LLM 评估触发条件"""
+        prompt = f"""
+        分析用户状态，判断是否需要主动推送：
+
+        情绪状态：{extracted.get("emotion", {})}
+        行为模式：{extracted.get("behavior", {})}
+        话题热度：{extracted.get("topic_heat", {})}
+
+        评估以下触发条件：
+        1. emotion_care: 情绪低落需要关怀？(intensity < 0.3 连续3天)
+        2. goal_reminder: 有热点目标需要提醒？(某话题热度 > 0.7 但最近未讨论)
+        3. insight_share: 有新洞察值得分享？(原型有明显变化)
+
+        输出 JSON：
+        {{
+          "triggers": [
+            {{"type": "emotion_care", "should_send": bool, "priority": 0-2, "context": string}},
+            ...
+          ]
+        }}
+        """
+
+        response = await chat(
+            model="deepseek",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.content)
+
+    async def _generate_push_content(
+        self,
+        user_id: str,
+        push_type: str,
+        context: str
+    ) -> str:
+        """LLM 生成推送内容"""
+        profile = await self.profile_repo.get_profile(user_id)
+
+        prompt = f"""
+        生成一条主动推送消息：
+
+        推送类型：{push_type}
+        触发上下文：{context}
+        用户昵称：{profile.get("account", {}).get("display_name", "用户")}
+
+        要求：
+        - 温暖关怀，不要机械
+        - 简短有力，不超过30字
+        - 包含一个可点击开始对话的引导
+
+        输出纯文本消息。
+        """
+
+        response = await chat(
+            model="deepseek",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content
+```
+
+---
+
+## 六、Me/Journey 页面 API
+
+### 6.1 Me 页 API
+
+```python
+# apps/api/routes/me.py (新增或扩展)
+
+@router.get("/api/v1/me/dashboard")
+async def get_me_dashboard(user_id: str = Depends(get_current_user)):
+    """Me 页仪表盘数据"""
+    profile = await profile_repo.get_profile(user_id)
+    extracted = profile.get("extracted", {})
+
+    return {
+        # 融合洞察
+        "fusion_insight": extracted.get("insights", [{}])[0] if extracted.get("insights") else None,
+
+        # 原型演化
+        "archetype": extracted.get("archetype", {}),
+
+        # 情绪轨迹
+        "emotion_trajectory": {
+            "current": extracted.get("emotion", {}),
+            "history": extracted.get("emotion", {}).get("history", [])[-7:]
+        },
+
+        # 话题热度
+        "topic_heat": extracted.get("topic_heat", {})
+    }
+```
+
+### 6.2 Journey 页 API
+
+```python
+# apps/api/routes/journey.py (新增或扩展)
+
+@router.get("/api/v1/journey/goals")
+async def get_journey_goals(
+    user_id: str = Depends(get_current_user),
+    sort: str = "intelligent"
+):
+    """Journey 页目标列表"""
+    profile = await profile_repo.get_profile(user_id)
+    extracted = profile.get("extracted", {})
+    topic_heat = extracted.get("topic_heat", {})
+
+    # 获取用户目标（从 lifecoach 数据）
+    goals = await goal_repo.get_user_goals(user_id)
+
+    if sort == "intelligent":
+        # 基于话题热度排序
+        for goal in goals:
+            goal["relevance"] = calculate_goal_relevance(goal, topic_heat)
+            goal["heat_indicator"] = get_heat_indicator(goal["relevance"])
+
+        goals.sort(key=lambda g: g["relevance"], reverse=True)
+
+    return {"goals": goals}
+
+
+def calculate_goal_relevance(goal: Dict, topic_heat: Dict) -> float:
+    """计算目标与当前关注的相关性"""
+    goal_topics = goal.get("tags", [])
+    relevance = 0.0
+    for topic in goal_topics:
+        relevance += topic_heat.get(topic, 0.0)
+    return min(relevance, 1.0)
+
+
+def get_heat_indicator(relevance: float) -> str:
+    if relevance > 0.6:
+        return "hot"
+    elif relevance > 0.3:
+        return "warm"
+    return "cold"
+```
+
+---
+
+## 七、集成点总结
+
+| 现有组件 | v9 扩展 | 改动量 |
+|----------|---------|--------|
+| **CoreAgent** | 对话结束时调用 ProfileExtractor | 1行代码 |
+| **ProfileExtractor** | 扩展抽取 Prompt + 更新逻辑 | ~100行 |
+| **unified_profiles** | 扩展 extracted JSONB 字段 | 无 DB 迁移 |
+| **ProactiveEngine** | 增加 LLM 触发评估 | ~80行 |
+| **API Routes** | 新增 me/journey 接口 | ~50行 |
+
+**总代码量：~230 行 Python**
+
+---
+
+## 八、实施计划
+
+### Phase 1: 抽取扩展 (3天)
+
+```
+Day 1: 扩展 EXTRACTION_PROMPT_V9
+Day 2: 实现 _update_archetype_weights, _append_emotion_history
+Day 3: 实现 _generate_fusion_insight
+```
+
+### Phase 2: Proactive 智能化 (3天)
+
+```
+Day 4: 实现 _llm_evaluate_triggers
+Day 5: 实现 _generate_push_content
+Day 6: 集成测试
+```
+
+### Phase 3: 前端 API (2天)
+
+```
+Day 7: 实现 Me/Journey API
+Day 8: 前端对接
+```
+
+**总计：8天**
+
+---
+
+## 九、验收标准
+
+### 功能验收
+
+- [ ] 对话结束后自动抽取情绪、行为、话题热度
+- [ ] Me 页显示融合洞察卡片
+- [ ] Me 页显示原型权重变化
+- [ ] Journey 页目标按热度排序
+- [ ] 情绪低落时触发关怀推送
+
+### 性能验收
+
+- [ ] 抽取延迟 < 1s
+- [ ] API 响应 < 200ms
+- [ ] 推送决策 < 500ms
+
+---
+
+## 附录：与 ref 文档的简化对比
+
+| ref 文档设计 | v9 极简设计 | 简化点 |
+|--------------|-------------|--------|
+| 新增 extracted_signals 表 | 复用 unified_profiles.extracted | 无 DB 迁移 |
+| 新增 emotion_snapshots 表 | 存入 extracted.emotion.history | 无 DB 迁移 |
+| 新增 topic_heat_index 表 | 存入 extracted.topic_heat | 无 DB 迁移 |
+| 独立 EmotionExtractor 类 | 统一在 ProfileExtractor | 代码集中 |
+| 独立 IntelligentTrigger 类 | 扩展 ProactiveEngine | 代码集中 |
+| 4个新 API 路由文件 | 2个接口 | 接口精简 |
+
+**核心思路：不新增，只扩展。LLM 做重活，代码做薄层。**

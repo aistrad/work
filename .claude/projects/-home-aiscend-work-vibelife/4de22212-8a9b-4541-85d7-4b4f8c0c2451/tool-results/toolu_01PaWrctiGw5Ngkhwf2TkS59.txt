@@ -1,0 +1,1145 @@
+     1→"""
+     2→SkillLoader v7 - 支持 Agentic + Rule 架构的 Skill 加载器
+     3→
+     4→v7 架构：
+     5→- SKILL.md: 核心定义（专家身份、能力索引、伦理边界）
+     6→- rules/*.md: 规则文件（分析要点、输出要求、常见问题）
+     7→- scenarios/*.md: (旧架构兼容) MiniSkill 场景文件
+     8→- tools/*.py: 工具定义（收集/计算/展示/检索）
+     9→
+    10→v7.4 新增：
+    11→- Skill Management 支持：category, pricing, showcase, subscription 字段
+    12→"""
+    13→import re
+    14→import json
+    15→import logging
+    16→import yaml
+    17→from pathlib import Path
+    18→from dataclasses import dataclass, field
+    19→from typing import Dict, List, Optional, Any
+    20→from functools import lru_cache
+    21→
+    22→logger = logging.getLogger(__name__)
+    23→
+    24→SKILLS_DIR = Path(__file__).parent.parent.parent / "skills"
+    25→
+    26→
+    27→# ═══════════════════════════════════════════════════════════════════════════
+    28→# 数据结构
+    29→# ═══════════════════════════════════════════════════════════════════════════
+    30→
+    31→@dataclass
+    32→class SkillPricing:
+    33→    """Skill 定价配置"""
+    34→    type: str = "free"  # free | premium | credits
+    35→    trial_messages: int = 3
+    36→    credits_per_use: Optional[int] = None
+    37→
+    38→
+    39→@dataclass
+    40→class SkillShowcase:
+    41→    """Skill 展示配置（用于 Skill 市场）"""
+    42→    tagline: str = ""
+    43→    highlights: List[str] = field(default_factory=list)
+    44→    preview_image: Optional[str] = None
+    45→    demo_prompts: List[str] = field(default_factory=list)
+    46→
+    47→
+    48→@dataclass
+    49→class SkillSubscription:
+    50→    """Skill 订阅配置"""
+    51→    auto_subscribe: bool = False
+    52→    can_unsubscribe: bool = True
+    53→    push_default: bool = True
+    54→    min_subscription_days: int = 0
+    55→
+    56→
+    57→@dataclass
+    58→class SkillFeature:
+    59→    """Skill 功能特性"""
+    60→    name: str
+    61→    description: str = ""
+    62→    icon: str = "📌"
+    63→    tier: str = "free"  # free | basic | premium
+    64→
+    65→
+    66→@dataclass
+    67→class SkillMetadata:
+    68→    """Skill 元数据（用于 Skill Management API）"""
+    69→    id: str
+    70→    name: str
+    71→    description: str
+    72→    version: str = "1.0.0"
+    73→    category: str = "professional"  # core | default | professional
+    74→    icon: str = "💡"
+    75→    color: str = "#6B7280"
+    76→    triggers: List[str] = field(default_factory=list)
+    77→    pricing: SkillPricing = field(default_factory=SkillPricing)
+    78→    features: List[SkillFeature] = field(default_factory=list)
+    79→    showcase: SkillShowcase = field(default_factory=SkillShowcase)
+    80→    subscription: SkillSubscription = field(default_factory=SkillSubscription)
+    81→
+    82→    def to_dict(self) -> Dict[str, Any]:
+    83→        """转换为 API 响应格式"""
+    84→        return {
+    85→            "id": self.id,
+    86→            "name": self.name,
+    87→            "description": self.description,
+    88→            "version": self.version,
+    89→            "category": self.category,
+    90→            "icon": self.icon,
+    91→            "color": self.color,
+    92→            "triggers": self.triggers,
+    93→            "pricing": {
+    94→                "type": self.pricing.type,
+    95→                "trial_messages": self.pricing.trial_messages,
+    96→                "credits_per_use": self.pricing.credits_per_use,
+    97→            },
+    98→            "features": [
+    99→                {"name": f.name, "description": f.description, "icon": f.icon, "tier": f.tier}
+   100→                for f in self.features
+   101→            ],
+   102→            "showcase": {
+   103→                "tagline": self.showcase.tagline,
+   104→                "highlights": self.showcase.highlights,
+   105→                "preview_image": self.showcase.preview_image,
+   106→                "demo_prompts": self.showcase.demo_prompts,
+   107→            },
+   108→            "subscription": {
+   109→                "auto_subscribe": self.subscription.auto_subscribe,
+   110→                "can_unsubscribe": self.subscription.can_unsubscribe,
+   111→                "push_default": self.subscription.push_default,
+   112→            },
+   113→        }
+   114→
+   115→
+   116→@dataclass
+   117→class SkillConfig:
+   118→    """Skill 核心配置（从 SKILL.md 加载）"""
+   119→    id: str
+   120→    name: str
+   121→    description: str
+   122→    expert_persona: str
+   123→    scenarios: Dict[str, List[str]]  # {entry: [...], standard: [...], professional: [...]}
+   124→    ethics: Dict[str, Any]
+   125→    tools: List[str]
+   126→    default_scenario: str = "basic_reading"
+   127→    triggers: List[str] = field(default_factory=list)
+   128→    global_tools: List[str] = field(default_factory=list)  # 需要的全局工具
+   129→    # v7.1: SOP 配置驱动
+   130→    requires_birth_info: bool = False  # 是否需要出生信息
+   131→    requires_compute: bool = False     # 是否需要计算（排盘）
+   132→    compute_type: Optional[str] = None # 计算类型：bazi/zodiac/tarot，None 表示使用自身
+   133→    compute_tool: Optional[str] = None # 计算工具名，None 时使用默认约定 calculate_{compute_type}
+   134→    collect_tool: Optional[str] = None # 收集工具名，None 时使用默认约定 request_info
+   135→    external_tools: List[str] = field(default_factory=list)  # v7.3: 从其他 skill 导入的工具
+   136→
+   137→
+   138→@dataclass
+   139→class ServiceItem:
+   140→    """服务项（用于服务目录展示）"""
+   141→    scenario_id: str
+   142→    name: str
+   143→    icon: str
+   144→    description: str
+   145→    tier: str  # entry/standard/professional
+   146→    billing: str  # 免费/基础/高级
+   147→    highlights: List[str] = field(default_factory=list)  # 价值点
+   148→
+   149→
+   150→@dataclass
+   151→class ScenarioConfig:
+   152→    """场景配置（从 scenarios/*.md 加载）"""
+   153→    id: str
+   154→    name: str
+   155→    level: str  # entry/standard/professional
+   156→    billing: str  # free/basic/premium
+   157→    description: str
+   158→    triggers: Dict[str, List[str]]  # {primary: [...], secondary: [...]}
+   159→    prerequisites: List[str]
+   160→    sop: List[Dict[str, Any]]  # SOP 阶段列表
+   161→    knowledge_config: Dict[str, Any]  # 知识检索配置
+   162→    output_config: Dict[str, Any]  # 输出配置
+   163→    tools: List[str]
+   164→
+   165→
+   166→@dataclass
+   167→class ToolMetadata:
+   168→    """工具元数据"""
+   169→    name: str
+   170→    description: str
+   171→    tool_type: str  # collect/calculate/display/search
+   172→    card_type: Optional[str] = None
+   173→    card_props_schema: Optional[Dict] = None
+   174→    parameters: Dict[str, Any] = field(default_factory=dict)
+   175→    when_to_call: Optional[str] = None
+   176→
+   177→
+   178→@dataclass
+   179→class RuleConfig:
+   180→    """规则配置（从 rules/*.md 加载）- v7 新增"""
+   181→    id: str
+   182→    name: str
+   183→    impact: str  # CRITICAL/HIGH/MEDIUM/LOW
+   184→    impact_description: str
+   185→    tags: List[str]
+   186→    content: str  # 完整的规则内容
+   187→    analysis_steps: List[Dict[str, Any]]  # 分析要点表格
+   188→    output_requirements: str  # 输出要求
+   189→    common_questions: str  # 常见问题
+   190→
+   191→
+   192→# ═══════════════════════════════════════════════════════════════════════════
+   193→# 解析函数
+   194→# ═══════════════════════════════════════════════════════════════════════════
+   195→
+   196→def parse_frontmatter(text: str) -> tuple[Dict, str]:
+   197→    """解析 YAML frontmatter（支持嵌套对象）"""
+   198→    pattern = r'^---\s*\n(.*?)\n---\s*\n(.*)$'
+   199→    match = re.match(pattern, text, re.DOTALL)
+   200→    if not match:
+   201→        return {}, text
+   202→
+   203→    frontmatter_str, content = match.groups()
+   204→
+   205→    # 使用 YAML 解析以支持嵌套对象
+   206→    try:
+   207→        metadata = yaml.safe_load(frontmatter_str) or {}
+   208→    except yaml.YAMLError as e:
+   209→        logger.warning(f"YAML parse error in frontmatter: {e}, falling back to simple parse")
+   210→        # 回退到简单解析
+   211→        metadata = {}
+   212→        current_key = None
+   213→        current_list = None
+   214→
+   215→        for line in frontmatter_str.strip().split('\n'):
+   216→            stripped = line.strip()
+   217→            if not stripped:
+   218→                continue
+   219→            if stripped.startswith('- ') and current_key:
+   220→                if current_list is None:
+   221→                    current_list = []
+   222→                current_list.append(stripped[2:].strip())
+   223→                metadata[current_key] = current_list
+   224→            elif ':' in line and not line.startswith(' '):
+   225→                current_list = None
+   226→                key, value = line.split(':', 1)
+   227→                current_key = key.strip()
+   228→                value = value.strip()
+   229→                if value in ('|', ''):
+   230→                    continue
+   231→                elif value.lower() == 'true':
+   232→                    metadata[current_key] = True
+   233→                elif value.lower() == 'false':
+   234→                    metadata[current_key] = False
+   235→                else:
+   236→                    metadata[current_key] = value
+   237→
+   238→    return metadata, content.strip()
+   239→
+   240→
+   241→def parse_skill_md(text: str) -> Dict[str, Any]:
+   242→    """解析 SKILL.md 内容，提取结构化信息
+   243→
+   244→    支持两种触发词格式：
+   245→    1. 旧格式：frontmatter 中的 triggers: 列表
+   246→    2. 新格式：description 中的 "触发词：xxx、xxx、xxx"
+   247→    """
+   248→    metadata, content = parse_frontmatter(text)
+   249→
+   250→    # 从 frontmatter 获取触发词（旧格式）
+   251→    triggers = metadata.get("triggers", [])
+   252→
+   253→    # 如果 frontmatter 没有 triggers，尝试从 description 中提取（新格式）
+   254→    if not triggers:
+   255→        description = metadata.get("description", "")
+   256→        # 匹配 "触发词：xxx、xxx、xxx" 或 "触发词:xxx,xxx,xxx"
+   257→        trigger_match = re.search(r'触发词[：:]\s*([^。.]+)', description)
+   258→        if trigger_match:
+   259→            trigger_str = trigger_match.group(1)
+   260→            # 支持顿号、逗号分隔
+   261→            triggers = [t.strip() for t in re.split(r'[、,，]', trigger_str) if t.strip()]
+   262→
+   263→    result = {
+   264→        "id": metadata.get("id", ""),
+   265→        "name": metadata.get("name", ""),
+   266→        "description": metadata.get("description", ""),
+   267→        "triggers": triggers,
+   268→        "default_scenario": metadata.get("default_scenario", "basic_reading"),
+   269→        "global_tools": metadata.get("global_tools", []),  # 从 frontmatter 读取
+   270→        # v7.1: SOP 配置驱动
+   271→        "requires_birth_info": metadata.get("requires_birth_info", False),
+   272→        "requires_compute": metadata.get("requires_compute", False),
+   273→        "compute_type": metadata.get("compute_type", None),
+   274→        "compute_tool": metadata.get("compute_tool", None),
+   275→        "collect_tool": metadata.get("collect_tool", None),
+   276→        "external_tools": metadata.get("external_tools", []),  # v7.3
+   277→    }
+   278→
+   279→    # 提取专家身份
+   280→    expert_match = re.search(r'## 专家身份\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+   281→    result["expert_persona"] = expert_match.group(1).strip() if expert_match else ""
+   282→
+   283→    # 提取场景目录
+   284→    scenarios = {"entry": [], "standard": [], "professional": []}
+   285→    for level in scenarios.keys():
+   286→        pattern = rf'### {level.capitalize()}.*?\n\|.*?\n\|.*?\n((?:\|.*?\n)*)'
+   287→        match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+   288→        if match:
+   289→            for row in match.group(1).strip().split('\n'):
+   290→                cols = [c.strip() for c in row.split('|')[1:-1]]
+   291→                if len(cols) >= 2:
+   292→                    scenarios[level].append(cols[1])  # 文件名
+   293→    result["scenarios"] = scenarios
+   294→
+   295→    # 提取伦理边界
+   296→    ethics = {"forbidden": [], "sensitive": [], "principles": []}
+   297→    forbidden_match = re.search(r'### 绝对禁止\s*\n((?:- .*?\n)*)', content)
+   298→    if forbidden_match:
+   299→        ethics["forbidden"] = [l[2:].strip() for l in forbidden_match.group(1).strip().split('\n')]
+   300→    result["ethics"] = ethics
+   301→
+   302→    # 提取工具列表
+   303→    tools = []
+   304→    tools_match = re.search(r'## 工具列表\s*\n\|.*?\n\|.*?\n((?:\|.*?\n)*)', content)
+   305→    if tools_match:
+   306→        for row in tools_match.group(1).strip().split('\n'):
+   307→            cols = [c.strip() for c in row.split('|')[1:-1]]
+   308→            if len(cols) >= 1:
+   309→                tools.append(cols[0])
+   310→    result["tools"] = tools
+   311→
+   312→    return result
+   313→
+   314→
+   315→def parse_scenario_md(text: str) -> Dict[str, Any]:
+   316→    """解析 scenario.md 内容"""
+   317→    metadata, content = parse_frontmatter(text)
+   318→
+   319→    result = {
+   320→        "id": metadata.get("id", ""),
+   321→        "name": metadata.get("name", ""),
+   322→        "level": metadata.get("level", "entry"),
+   323→        "billing": metadata.get("billing", "free"),
+   324→        "description": metadata.get("description", ""),
+   325→    }
+   326→
+   327→    # 提取触发条件
+   328→    triggers = {"primary": [], "secondary": []}
+   329→    primary_match = re.search(r'\*\*主要触发词\*\*:\s*(.*?)(?:\n|$)', content)
+   330→    if primary_match:
+   331→        triggers["primary"] = [t.strip() for t in primary_match.group(1).split(',')]
+   332→    secondary_match = re.search(r'\*\*次要触发词\*\*:\s*(.*?)(?:\n|$)', content)
+   333→    if secondary_match:
+   334→        triggers["secondary"] = [t.strip() for t in secondary_match.group(1).split(',')]
+   335→    result["triggers"] = triggers
+   336→
+   337→    # 提取前置要求
+   338→    prereq_match = re.search(r'## 前置要求\s*\n((?:- .*?\n)*)', content)
+   339→    result["prerequisites"] = []
+   340→    if prereq_match:
+   341→        result["prerequisites"] = [l[2:].strip() for l in prereq_match.group(1).strip().split('\n')]
+   342→
+   343→    # 提取 SOP 阶段
+   344→    sop = []
+   345→    phase_pattern = r'### Phase (\d+):\s*(.*?)\n(.*?)(?=### Phase|\Z)'
+   346→    for match in re.finditer(phase_pattern, content, re.DOTALL):
+   347→        phase_num, phase_name, phase_content = match.groups()
+   348→        phase = {
+   349→            "phase": int(phase_num),
+   350→            "name": phase_name.strip(),
+   351→            "content": phase_content.strip()
+   352→        }
+   353→        # 提取类型
+   354→        type_match = re.search(r'\*\*类型\*\*:\s*(\w+)', phase_content)
+   355→        if type_match:
+   356→            phase["type"] = type_match.group(1)
+   357→        sop.append(phase)
+   358→    result["sop"] = sop
+   359→
+   360→    # 提取工具列表
+   361→    tools_match = re.search(r'\*\*使用工具\*\*:\s*\n((?:- .*?\n)*)', content)
+   362→    result["tools"] = []
+   363→    if tools_match:
+   364→        result["tools"] = [l[2:].strip() for l in tools_match.group(1).strip().split('\n')]
+   365→
+   366→    # 知识检索配置
+   367→    result["knowledge_config"] = {}
+   368→    result["output_config"] = {}
+   369→
+   370→    return result
+   371→
+   372→
+   373→def parse_rule_md(text: str) -> Dict[str, Any]:
+   374→    """解析 rules/*.md 内容 - v7 新增"""
+   375→    metadata, content = parse_frontmatter(text)
+   376→
+   377→    # 解析 tags（支持逗号分隔的字符串或列表）
+   378→    tags_raw = metadata.get("tags", [])
+   379→    if isinstance(tags_raw, str):
+   380→        tags = [t.strip() for t in re.split(r'[,，、]', tags_raw) if t.strip()]
+   381→    else:
+   382→        tags = tags_raw
+   383→
+   384→    result = {
+   385→        "id": metadata.get("id", ""),
+   386→        "name": metadata.get("name", ""),
+   387→        "impact": metadata.get("impact", "MEDIUM"),
+   388→        "impact_description": metadata.get("impactDescription", ""),
+   389→        "tags": tags,
+   390→        "content": content,
+   391→    }
+   392→
+   393→    # 提取分析要点表格
+   394→    analysis_steps = []
+   395→    table_match = re.search(r'## 分析要点\s*\n\|[^\n]+\n\|[-\s|]+\n((?:\|[^\n]+\n)*)', content)
+   396→    if table_match:
+   397→        for row in table_match.group(1).strip().split('\n'):
+   398→            cols = [c.strip() for c in row.split('|')[1:-1]]
+   399→            if len(cols) >= 4:
+   400→                analysis_steps.append({
+   401→                    "step": cols[0],
+   402→                    "point": cols[1],
+   403→                    "query": cols[2],
+   404→                    "priority": cols[3],
+   405→                })
+   406→    result["analysis_steps"] = analysis_steps
+   407→
+   408→    # 提取输出要求
+   409→    output_match = re.search(r'## 输出要求\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+   410→    result["output_requirements"] = output_match.group(1).strip() if output_match else ""
+   411→
+   412→    # 提取常见问题
+   413→    faq_match = re.search(r'## 常见问题\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+   414→    result["common_questions"] = faq_match.group(1).strip() if faq_match else ""
+   415→
+   416→    return result
+   417→
+   418→
+   419→def parse_skill_services(text: str) -> Dict[str, List[Dict[str, Any]]]:
+   420→    """解析 SKILL.md 中的服务目录，提取展示信息"""
+   421→    services = {"entry": [], "standard": [], "professional": []}
+   422→
+   423→    tier_map = {
+   424→        "entry": "entry",
+   425→        "standard": "standard",
+   426→        "professional": "professional"
+   427→    }
+   428→
+   429→    for tier_name, tier_key in tier_map.items():
+   430→        # 匹配表格头和内容
+   431→        pattern = rf'### {tier_name.capitalize()}.*?\n\|[^\n]+\n\|[-\s|]+\n((?:\|[^\n]+\n)*)'
+   432→        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+   433→        if not match:
+   434→            continue
+   435→
+   436→        table_content = match.group(1).strip()
+   437→        if not table_content:
+   438→            continue
+   439→
+   440→        for row in table_content.split('\n'):
+   441→            cols = [c.strip() for c in row.split('|')[1:-1]]
+   442→            if len(cols) < 7:  # 至少需要 7 列（场景、文件、触发词、计费、展示名称、图标、简介）
+   443→                continue
+   444→
+   445→            service = {
+   446→                "scenario_id": cols[1].replace('.md', '') if cols[1] else cols[0].lower().replace(' ', '_'),
+   447→                "name": cols[4] if len(cols) > 4 and cols[4] else cols[0],
+   448→                "icon": cols[5] if len(cols) > 5 and cols[5] else "📌",
+   449→                "description": cols[6] if len(cols) > 6 and cols[6] else "",
+   450→                "tier": tier_key,
+   451→                "billing": cols[3] if len(cols) > 3 else "免费",
+   452→                "highlights": []
+   453→            }
+   454→
+   455→            # 解析价值点（第8列，如果存在）
+   456→            if len(cols) > 7 and cols[7]:
+   457→                service["highlights"] = [h.strip() for h in cols[7].split(',')]
+   458→
+   459→            services[tier_key].append(service)
+   460→
+   461→    return services
+   462→
+   463→
+   464→def get_skill_services(skill_id: str) -> Optional[Dict[str, Any]]:
+   465→    """获取 Skill 的服务目录数据（用于 show_skill_services 工具）"""
+   466→    skill_path = SKILLS_DIR / skill_id / "SKILL.md"
+   467→    if not skill_path.exists():
+   468→        return None
+   469→
+   470→    text = skill_path.read_text(encoding='utf-8')
+   471→    metadata, _ = parse_frontmatter(text)
+   472→    services = parse_skill_services(text)
+   473→
+   474→    return {
+   475→        "skill_id": skill_id,
+   476→        "skill_name": metadata.get("name", skill_id),
+   477→        "description": metadata.get("description", ""),
+   478→        "services": services
+   479→    }
+   480→
+   481→
+   482→# ═══════════════════════════════════════════════════════════════════════════
+   483→# 加载函数
+   484→# ═══════════════════════════════════════════════════════════════════════════
+   485→
+   486→@lru_cache(maxsize=32)
+   487→def load_skill(skill_id: str) -> Optional[SkillConfig]:
+   488→    """加载 Skill 核心配置"""
+   489→    skill_path = SKILLS_DIR / skill_id / "SKILL.md"
+   490→    if not skill_path.exists():
+   491→        return None
+   492→
+   493→    text = skill_path.read_text(encoding='utf-8')
+   494→    data = parse_skill_md(text)
+   495→
+   496→    return SkillConfig(
+   497→        id=data.get("id", skill_id),
+   498→        name=data.get("name", skill_id),
+   499→        description=data.get("description", ""),
+   500→        expert_persona=data.get("expert_persona", ""),
+   501→        scenarios=data.get("scenarios", {}),
+   502→        ethics=data.get("ethics", {}),
+   503→        tools=data.get("tools", []),
+   504→        default_scenario=data.get("default_scenario", "basic_reading"),
+   505→        triggers=data.get("triggers", []),
+   506→        global_tools=data.get("global_tools", []),
+   507→        # v7.1: SOP 配置驱动
+   508→        requires_birth_info=data.get("requires_birth_info", False),
+   509→        requires_compute=data.get("requires_compute", False),
+   510→        compute_type=data.get("compute_type", None),
+   511→        compute_tool=data.get("compute_tool", None),
+   512→        collect_tool=data.get("collect_tool", None),
+   513→        external_tools=data.get("external_tools", []),  # v7.3
+   514→    )
+   515→
+   516→
+   517→@lru_cache(maxsize=32)
+   518→def load_skill_metadata(skill_id: str) -> Optional[SkillMetadata]:
+   519→    """加载 Skill 元数据（用于 Skill Management API）- v7.4 新增
+   520→
+   521→    从 SKILL.md 的 frontmatter 中读取完整的元数据配置，
+   522→    包括 category, pricing, showcase, subscription 等字段。
+   523→    """
+   524→    skill_path = SKILLS_DIR / skill_id / "SKILL.md"
+   525→    if not skill_path.exists():
+   526→        return None
+   527→
+   528→    text = skill_path.read_text(encoding='utf-8')
+   529→    metadata, _ = parse_frontmatter(text)
+   530→
+   531→    # 从 description 中提取触发词（如果 frontmatter 中没有）
+   532→    triggers = metadata.get("triggers", [])
+   533→    if not triggers:
+   534→        description = metadata.get("description", "")
+   535→        trigger_match = re.search(r'触发词[：:]\s*([^。.]+)', description)
+   536→        if trigger_match:
+   537→            trigger_str = trigger_match.group(1)
+   538→            triggers = [t.strip() for t in re.split(r'[、,，]', trigger_str) if t.strip()]
+   539→
+   540→    # 解析 pricing
+   541→    pricing_data = metadata.get("pricing", {})
+   542→    pricing = SkillPricing(
+   543→        type=pricing_data.get("type", "free") if isinstance(pricing_data, dict) else "free",
+   544→        trial_messages=pricing_data.get("trial_messages", 3) if isinstance(pricing_data, dict) else 3,
+   545→        credits_per_use=pricing_data.get("credits_per_use") if isinstance(pricing_data, dict) else None,
+   546→    )
+   547→
+   548→    # 解析 features
+   549→    features_data = metadata.get("features", [])
+   550→    features = []
+   551→    if isinstance(features_data, list):
+   552→        for f in features_data:
+   553→            if isinstance(f, dict):
+   554→                features.append(SkillFeature(
+   555→                    name=f.get("name", ""),
+   556→                    description=f.get("description", ""),
+   557→                    icon=f.get("icon", "📌"),
+   558→                    tier=f.get("tier", "free"),
+   559→                ))
+   560→
+   561→    # 解析 showcase
+   562→    showcase_data = metadata.get("showcase", {})
+   563→    showcase = SkillShowcase(
+   564→        tagline=showcase_data.get("tagline", "") if isinstance(showcase_data, dict) else "",
+   565→        highlights=showcase_data.get("highlights", []) if isinstance(showcase_data, dict) else [],
+   566→        preview_image=showcase_data.get("preview_image") if isinstance(showcase_data, dict) else None,
+   567→        demo_prompts=showcase_data.get("demo_prompts", []) if isinstance(showcase_data, dict) else [],
+   568→    )
+   569→
+   570→    # 解析 subscription
+   571→    subscription_data = metadata.get("subscription", {})
+   572→    category = metadata.get("category", "professional")
+   573→    subscription = SkillSubscription(
+   574→        auto_subscribe=subscription_data.get("auto_subscribe", category == "default") if isinstance(subscription_data, dict) else (category == "default"),
+   575→        can_unsubscribe=subscription_data.get("can_unsubscribe", category != "core") if isinstance(subscription_data, dict) else (category != "core"),
+   576→        push_default=subscription_data.get("push_default", True) if isinstance(subscription_data, dict) else True,
+   577→        min_subscription_days=subscription_data.get("min_subscription_days", 0) if isinstance(subscription_data, dict) else 0,
+   578→    )
+   579→
+   580→    return SkillMetadata(
+   581→        id=metadata.get("id", skill_id),
+   582→        name=metadata.get("name", skill_id),
+   583→        description=metadata.get("description", ""),
+   584→        version=metadata.get("version", "1.0.0"),
+   585→        category=category,
+   586→        icon=metadata.get("icon", "💡"),
+   587→        color=metadata.get("color", "#6B7280"),
+   588→        triggers=triggers,
+   589→        pricing=pricing,
+   590→        features=features,
+   591→        showcase=showcase,
+   592→        subscription=subscription,
+   593→    )
+   594→
+   595→
+   596→def get_all_skill_metadata() -> List[SkillMetadata]:
+   597→    """获取所有可用 Skill 的元数据（用于 Skill 列表 API）- v7.4 新增"""
+   598→    skills = []
+   599→    for skill_id in get_available_skills():
+   600→        metadata = load_skill_metadata(skill_id)
+   601→        if metadata:
+   602→            skills.append(metadata)
+   603→    return skills
+   604→
+   605→
+   606→def get_skills_by_category(category: str) -> List[SkillMetadata]:
+   607→    """按分类获取 Skill 列表 - v7.4 新增
+   608→
+   609→    Args:
+   610→        category: core | default | professional
+   611→
+   612→    Returns:
+   613→        该分类下所有 Skill 的元数据列表
+   614→    """
+   615→    return [s for s in get_all_skill_metadata() if s.category == category]
+   616→
+   617→
+   618→@lru_cache(maxsize=64)
+   619→def load_scenario(skill_id: str, scenario_id: str) -> Optional[ScenarioConfig]:
+   620→    """加载场景配置"""
+   621→    scenario_path = SKILLS_DIR / skill_id / "scenarios" / f"{scenario_id}.md"
+   622→    if not scenario_path.exists():
+   623→        return None
+   624→
+   625→    text = scenario_path.read_text(encoding='utf-8')
+   626→    data = parse_scenario_md(text)
+   627→
+   628→    return ScenarioConfig(
+   629→        id=data.get("id", scenario_id),
+   630→        name=data.get("name", scenario_id),
+   631→        level=data.get("level", "entry"),
+   632→        billing=data.get("billing", "free"),
+   633→        description=data.get("description", ""),
+   634→        triggers=data.get("triggers", {}),
+   635→        prerequisites=data.get("prerequisites", []),
+   636→        sop=data.get("sop", []),
+   637→        knowledge_config=data.get("knowledge_config", {}),
+   638→        output_config=data.get("output_config", {}),
+   639→        tools=data.get("tools", [])
+   640→    )
+   641→
+   642→
+   643→@lru_cache(maxsize=128)
+   644→def load_rule(skill_id: str, rule_id: str) -> Optional[RuleConfig]:
+   645→    """加载规则配置 - v7 新增"""
+   646→    rule_path = SKILLS_DIR / skill_id / "rules" / f"{rule_id}.md"
+   647→    if not rule_path.exists():
+   648→        return None
+   649→
+   650→    text = rule_path.read_text(encoding='utf-8')
+   651→    data = parse_rule_md(text)
+   652→
+   653→    return RuleConfig(
+   654→        id=data.get("id", rule_id),
+   655→        name=data.get("name", rule_id),
+   656→        impact=data.get("impact", "MEDIUM"),
+   657→        impact_description=data.get("impact_description", ""),
+   658→        tags=data.get("tags", []),
+   659→        content=data.get("content", ""),
+   660→        analysis_steps=data.get("analysis_steps", []),
+   661→        output_requirements=data.get("output_requirements", ""),
+   662→        common_questions=data.get("common_questions", ""),
+   663→    )
+   664→
+   665→
+   666→def get_skill_rules(skill_id: str) -> List[str]:
+   667→    """获取 Skill 的所有规则 ID - v7 新增"""
+   668→    rules_dir = SKILLS_DIR / skill_id / "rules"
+   669→    if not rules_dir.exists():
+   670→        return []
+   671→    return [p.stem for p in rules_dir.glob("*.md") if not p.stem.startswith("_")]
+   672→
+   673→
+   674→def has_rules(skill_id: str) -> bool:
+   675→    """检查 Skill 是否使用 rules 架构 - v7 新增"""
+   676→    rules_dir = SKILLS_DIR / skill_id / "rules"
+   677→    if not rules_dir.exists():
+   678→        return False
+   679→    rules = list(rules_dir.glob("*.md"))
+   680→    return len(rules) > 0
+   681→
+   682→
+   683→def get_available_skills() -> List[str]:
+   684→    """获取所有可用的 Skill"""
+   685→    if not SKILLS_DIR.exists():
+   686→        return []
+   687→    return [p.name for p in SKILLS_DIR.iterdir()
+   688→            if p.is_dir() and (p / "SKILL.md").exists()]
+   689→
+   690→
+   691→def get_skill_scenarios(skill_id: str) -> List[str]:
+   692→    """获取 Skill 的所有场景
+   693→
+   694→    支持两种架构：
+   695→    1. 旧架构：scenarios/*.md
+   696→    2. 新架构：rules/*.md（Agentic 架构）
+   697→    """
+   698→    # 优先检查 rules 目录（新架构）
+   699→    rules_dir = SKILLS_DIR / skill_id / "rules"
+   700→    if rules_dir.exists():
+   701→        rules = [p.stem for p in rules_dir.glob("*.md") if not p.stem.startswith("_")]
+   702→        if rules:
+   703→            return rules
+   704→
+   705→    # 回退到 scenarios 目录（旧架构）
+   706→    scenarios_dir = SKILLS_DIR / skill_id / "scenarios"
+   707→    if not scenarios_dir.exists():
+   708→        return []
+   709→    return [p.stem for p in scenarios_dir.glob("*.md")]
+   710→
+   711→
+   712→def get_skill_triggers() -> Dict[str, List[str]]:
+   713→    """获取所有 Skill 的触发词"""
+   714→    triggers = {}
+   715→    for skill_id in get_available_skills():
+   716→        if skill_id == "core":
+   717→            continue
+   718→        skill = load_skill(skill_id)
+   719→        if skill and skill.triggers:
+   720→            triggers[skill_id] = skill.triggers
+   721→    return triggers
+   722→
+   723→
+   724→def get_skill_global_tools(skill_id: str) -> List[str]:
+   725→    """获取 Skill 声明需要的全局工具列表"""
+   726→    skill = load_skill(skill_id)
+   727→    if skill and skill.global_tools:
+   728→        return skill.global_tools
+   729→    # 默认返回所有全局工具（向后兼容）
+   730→    return []
+   731→
+   732→
+   733→def get_skill_external_tools(skill_id: str) -> List[str]:
+   734→    """获取 Skill 声明需要从其他 Skill 导入的工具列表 (v7.3)"""
+   735→    skill = load_skill(skill_id)
+   736→    if skill and skill.external_tools:
+   737→        return skill.external_tools
+   738→    return []
+   739→
+   740→
+   741→# ═══════════════════════════════════════════════════════════════════════════
+   742→# v7.1: SOP 配置查询函数
+   743→# ═══════════════════════════════════════════════════════════════════════════
+   744→
+   745→def skill_requires_birth_info(skill_id: str) -> bool:
+   746→    """检查 Skill 是否需要出生信息（配置驱动）"""
+   747→    skill = load_skill(skill_id)
+   748→    return skill.requires_birth_info if skill else False
+   749→
+   750→
+   751→def skill_requires_compute(skill_id: str) -> bool:
+   752→    """检查 Skill 是否需要计算/排盘（配置驱动）"""
+   753→    skill = load_skill(skill_id)
+   754→    return skill.requires_compute if skill else False
+   755→
+   756→
+   757→def get_skill_compute_type(skill_id: str) -> Optional[str]:
+   758→    """获取 Skill 的计算类型（配置驱动）
+   759→
+   760→    返回值：
+   761→    - None: 使用自身的计算器
+   762→    - "zodiac": 使用 zodiac 计算器（如 jungastro）
+   763→    - "bazi": 使用 bazi 计算器
+   764→    """
+   765→    skill = load_skill(skill_id)
+   766→    return skill.compute_type if skill else None
+   767→
+   768→
+   769→def get_skill_compute_tool(skill_id: str) -> Optional[str]:
+   770→    """获取 Skill 的计算工具名（配置驱动）
+   771→
+   772→    返回值：
+   773→    - 配置的工具名（如 "calculate_zodiac"）
+   774→    - None: 使用默认约定 calculate_{compute_type}
+   775→    """
+   776→    skill = load_skill(skill_id)
+   777→    return skill.compute_tool if skill else None
+   778→
+   779→
+   780→def get_skill_collect_tool(skill_id: str) -> Optional[str]:
+   781→    """获取 Skill 的收集工具名（配置驱动）
+   782→
+   783→    返回值：
+   784→    - 配置的工具名（如 "collect_birth_info"）
+   785→    - None: 使用默认约定 request_info
+   786→    """
+   787→    skill = load_skill(skill_id)
+   788→    return skill.collect_tool if skill else None
+   789→
+   790→
+   791→# ═══════════════════════════════════════════════════════════════════════════
+   792→# System Prompt 构建
+   793→# ═══════════════════════════════════════════════════════════════════════════
+   794→
+   795→def build_system_prompt(
+   796→    skill_id: str,
+   797→    scenario_id: Optional[str] = None,
+   798→    user_context: Optional[Dict] = None
+   799→) -> str:
+   800→    """构建完整的 System Prompt
+   801→
+   802→    v7 更新：支持 rules 架构，scenario_id 可以是 rule_id
+   803→    """
+   804→    parts = []
+   805→
+   806→    # 加载 Skill
+   807→    skill = load_skill(skill_id)
+   808→    if not skill:
+   809→        return ""
+   810→
+   811→    # 专家身份
+   812→    parts.append(f"# {skill.name}\n\n{skill.expert_persona}")
+   813→
+   814→    # 加载场景或规则
+   815→    if scenario_id:
+   816→        # v7: 优先尝试加载规则
+   817→        if has_rules(skill_id):
+   818→            rule = load_rule(skill_id, scenario_id)
+   819→            if rule:
+   820→                parts.append(f"\n---\n\n## 当前规则: {rule.name}\n")
+   821→                # 添加规则完整内容
+   822→                parts.append(rule.content)
+   823→            else:
+   824→                # 规则不存在，尝试加载场景（向后兼容）
+   825→                scenario = load_scenario(skill_id, scenario_id)
+   826→                if scenario:
+   827→                    parts.append(f"\n---\n\n## 当前场景: {scenario.name}\n\n{scenario.description}")
+   828→                    if scenario.sop:
+   829→                        sop_text = "\n## 服务流程 (SOP)\n\n"
+   830→                        for phase in scenario.sop:
+   831→                            sop_text += f"### Phase {phase['phase']}: {phase['name']}\n{phase['content']}\n\n"
+   832→                        parts.append(sop_text)
+   833→        else:
+   834→            # 旧架构：加载场景
+   835→            scenario = load_scenario(skill_id, scenario_id)
+   836→            if scenario:
+   837→                parts.append(f"\n---\n\n## 当前场景: {scenario.name}\n\n{scenario.description}")
+   838→                # SOP
+   839→                if scenario.sop:
+   840→                    sop_text = "\n## 服务流程 (SOP)\n\n"
+   841→                    for phase in scenario.sop:
+   842→                        sop_text += f"### Phase {phase['phase']}: {phase['name']}\n{phase['content']}\n\n"
+   843→                    parts.append(sop_text)
+   844→
+   845→    # 伦理边界
+   846→    if skill.ethics.get("forbidden"):
+   847→        ethics_text = "\n## 伦理边界\n\n### 绝对禁止\n"
+   848→        for item in skill.ethics["forbidden"]:
+   849→            ethics_text += f"- {item}\n"
+   850→        parts.append(ethics_text)
+   851→
+   852→    # 用户上下文 - 自动处理所有字段
+   853→    if user_context:
+   854→        ctx_text = "\n## 用户上下文\n"
+   855→
+   856→        # 特殊处理 birth_info
+   857→        if user_context.get("birth_info"):
+   858→            birth_info = user_context['birth_info']
+   859→            ctx_text += f"\n### 出生信息（已收集，无需再次询问）\n"
+   860→            ctx_text += f"{json.dumps(birth_info, ensure_ascii=False)}\n"
+   861→            ctx_text += f"\n**重要**: 用户已提供出生信息，可以直接进行排盘和分析，无需调用 collect_bazi_info 工具。\n"
+   862→
+   863→        # 特殊处理 portrait
+   864→        if user_context.get("portrait"):
+   865→            ctx_text += f"\n### 用户画像\n{user_context['portrait']}\n"
+   866→
+   867→        # 特殊处理 extracted (抽取的用户信息)
+   868→        if user_context.get("extracted"):
+   869→            extracted = user_context['extracted']
+   870→            ctx_text += f"\n### 用户信息 (从历史对话中抽取)\n"
+   871→            if extracted.get("facts"):
+   872→                ctx_text += f"**基本信息**: {json.dumps(extracted['facts'], ensure_ascii=False)}\n"
+   873→            if extracted.get("concerns"):
+   874→                ctx_text += f"**关注领域**: {', '.join(extracted['concerns'])}\n"
+   875→            if extracted.get("goals"):
+   876→                ctx_text += f"**当前目标**: {', '.join(extracted['goals'])}\n"
+   877→            if extracted.get("pain_points"):
+   878→                ctx_text += f"**面临困难**: {', '.join(extracted['pain_points'])}\n"
+   879→            if extracted.get("life_events"):
+   880→                events = [f"{e.get('date', '?')}: {e.get('event', '')}" for e in extracted['life_events'][:5]]
+   881→                ctx_text += f"**近期事件**: {'; '.join(events)}\n"
+   882→
+   883→        # 特殊处理 identity_prism
+   884→        if user_context.get("identity_prism"):
+   885→            prism = user_context['identity_prism']
+   886→            ctx_text += f"\n### 身份特征\n"
+   887→            if prism.get("core"):
+   888→                ctx_text += f"**核心特质**: {prism['core']}\n"
+   889→            if prism.get("inner"):
+   890→                ctx_text += f"**内在需求**: {prism['inner']}\n"
+   891→            if prism.get("outer"):
+   892→                ctx_text += f"**外在表现**: {prism['outer']}\n"
+   893→
+   894→        # 特殊处理 life_context
+   895→        if user_context.get("life_context"):
+   896→            life_ctx = user_context['life_context']
+   897→            if life_ctx.get("concerns") or life_ctx.get("goals") or life_ctx.get("pain_points"):
+   898→                ctx_text += f"\n### 生活背景\n"
+   899→                if life_ctx.get("concerns"):
+   900→                    ctx_text += f"**关注**: {', '.join(life_ctx['concerns'])}\n"
+   901→                if life_ctx.get("goals"):
+   902→                    ctx_text += f"**目标**: {', '.join(life_ctx['goals'])}\n"
+   903→                if life_ctx.get("pain_points"):
+   904→                    ctx_text += f"**困难**: {', '.join(life_ctx['pain_points'])}\n"
+   905→
+   906→        parts.append(ctx_text)
+   907→
+   908→    return "\n".join(parts)
+   909→
+   910→
+   911→# ═══════════════════════════════════════════════════════════════════════════
+   912→# 缓存管理
+   913→# ═══════════════════════════════════════════════════════════════════════════
+   914→
+   915→def clear_cache():
+   916→    """清除所有缓存"""
+   917→    load_skill.cache_clear()
+   918→    load_skill_metadata.cache_clear()  # v7.4
+   919→    load_scenario.cache_clear()
+   920→    load_rule.cache_clear()
+   921→    get_scenario_triggers.cache_clear()
+   922→    get_rule_triggers.cache_clear()
+   923→    logger.info("Skill cache cleared")
+   924→
+   925→
+   926→def reload_skill(skill_id: str) -> Optional[SkillConfig]:
+   927→    """重载单个 Skill"""
+   928→    load_skill.cache_clear()
+   929→    load_scenario.cache_clear()
+   930→    load_rule.cache_clear()
+   931→    return load_skill(skill_id)
+   932→
+   933→
+   934→# ═══════════════════════════════════════════════════════════════════════════
+   935→# 场景路由 (内存匹配)
+   936→# ═══════════════════════════════════════════════════════════════════════════
+   937→
+   938→def parse_scenario_triggers(text: str) -> Dict[str, Dict[str, List[str]]]:
+   939→    """从 SKILL.md 解析场景目录表格，提取触发词"""
+   940→    triggers = {}  # {scenario_id: {primary: [...], secondary: [...]}}
+   941→
+   942→    # 匹配三个级别的表格
+   943→    for level in ["entry", "standard", "professional"]:
+   944→        pattern = rf'### {level.capitalize()}.*?\n\|[^\n]+\n\|[-\s|]+\n((?:\|[^\n]+\n)*)'
+   945→        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+   946→        if not match:
+   947→            continue
+   948→
+   949→        for row in match.group(1).strip().split('\n'):
+   950→            cols = [c.strip() for c in row.split('|')[1:-1]]
+   951→            if len(cols) >= 3:
+   952→                # cols[1] = 文件名, cols[2] = 触发词
+   953→                scenario_id = cols[1].replace('.md', '')
+   954→                trigger_str = cols[2]
+   955→                # 解析触发词（用顿号或逗号分隔）
+   956→                trigger_words = [t.strip() for t in re.split(r'[、,，]', trigger_str) if t.strip()]
+   957→                triggers[scenario_id] = {
+   958→                    "primary": trigger_words,
+   959→                    "secondary": []
+   960→                }
+   961→
+   962→    return triggers
+   963→
+   964→
+   965→@lru_cache(maxsize=32)
+   966→def get_scenario_triggers(skill_id: str) -> Dict[str, Dict[str, List[str]]]:
+   967→    """获取 Skill 的场景触发词映射（带缓存）"""
+   968→    skill_path = SKILLS_DIR / skill_id / "SKILL.md"
+   969→    if not skill_path.exists():
+   970→        return {}
+   971→
+   972→    text = skill_path.read_text(encoding='utf-8')
+   973→    return parse_scenario_triggers(text)
+   974→
+   975→
+   976→def route_scenario(skill_id: str, message: str) -> Optional[str]:
+   977→    """
+   978→    内存场景路由 - 根据用户消息匹配最佳场景
+   979→
+   980→    Args:
+   981→        skill_id: Skill ID
+   982→        message: 用户消息
+   983→
+   984→    Returns:
+   985→        匹配的 scenario_id，无匹配则返回 None
+   986→    """
+   987→    triggers = get_scenario_triggers(skill_id)
+   988→    if not triggers:
+   989→        return None
+   990→
+   991→    best_match = None
+   992→    best_score = 0
+   993→
+   994→    for scenario_id, trigger_config in triggers.items():
+   995→        score = 0
+   996→        # 主要触发词权重 1.0
+   997→        for word in trigger_config.get("primary", []):
+   998→            if word in message:
+   999→                score += 1.0
+  1000→        # 次要触发词权重 0.5
+  1001→        for word in trigger_config.get("secondary", []):
+  1002→            if word in message:
+  1003→                score += 0.5
+  1004→
+  1005→        if score > best_score:
+  1006→            best_score = score
+  1007→            best_match = scenario_id
+  1008→
+  1009→    return best_match
+  1010→
+  1011→
+  1012→# ═══════════════════════════════════════════════════════════════════════════
+  1013→# 规则路由 (v7 新增)
+  1014→# ═══════════════════════════════════════════════════════════════════════════
+  1015→
+  1016→@lru_cache(maxsize=32)
+  1017→def get_rule_triggers(skill_id: str) -> Dict[str, List[str]]:
+  1018→    """获取 Skill 的规则触发词映射（带缓存）- v7 新增
+  1019→
+  1020→    从 rules/*.md 的 frontmatter 中读取 tags 作为触发词
+  1021→    """
+  1022→    triggers = {}  # {rule_id: [tag1, tag2, ...]}
+  1023→
+  1024→    rules_dir = SKILLS_DIR / skill_id / "rules"
+  1025→    if not rules_dir.exists():
+  1026→        return triggers
+  1027→
+  1028→    for rule_path in rules_dir.glob("*.md"):
+  1029→        if rule_path.stem.startswith("_"):
+  1030→            continue
+  1031→
+  1032→        rule = load_rule(skill_id, rule_path.stem)
+  1033→        if rule and rule.tags:
+  1034→            triggers[rule.id] = rule.tags
+  1035→
+  1036→    return triggers
+  1037→
+  1038→
+  1039→def route_to_rule(skill_id: str, message: str) -> Optional[str]:
+  1040→    """
+  1041→    规则路由 - 根据用户消息匹配最佳规则 - v7 新增
+  1042→
+  1043→    使用 tags 进行语义匹配，支持更灵活的路由
+  1044→
+  1045→    Args:
+  1046→        skill_id: Skill ID
+  1047→        message: 用户消息
+  1048→
+  1049→    Returns:
+  1050→        匹配的 rule_id，无匹配则返回 None
+  1051→    """
+  1052→    # 优先使用规则路由
+  1053→    if has_rules(skill_id):
+  1054→        triggers = get_rule_triggers(skill_id)
+  1055→        if not triggers:
+  1056→            return None
+  1057→
+  1058→        best_match = None
+  1059→        best_score = 0
+  1060→
+  1061→        for rule_id, tags in triggers.items():
+  1062→            score = 0
+  1063→            for tag in tags:
+  1064→                if tag in message:
+  1065→                    score += 1.0
+  1066→
+  1067→            if score > best_score:
+  1068→                best_score = score
+  1069→                best_match = rule_id
+  1070→
+  1071→        return best_match
+  1072→
+  1073→    # 回退到场景路由（兼容旧架构）
+  1074→    return route_scenario(skill_id, message)
+  1075→
+  1076→
+  1077→def build_rule_prompt(skill_id: str, rule_id: str, user_context: Optional[Dict] = None) -> str:
+  1078→    """构建包含规则的 System Prompt - v7 新增
+  1079→
+  1080→    Args:
+  1081→        skill_id: Skill ID
+  1082→        rule_id: Rule ID
+  1083→        user_context: 用户上下文
+  1084→
+  1085→    Returns:
+  1086→        完整的 system prompt，包含规则内容
+  1087→    """
+  1088→    parts = []
+  1089→
+  1090→    # 加载 Skill
+  1091→    skill = load_skill(skill_id)
+  1092→    if not skill:
+  1093→        return ""
+  1094→
+  1095→    # 专家身份
+  1096→    parts.append(f"# {skill.name}\n\n{skill.expert_persona}")
+  1097→
+  1098→    # 加载规则
+  1099→    rule = load_rule(skill_id, rule_id)
+  1100→    if rule:
+  1101→        parts.append(f"\n---\n\n## 当前规则: {rule.name}\n")
+  1102→
+  1103→        # 添加规则完整内容
+  1104→        parts.append(rule.content)
+  1105→
+  1106→    # 伦理边界
+  1107→    if skill.ethics.get("forbidden"):
+  1108→        ethics_text = "\n## 伦理边界\n\n### 绝对禁止\n"
+  1109→        for item in skill.ethics["forbidden"]:
+  1110→            ethics_text += f"- {item}\n"
+  1111→        parts.append(ethics_text)
+  1112→
+  1113→    # 用户上下文（复用原有逻辑）
+  1114→    if user_context:
+  1115→        ctx_text = "\n## 用户上下文\n"
+  1116→
+  1117→        if user_context.get("birth_info"):
+  1118→            birth_info = user_context['birth_info']
+  1119→            ctx_text += f"\n### 出生信息（已收集，无需再次询问）\n"
+  1120→            ctx_text += f"{json.dumps(birth_info, ensure_ascii=False)}\n"
+  1121→            ctx_text += f"\n**重要**: 用户已提供出生信息，可以直接进行排盘和分析，无需调用 collect_bazi_info 工具。\n"
+  1122→
+  1123→        if user_context.get("portrait"):
+  1124→            ctx_text += f"\n### 用户画像\n{user_context['portrait']}\n"
+  1125→
+  1126→        if user_context.get("extracted"):
+  1127→            extracted = user_context['extracted']
+  1128→            ctx_text += f"\n### 用户信息 (从历史对话中抽取)\n"
+  1129→            if extracted.get("facts"):
+  1130→                ctx_text += f"**基本信息**: {json.dumps(extracted['facts'], ensure_ascii=False)}\n"
+  1131→            if extracted.get("concerns"):
+  1132→                ctx_text += f"**关注领域**: {', '.join(extracted['concerns'])}\n"
+  1133→            if extracted.get("goals"):
+  1134→                ctx_text += f"**当前目标**: {', '.join(extracted['goals'])}\n"
+  1135→            if extracted.get("pain_points"):
+  1136→                ctx_text += f"**面临困难**: {', '.join(extracted['pain_points'])}\n"
+  1137→
+  1138→        parts.append(ctx_text)
+  1139→
+  1140→    return "\n".join(parts)
+  1141→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

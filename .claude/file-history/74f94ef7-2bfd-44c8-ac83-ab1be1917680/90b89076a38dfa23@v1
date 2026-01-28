@@ -1,0 +1,405 @@
+"""
+VibeLife Billing Routes
+订阅与支付 API 路由
+"""
+
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query, Request, Header
+from pydantic import BaseModel
+
+from stores.db import get_db_pool
+from services.billing import StripeService, SubscriptionService, PaywallService
+from services.billing.subscription import SubscriptionStatus
+from services.billing.paywall import PaywallTrigger
+
+router = APIRouter(prefix="/billing", tags=["billing"])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────────
+
+class CreateCheckoutRequest(BaseModel):
+    user_id: str
+    plan_id: str
+    billing_cycle: str = "monthly"  # monthly or yearly
+    success_url: str
+    cancel_url: str
+
+
+class SubscriptionResponse(BaseModel):
+    id: str
+    plan_id: str
+    plan_name: str
+    status: str
+    started_at: str
+    current_period_end: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+
+class PlanResponse(BaseModel):
+    id: str
+    name: str
+    plan_type: str
+    skill_ids: list[str]
+    price_monthly: int
+    price_yearly: int
+    currency: str
+    features: list[str]
+
+
+class PaywallCheckRequest(BaseModel):
+    user_id: str
+    trigger: str
+    skill_id: Optional[str] = None
+
+
+class UsageResponse(BaseModel):
+    today_messages: int
+    month_messages: int
+    daily_limit: int
+    remaining_today: int
+
+
+# ─────────────────────────────────────────────────────────────────
+# Subscription Plans
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/plans")
+async def get_subscription_plans():
+    """获取所有订阅计划"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+
+    plans = await service.get_all_plans()
+
+    return {
+        "plans": [
+            PlanResponse(
+                id=p.id,
+                name=p.name,
+                plan_type=p.plan_type.value,
+                skill_ids=p.skill_ids,
+                price_monthly=p.price_monthly,
+                price_yearly=p.price_yearly,
+                currency=p.currency,
+                features=p.features
+            )
+            for p in plans
+        ]
+    }
+
+
+@router.get("/plans/{plan_id}")
+async def get_plan_detail(plan_id: str):
+    """获取计划详情"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+
+    plan = await service.get_plan(plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    return {
+        "plan": PlanResponse(
+            id=plan.id,
+            name=plan.name,
+            plan_type=plan.plan_type.value,
+            skill_ids=plan.skill_ids,
+            price_monthly=plan.price_monthly,
+            price_yearly=plan.price_yearly,
+            currency=plan.currency,
+            features=plan.features
+        )
+    }
+
+
+@router.get("/plans/{plan_id}/features")
+async def get_plan_features(plan_id: str):
+    """获取计划功能列表"""
+    pool = await get_db_pool()
+    subscription = SubscriptionService(pool)
+    paywall = PaywallService(pool, subscription)
+
+    features = await paywall.get_feature_list(plan_id)
+
+    return features
+
+
+# ─────────────────────────────────────────────────────────────────
+# User Subscription
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/subscription/{user_id}")
+async def get_user_subscription(user_id: str):
+    """获取用户当前订阅"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+
+    subscription = await service.get_user_subscription(user_id)
+
+    if not subscription:
+        return {"subscription": None, "tier": "free"}
+
+    plan = await service.get_plan(subscription.plan_id)
+
+    return {
+        "subscription": SubscriptionResponse(
+            id=subscription.id,
+            plan_id=subscription.plan_id,
+            plan_name=plan.name if plan else "Unknown",
+            status=subscription.status.value,
+            started_at=subscription.started_at.isoformat(),
+            current_period_end=subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+            cancelled_at=subscription.cancelled_at.isoformat() if subscription.cancelled_at else None
+        ),
+        "tier": plan.plan_type.value if plan else "free"
+    }
+
+
+@router.get("/subscription/{user_id}/history")
+async def get_subscription_history(
+    user_id: str,
+    limit: int = Query(10, ge=1, le=50)
+):
+    """获取订阅历史"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+
+    history = await service.get_user_subscription_history(user_id, limit)
+
+    return {
+        "history": [
+            SubscriptionResponse(
+                id=s.id,
+                plan_id=s.plan_id,
+                plan_name=s.plan_id,
+                status=s.status.value,
+                started_at=s.started_at.isoformat(),
+                current_period_end=s.current_period_end.isoformat() if s.current_period_end else None,
+                cancelled_at=s.cancelled_at.isoformat() if s.cancelled_at else None
+            )
+            for s in history
+        ]
+    }
+
+
+@router.get("/usage/{user_id}")
+async def get_user_usage(user_id: str):
+    """获取用户使用量"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+
+    usage = await service.get_user_usage(user_id)
+
+    return {
+        "usage": UsageResponse(**usage)
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Checkout & Payment
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/checkout/create")
+async def create_checkout_session(request: CreateCheckoutRequest):
+    """创建 Stripe Checkout Session"""
+    stripe = StripeService()
+
+    # 获取对应的 price_id
+    from services.billing.stripe_service import STRIPE_PRICE_IDS
+
+    price_key = f"{request.plan_id}_{request.billing_cycle}"
+    price_id = STRIPE_PRICE_IDS.get(price_key)
+
+    if not price_id:
+        raise HTTPException(status_code=400, detail="Invalid plan or billing cycle")
+
+    session = await stripe.create_checkout_session(
+        user_id=request.user_id,
+        price_id=price_id,
+        success_url=request.success_url,
+        cancel_url=request.cancel_url
+    )
+
+    if not session:
+        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+
+    return {
+        "session_id": session.session_id,
+        "checkout_url": session.url
+    }
+
+
+@router.post("/portal/{user_id}")
+async def create_billing_portal(user_id: str, return_url: str):
+    """创建账单管理门户"""
+    pool = await get_db_pool()
+    service = SubscriptionService(pool)
+    stripe = StripeService()
+
+    # 获取用户订阅
+    subscription = await service.get_user_subscription(user_id)
+    if not subscription or not subscription.payment_subscription_id:
+        raise HTTPException(status_code=404, detail="No active subscription found")
+
+    # 获取 Stripe 客户 ID
+    stripe_sub = await stripe.get_subscription(subscription.payment_subscription_id)
+    if not stripe_sub:
+        raise HTTPException(status_code=404, detail="Subscription not found in Stripe")
+
+    # 创建门户会话
+    portal_url = await stripe.create_billing_portal_session(
+        customer_id=stripe_sub.get("customer"),
+        return_url=return_url
+    )
+
+    if not portal_url:
+        raise HTTPException(status_code=500, detail="Failed to create billing portal")
+
+    return {"portal_url": portal_url}
+
+
+@router.post("/subscription/{user_id}/cancel")
+async def cancel_subscription(user_id: str):
+    """取消订阅"""
+    pool = await get_db_pool()
+    stripe = StripeService()
+    service = SubscriptionService(pool, stripe)
+
+    success = await service.cancel_subscription(user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to cancel subscription")
+
+    return {"message": "Subscription will be cancelled at the end of billing period"}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Paywall
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/paywall/check")
+async def check_paywall(request: PaywallCheckRequest):
+    """检查付费墙"""
+    try:
+        trigger = PaywallTrigger(request.trigger)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid trigger")
+
+    pool = await get_db_pool()
+    subscription = SubscriptionService(pool)
+    paywall = PaywallService(pool, subscription)
+
+    result = await paywall.check_access(request.user_id, trigger, request.skill_id)
+
+    return {
+        "allowed": result.allowed,
+        "trigger": result.trigger.value,
+        "reason": result.reason,
+        "upgrade_prompt": result.upgrade_prompt,
+        "recommended_plan": result.recommended_plan
+    }
+
+
+@router.get("/paywall/upgrade-prompt/{user_id}")
+async def get_upgrade_prompt(user_id: str, context: Optional[str] = None):
+    """获取升级提示"""
+    pool = await get_db_pool()
+    subscription = SubscriptionService(pool)
+    paywall = PaywallService(pool, subscription)
+
+    prompt = await paywall.should_show_upgrade_prompt(user_id, context)
+
+    return {"prompt": prompt}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Stripe Webhook
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/webhook/stripe")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature")
+):
+    """处理 Stripe Webhook"""
+    stripe = StripeService()
+
+    # 获取原始请求体
+    payload = await request.body()
+
+    # 验证签名
+    if not stripe_signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
+    event = stripe.verify_webhook_signature(payload, stripe_signature)
+    if not event:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    pool = await get_db_pool()
+    subscription_service = SubscriptionService(pool, stripe)
+
+    event_type = event["type"]
+    data = event["data"]
+
+    # 处理不同事件类型
+    if event_type == "checkout.session.completed":
+        # 支付成功，创建订阅
+        session = data
+        user_id = session.get("metadata", {}).get("user_id")
+        subscription_id = session.get("subscription")
+
+        if user_id and subscription_id:
+            # 获取订阅详情
+            stripe_sub = await stripe.get_subscription(subscription_id)
+            if stripe_sub:
+                # 从 price 推断 plan_id
+                price_id = stripe_sub["plan"]["id"]
+                plan_id = _price_to_plan(price_id)
+
+                await subscription_service.create_subscription(
+                    user_id=user_id,
+                    plan_id=plan_id,
+                    payment_subscription_id=subscription_id,
+                    current_period_end=stripe_sub["current_period_end"]
+                )
+
+    elif event_type == "customer.subscription.updated":
+        # 订阅更新
+        subscription = data
+        await subscription_service.sync_stripe_subscription(subscription["id"])
+
+    elif event_type == "customer.subscription.deleted":
+        # 订阅取消
+        subscription = data
+        await subscription_service.update_subscription_status(
+            subscription["id"],
+            SubscriptionStatus.CANCELED
+        )
+
+    elif event_type == "invoice.payment_failed":
+        # 支付失败
+        invoice = data
+        subscription_id = invoice.get("subscription")
+        if subscription_id:
+            await subscription_service.update_subscription_status(
+                subscription_id,
+                SubscriptionStatus.PAST_DUE
+            )
+
+    return {"received": True}
+
+
+def _price_to_plan(price_id: str) -> str:
+    """从 Stripe Price ID 推断 Plan ID"""
+    from services.billing.stripe_service import STRIPE_PRICE_IDS
+
+    for plan_key, pid in STRIPE_PRICE_IDS.items():
+        if pid == price_id:
+            # plan_key 格式为 "bazi_monthly" -> plan_id 为 "bazi_premium"
+            parts = plan_key.split("_")
+            if parts[0] == "vibelife":
+                return "vibelife_all"
+            return f"{parts[0]}_premium"
+
+    return "free"

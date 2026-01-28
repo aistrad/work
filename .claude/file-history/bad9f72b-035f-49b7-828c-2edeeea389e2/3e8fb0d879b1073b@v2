@@ -1,0 +1,1051 @@
+# VibeLife V10.3 LLM-First 架构设计
+
+> Version: 10.3 | 2026-01-25
+> 核心理念：完全 LLM 驱动，Prompt 驱动，零硬编码逻辑
+
+---
+
+## 0. V10.3 硬编码清理（重要！）
+
+### 0.1 移除的硬编码逻辑
+
+| 文件 | 删除的函数/常量 | 替代方案 |
+|------|----------------|---------|
+| `prompt_builder.py` | `_build_sop_rules()` | SKILL.md 中的规则驱动 LLM |
+| `prompt_builder.py` | `_compute_status()` | LLM 自主判断 profile/skill_data |
+| `prompt_builder.py` | `_build_personalization_hint()` | LLM 读取 profile 自主决定路由 |
+| `prompt_builder.py` | `_extract_chart_summary()` | LLM 直接读取 skill_data |
+| `session_manager.py` | `RESUME_KEYWORDS` | LLM 判断用户意图 |
+| `session_manager.py` | `ABANDON_KEYWORDS` | LLM 判断用户意图 |
+| `tool_executor.py` | `CHECKPOINT_TOOLS` | tools.yaml 中声明 |
+| `tool_executor.py` | `COLLECT_TOOLS` | tools.yaml 中声明 |
+| `core.py` | `_compute_sop_status()` | LLM 自主判断 |
+| `skill_loader.py` | `_build_persona_prompt()` if/elif | rules/persona.md 模板 |
+
+### 0.2 LLM-First 原则（强制）
+
+**只允许 LLM 工具调用方式进行决策，禁止 Python 硬编码条件判断。**
+
+```python
+# ❌ 禁止：Python 层面的条件判断
+if "职业" in focus:
+    hints.append("优先考虑 career")
+if archetype in ["成长者", "探索者"]:
+    hints.append("适合规划类服务")
+
+# ✅ 正确：让 LLM 读取数据自主决定
+# SKILL.md 中写规则，LLM 根据 profile 自主判断
+```
+
+### 0.3 SKILL.md 规则示例
+
+```markdown
+## 信息检查流程（LLM 自主执行）
+
+1. **检查本次对话**：用户可能已在聊天中说过
+   - "我是1990年出生" → 用户自己的信息
+   - "帮我朋友测，他1985年出生" → 第三方信息（不保存到 profile）
+
+2. **检查 profile**：`read(path="identity.birth_info")`
+   - 若有数据，直接使用
+
+3. **收集信息**：若以上都没有
+   - 调用 `ask(form_type="birth")` 收集
+
+**重要**：
+- 第三方测算的信息**不要**保存到用户 profile
+- 用户自己的信息**应该**保存（调用 `save`）
+```
+
+### 0.4 会话恢复规则
+
+```markdown
+## 会话恢复判断（LLM 自主执行）
+
+当检测到有未完成的会话时：
+1. 观察用户消息的语义
+2. 如果用户表达想继续 → 恢复会话
+3. 如果用户表达想重新开始 → 新建会话
+4. 不确定时 → 询问用户
+
+**不要硬编码关键词**，用语义理解判断用户意图。
+```
+
+---
+
+## 1. 设计目标
+
+### 1.1 从 V9.0 到 V9.2
+
+| 维度 | V9.0 | V9.2 |
+|------|------|------|
+| routing.yaml | 仍存在（技能/协议/模板） | **完全删除** |
+| Skills Index | 从 routing.yaml 读取 | 从 SKILL.md frontmatter 解析 |
+| Phase 1 工具 | show_skill_intro/recommend_skills | 统一为 show(type=...) |
+| 协议配置 | core/config/routing.yaml | lifecoach/rules/*.md |
+| 订阅同步 | 未明确 | save/read 原子工具 |
+
+### 1.2 LLM-First 原则
+
+1. **单一事实源**：一切路由/工具/规则信息来自各 Skill 的 SKILL.md + tools.yaml + rules/*.md
+2. **平台无业务逻辑**：平台只做"加载/聚合/权限/校验/观测"，不硬编码路由规则
+3. **LLM 自主编排**：Phase 1 LLM 根据 Skill metas 自主决定激活哪些 Skill
+4. **7 原子工具**：activate_skills, ask, save, read, search, show, remind
+
+---
+
+## 2. 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        启动时                                    │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Core Skill 全文加载（<500 tokens）                           │
+│  2. 所有其他 Skill 的 frontmatter 解析 → SkillMeta 列表          │
+│     来源：skills/*/SKILL.md（不再从 routing.yaml）               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1: Skill 选择（LLM 自主决定）                             │
+├─────────────────────────────────────────────────────────────────┤
+│  System Prompt:                                                  │
+│  - Core 精简人格（<300 tokens）                                  │
+│  - Skill Index（所有 SkillMeta 列表）                            │
+│  - 边界规则（来自 Core rules/boundary.md）                       │
+│  - 用户画像摘要                                                  │
+│                                                                  │
+│  可用工具（3 个）:                                              │
+│  - activate_skills(skills: List[str])                           │
+│  - ask(question, form_type?)                                    │
+│  - show(type: skill_list|recommendation|card)                   │
+│                                                                  │
+│  约束: "本轮只允许上述工具，不要假设未激活 Skill 的工具存在"     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ LLM: activate_skills(["zodiac"])
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 2: Skill 执行                                             │
+├─────────────────────────────────────────────────────────────────┤
+│  System Prompt:                                                  │
+│  - Core 全文 + 已激活 Skill 全文                                 │
+│  - 已激活 Skill 的 rules/*.md                                    │
+│  - Profile + skills.{id} 数据                                   │
+│                                                                  │
+│  可用工具:                                                       │
+│  - Core 7 个原子工具（始终可用）                                 │
+│  - 已激活 Skill 的所有工具                                       │
+│                                                                  │
+│  约束: "优先使用当前 Skill 工具；确需切换时可再次 activate_skills"│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 删除 routing.yaml
+
+### 3.1 原有内容处理
+
+| 原配置项 | 处理方式 |
+|---------|---------|
+| `phase1_prompt` | 内置到 prompt_builder.py |
+| `protocols` | 迁移到 lifecoach/rules/*.md |
+| `skills` | **删除**（从 SKILL.md 解析） |
+| `sop_templates` | 迁移到各 Skill/rules/*.md |
+| `welcome` | **删除**（内置极简问候） |
+| `boundary_rules` | 迁移到 core/rules/boundary.md |
+
+### 3.2 为什么完全删除
+
+1. **消除双轨维护**：不再需要同步 SKILL.md 和 routing.yaml
+2. **符合 LLM-First**：路由决策完全由 LLM 基于 Skill metas 做出
+3. **降低提示注入风险**：减少长文本配置注入到 prompt
+4. **简化发布流程**：新增/修改 Skill 只需改一处
+
+---
+
+## 4. Skill 索引机制
+
+### 4.1 数据结构
+
+```python
+@dataclass
+class SkillMeta:
+    """从 SKILL.md frontmatter 解析"""
+    id: str
+    name: str
+    description: str      # 内嵌工具列表
+    triggers: List[str]
+    category: str
+    version: str
+    # 派生字段
+    tools_list: List[str] # 从 description 或 tools.yaml 提取
+    sha: str              # 目录快照 hash
+    updated_at: datetime
+```
+
+### 4.2 索引流程
+
+```
+skills/*/SKILL.md
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  skill_loader.parse_skill_md()                                   │
+│  - 解析 frontmatter (id, name, description, triggers, category) │
+│  - 提取 tools_list（优先从 tools.yaml，回退从 description）      │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  skill_loader.load_all_skill_metas()                             │
+│  - 遍历 skills/ 目录（排除 core）                                │
+│  - 生成 Dict[str, SkillMeta]                                    │
+│  - 缓存到内存（启动时初始化）                                    │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SkillRegistry（全局单例）                                        │
+│  - _metas: Dict[str, SkillMeta]                                 │
+│  - _catalog_version: str                                        │
+│  - list_metas(subscribed?, tier?) -> Dict[str, SkillMeta]       │
+│  - get_meta(skill_id) -> SkillMeta                              │
+│  - refresh() -> None                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3 工具列表提取规则
+
+优先级：
+1. `tools/tools.yaml` 存在 → 遍历所有分组键提取 `name`
+2. 回退 → 从 `description` 正则匹配 `工具：xxx, yyy, zzz`
+
+```python
+# 标准分组键（与 DSL 类型对应）
+TOOL_GROUP_KEYS = ["compute", "collect", "action", "display", "search", "trigger", "routing"]
+
+def extract_tools_list(skill_dir: Path, description: str) -> List[str]:
+    """提取 Skill 的工具列表（遍历所有分组键）"""
+    tools_yaml = skill_dir / "tools" / "tools.yaml"
+    if tools_yaml.exists():
+        data = yaml.safe_load(tools_yaml.read_text())
+        tools = []
+
+        # 遍历所有分组键
+        for group_key in TOOL_GROUP_KEYS:
+            group_tools = data.get(group_key, [])
+            if isinstance(group_tools, list):
+                for tool in group_tools:
+                    if isinstance(tool, dict) and "name" in tool:
+                        tools.append(tool["name"])
+
+        # 兼容旧格式：顶层 tools 数组
+        if not tools and "tools" in data:
+            for tool in data.get("tools", []):
+                if isinstance(tool, dict) and "name" in tool:
+                    tools.append(tool["name"])
+
+        return tools
+
+    # 回退：从 description 解析
+    match = re.search(r'工具[：:]\s*(.+)', description)
+    if match:
+        return [t.strip() for t in match.group(1).split(',')]
+    return []
+```
+
+### 4.4 DSL 版本与类型统一
+
+**强制规范**：
+```yaml
+# 所有 Skill 的 tools.yaml 必须遵循
+version: "3.0"
+skill_id: {skill_id}
+
+# 类型枚举（type 字段）
+# collect  - 收集用户信息（表单、问答）
+# compute  - 计算/排盘（八字、星盘）
+# action   - 执行动作（保存、激活）
+# display  - 展示内容（卡片、列表）
+# search   - 检索知识库
+# trigger  - 触发提醒/事件
+# routing  - 路由相关（activate_skills）
+```
+
+**迁移要求**：
+- 所有 Skill 升级到 version: "3.0"
+- type 字段必须为上述枚举之一
+- Core 工具统一分组存放
+
+### 4.4 缓存与更新
+
+**启动时**：
+```python
+# services/agent/skill_loader.py
+_registry: SkillRegistry = None
+
+def get_registry() -> SkillRegistry:
+    global _registry
+    if _registry is None:
+        _registry = SkillRegistry()
+        _registry.refresh()
+    return _registry
+```
+
+**热更新（可选）**：
+```python
+# 文件监听（开发环境）
+import watchdog
+# watch skills/*/SKILL.md, */tools/tools.yaml
+# on_modified → registry.refresh()
+```
+
+**生产环境**：
+- 部署时重启服务（简单可靠）
+- 或通过 API 触发 `refresh()`
+
+---
+
+## 5. 订阅同步机制
+
+### 5.1 数据模型
+
+```yaml
+profile:
+  preferences:
+    subscribed_skills:
+      zodiac:
+        tier: "free"
+        subscribed_at: "2026-01-25T10:00:00Z"
+      bazi:
+        tier: "premium"
+        subscribed_at: "2026-01-20T08:00:00Z"
+```
+
+### 5.2 订阅/退订（LLM 驱动）
+
+```
+用户: "我想订阅星座功能"
+        │
+        ▼
+LLM: save(
+  path="preferences.subscribed_skills.zodiac",
+  data={"tier": "free", "subscribed_at": "2026-01-25T..."}
+)
+        │
+        ▼
+服务端 save handler:
+  1. 写入 profile.preferences.subscribed_skills.zodiac
+  2. 同步写入 DB 表 user_skill_subscriptions（跨设备）
+```
+
+**退订**：
+```
+LLM: save(
+  path="preferences.subscribed_skills.zodiac",
+  data=null  # 删除
+)
+```
+
+### 5.3 Phase 1 个性化注入
+
+```python
+def build_skill_index(profile: dict, metas: Dict[str, SkillMeta]) -> str:
+    """构建个性化的 Skill 列表"""
+    subscribed = profile.get("preferences", {}).get("subscribed_skills", {})
+    tier = profile.get("account", {}).get("tier", "free")
+
+    # 分组
+    subscribed_metas = []
+    available_metas = []
+
+    for skill_id, meta in metas.items():
+        if skill_id in subscribed:
+            subscribed_metas.append(meta)
+        elif is_available_for_tier(skill_id, tier):
+            available_metas.append(meta)
+
+    # 排序：已订阅优先 + 按 category 分组
+    subscribed_metas.sort(key=lambda m: m.category)
+    available_metas.sort(key=lambda m: (m.category, -usage_score(m.id)))
+
+    # 生成文本
+    lines = ["## 已订阅技能"]
+    for meta in subscribed_metas:
+        lines.append(f"- **{meta.name}** ({meta.id}): {meta.description}")
+
+    lines.append("\n## 可用技能")
+    for meta in available_metas[:5]:  # 限制数量
+        lines.append(f"- **{meta.name}** ({meta.id}): {meta.description}")
+
+    return "\n".join(lines)
+```
+
+---
+
+## 6. Phase 1 工具精简
+
+### 6.1 移除的工具
+
+| 工具 | 替代方案 |
+|------|---------|
+| `show_skill_intro` | `show(type="skill_list")` |
+| `recommend_skills` | `show(type="recommendation", data={...})` |
+| `show_protocol_invitation` | `show(type="card", card_type="protocol_invitation")` |
+
+### 6.2 Phase 1 可用工具（4 个）
+
+**V9.3 更新**：增加 `read` 工具，支持 LLM 在 Phase 1 读取用户信息（如回答"我的生日是哪天"）。
+
+```yaml
+# core/tools/tools.yaml - Phase 1 子集（通过 phase1: true 标记）
+routing:
+  - name: activate_skills
+    phase1: true
+    description: 激活一个或多个 Skill
+    parameters:
+      - name: skills
+        type: array
+        items: string
+        required: true
+
+collect:
+  - name: ask
+    phase1: true
+    description: 向用户提问
+    parameters:
+      - name: question
+        type: string
+        required: true
+      - name: form_type
+        type: string
+        enum: [text, select, birth]
+
+action:
+  - name: read
+    phase1: true  # V9.3: Phase 1 可用
+    description: 读取用户数据（身份、出生信息等）
+    parameters:
+      - name: path
+        type: string
+        required: true
+        description: "identity, identity.birth_info, skills.{id}, etc."
+
+display:
+  - name: show
+    phase1: true
+    description: 展示内容
+    parameters:
+      - name: type
+        type: string
+        required: true
+        enum: [skill_list, recommendation, card]
+      - name: card_type
+        type: string
+      - name: data
+        type: object
+```
+
+**配置驱动**：Phase 1 工具由 `tools.yaml` 中的 `phase1: true` 标记决定，不再硬编码。
+
+### 6.3 场景映射
+
+| 用户说 | Phase 1 工具调用 |
+|-------|-----------------|
+| "帮我看星座" | `activate_skills(["zodiac"])` |
+| "你能做什么" | `show(type="skill_list")` |
+| "推荐适合我的" | `show(type="recommendation", data={focus: "career"})` |
+| "Dan Koe 协议" | `activate_skills(["lifecoach"])` → Phase 2 展示协议 |
+
+---
+
+## 7. 协议迁移
+
+### 7.1 目录结构
+
+```
+skills/lifecoach/
+├── SKILL.md
+├── rules/
+│   ├── _index.md           # 规则索引
+│   ├── protocols/
+│   │   ├── dankoe.md       # Dan Koe 一日重置
+│   │   ├── covey.md        # Covey 七个习惯
+│   │   ├── yangming.md     # 王阳明心学
+│   │   └── liaofan.md      # 了凡四训
+│   └── sop/
+│       └── coaching.md     # 教练 SOP
+└── tools/
+    └── tools.yaml
+```
+
+### 7.2 协议文件格式
+
+```markdown
+# dankoe.md
+
+---
+id: dankoe
+name: Dan Koe 一日重置
+estimated_time: 20分钟
+total_steps: 6
+triggers:
+  - Dan Koe
+  - 人生重置
+  - 快速重置
+  - 人生重构
+---
+
+## 协议目标
+
+帮助用户在一天内完成人生状态的重新校准...
+
+## 执行流程
+
+### Step 1: 觉察当前状态
+...
+
+### Step 2: 明确核心价值
+...
+```
+
+### 7.3 协议展示（通过 show 工具）
+
+```python
+# Phase 2 LLM 调用
+show(
+    type="card",
+    card_type="protocol_invitation",
+    data={
+        "protocol_id": "dankoe",
+        "name": "Dan Koe 一日重置",
+        "description": "帮助你在一天内完成人生状态的重新校准",
+        "estimated_time": "20分钟",
+        "steps": 6
+    }
+)
+```
+
+---
+
+## 8. Prompt 构建
+
+### 8.1 Phase 1 Prompt
+
+```python
+def build_phase1_prompt(profile: dict) -> str:
+    """构建 Phase 1 系统提示"""
+    registry = get_registry()
+    metas = registry.list_metas()
+
+    parts = [
+        # 1. Core 精简人格
+        CORE_INTRO,  # <300 tokens
+
+        # 2. Skill 列表（个性化）
+        build_skill_index(profile, metas),
+
+        # 3. 边界规则
+        load_boundary_rules(),  # core/rules/boundary.md
+
+        # 4. 用户画像摘要
+        build_profile_summary(profile),
+
+        # 5. 约束
+        PHASE1_CONSTRAINTS
+    ]
+
+    return "\n\n---\n\n".join(parts)
+
+
+CORE_INTRO = """
+# Vibe - 生命对话者
+
+温暖但不粘腻，智慧但不说教，好奇但不窥探，诚实但不伤害。
+
+> "我不是来给你答案的，我是来陪你找到你自己的答案的。"
+
+## 当前阶段：技能选择
+
+根据用户意图，选择要激活的技能。
+- 意图明确 → activate_skills
+- 不确定 → ask 追问
+- 用户问"能做什么" → show(type="skill_list")
+"""
+
+PHASE1_CONSTRAINTS = """
+## 约束
+
+- **本轮只允许**：activate_skills、ask、show
+- **禁止假设**：未激活 Skill 的工具不存在
+- **禁止编造**：不要假装知道用户的命盘/星座数据
+"""
+```
+
+### 8.2 Phase 2 Prompt
+
+```python
+def build_phase2_prompt(
+    profile: dict,
+    active_skills: List[str]
+) -> str:
+    """构建 Phase 2 系统提示"""
+    parts = [
+        # 1. Core 全文
+        load_core_skill_full(),
+
+        # 2. 已激活 Skill 全文 + rules
+        *[load_skill_full(sid) for sid in active_skills],
+
+        # 3. 用户数据
+        build_user_data_section(profile, active_skills),
+
+        # 4. 约束
+        PHASE2_CONSTRAINTS
+    ]
+
+    return "\n\n---\n\n".join(parts)
+
+
+PHASE2_CONSTRAINTS = """
+## 约束
+
+- 优先使用当前 Skill 的工具
+- 确需切换时可再次调用 activate_skills
+- 已有数据直接用，**禁止**重复收集
+"""
+```
+
+---
+
+## 9. 用户信息查询机制
+
+### 9.1 设计原则
+
+**Profile 内已有信息 → 直接回答，不调用工具**
+
+```
+用户: "我的生日是什么"
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1 System Prompt 已包含用户画像摘要                         │
+│                                                                  │
+│  ## 用户画像                                                     │
+│  - 生日: 1990-01-15                                             │
+│  - 星座: 摩羯座                                                  │
+│  - 当前状态: neutral                                             │
+│  - 目标: [找到理想工作, 提升收入]                                 │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+LLM 判断：Profile 内已有 → 直接回答
+        │
+        ▼
+"你的生日是 1990年1月15日，摩羯座～"（不调用工具）
+```
+
+### 9.2 Profile 摘要注入
+
+```python
+def build_profile_summary(profile: dict) -> str:
+    """构建用户画像摘要，注入到 Phase 1/2"""
+    identity = profile.get("identity", {})
+    state = profile.get("state", {})
+    goals = profile.get("life_context", {}).get("goals", [])
+
+    lines = ["## 用户画像"]
+
+    # 身份信息
+    if birth := identity.get("birth_info"):
+        lines.append(f"- 生日: {birth.get('date')}")
+        if zodiac := birth.get("zodiac"):
+            lines.append(f"- 星座: {zodiac}")
+
+    # 当前状态
+    if emotion := state.get("emotion"):
+        lines.append(f"- 当前情绪: {emotion}")
+    if focus := state.get("focus"):
+        lines.append(f"- 关注领域: {', '.join(focus)}")
+
+    # 目标（最多3个）
+    if goals:
+        goal_names = [g.get("name", g) for g in goals[:3]]
+        lines.append(f"- 目标: {goal_names}")
+
+    return "\n".join(lines)
+```
+
+### 9.3 三种场景对比
+
+| 场景 | 处理方式 | 工具调用 |
+|------|---------|---------|
+| "我的生日" | 直接回答（prompt 中有） | ❌ 无 |
+| "我的目标" | 直接回答（prompt 中有摘要） | ❌ 无 |
+| "我的详细星盘" | 需要完整数据 | `read(path="skills.zodiac.chart")` |
+| "保存我的新目标" | 写入数据 | `save(path="goals.xxx", data={...})` |
+
+### 9.4 Boundary Rules（core/rules/boundary.md）
+
+```markdown
+## 能力边界
+
+### Profile 查询 → 直接回答
+
+当用户询问已在上下文中的信息时，直接用文字回答，**不要调用工具**：
+
+| 用户问 | 处理方式 |
+|-------|---------|
+| "我的生日" | 直接说"你的生日是 xxxx" |
+| "我是什么星座" | 直接说"你是 xx 座" |
+| "我有什么目标" | 直接列出目标 |
+| "我现在什么状态" | 描述当前状态 |
+
+### 何时使用 read 工具
+
+只有当需要查询**不在当前 prompt 中的详细数据**时：
+- 完整命盘/星盘数据
+- 历史分析记录
+- 详细目标进度
+```
+
+### 9.5 设计优势
+
+1. **减少工具调用**：常见查询无需 round-trip
+2. **降低延迟**：直接从 prompt 上下文回答
+3. **自然对话**：像真人一样记得用户信息
+4. **Token 可控**：只注入摘要，详细数据按需 read
+
+---
+
+## 10. 平台侧职责
+
+### 10.1 保留的非 LLM 职责
+
+| 职责 | 说明 |
+|------|------|
+| **工具执行** | handlers.py 实际执行逻辑 |
+| **路径白名单** | save/read 只允许特定路径 |
+| **Schema 校验** | 工具参数、卡片数据校验 |
+| **速率限制** | 工具调用频率、步数上限 |
+| **观测指标** | 激活率、工具成功率、切换频率 |
+| **故障回退** | LLM 异常时的兜底响应 |
+
+### 10.2 工具参数校验
+
+```python
+# services/agent/validators.py
+
+SAVE_PATH_WHITELIST = [
+    r"^identity\.birth_info$",
+    r"^state\.\w+$",
+    r"^preferences\.\w+(\.\w+)*$",
+    r"^skills\.\w+(\.\w+)*$",
+    r"^goals(\.\w+)*$",
+]
+
+def validate_save_path(path: str) -> bool:
+    return any(re.match(pattern, path) for pattern in SAVE_PATH_WHITELIST)
+```
+
+### 10.3 观测指标
+
+```python
+# metrics to track
+- skill_activation_count{skill_id}
+- tool_call_count{skill_id, tool_name}
+- tool_success_rate{skill_id, tool_name}
+- skill_switch_count  # Phase 2 中切换 Skill 的次数
+- phase1_tool_usage{tool_name}  # activate_skills vs ask vs show
+```
+
+### 10.4 Phase 1 注入安全与体量控制
+
+**截断策略**：
+```python
+# Phase 1 仅注入结构化字段，文本截断
+PHASE1_LIMITS = {
+    "description_max_chars": 120,  # description 截断
+    "triggers_max_count": 5,       # triggers 最多5个
+    "skills_max_count": 10,        # Skill 列表最多10个
+    "profile_summary_max_tokens": 200,
+}
+
+def build_skill_meta_for_phase1(meta: SkillMeta) -> dict:
+    """Phase 1 只注入精简字段"""
+    return {
+        "id": meta.id,
+        "name": meta.name,
+        "description": meta.description[:120] + "..." if len(meta.description) > 120 else meta.description,
+        "triggers": meta.triggers[:5],
+        "tools_list": meta.tools_list,
+        # 不注入：完整规则、详细说明
+    }
+```
+
+**转义规则**：
+- 所有注入文本做 Markdown 转义（防止 prompt injection）
+- 用户提供的数据用 `<user_data>` 标签包裹
+- 禁止注入可执行代码或系统指令
+
+**Phase 2 才加载**：
+- 完整 SKILL.md 内容
+- rules/*.md 规则文件
+- 详细 skill_data（命盘等）
+
+### 10.5 防抖与预算阈值
+
+**可配置阈值**：
+```python
+# services/agent/config.py
+AGENT_LIMITS = {
+    # 激活控制
+    "max_activations_per_turn": 1,      # 单轮最多激活1次
+    "max_skill_switches_per_session": 3, # 会话内切换≤3次
+
+    # 工具控制
+    "max_tool_calls_per_turn": 5,       # 单轮最多5次工具调用
+    "max_total_steps": 20,              # 总步数上限
+
+    # 超时
+    "tool_timeout_seconds": 30,         # 单工具超时
+    "turn_timeout_seconds": 120,        # 单轮超时
+
+    # 预算（可选）
+    "max_tokens_per_session": 50000,    # 会话 token 上限
+}
+```
+
+**约束注入到 Prompt**：
+```markdown
+## 限制
+
+- 单轮最多调用 1 次 activate_skills
+- 单轮最多调用 5 次工具
+- 不要在同一会话中频繁切换技能
+```
+
+**超时兜底**：
+```python
+async def execute_with_timeout(tool_call, timeout=30):
+    try:
+        return await asyncio.wait_for(execute_tool(tool_call), timeout)
+    except asyncio.TimeoutError:
+        return {"error": "工具执行超时，请稍后重试"}
+```
+
+### 10.6 展示/提醒契约规范
+
+#### show 卡片 JSON Schema
+
+```python
+# schemas/cards.py
+CARD_SCHEMAS = {
+    "skill_list": {
+        "type": "object",
+        "properties": {
+            "skills": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id", "name"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string", "maxLength": 200}
+                    }
+                }
+            }
+        },
+        "required": ["skills"]
+    },
+    "recommendation": {
+        "type": "object",
+        "required": ["skill_id", "reason"],
+        "properties": {
+            "skill_id": {"type": "string"},
+            "reason": {"type": "string", "maxLength": 300}
+        }
+    },
+    "protocol_invitation": {
+        "type": "object",
+        "required": ["protocol_id", "title", "estimated_time"],
+        "properties": {
+            "protocol_id": {"type": "string"},
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "estimated_time": {"type": "string"},
+            "total_steps": {"type": "integer"}
+        }
+    }
+}
+
+def validate_card_data(card_type: str, data: dict) -> bool:
+    schema = CARD_SCHEMAS.get(card_type)
+    if not schema:
+        return True  # 未注册的类型暂时放行
+    return jsonschema.validate(data, schema)
+```
+
+#### remind 时间格式规范
+
+```yaml
+# 时间格式：ISO8601 + 时区
+schedule:
+  # 单次提醒
+  once: "2026-01-26T08:00:00+08:00"  # ISO8601 with timezone
+
+  # 重复提醒（使用 RRULE）
+  rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0"
+  timezone: "Asia/Shanghai"
+
+  # 相对时间
+  relative: "1h"   # 1小时后
+  relative: "1d"   # 1天后
+```
+
+**示例调用**：
+```python
+# 明天早上8点提醒
+remind(
+    action="set",
+    title="晨间冥想",
+    schedule={
+        "once": "2026-01-26T08:00:00+08:00"
+    }
+)
+
+# 每天早上8点重复
+remind(
+    action="set",
+    title="每日复盘",
+    schedule={
+        "rrule": "FREQ=DAILY;BYHOUR=8;BYMINUTE=0",
+        "timezone": "Asia/Shanghai"
+    }
+)
+```
+
+**跨时区处理**：
+- 存储统一用 UTC
+- 展示时转换为用户时区（从 profile.preferences.timezone 读取）
+- RRULE 计算基于用户本地时区
+
+---
+
+## 11. 迁移实施
+
+### 11.1 代码变更清单
+
+| 文件 | 变更 |
+|------|------|
+| `skills/core/config/routing.yaml` | **删除** |
+| `services/agent/routing_config.py` | 移除或标注弃用 |
+| `services/agent/skill_loader.py` | 实现 `load_all_skill_metas()` |
+| `services/agent/prompt_builder.py` | 重构 Phase 1/2 构建 |
+| `services/agent/core.py` | Phase 1 工具精简 |
+| `skills/core/rules/boundary.md` | 新建（从 routing.yaml 迁移） |
+| `skills/lifecoach/rules/protocols/*.md` | 新建协议文件 |
+
+### 11.2 执行顺序
+
+1. **新建文件**：boundary.md、协议文件
+2. **修改 skill_loader**：实现索引机制
+3. **修改 prompt_builder**：不再依赖 routing_config
+4. **修改 core.py**：Phase 1 工具精简
+5. **删除 routing.yaml**
+6. **验证**：E2E 测试
+
+### 11.3 验证用例
+
+| 场景 | 预期结果 |
+|------|---------|
+| "帮我看星座" | Phase 1: activate_skills(["zodiac"]) |
+| "我能做什么" | Phase 1: show(type="skill_list") |
+| "推荐适合我的" | Phase 1: show(type="recommendation") |
+| "Dan Koe 协议" | Phase 1: activate_skills(["lifecoach"]) → Phase 2: show 协议卡片 |
+| "帮我算命和看职业" | Phase 1: activate_skills(["bazi", "career"]) |
+
+---
+
+## 12. 版本历史
+
+- **V10.3** (2026-01-25):
+  - **彻底移除所有硬编码逻辑**
+  - 删除 `_build_sop_rules`, `_compute_status`, `_build_personalization_hint`
+  - 删除 `RESUME_KEYWORDS`, `ABANDON_KEYWORDS`
+  - 删除 `CHECKPOINT_TOOLS`, `COLLECT_TOOLS`
+  - 删除 `_compute_sop_status`
+  - 简化 `_build_persona_prompt` 为模板加载
+  - SKILL.md 规则驱动所有决策
+
+- **V9.2** (2026-01-25):
+  - **完全删除 routing.yaml**
+  - Skill 索引从 SKILL.md frontmatter 解析
+  - Phase 1 工具精简为 3 个（activate_skills, ask, show）
+  - 协议迁移到 lifecoach/rules/protocols/
+  - 订阅同步通过 save/read 原子工具
+
+- **V9.0** (2026-01-24):
+  - 两层架构：Core Layer + Skill Layer
+  - 7 个原子工具
+  - 渐进式加载
+
+---
+
+## 13. Core SKILL.md 必备规则
+
+### 13.1 信息收集与保存
+
+当用户在对话中主动提供以下信息时，**必须调用 save 工具保存**：
+
+| 用户说 | 动作 |
+|-------|------|
+| "我是1990年1月15日出生" | `save(path="identity.birth_info", data={date: "1990-01-15"})` |
+| "我在北京出生" | `save(path="identity.birth_info", data={location: "北京"})` |
+| "我叫小明" | `save(path="identity.display_name", data="小明")` |
+
+**原则**：用户提供的个人信息是宝贵的，不要只是"记住了"——要持久化保存。
+
+### 13.2 第三方信息处理
+
+```
+场景分析：
+┌─────────────────────────────┬──────────────┬─────────────────────────────────────┐
+│            场景             │   信息归属   │        应该保存到 profile？         │
+├─────────────────────────────┼──────────────┼─────────────────────────────────────┤
+│ "我是1990年出生"            │ 用户自己     │ ✅ 是                               │
+├─────────────────────────────┼──────────────┼─────────────────────────────────────┤
+│ "帮我朋友测，他1985年出生"  │ 朋友（临时） │ ❌ 否                               │
+├─────────────────────────────┼──────────────┼─────────────────────────────────────┤
+│ "帮我和对象看合盘，她是..." │ 配对对象     │ ❌ 否（或保存到 synastry 专用字段） │
+└─────────────────────────────┴──────────────┴─────────────────────────────────────┘
+```
+
+### 13.3 工具属性声明
+
+工具的行为属性应在 `tools.yaml` 中声明，不在代码中硬编码：
+
+```yaml
+# tools.yaml
+action:
+  - name: save
+    description: 保存用户数据
+    checkpoint: true  # 标记为需要 checkpoint 的工具
+    parameters:
+      - name: path
+        type: string
+        required: true
+
+collect:
+  - name: request_info
+    description: 收集用户信息
+    checkpoint: true
+    collect_type: true  # 标记为收集型工具
+    parameters:
+      - name: form_type
+        type: string
+        enum: [birth, basic, custom]
+```

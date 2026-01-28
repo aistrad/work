@@ -1,0 +1,462 @@
+"""
+Unified Profile Repository - 统一 Profile 数据访问层
+
+基于 unified_profiles 表，提供统一的 Profile 访问接口。
+使用 jsonb_set() 进行局部更新，避免重写整个 profile。
+"""
+import json
+import logging
+from typing import Optional, Dict, Any, List
+from uuid import UUID
+
+from .db import get_connection, fetch, fetchrow, fetchval, execute
+
+logger = logging.getLogger(__name__)
+
+
+def deep_merge(base: Dict, update: Dict) -> Dict:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif value is not None:
+            result[key] = value
+    return result
+
+
+class UnifiedProfileRepository:
+    """统一 Profile 数据访问层"""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 读取操作
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def get_profile(user_id: UUID) -> Optional[Dict[str, Any]]:
+        """获取完整 Profile"""
+        row = await fetchrow(
+            "SELECT profile FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+        if not row:
+            return None
+
+        profile = row["profile"]
+        if isinstance(profile, str):
+            profile = json.loads(profile)
+        return profile
+
+    @staticmethod
+    async def get_birth_info(user_id: UUID) -> Dict[str, Any]:
+        """获取出生信息"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        return profile.get("birth_info", {}) if profile else {}
+
+    @staticmethod
+    async def get_skill_data(user_id: UUID, skill: str) -> Dict[str, Any]:
+        """获取 Skill 数据"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("skill_data", {}).get(skill, {})
+        return {}
+
+    @staticmethod
+    async def get_all_skill_data(user_id: UUID) -> Dict[str, Any]:
+        """获取所有 Skill 数据"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("skill_data", {})
+        return {}
+
+    @staticmethod
+    async def get_preferences(user_id: UUID) -> Dict[str, Any]:
+        """获取用户偏好"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("preferences", {"voice_mode": "warm", "language": "zh-CN"})
+        return {"voice_mode": "warm", "language": "zh-CN"}
+
+    @staticmethod
+    async def get_identity_prism(user_id: UUID) -> Dict[str, Any]:
+        """获取 Identity Prism"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("identity_prism", {})
+        return {}
+
+    @staticmethod
+    async def get_life_context(user_id: UUID) -> Dict[str, Any]:
+        """获取生活上下文"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("life_context", {})
+        return {}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 写入操作
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def create_profile(user_id: UUID, initial_profile: Dict[str, Any] = None) -> Dict[str, Any]:
+        """创建新的 Profile"""
+        profile = initial_profile or {
+            "birth_info": {},
+            "life_context": {},
+            "identity_prism": {},
+            "preferences": {"voice_mode": "warm", "language": "zh-CN"},
+            "skill_data": {}
+        }
+
+        await execute(
+            """INSERT INTO unified_profiles (user_id, profile)
+               VALUES ($1, $2::jsonb)
+               ON CONFLICT (user_id) DO NOTHING""",
+            user_id, json.dumps(profile, ensure_ascii=False, default=str)
+        )
+
+        return profile
+
+    @staticmethod
+    async def update_profile(user_id: UUID, updates: Dict[str, Any]) -> None:
+        """
+        更新 Profile (全量合并更新)
+
+        Args:
+            user_id: 用户 ID
+            updates: 要更新的字段，会与现有数据深度合并
+        """
+        current = await UnifiedProfileRepository.get_profile(user_id)
+
+        if current:
+            merged = deep_merge(current, updates)
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = $2::jsonb, updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(merged, ensure_ascii=False, default=str)
+            )
+        else:
+            # 不存在则创建
+            default_profile = {
+                "birth_info": {},
+                "life_context": {},
+                "identity_prism": {},
+                "preferences": {"voice_mode": "warm", "language": "zh-CN"},
+                "skill_data": {}
+            }
+            merged = deep_merge(default_profile, updates)
+            await execute(
+                """INSERT INTO unified_profiles (user_id, profile)
+                   VALUES ($1, $2::jsonb)""",
+                user_id, json.dumps(merged, ensure_ascii=False, default=str)
+            )
+
+        # 失效缓存
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def update_birth_info(user_id: UUID, birth_info: Dict[str, Any]) -> None:
+        """
+        更新出生信息 (使用 jsonb_set 局部更新)
+
+        Args:
+            user_id: 用户 ID
+            birth_info: 出生信息 {date, time, place, gender, timezone}
+        """
+        # 确保记录存在
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       COALESCE(profile, '{}'::jsonb),
+                       '{birth_info}',
+                       $2::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(birth_info, ensure_ascii=False, default=str)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"birth_info": birth_info})
+
+        # 失效所有缓存 (birth_info 影响所有 skill)
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def update_skill_data(user_id: UUID, skill: str, data: Dict[str, Any]) -> None:
+        """
+        更新 Skill 数据 (使用 jsonb_set 局部更新，避免重写整个 profile)
+
+        Args:
+            user_id: 用户 ID
+            skill: Skill 标识 (bazi, zodiac, tarot, career)
+            data: Skill 数据 (如命盘数据)
+        """
+        # 确保记录存在
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            # 使用 jsonb_set 进行嵌套路径更新
+            # 先确保 skill_data 存在，再设置具体 skill
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       jsonb_set(
+                           COALESCE(profile, '{}'::jsonb),
+                           '{skill_data}',
+                           COALESCE(profile -> 'skill_data', '{}'::jsonb)
+                       ),
+                       ARRAY['skill_data', $2],
+                       $3::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, skill, json.dumps(data, ensure_ascii=False, default=str)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"skill_data": {skill: data}})
+
+        # 只失效该 skill 的缓存
+        await UnifiedProfileRepository._invalidate_cache(user_id, skill)
+
+    @staticmethod
+    async def update_preferences(user_id: UUID, preferences: Dict[str, Any]) -> None:
+        """更新用户偏好 (使用 jsonb_set 局部更新)"""
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            # 合并现有偏好
+            current_prefs = await UnifiedProfileRepository.get_preferences(user_id)
+            merged_prefs = {**current_prefs, **preferences}
+
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       COALESCE(profile, '{}'::jsonb),
+                       '{preferences}',
+                       $2::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(merged_prefs, ensure_ascii=False)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"preferences": preferences})
+
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def update_identity_prism(user_id: UUID, identity_prism: Dict[str, Any]) -> None:
+        """更新 Identity Prism (使用 jsonb_set 局部更新)"""
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       COALESCE(profile, '{}'::jsonb),
+                       '{identity_prism}',
+                       $2::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(identity_prism, ensure_ascii=False, default=str)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"identity_prism": identity_prism})
+
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def update_life_context(user_id: UUID, life_context: Dict[str, Any]) -> None:
+        """更新生活上下文 (使用 jsonb_set 局部更新)"""
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            # 合并现有上下文
+            current_ctx = await UnifiedProfileRepository.get_life_context(user_id)
+            merged_ctx = deep_merge(current_ctx, life_context)
+
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       COALESCE(profile, '{}'::jsonb),
+                       '{life_context}',
+                       $2::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(merged_ctx, ensure_ascii=False, default=str)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"life_context": life_context})
+
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def update_extracted(user_id: UUID, extracted: Dict[str, Any]) -> None:
+        """
+        更新抽取的用户信息 (使用 jsonb_set 局部更新)
+
+        Args:
+            user_id: 用户 ID
+            extracted: 抽取的信息 {facts, concerns, goals, pain_points, life_events, patterns, ...}
+        """
+        exists = await fetchval(
+            "SELECT 1 FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+
+        if exists:
+            await execute(
+                """UPDATE unified_profiles
+                   SET profile = jsonb_set(
+                       COALESCE(profile, '{}'::jsonb),
+                       '{extracted}',
+                       $2::jsonb
+                   ),
+                   updated_at = NOW()
+                   WHERE user_id = $1""",
+                user_id, json.dumps(extracted, ensure_ascii=False, default=str)
+            )
+        else:
+            await UnifiedProfileRepository.create_profile(user_id, {"extracted": extracted})
+
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+
+    @staticmethod
+    async def get_extracted(user_id: UUID) -> Dict[str, Any]:
+        """获取抽取的用户信息"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if profile:
+            return profile.get("extracted", {})
+        return {}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 删除操作
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def delete_profile(user_id: UUID) -> bool:
+        """删除用户 Profile"""
+        result = await execute(
+            "DELETE FROM unified_profiles WHERE user_id = $1",
+            user_id
+        )
+        await UnifiedProfileRepository._invalidate_cache(user_id)
+        return "DELETE 1" in str(result)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 历史归档
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def archive_profile(user_id: UUID) -> bool:
+        """归档当前 Profile 到历史表"""
+        profile = await UnifiedProfileRepository.get_profile(user_id)
+        if not profile:
+            return False
+
+        await execute(
+            """INSERT INTO unified_profiles_history (user_id, profile)
+               VALUES ($1, $2::jsonb)""",
+            user_id, json.dumps(profile, ensure_ascii=False, default=str)
+        )
+        return True
+
+    @staticmethod
+    async def get_profile_history(user_id: UUID, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取 Profile 历史记录"""
+        rows = await fetch(
+            """SELECT profile, archived_at FROM unified_profiles_history
+               WHERE user_id = $1
+               ORDER BY archived_at DESC
+               LIMIT $2""",
+            user_id, limit
+        )
+        return [
+            {
+                "profile": row["profile"] if isinstance(row["profile"], dict) else json.loads(row["profile"]),
+                "archived_at": row["archived_at"]
+            }
+            for row in rows
+        ]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 缓存管理
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def _invalidate_cache(user_id: UUID, skill: str = None) -> None:
+        """
+        失效缓存
+
+        Args:
+            user_id: 用户 ID
+            skill: 如果指定，只失效该 skill 的缓存；否则失效所有缓存
+        """
+        try:
+            from stores.profile_cache import get_profile_cache
+            cache = get_profile_cache()
+
+            if skill:
+                # 只失效特定 skill 的缓存
+                await cache.invalidate_by_key(f"{user_id}:{skill}")
+                # 也失效 all 缓存
+                await cache.invalidate_by_key(f"{user_id}:all")
+            else:
+                # 失效该用户所有缓存
+                await cache.invalidate_by_prefix(str(user_id))
+
+            logger.debug(f"缓存已失效: user_id={user_id}, skill={skill}")
+        except Exception as e:
+            logger.warning(f"缓存失效失败: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 便捷函数 (兼容旧代码)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_unified_profile(user_id: UUID) -> Optional[Dict[str, Any]]:
+    """获取统一 Profile (便捷函数)"""
+    return await UnifiedProfileRepository.get_profile(user_id)
+
+
+async def get_unified_profile_with_skill(user_id: UUID, skill: str = None) -> Dict[str, Any]:
+    """
+    获取 Profile 和 Skill 数据 (兼容 profile_cache 接口)
+
+    Returns:
+        {
+            "profile": {...},
+            "skill_data": {...}
+        }
+    """
+    profile = await UnifiedProfileRepository.get_profile(user_id)
+
+    if profile:
+        skill_data = profile.get("skill_data", {})
+        return {
+            "profile": profile,
+            "skill_data": skill_data
+        }
+
+    return {"profile": {}, "skill_data": {}}

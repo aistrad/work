@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from services import stream_processor, auth_service
+from stores import mentis_db
+
+
+router = APIRouter(prefix="/v3", tags=["stream"])
+
+
+class MediaItem(BaseModel):
+    type: str = Field(..., description="image|audio")
+    data: str = Field(..., description="base64 or URL")
+
+
+class StreamRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=10000)
+    type: str = Field(default="vibe_diary")
+    media: List[MediaItem] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StreamListResponse(BaseModel):
+    items: List[Dict[str, Any]]
+
+
+def _request_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{uuid4().hex[:8]}"
+
+
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    payload: Dict[str, Any] = {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        }
+    }
+    if details:
+        payload["error"]["details"] = details
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _resolve_user_id(request: Request) -> str:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            UUID(token)
+            return token
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    header_user = (request.headers.get("X-Mentis-User-Id") or "").strip()
+    if header_user:
+        try:
+            UUID(header_user)
+            return header_user
+        except Exception:
+            raise HTTPException(status_code=401, detail="auth/invalid-token")
+
+    raise HTTPException(status_code=401, detail="auth/missing-token")
+
+
+def _require_mentis_user(user_id: str) -> None:
+    row = mentis_db.fetch_one("SELECT id FROM mentis_user WHERE id = %s", (user_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="resource/user-not-found")
+
+
+def _fetch_stream_entry(stream_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    return mentis_db.fetch_one(
+        """
+        SELECT id, type, raw_content, emotion, context, tags, energy_delta, created_at
+        FROM stream_entry
+        WHERE id = %s AND user_id = %s
+        """,
+        (stream_id, user_id),
+    )
+
+
+def _today_bounds() -> tuple[datetime, datetime]:
+    now = datetime.now(timezone.utc)
+    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return start, end
+
+
+@router.post("/stream")
+async def create_stream(request: Request, body: StreamRequest):
+    request_id = _request_id("stream")
+
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    media_urls = [m.data for m in body.media if isinstance(m.data, str)]
+
+    def event_generator():
+        for event in stream_processor.process_stream(
+            user_id=user_id,
+            stream_type=body.type,
+            content=body.content,
+            media_urls=media_urls or None,
+        ):
+            payload = json.dumps(event, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Request-Id": request_id,
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+@router.get("/stream", response_model=StreamListResponse)
+async def list_stream(request: Request, limit: int = 20, offset: int = 0):
+    request_id = _request_id("stream-list")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    safe_limit = max(1, min(100, int(limit)))
+    safe_offset = max(0, int(offset))
+    rows = mentis_db.fetch_all(
+        """
+        SELECT id, type, raw_content, emotion, context, tags, energy_delta, created_at
+        FROM stream_entry
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, safe_limit, safe_offset),
+    )
+    return {"items": rows}
+
+
+@router.get("/stream/{stream_id}")
+async def get_stream(request: Request, stream_id: str):
+    request_id = _request_id("stream-get")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    row = _fetch_stream_entry(stream_id, user_id)
+    if not row:
+        return _error_response(
+            status_code=404,
+            code="resource/stream-not-found",
+            message="Stream entry not found",
+            request_id=request_id,
+        )
+    return row
+
+
+@router.delete("/stream/{stream_id}")
+async def delete_stream(request: Request, stream_id: str):
+    request_id = _request_id("stream-delete")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    row = _fetch_stream_entry(stream_id, user_id)
+    if not row:
+        return _error_response(
+            status_code=404,
+            code="resource/stream-not-found",
+            message="Stream entry not found",
+            request_id=request_id,
+        )
+
+    mentis_db.execute("DELETE FROM stream_entry WHERE id = %s AND user_id = %s", (stream_id, user_id))
+    return {"ok": True, "deleted_id": stream_id}
+
+
+@router.get("/user/state")
+async def get_user_state(request: Request):
+    request_id = _request_id("user-state")
+    try:
+        user_id = _resolve_user_id(request)
+        _require_mentis_user(user_id)
+    except HTTPException as exc:
+        return _error_response(
+            status_code=exc.status_code,
+            code=str(exc.detail),
+            message="Unauthorized" if exc.status_code == 401 else "Resource not found",
+            request_id=request_id,
+        )
+
+    state = mentis_db.fetch_one(
+        """
+        SELECT energy_score, momentum, streak_days, current_mood, mood_intensity,
+               aura_state, last_active_at
+        FROM user_state
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    if not state:
+        return _error_response(
+            status_code=404,
+            code="resource/user-state-not-found",
+            message="User state not found",
+            request_id=request_id,
+        )
+
+    start, end = _today_bounds()
+    stream_count = mentis_db.fetch_one(
+        "SELECT COUNT(*) AS count FROM stream_entry WHERE user_id = %s AND created_at BETWEEN %s AND %s",
+        (user_id, start, end),
+    ) or {"count": 0}
+    checkin_count = mentis_db.fetch_one(
+        "SELECT COUNT(*) AS count FROM checkin_log WHERE user_id = %s AND created_at BETWEEN %s AND %s",
+        (user_id, start, end),
+    ) or {"count": 0}
+
+    return {
+        "energy_score": state.get("energy_score"),
+        "momentum": state.get("momentum"),
+        "streak_days": state.get("streak_days"),
+        "current_mood": {
+            "primary": state.get("current_mood"),
+            "intensity": state.get("mood_intensity"),
+            "detected_at": state.get("last_active_at"),
+        },
+        "aura_state": state.get("aura_state"),
+        "today_stats": {
+            "stream_count": int(stream_count.get("count") or 0),
+            "checkin_count": int(checkin_count.get("count") or 0),
+            "energy_high": None,
+            "energy_low": None,
+        },
+        "pending_tasks": 0,
+        "unread_insights": 0,
+        "last_active_at": state.get("last_active_at"),
+    }

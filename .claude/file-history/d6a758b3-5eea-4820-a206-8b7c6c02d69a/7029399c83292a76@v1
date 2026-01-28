@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+数据迁移脚本: 迁移现有数据到 unified_profiles 表
+
+执行前请确保:
+1. 已执行 015_unified_profiles.sql 创建新表
+2. 已备份数据库: pg_dump -h 127.0.0.1 -p 8224 -U postgres vibelife > backup.sql
+
+执行方式:
+    cd apps/api && python scripts/migrate_profiles.py
+
+验证方式:
+    cd apps/api && python scripts/migrate_profiles.py --verify
+"""
+import asyncio
+import json
+import logging
+import sys
+import os
+from datetime import datetime
+from typing import Dict, Any, Optional
+from uuid import UUID
+
+# 添加项目路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from stores.db import init_db, fetch, fetchrow, fetchval, execute, get_connection
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def deep_merge(base: Dict, update: Dict) -> Dict:
+    """深度合并两个字典"""
+    result = base.copy()
+    for key, value in update.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif value is not None:
+            result[key] = value
+    return result
+
+
+def build_birth_info_with_priority(user: dict) -> dict:
+    """
+    构建 birth_info，��先使用 vibe_users 的数据
+
+    优先级: vibe_users > user_profiles (因为 vibe_users 是认证时写入的源头)
+    """
+    birth_info = {}
+
+    if user.get("birth_datetime"):
+        dt = user["birth_datetime"]
+        if hasattr(dt, 'date'):
+            birth_info["date"] = dt.date().isoformat()
+            birth_info["time"] = dt.time().isoformat()
+        else:
+            # 如果是字符串
+            birth_info["date"] = str(dt)[:10] if dt else None
+
+    birth_info["place"] = user.get("birth_location")
+    birth_info["gender"] = user.get("gender")
+    birth_info["timezone"] = user.get("timezone", "Asia/Shanghai")
+
+    # 清理 None 值
+    return {k: v for k, v in birth_info.items() if v is not None}
+
+
+async def migrate_single_user(user: dict) -> dict:
+    """迁移单个用户的数据"""
+    user_id = user["id"]
+
+    # 1. 构建 birth_info (优先级: vibe_users > user_profiles)
+    birth_info = build_birth_info_with_priority(user)
+
+    # 2. 获取旧 profile 数据
+    old_profile_row = await fetchrow(
+        "SELECT profile FROM user_profiles WHERE user_id = $1 ORDER BY version DESC LIMIT 1",
+        user_id
+    )
+
+    old_data = {}
+    if old_profile_row and old_profile_row["profile"]:
+        old_data = old_profile_row["profile"]
+        if isinstance(old_data, str):
+            old_data = json.loads(old_data)
+
+    # 3. 补充 vibe_users 没有的字段
+    if not birth_info.get("date") and old_data:
+        basic = old_data.get("basic", {})
+        if basic.get("birth_date"):
+            birth_info["date"] = basic["birth_date"]
+        if basic.get("birth_time"):
+            birth_info["time"] = basic["birth_time"]
+
+    # 4. 构建完整 profile
+    profile = {
+        "birth_info": birth_info,
+        "life_context": old_data.get("life_context", {}),
+        "preferences": {
+            "voice_mode": old_data.get("preferences", {}).get("voice_mode", "warm"),
+            "language": user.get("language", "zh-CN")
+        },
+        "skill_data": {}
+    }
+
+    # 5. 合并 user_skill_data
+    skill_data_rows = await fetch(
+        "SELECT skill, data FROM user_skill_data WHERE user_id = $1",
+        user_id
+    )
+    for sd in skill_data_rows:
+        skill = sd["skill"]
+        data = sd["data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        profile["skill_data"][skill] = data
+
+    # 6. 写入 unified_profiles (UPSERT)
+    await execute(
+        """INSERT INTO unified_profiles (user_id, profile)
+           VALUES ($1, $2::jsonb)
+           ON CONFLICT (user_id) DO UPDATE SET profile = $2::jsonb, updated_at = NOW()""",
+        user_id, json.dumps(profile, ensure_ascii=False, default=str)
+    )
+
+    return profile
+
+
+async def migrate_onboarding_data():
+    """迁移 skill_profiles 中的 onboarding 数据到 onboarding_data 表"""
+    logger.info("开始迁移 onboarding 数据...")
+
+    stats = {"success": 0, "skipped": 0, "failed": 0}
+
+    # 获取所有 skill_profiles 中有 onboarding 数据的记录
+    rows = await fetch(
+        """SELECT DISTINCT ON (user_id) user_id, skill_id, profile_data
+           FROM skill_profiles
+           WHERE profile_data IS NOT NULL
+           ORDER BY user_id, last_use_at DESC"""
+    )
+
+    for row in rows:
+        try:
+            user_id = row["user_id"]
+            profile_data = row["profile_data"]
+
+            if isinstance(profile_data, str):
+                profile_data = json.loads(profile_data)
+
+            interview_responses = profile_data.get("interview_responses", {})
+            focus_areas = profile_data.get("focus_areas", [])
+
+            # 只有有实际数据才迁移
+            if not interview_responses and not focus_areas:
+                stats["skipped"] += 1
+                continue
+
+            # 检查是否已存在
+            existing = await fetchrow(
+                "SELECT id FROM onboarding_data WHERE user_id = $1",
+                user_id
+            )
+
+            if existing:
+                stats["skipped"] += 1
+                continue
+
+            # 插入 onboarding_data
+            await execute(
+                """INSERT INTO onboarding_data
+                   (user_id, interview_responses, focus_areas, skill)
+                   VALUES ($1, $2::jsonb, $3::jsonb, $4)""",
+                user_id,
+                json.dumps(interview_responses, ensure_ascii=False),
+                json.dumps(focus_areas, ensure_ascii=False),
+                row["skill_id"]
+            )
+
+            stats["success"] += 1
+
+        except Exception as e:
+            logger.error(f"迁移 onboarding 数据失败 (user_id={row['user_id']}): {e}")
+            stats["failed"] += 1
+
+    logger.info(f"Onboarding 数据迁移完成: {stats}")
+    return stats
+
+
+async def migrate_profiles():
+    """迁移所有用户数据到 unified_profiles"""
+    await init_db()
+
+    stats = {"success": 0, "failed": 0, "skipped": 0}
+
+    # 1. 获取所有用户
+    users = await fetch("SELECT * FROM vibe_users WHERE status = 'active'")
+    total = len(users)
+    logger.info(f"开始迁移 {total} 个用户")
+
+    for i, user in enumerate(users, 1):
+        try:
+            await migrate_single_user(user)
+            stats["success"] += 1
+
+            if i % 100 == 0:
+                logger.info(f"进度: {i}/{total} ({i*100//total}%)")
+
+        except Exception as e:
+            logger.error(f"迁移用户 {user['id']} 失败: {e}")
+            stats["failed"] += 1
+
+    # 2. 迁移 onboarding 数据
+    onboarding_stats = await migrate_onboarding_data()
+
+    # 3. 输出统计
+    logger.info("=" * 50)
+    logger.info(f"Profile 迁移完成:")
+    logger.info(f"  - 成功: {stats['success']}")
+    logger.info(f"  - 失败: {stats['failed']}")
+    logger.info(f"  - 跳过: {stats['skipped']}")
+    logger.info(f"Onboarding 迁移: {onboarding_stats}")
+    logger.info("=" * 50)
+
+    return stats
+
+
+async def verify_migration():
+    """验证迁移数据完整性"""
+    await init_db()
+
+    logger.info("开始验证迁移数据...")
+
+    # 1. 数量校验
+    old_count = await fetchval("SELECT COUNT(*) FROM vibe_users WHERE status = 'active'")
+    new_count = await fetchval("SELECT COUNT(*) FROM unified_profiles")
+
+    logger.info(f"用户数量: vibe_users={old_count}, unified_profiles={new_count}")
+
+    if old_count != new_count:
+        logger.error(f"❌ 数量不匹配: {old_count} vs {new_count}")
+        return False
+
+    # 2. 抽样校验 (随机 10 个用户)
+    samples = await fetch(
+        """SELECT u.id, u.birth_datetime, u.birth_location, u.gender, p.profile
+           FROM vibe_users u
+           JOIN unified_profiles p ON u.id = p.user_id
+           ORDER BY RANDOM() LIMIT 10"""
+    )
+
+    errors = []
+    for s in samples:
+        profile = s["profile"]
+        if isinstance(profile, str):
+            profile = json.loads(profile)
+
+        birth_info = profile.get("birth_info", {})
+
+        # 检查 birth_datetime 是否正确迁移
+        if s["birth_datetime"]:
+            expected_date = s["birth_datetime"].date().isoformat()
+            actual_date = birth_info.get("date")
+            if expected_date != actual_date:
+                errors.append(f"用户 {s['id']}: birth_date 不匹配 ({expected_date} vs {actual_date})")
+
+        # 检查 gender 是否正确迁移
+        if s["gender"] and birth_info.get("gender") != s["gender"]:
+            errors.append(f"用户 {s['id']}: gender 不匹配")
+
+    if errors:
+        for err in errors:
+            logger.error(f"❌ {err}")
+        return False
+
+    # 3. 检查 skill_data 是否正确迁移
+    skill_data_count = await fetchval(
+        """SELECT COUNT(*) FROM unified_profiles
+           WHERE profile -> 'skill_data' != '{}'::jsonb"""
+    )
+    old_skill_data_count = await fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM user_skill_data"
+    )
+
+    logger.info(f"Skill 数据: user_skill_data 用户数={old_skill_data_count}, unified_profiles 有 skill_data 的用户数={skill_data_count}")
+
+    logger.info("✓ 数据校验通过")
+    return True
+
+
+async def main():
+    """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="迁移 Profile 数据到 unified_profiles")
+    parser.add_argument("--verify", action="store_true", help="只验证，不迁移")
+    parser.add_argument("--dry-run", action="store_true", help="模拟运行，不实际写入")
+    args = parser.parse_args()
+
+    if args.verify:
+        success = await verify_migration()
+        sys.exit(0 if success else 1)
+    else:
+        stats = await migrate_profiles()
+
+        # 自动验证
+        logger.info("\n开始自动验证...")
+        success = await verify_migration()
+
+        if not success:
+            logger.error("❌ 迁移验证失败，请检查数据")
+            sys.exit(1)
+
+        logger.info("✓ 迁移完成并验证通过")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

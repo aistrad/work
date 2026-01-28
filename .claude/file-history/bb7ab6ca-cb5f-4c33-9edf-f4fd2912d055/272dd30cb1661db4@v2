@@ -1,0 +1,200 @@
+"""
+订阅与支付服务测试
+"""
+
+import pytest
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+from services.billing.subscription import (
+    SubscriptionService,
+    SubscriptionTier,
+    SubscriptionStatus,
+    UserSubscription
+)
+from services.billing.paywall import PaywallService, PaywallTrigger
+
+
+class TestSubscriptionService:
+    """订阅服务测试"""
+
+    @pytest.mark.asyncio
+    async def test_get_all_plans(self, mock_db_pool):
+        """测试获取所有计划"""
+        service = SubscriptionService(mock_db_pool)
+        plans = await service.get_all_plans()
+
+        assert len(plans) > 0
+
+        # 验证包含免费计划
+        free_plan = next((p for p in plans if p.id == "free"), None)
+        assert free_plan is not None
+        assert free_plan.price_monthly == 0
+
+        # 验证包含付费计划
+        paid_plan = next((p for p in plans if p.id == "paid"), None)
+        assert paid_plan is not None
+        assert len(paid_plan.skill_ids) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_plan(self, mock_db_pool):
+        """测试获取单个计划"""
+        service = SubscriptionService(mock_db_pool)
+
+        plan = await service.get_plan("paid")
+        assert plan is not None
+        assert plan.name == "付费会员"
+        assert len(plan.skill_ids) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_user_subscription_none(self, mock_db_pool):
+        """测试获取用户订阅 - 无订阅"""
+        mock_db_pool.fetchrow.return_value = None
+
+        service = SubscriptionService(mock_db_pool)
+        subscription = await service.get_user_subscription("user-123")
+
+        assert subscription is None
+
+    @pytest.mark.asyncio
+    async def test_get_user_subscription_active(self, mock_db_pool):
+        """测试获取用户订阅 - 有效订阅"""
+        mock_db_pool.fetchrow.return_value = {
+            "id": "sub-1",
+            "user_id": "user-123",
+            "plan_id": "bazi_premium",
+            "status": "active",
+            "started_at": datetime.now() - timedelta(days=30),
+            "current_period_end": datetime.now() + timedelta(days=30),
+            "cancelled_at": None,
+            "payment_provider": "stripe",
+            "payment_subscription_id": "sub_stripe_123"
+        }
+
+        service = SubscriptionService(mock_db_pool)
+        subscription = await service.get_user_subscription("user-123")
+
+        assert subscription is not None
+        assert subscription.plan_id == "bazi_premium"
+        assert subscription.status == SubscriptionStatus.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_get_user_usage(self, mock_db_pool):
+        """测试获取用户使用量"""
+        # 设置今日消息数
+        mock_db_pool.fetchval.side_effect = [2, 50]  # 今日, 本月
+
+        service = SubscriptionService(mock_db_pool)
+        usage = await service.get_user_usage("user-123")
+
+        assert usage["today_messages"] == 2
+        assert usage["month_messages"] == 50
+        assert usage["daily_limit"] == 3
+        assert usage["remaining_today"] == 1
+
+    @pytest.mark.asyncio
+    async def test_check_feature_access_free_user(self, mock_db_pool):
+        """测试免费用户功能访问"""
+        mock_db_pool.fetchrow.return_value = None  # 无订阅
+
+        service = SubscriptionService(mock_db_pool)
+        has_access = await service.check_feature_access(
+            "user-123", "basic_chat", "bazi"
+        )
+
+        assert has_access is True
+
+    @pytest.mark.asyncio
+    async def test_check_feature_access_premium_feature(self, mock_db_pool):
+        """测试高级功能访问"""
+        mock_db_pool.fetchrow.return_value = None  # 无订阅
+
+        service = SubscriptionService(mock_db_pool)
+        has_access = await service.check_feature_access(
+            "user-123", "deep_pattern_analysis", "bazi"
+        )
+
+        assert has_access is False
+
+
+class TestPaywallService:
+    """付费墙服务测试"""
+
+    @pytest.mark.asyncio
+    async def test_check_access_free_user_daily_limit(self, mock_db_pool):
+        """测试免费用户每日限制"""
+        mock_db_pool.fetchrow.return_value = None  # 无订阅
+        mock_db_pool.fetchval.return_value = 5  # 已用5次
+
+        subscription = SubscriptionService(mock_db_pool)
+        paywall = PaywallService(mock_db_pool, subscription)
+
+        result = await paywall.check_access(
+            "user-123",
+            PaywallTrigger.UNLIMITED_CHAT,
+            "bazi"
+        )
+
+        assert result.allowed is False
+        assert "用完" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_check_access_premium_feature_no_sub(self, mock_db_pool):
+        """测试无订阅访问高级功能"""
+        mock_db_pool.fetchrow.return_value = None
+
+        subscription = SubscriptionService(mock_db_pool)
+        paywall = PaywallService(mock_db_pool, subscription)
+
+        result = await paywall.check_access(
+            "user-123",
+            PaywallTrigger.DEEP_PATTERN_ANALYSIS,
+            "bazi"
+        )
+
+        assert result.allowed is False
+        # 推荐升级计划
+        assert result.recommended_plan is not None
+
+    @pytest.mark.asyncio
+    async def test_check_access_free_user_blocked(self, mock_db_pool):
+        """测试免费用户被阻止访问高级功能"""
+        # 无订阅用户
+        mock_db_pool.fetchrow.return_value = None
+
+        subscription = SubscriptionService(mock_db_pool)
+        paywall = PaywallService(mock_db_pool, subscription)
+
+        result = await paywall.check_access(
+            "user-123",
+            PaywallTrigger.FULL_NATAL_CHART,
+            "zodiac"
+        )
+
+        assert result.allowed is False
+        # 推荐升级计划
+        assert result.recommended_plan is not None
+
+    def test_get_upgrade_prompt(self, mock_db_pool):
+        """测试获取升级提示"""
+        paywall = PaywallService(mock_db_pool)
+
+        prompt = paywall._get_upgrade_prompt(PaywallTrigger.DEEP_PATTERN_ANALYSIS)
+        # 提示中应该有相关内容
+        assert prompt is not None and len(prompt) > 0
+
+    def test_get_recommended_plan(self, mock_db_pool):
+        """测试获取推荐计划"""
+        paywall = PaywallService(mock_db_pool)
+
+        # 八字触发点推荐八字计划
+        plan = paywall._get_recommended_plan(
+            PaywallTrigger.DEEP_PATTERN_ANALYSIS, "bazi"
+        )
+        assert plan is not None
+
+        # 星座触发点推荐星座计划
+        plan = paywall._get_recommended_plan(
+            PaywallTrigger.FULL_NATAL_CHART, "zodiac"
+        )
+        assert plan is not None

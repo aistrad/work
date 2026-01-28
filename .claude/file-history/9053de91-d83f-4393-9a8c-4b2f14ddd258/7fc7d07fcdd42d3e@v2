@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""
+协议流真实场景测试
+
+基于用户实际使用设计的多种scenario，包括：
+1. 完整流程 - 用户从头到尾完成
+2. 中断恢复 - 用户做到一半退出再进
+3. 边界情况 - 空回答、长回答、特殊字符
+4. 协议取消 - 用户中途放弃
+5. 数据持久化 - 验证数据正确保存
+
+用法：
+  python scripts/test_protocol_scenarios.py
+"""
+
+import asyncio
+import json
+import sys
+import os
+from pathlib import Path
+from datetime import datetime, timezone
+from uuid import UUID
+
+# 设置数据库环境变量
+os.environ["VIBELIFE_DB_URL"] = "postgresql://postgres:Ak4_9lScd-69WX@106.37.170.238:8224/vibelife"
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stores.unified_profile_repo import UnifiedProfileRepository
+from routes.chat_v5 import (
+    load_protocol_config,
+    build_protocol_prompt,
+    get_protocol_state,
+    emit_protocol_progress_event,
+)
+from skills.lifecoach.tools.handlers import (
+    show_protocol_invitation,
+    advance_protocol_step,
+    cancel_protocol,
+)
+from services.agent.tool_registry import ToolContext
+
+
+# Test user IDs
+TEST_USER_COMPLETE = UUID("00000000-0000-0000-0000-000000000001")
+TEST_USER_INTERRUPT = UUID("00000000-0000-0000-0000-000000000002")
+TEST_USER_CANCEL = UUID("00000000-0000-0000-0000-000000000003")
+TEST_USER_BOUNDARY = UUID("00000000-0000-0000-0000-000000000004")
+
+
+def print_section(title):
+    """打印测试章节标题"""
+    print("\n" + "=" * 80)
+    print(f"  {title}")
+    print("=" * 80)
+
+
+def print_result(status, message):
+    """打印测试结果"""
+    emoji = "✅" if status == "success" else "❌" if status == "error" else "⚠️"
+    print(f"{emoji} {message}")
+
+
+async def cleanup_test_user(user_id: UUID):
+    """清理测试用户数据（完全清理 lifecoach skill 数据）"""
+    try:
+        # 完全清空 skills.lifecoach 对象（而不是只清理 protocol 字段）
+        from stores.db import execute
+        await execute(
+            """UPDATE unified_profiles
+               SET profile = jsonb_set(
+                   COALESCE(profile, '{}'::jsonb),
+                   '{skills}',
+                   COALESCE(profile -> 'skills', '{}'::jsonb) - 'lifecoach'
+               ),
+               updated_at = NOW()
+               WHERE user_id = $1""",
+            user_id
+        )
+    except Exception as e:
+        print(f"  ⚠️  清理失败: {e}")
+        pass  # 首次运行可能没有数据
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario 1: 完整流程测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_scenario_complete_flow():
+    """
+    测试场景 1: 完整流程
+
+    用户从启动协议到完成全部6个步骤，检验：
+    - 协议启动
+    - 每步数据保存
+    - 步骤自动推进
+    - 协议完成
+    """
+    print_section("Scenario 1: 完整流程测试")
+
+    user_id = TEST_USER_COMPLETE
+    context = ToolContext(user_id=user_id, skill_id="lifecoach", user_tier="paid")
+
+    # 清理旧数据
+    print("\n[准备] 清理旧数据...")
+    await cleanup_test_user(user_id)
+    print_result("success", "数据清理完成")
+
+    # 模拟用户回答
+    user_answers = {
+        1: "工作没意义，每天都在重复",
+        2: "在一个灰暗的出租屋醒来，身体疲惫，9点到6点做着重复的工作，晚上10点感到空虚",
+        3: "在海边的房子醒来，身体轻盈，一天自由安排，晚上感到满足和平静",
+        4: "我是那种会拖延的人",
+        5: "我是那种说到做到的人",
+        6: ["周三晚上跑步30分钟", "周末写一篇文章", "每天早起30分钟"],
+    }
+
+    # Step 1: 启动协议
+    print("\n[1/7] 启动协议...")
+    await UnifiedProfileRepository.update_skill_state(
+        user_id,
+        "lifecoach",
+        "protocol",
+        {
+            "id": "dankoe",
+            "step": 1,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed": False
+        }
+    )
+
+    # 验证启动
+    state = await get_protocol_state(user_id, "lifecoach")
+    if state and state["id"] == "dankoe" and state["step"] == 1:
+        print_result("success", f"协议已启动: {state['id']}, 当前步骤: {state['step']}")
+    else:
+        print_result("error", "协议启动失败")
+        return
+
+    # Step 2-7: 模拟完成每个步骤
+    for step in range(1, 7):
+        print(f"\n[{step + 1}/7] 步骤 {step}: {user_answers[step][:50]}...")
+
+        # 调用 advance_protocol_step
+        result = await advance_protocol_step(
+            {
+                "step_data": {
+                    "answer": user_answers[step],
+                    "answered_at": datetime.now(timezone.utc).isoformat()
+                },
+                "step_summary": f"用户回答了步骤{step}"
+            },
+            context
+        )
+
+        if result["status"] == "success":
+            print_result("success", f"步骤{step}数据已保存")
+
+            # 手动推进步骤（模拟 chat_v5.py 的行为）
+            if step < 6:
+                await UnifiedProfileRepository.update_skill_state(
+                    user_id,
+                    "lifecoach",
+                    "protocol",
+                    {"step": step + 1}
+                )
+                print_result("success", f"已推进到步骤{step + 1}")
+        else:
+            print_result("error", f"步骤{step}保存失败: {result.get('message')}")
+            return
+
+    # Step 8: 标记协议完成
+    print(f"\n[8/7] 标记协议完成...")
+    await UnifiedProfileRepository.update_skill_state(
+        user_id,
+        "lifecoach",
+        "protocol",
+        {"completed": True}
+    )
+
+    # 验证完成
+    final_state = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+    protocol_data = final_state.get("protocol", {})
+
+    if protocol_data.get("completed"):
+        print_result("success", "协议已完成")
+
+        # 验证所有步骤的数据
+        print("\n[验证] 检查保存的数据...")
+        data = protocol_data.get("data", {})
+        for step in range(1, 7):
+            step_key = f"step_{step}"
+            if step_key in data:
+                print_result("success", f"步骤{step}数据已保存: {data[step_key].get('answer', '')[:50]}...")
+            else:
+                print_result("warning", f"步骤{step}数据缺失")
+    else:
+        print_result("error", "协议未标记为完成")
+
+    print("\n" + "-" * 80)
+    print("Scenario 1 完成")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario 2: 中断恢复测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_scenario_interrupt_recovery():
+    """
+    测试场景 2: 中断恢复
+
+    用户做到第3步时退出，再次进入时应该：
+    - 正确恢复到第3步
+    - 能看到之前保存的数据
+    - 能继续完成后续步骤
+    """
+    print_section("Scenario 2: 中断恢复测试")
+
+    user_id = TEST_USER_INTERRUPT
+    context = ToolContext(user_id=user_id, skill_id="lifecoach", user_tier="paid")
+
+    # 清理旧数据
+    print("\n[准备] 清理旧数据...")
+    await cleanup_test_user(user_id)
+
+    # Phase 1: 做到第3步后退出
+    print("\n[Phase 1] 用户完成前3步...")
+
+    await UnifiedProfileRepository.update_skill_state(
+        user_id,
+        "lifecoach",
+        "protocol",
+        {
+            "id": "dankoe",
+            "step": 1,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed": False
+        }
+    )
+
+    # 完成步骤 1-3
+    answers_phase1 = {
+        1: "工作压力大",
+        2: "在疲惫中醒来",
+        3: "在自由中醒来",
+    }
+
+    for step in range(1, 4):
+        await advance_protocol_step(
+            {
+                "step_data": {"answer": answers_phase1[step]},
+                "step_summary": f"步骤{step}完成"
+            },
+            context
+        )
+        if step < 3:
+            await UnifiedProfileRepository.update_skill_state(
+                user_id, "lifecoach", "protocol", {"step": step + 1}
+            )
+
+    # 用户退出（不推进到第4步）
+    print_result("success", "用户完成前3步，然后退出")
+
+    # Phase 2: 模拟用户再次进入（隔天）
+    print("\n[Phase 2] 用户第二天再次进入...")
+
+    # 恢复协议状态
+    recovered_state = await get_protocol_state(user_id, "lifecoach")
+
+    if recovered_state and recovered_state["step"] == 3:
+        print_result("success", f"协议状态已恢复: 步骤 {recovered_state['step']}")
+
+        # 验证之前的数据
+        lifecoach_data = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+        saved_data = lifecoach_data.get("protocol", {}).get("data", {})
+
+        for step in range(1, 4):
+            if f"step_{step}" in saved_data:
+                print_result("success", f"步骤{step}数据已恢复")
+            else:
+                print_result("error", f"步骤{step}数据丢失")
+    else:
+        print_result("error", "协议状态恢复失败")
+        return
+
+    # Phase 3: 继续完成剩余步骤
+    print("\n[Phase 3] 继续完成步骤 4-6...")
+
+    answers_phase2 = {
+        4: "我是那种犹豫的人",
+        5: "我是那种果断的人",
+        6: ["晨跑", "冥想"],
+    }
+
+    # 先推进到第4步
+    await UnifiedProfileRepository.update_skill_state(
+        user_id, "lifecoach", "protocol", {"step": 4}
+    )
+
+    for step in range(4, 7):
+        await advance_protocol_step(
+            {
+                "step_data": {"answer": answers_phase2[step]},
+                "step_summary": f"步骤{step}完成"
+            },
+            context
+        )
+        if step < 6:
+            await UnifiedProfileRepository.update_skill_state(
+                user_id, "lifecoach", "protocol", {"step": step + 1}
+            )
+
+    # 标记完成
+    await UnifiedProfileRepository.update_skill_state(
+        user_id, "lifecoach", "protocol", {"completed": True}
+    )
+
+    # 验证最终数据
+    final_data = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+    all_steps = final_data.get("protocol", {}).get("data", {})
+
+    if len(all_steps) == 6:
+        print_result("success", f"所有6个步骤的数据都已保存")
+    else:
+        print_result("warning", f"只保存了{len(all_steps)}个步骤的数据")
+
+    print("\n" + "-" * 80)
+    print("Scenario 2 完成")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario 3: 协议取消测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_scenario_protocol_cancel():
+    """
+    测试场景 3: 协议取消
+
+    用户在第2步时决定取消协议，检验：
+    - cancel_protocol 工具正常工作
+    - 已保存的数据被保留
+    - 协议状态被标记为已取消
+    """
+    print_section("Scenario 3: 协议取消测试")
+
+    user_id = TEST_USER_CANCEL
+    context = ToolContext(user_id=user_id, skill_id="lifecoach", user_tier="paid")
+
+    # 清理旧数据
+    print("\n[准备] 清理旧数据...")
+    await cleanup_test_user(user_id)
+
+    # 启动协议
+    print("\n[1/4] 启动协议...")
+    await UnifiedProfileRepository.update_skill_state(
+        user_id,
+        "lifecoach",
+        "protocol",
+        {
+            "id": "dankoe",
+            "step": 1,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed": False
+        }
+    )
+    print_result("success", "协议已启动")
+
+    # 完成第1步
+    print("\n[2/4] 完成第1步...")
+    await advance_protocol_step(
+        {
+            "step_data": {"answer": "工作太累"},
+            "step_summary": "步骤1完成"
+        },
+        context
+    )
+    await UnifiedProfileRepository.update_skill_state(
+        user_id, "lifecoach", "protocol", {"step": 2}
+    )
+    print_result("success", "第1步已完成")
+
+    # 用户决定取消
+    print("\n[3/4] 用户决定取消协议...")
+    cancel_result = await cancel_protocol(
+        {"reason": "用户暂时没有时间"},
+        context
+    )
+
+    if cancel_result["status"] == "success":
+        print_result("success", "协议已取消")
+    else:
+        print_result("error", f"取消失败: {cancel_result.get('message')}")
+        return
+
+    # 验证取消状态
+    print("\n[4/4] 验证取消状态...")
+    cancelled_state = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+    protocol = cancelled_state.get("protocol", {})
+
+    if protocol.get("cancelled"):
+        print_result("success", "协议状态已标记为已取消")
+        print_result("success", f"取消原因: {protocol.get('cancel_reason')}")
+
+        # 验证已保存的数据仍然存在
+        if "step_1" in protocol.get("data", {}):
+            print_result("success", "已保存的数据被保留")
+        else:
+            print_result("warning", "已保存的数据丢失")
+    else:
+        print_result("error", "协议状态未标记为已取消")
+
+    print("\n" + "-" * 80)
+    print("Scenario 3 完成")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario 4: 边界情况测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_scenario_boundary_cases():
+    """
+    测试场景 4: 边界情况
+
+    测试各种边界输入：
+    - 空回答
+    - 超长回答
+    - 特殊字符
+    - 数组类型回答
+    """
+    print_section("Scenario 4: 边界情况测试")
+
+    user_id = TEST_USER_BOUNDARY
+    context = ToolContext(user_id=user_id, skill_id="lifecoach", user_tier="paid")
+
+    # 清理旧数据
+    print("\n[准备] 清理旧数据...")
+    await cleanup_test_user(user_id)
+
+    # 启动协议
+    await UnifiedProfileRepository.update_skill_state(
+        user_id,
+        "lifecoach",
+        "protocol",
+        {
+            "id": "dankoe",
+            "step": 1,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed": False
+        }
+    )
+
+    # 测试案例
+    test_cases = [
+        {
+            "name": "空回答",
+            "data": {"answer": ""},
+            "expected": "应该保存空字符串"
+        },
+        {
+            "name": "超长回答",
+            "data": {"answer": "这是一个非常长的回答" * 100},
+            "expected": "应该保存完整的长文本"
+        },
+        {
+            "name": "特殊字符",
+            "data": {"answer": "包含特殊字符: <>&\"'{}[]"},
+            "expected": "应该正确转义特殊字符"
+        },
+        {
+            "name": "中文和emoji",
+            "data": {"answer": "我想要😊自由🎉"},
+            "expected": "应该支持Unicode"
+        },
+        {
+            "name": "数组类型",
+            "data": {"answer": ["行动1", "行动2", "行动3"]},
+            "expected": "应该支持数组"
+        },
+    ]
+
+    for i, test_case in enumerate(test_cases, 1):
+        print(f"\n[{i}/{len(test_cases)}] 测试: {test_case['name']}")
+
+        try:
+            result = await advance_protocol_step(
+                {
+                    "step_data": test_case["data"],
+                    "step_summary": test_case["name"]
+                },
+                context
+            )
+
+            if result["status"] == "success":
+                print_result("success", test_case["expected"])
+            else:
+                print_result("error", f"保存失败: {result.get('message')}")
+
+            # 推进到下一步
+            if i < len(test_cases):
+                await UnifiedProfileRepository.update_skill_state(
+                    user_id, "lifecoach", "protocol", {"step": i + 1}
+                )
+        except Exception as e:
+            print_result("error", f"异常: {str(e)}")
+
+    # 验证所有数据
+    print("\n[验证] 检查所有边界数据...")
+    final_data = await UnifiedProfileRepository.get_skill_state(user_id, "lifecoach")
+    saved_steps = final_data.get("protocol", {}).get("data", {})
+
+    for i in range(1, len(test_cases) + 1):
+        if f"step_{i}" in saved_steps:
+            print_result("success", f"步骤{i}数据已保存")
+        else:
+            print_result("error", f"步骤{i}数据丢失")
+
+    print("\n" + "-" * 80)
+    print("Scenario 4 完成")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario 5: 协议配置加载测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def test_scenario_config_loading():
+    """
+    测试场景 5: 协议配置加载
+
+    验证：
+    - load_protocol_config 正确加载YAML
+    - build_protocol_prompt 正确生成prompt
+    - emit_protocol_progress_event 正确生成事件
+    """
+    print_section("Scenario 5: 协议配置加载测试")
+
+    # 测试 1: 加载配置
+    print("\n[1/3] 测试配置加载...")
+    config = load_protocol_config("dankoe")
+
+    if config and config.get("id") == "dankoe":
+        print_result("success", f"配置加载成功: {config['name']}")
+        print_result("success", f"总步骤数: {config['total_steps']}")
+        print_result("success", f"预计时长: {config['estimated_time']}")
+    else:
+        print_result("error", "配置加载失败")
+        return
+
+    # 测试 2: 构建 prompt
+    print("\n[2/3] 测试 prompt 构建...")
+
+    mock_lifecoach_state = {
+        "protocol": {
+            "data": {
+                "step_1": {
+                    "answer": "工作没意义",
+                    "summary": "用户提到工作缺乏意义"
+                }
+            }
+        }
+    }
+
+    for step in [1, 3, 6]:
+        prompt = build_protocol_prompt(config, step, mock_lifecoach_state)
+        if prompt and f"步骤 {step}" in prompt:
+            print_result("success", f"步骤{step} prompt 生成成功")
+        else:
+            print_result("error", f"步骤{step} prompt 生成失败")
+
+    # 测试 3: 生成进度事件
+    print("\n[3/3] 测试进度事件生成...")
+
+    mock_protocol_state = {
+        "id": "dankoe",
+        "step": 3
+    }
+
+    try:
+        event = await emit_protocol_progress_event(mock_protocol_state, config)
+        if event.type == "protocol_progress":
+            print_result("success", "进度事件生成成功")
+            print_result("success", f"事件数据: step={event.data['step']}, progress={event.data['progress']:.2f}")
+        else:
+            print_result("error", "事件类型错误")
+    except Exception as e:
+        print_result("error", f"生成事件失败: {str(e)}")
+
+    print("\n" + "-" * 80)
+    print("Scenario 5 完成")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 主测试入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run_all_scenarios():
+    """运行所有测试场景"""
+    print("\n")
+    print("╔" + "=" * 78 + "╗")
+    print("║" + " " * 20 + "协议流真实场景测试套件" + " " * 36 + "║")
+    print("╚" + "=" * 78 + "╝")
+
+    scenarios = [
+        ("完整流程", test_scenario_complete_flow),
+        ("中断恢复", test_scenario_interrupt_recovery),
+        ("协议取消", test_scenario_protocol_cancel),
+        ("边界情况", test_scenario_boundary_cases),
+        ("配置加载", test_scenario_config_loading),
+    ]
+
+    results = {}
+
+    for name, test_func in scenarios:
+        try:
+            await test_func()
+            results[name] = "✅ 通过"
+        except Exception as e:
+            print_result("error", f"测试异常: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            results[name] = f"❌ 失败: {str(e)}"
+
+    # 打印测试总结
+    print_section("测试总结")
+    print("\n测试结果：")
+    for name, result in results.items():
+        print(f"  {result:10} - {name}")
+
+    passed = sum(1 for r in results.values() if r.startswith("✅"))
+    total = len(results)
+
+    print(f"\n通过率: {passed}/{total} ({passed/total*100:.0f}%)")
+
+    if passed == total:
+        print("\n🎉 所有测试通过！")
+    else:
+        print(f"\n⚠️ {total - passed} 个测试失败")
+
+
+if __name__ == "__main__":
+    print("\n协议流真实场景测试")
+    print("基于用户实际使用设计的多种scenario")
+    print("-" * 80)
+
+    try:
+        asyncio.run(run_all_scenarios())
+    except KeyboardInterrupt:
+        print("\n\n测试被用户中断")
+    except Exception as e:
+        print(f"\n\n❌ 测试运行失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

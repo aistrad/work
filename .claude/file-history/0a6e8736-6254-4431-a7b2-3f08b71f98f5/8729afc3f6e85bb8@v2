@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Verification script for Migration 021
+Validates that all business data from vibe_users has been correctly synced to unified_profiles
+"""
+import asyncio
+import json
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import asyncpg
+from stores.db import get_connection
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+async def verify_all_users() -> bool:
+    """Verify all users have consistent data between vibe_users and unified_profiles"""
+    logger.info("Starting Migration 021 verification...")
+
+    async with get_connection() as conn:
+        # Check 1: All vibe_users have unified_profiles
+        missing_profiles = await conn.fetch("""
+            SELECT vu.id, vu.vibe_id
+            FROM vibe_users vu
+            LEFT JOIN unified_profiles up ON vu.id = up.user_id
+            WHERE up.user_id IS NULL
+        """)
+
+        if missing_profiles:
+            logger.error(f"❌ Found {len(missing_profiles)} users without unified_profiles!")
+            for row in missing_profiles[:5]:
+                logger.error(f"  Missing profile: user_id={row['id']}, vibe_id={row['vibe_id']}")
+            return False
+
+        logger.info("✓ All users have unified_profiles")
+
+        # Check 2: Data consistency - account fields (only fields that still exist after Migration 022)
+        account_mismatches = await conn.fetch("""
+            SELECT
+                vu.id,
+                vu.vibe_id,
+                vu.status AS vu_status,
+                up.profile->'account'->>'status' AS up_status,
+                vu.tier AS vu_tier,
+                up.profile->'account'->>'tier' AS up_tier
+            FROM vibe_users vu
+            JOIN unified_profiles up ON vu.id = up.user_id
+            WHERE
+                vu.vibe_id IS DISTINCT FROM (up.profile->'account'->>'vibe_id')
+                OR vu.status IS DISTINCT FROM (up.profile->'account'->>'status')
+                OR COALESCE(vu.tier, 'free') IS DISTINCT FROM COALESCE(up.profile->'account'->>'tier', 'free')
+        """)
+
+        if account_mismatches:
+            logger.error(f"❌ Found {len(account_mismatches)} account field mismatches!")
+            for row in account_mismatches[:5]:
+                logger.error(f"  Mismatch for user {row['vibe_id']}:")
+                if row['vu_status'] != row['up_status']:
+                    logger.error(f"    status: '{row['vu_status']}' != '{row['up_status']}'")
+                if row['vu_tier'] != row['up_tier']:
+                    logger.error(f"    tier: '{row['vu_tier']}' != '{row['up_tier']}'")
+            return False
+
+        logger.info("✓ All account fields are consistent (vibe_id, status, tier)")
+
+        # Check 3: Verify unified_profiles has required sections
+        # (Migration 022 removed business fields from vibe_users, so we only check unified_profiles)
+        profiles_without_sections = await conn.fetch("""
+            SELECT
+                user_id,
+                profile ? 'account' AS has_account,
+                profile ? 'preferences' AS has_preferences
+            FROM unified_profiles
+            WHERE NOT (profile ? 'account' AND profile ? 'preferences')
+        """)
+
+        if profiles_without_sections:
+            logger.error(f"❌ Found {len(profiles_without_sections)} profiles missing required sections!")
+            for row in profiles_without_sections[:5]:
+                logger.error(f"  Profile {row['user_id']}: account={row['has_account']}, preferences={row['has_preferences']}")
+            return False
+
+        logger.info("✓ All profiles have required sections (account, preferences)")
+
+        # Check 4: Skip birth_info/preferences/deletion checks
+        # (These fields no longer exist in vibe_users after Migration 022)
+        logger.info("✓ Skipping birth_info/preferences/deletion consistency checks (fields removed from vibe_users)")
+
+        # Summary statistics
+        stats = await conn.fetchrow("""
+            SELECT
+                COUNT(*) AS total_users,
+                COUNT(CASE WHEN up.profile ? 'birth_info' THEN 1 END) AS with_birth_info,
+                COUNT(CASE WHEN up.profile->'account'->>'avatar_url' IS NOT NULL THEN 1 END) AS with_avatar,
+                COUNT(CASE WHEN vu.status = 'pending_deletion' THEN 1 END) AS pending_deletion
+            FROM vibe_users vu
+            JOIN unified_profiles up ON vu.id = up.user_id
+        """)
+
+        logger.info("\n" + "=" * 60)
+        logger.info("Migration 021 Summary:")
+        logger.info(f"  Total users: {stats['total_users']}")
+        logger.info(f"  Users with birth_info: {stats['with_birth_info']}")
+        logger.info(f"  Users with avatar: {stats['with_avatar']}")
+        logger.info(f"  Users pending deletion: {stats['pending_deletion']}")
+        logger.info("=" * 60)
+        logger.info("✅ All data verified consistent!")
+        logger.info("=" * 60)
+
+        return True
+
+
+async def verify_indexes() -> bool:
+    """Verify that JSONB indexes are created"""
+    logger.info("\nVerifying JSONB indexes...")
+
+    async with get_connection() as conn:
+        indexes = await conn.fetch("""
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE tablename = 'unified_profiles'
+            AND indexname LIKE 'idx_profile%'
+            ORDER BY indexname
+        """)
+
+        expected_indexes = {
+            'idx_profile_account_status',
+            'idx_profile_account_vibe_id',
+            'idx_profile_account_tier',
+            'idx_profile_gin'
+        }
+
+        found_indexes = {row['indexname'] for row in indexes}
+        missing_indexes = expected_indexes - found_indexes
+
+        if missing_indexes:
+            logger.error(f"❌ Missing indexes: {missing_indexes}")
+            return False
+
+        logger.info("✓ All expected indexes exist:")
+        for row in indexes:
+            logger.info(f"  - {row['indexname']}")
+
+        return True
+
+
+async def verify_trigger() -> bool:
+    """Verify that the enhanced trigger is installed"""
+    logger.info("\nVerifying trigger...")
+
+    async with get_connection() as conn:
+        trigger = await conn.fetchrow("""
+            SELECT
+                t.tgname,
+                p.proname AS function_name,
+                pg_get_triggerdef(t.oid) AS definition
+            FROM pg_trigger t
+            JOIN pg_proc p ON t.tgfoid = p.oid
+            WHERE t.tgrelid = 'vibe_users'::regclass
+            AND t.tgname = 'trigger_sync_account_to_profile'
+        """)
+
+        if not trigger:
+            logger.error("❌ Trigger 'trigger_sync_account_to_profile' not found!")
+            return False
+
+        if trigger['function_name'] != 'sync_account_to_profile_enhanced':
+            logger.error(f"❌ Trigger uses wrong function: {trigger['function_name']}")
+            logger.error("   Expected: sync_account_to_profile_enhanced")
+            return False
+
+        logger.info("✓ Trigger correctly installed:")
+        logger.info(f"  Function: {trigger['function_name']}")
+
+        # Check trigger monitors all required columns
+        definition = trigger['definition'].lower()
+        required_columns = [
+            'vibe_id', 'display_name', 'avatar_url', 'tier', 'status',
+            'birth_datetime', 'birth_location', 'gender',
+            'timezone', 'language',
+            'deletion_requested_at', 'deletion_scheduled_at'
+        ]
+
+        for col in required_columns:
+            if col not in definition:
+                logger.warning(f"  ⚠ Column '{col}' may not be monitored by trigger")
+
+        return True
+
+
+async def main():
+    """Run all verification checks"""
+    try:
+        # Run all checks
+        checks = [
+            ("Data consistency", verify_all_users()),
+            ("JSONB indexes", verify_indexes()),
+            ("Trigger setup", verify_trigger())
+        ]
+
+        results = await asyncio.gather(*[check[1] for check in checks], return_exceptions=True)
+
+        all_passed = True
+        for (name, _), result in zip(checks, results):
+            if isinstance(result, Exception):
+                logger.error(f"❌ {name} check failed with exception: {result}")
+                all_passed = False
+            elif not result:
+                logger.error(f"❌ {name} check failed")
+                all_passed = False
+
+        if all_passed:
+            logger.info("\n" + "=" * 60)
+            logger.info("✅ All verification checks passed!")
+            logger.info("Migration 021 is ready for production.")
+            logger.info("=" * 60)
+            return 0
+        else:
+            logger.error("\n" + "=" * 60)
+            logger.error("❌ Some verification checks failed!")
+            logger.error("Please review the errors above and fix the migration.")
+            logger.error("=" * 60)
+            return 1
+
+    except Exception as e:
+        logger.exception(f"Verification failed with exception: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    exit(exit_code)

@@ -1,0 +1,1239 @@
+"""
+Chat Routes - Conversation endpoints for VibeLife v3.0
+Based on: vibelife spec v3.0
+
+Features:
+- SSE streaming responses
+- Voice mode toggle (warm / sarcastic)
+- Skill-based conversations (bazi / zodiac)
+- Guest mode for demo
+- AI Interview endpoints
+- File upload + extraction
+"""
+import asyncio
+import json
+import logging
+from typing import Optional, List
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from services.identity import get_optional_user, CurrentUser
+from services.entitlement import EntitlementService
+from services.usage import UsageService
+from services.vibe_engine import (
+    get_llm_service,
+    get_context_builder,
+    get_portrait_service,
+    get_tools_for_skill,
+    VoiceMode,
+    Skill,
+    create_user_message,
+)
+from services.vibe_engine.profile_cache import get_cached_profile, get_cached_profile_with_skill
+from services.agent.tool_registry import ToolRegistry, ToolContext
+from services.interview import get_interview_service, InterviewSession
+from services.extraction import get_extraction_service
+from services.knowledge.rag_service import RAGService
+from stores import conversation_repo, message_repo
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ChatRequest(BaseModel):
+    """Chat request model"""
+    message: str = Field(..., description="User message")
+    skill: str = Field(..., description="Skill: bazi or zodiac")
+    conversation_id: Optional[UUID] = Field(None, description="Existing conversation ID")
+    voice_mode: Optional[str] = Field("warm", description="Voice mode: warm or sarcastic")
+
+
+class ChatResponse(BaseModel):
+    """Chat response model (for non-streaming)"""
+    content: str
+    conversation_id: UUID
+    skill: str
+    voice_mode: str
+    metadata: Optional[dict] = None
+
+
+class GuestChatRequest(BaseModel):
+    """Guest chat request (no auth required)"""
+    message: str
+    skill: str = "bazi"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_skill(skill_str: str) -> Skill:
+    """Parse skill string to enum"""
+    skill_lower = skill_str.lower()
+    if skill_lower in ("bazi", "八字"):
+        return Skill.BAZI
+    elif skill_lower in ("zodiac", "星座"):
+        return Skill.ZODIAC
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown skill: {skill_str}")
+
+
+def parse_voice_mode(mode_str: str) -> VoiceMode:
+    """Parse voice mode string to enum"""
+    mode_lower = mode_str.lower()
+    if mode_lower in ("warm", "温暖"):
+        return VoiceMode.WARM
+    elif mode_lower in ("sarcastic", "吐槽"):
+        return VoiceMode.SARCASTIC
+    else:
+        return VoiceMode.WARM  # Default
+
+
+async def get_user_profile(user_id: Optional[UUID]) -> dict:
+    """Get user profile from cache or database (兼容旧接口)"""
+    if user_id:
+        try:
+            profile_data = await get_cached_profile(user_id)
+            if profile_data:
+                return profile_data
+        except Exception as e:
+            logger.error(f"Failed to get user profile for {user_id}: {e}")
+
+    from services.vibe_engine import DEFAULT_PROFILE
+    return DEFAULT_PROFILE.copy()
+
+
+async def get_user_profile_with_skill(user_id: Optional[UUID], skill: str) -> tuple:
+    """
+    Get user profile and skill data from cache or database.
+    v2.0: 支持合并缓存
+
+    Returns:
+        tuple: (profile, skill_data)
+    """
+    if user_id:
+        try:
+            result = await get_cached_profile_with_skill(user_id, skill)
+            return result.get("profile", {}), result.get("skill_data", {})
+        except Exception as e:
+            logger.error(f"Failed to get profile with skill for {user_id}: {e}")
+
+    from services.vibe_engine import DEFAULT_PROFILE
+    return DEFAULT_PROFILE.copy(), {}
+
+
+async def get_conversation_history(
+    conversation_id: Optional[UUID],
+    limit: int = 20
+) -> List[dict]:
+    """Get conversation history from database"""
+    if not conversation_id:
+        return []
+
+    try:
+        messages = await message_repo.get_messages_for_context(conversation_id, limit)
+        return messages
+    except Exception as e:
+        logger.error(f"Failed to get conversation history for {conversation_id}: {e}")
+        return []
+
+
+async def maybe_update_portrait(user_id: UUID, skill_id: str) -> None:
+    """Background task: Portrait 更新已废弃，用户信息通过 profile_extractor 定时抽取"""
+    pass
+
+
+async def save_message(
+    conversation_id: UUID,
+    role: str,
+    content: str,
+    metadata: Optional[dict] = None
+) -> None:
+    """Save message to database"""
+    try:
+        await message_repo.create_message(
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            metadata=metadata
+        )
+    except Exception as e:
+        # Log but don't fail the request
+        logger.warning(f"Failed to save message: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """
+    Send a message and get streaming response (SSE).
+
+    Returns Server-Sent Events with chunks of the response.
+    Final event contains [DONE] marker.
+    """
+    skill = parse_skill(request.skill)
+    voice_mode = parse_voice_mode(request.voice_mode or "warm")
+
+    # Get user ID if authenticated
+    user_id = current_user.user_id if current_user else None
+
+    # Get or create conversation - ensure it exists in database
+    if request.conversation_id:
+        conversation_id = request.conversation_id
+        existing = await conversation_repo.get_conversation(conversation_id)
+        if not existing:
+            await conversation_repo.create_conversation(
+                skill=skill.value,
+                user_id=user_id,
+                voice_mode=voice_mode.value,
+                conversation_id=conversation_id
+            )
+    else:
+        conv = await conversation_repo.create_conversation(
+            skill=skill.value,
+            user_id=user_id,
+            voice_mode=voice_mode.value
+        )
+        conversation_id = conv.id
+
+    # Check entitlement for authenticated users
+    if user_id:
+        can_chat = await EntitlementService.check_can_chat(user_id)
+        if not can_chat["can_chat"]:
+            async def quota_exceeded():
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "type": "quota_exceeded",
+                        "message": "今日对话次数已用完",
+                        "remaining": 0,
+                        "tier": can_chat["tier"]
+                    })
+                }
+            return EventSourceResponse(quota_exceeded())
+
+    # Get services
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    async def generate():
+        try:
+            # Get user profile and skill data (v2.0: 合并缓存)
+            profile, skill_data = await get_user_profile_with_skill(user_id, skill.value)
+
+            # Get conversation history
+            history = await get_conversation_history(conversation_id)
+
+            # Build context (without knowledge - will be added via Function Call if needed)
+            system_prompt, messages = await context_builder.build(
+                skill=skill,
+                voice_mode=voice_mode,
+                current_message=request.message,
+                profile=profile,
+                skill_data=skill_data,  # v2.0: 传递 skill_data
+                history=history,
+                knowledge_chunks=[]  # Empty - RAG via Function Call
+            )
+
+            # Save user message
+            await save_message(conversation_id, "user", request.message)
+
+            # Get tools for the current skill + RAG search tool
+            tools = get_tools_for_skill(skill.value)
+            tools.append(RAGService.get_search_knowledge_tool())
+
+            # Stream response with tool support
+            full_content = ""
+            tool_calls = []
+
+            async for chunk in llm.stream(messages, tools=tools):
+                chunk_type = chunk.get("type")
+
+                if chunk_type == "content":
+                    # Text content chunk - AI SDK 6 format
+                    content = chunk.get("content", "")
+                    full_content += content
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "text-delta",
+                            "textDelta": content
+                        })
+                    }
+
+                elif chunk_type == "tool_call":
+                    # Tool call event
+                    tool_call_id = chunk.get("tool_call_id")
+                    tool_name = chunk.get("tool_name")
+                    tool_args_str = chunk.get("tool_args", "{}")
+
+                    try:
+                        tool_args = json.loads(tool_args_str)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    # Handle search_knowledge tool call (RAG)
+                    if tool_name == "search_knowledge":
+                        query = tool_args.get("query", request.message)
+                        knowledge_context = await RAGService.get_context_for_chat(
+                            message=query,
+                            profile=profile or {},
+                            skill_id=skill.value,
+                            top_k=3
+                        )
+
+                        # Add knowledge to messages and continue generation
+                        if knowledge_context:
+                            messages.append(create_user_message(
+                                f"以下是检索到的相关知识：\n{knowledge_context}\n\n请基于以上知识回答用户的问题。"
+                            ))
+
+                            # Continue streaming with knowledge context
+                            async for knowledge_chunk in llm.stream(messages, tools=[]):
+                                if knowledge_chunk.get("type") == "content":
+                                    content = knowledge_chunk.get("content", "")
+                                    full_content += content
+                                    yield {
+                                        "event": "message",
+                                        "data": json.dumps({
+                                            "type": "text-delta",
+                                            "textDelta": content
+                                        })
+                                    }
+
+                    # Handle UI Tools - execute via ToolRegistry
+                    elif ToolRegistry.has_handler(tool_name):
+                        tool_calls.append({
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "args": tool_args
+                        })
+
+                        # Create tool context
+                        tool_context = ToolContext(
+                            user_id=str(user_id) if user_id else "guest",
+                            user_tier="free",
+                            profile=profile,
+                            skill_data=skill_data,
+                            skill_id=skill.value,
+                        )
+
+                        # Execute tool via ToolRegistry
+                        tool_result = await ToolRegistry.execute(
+                            tool_name=tool_name,
+                            args=tool_args,
+                            context=tool_context,
+                        )
+
+                        # AI SDK 6 format: tool-input-available + tool-output-available
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": "tool-input-available",
+                                "toolCallId": tool_call_id,
+                                "toolName": tool_name,
+                                "input": tool_args
+                            })
+                        }
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": "tool-output-available",
+                                "toolCallId": tool_call_id,
+                                "output": tool_result
+                            })
+                        }
+
+                    else:
+                        # Unknown tools - send to frontend for handling
+                        tool_calls.append({
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "args": tool_args
+                        })
+
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": "tool_call",
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "args": tool_args
+                            })
+                        }
+
+            # Save assistant message
+            message_metadata = {}
+            if tool_calls:
+                message_metadata["tool_calls"] = tool_calls
+
+            await save_message(
+                conversation_id,
+                "assistant",
+                full_content,
+                metadata=message_metadata
+            )
+
+            # Trigger portrait update in background (if user is logged in)
+            if user_id:
+                asyncio.create_task(maybe_update_portrait(user_id, skill.value))
+                # Record usage with new UsageService (支持计费)
+                await UsageService.record_conversation(user_id, skill.value, conversation_id)
+                await UsageService.record_llm_call(
+                    user_id=user_id,
+                    model="glm-4-flash",  # 流式模式使用默认模型
+                    skill_id=skill.value,
+                    conversation_id=conversation_id
+                )
+                # Record tool calls
+                for tc in tool_calls:
+                    await UsageService.record_tool_call(
+                        user_id=user_id,
+                        tool_name=tc["name"],
+                        skill_id=skill.value,
+                        conversation_id=conversation_id
+                    )
+
+            # Send completion event
+            yield {
+                "event": "message",
+                "data": json.dumps({
+                    "type": "done",
+                    "conversation_id": str(conversation_id),
+                    "skill": skill.value,
+                    "voice_mode": voice_mode.value
+                })
+            }
+
+        except Exception as e:
+            logger.error(f"Chat stream error: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                })
+            }
+
+    return EventSourceResponse(generate())
+
+
+@router.post("/", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """
+    Send a message and get non-streaming response.
+    For clients that don't support SSE.
+    """
+    skill = parse_skill(request.skill)
+    voice_mode = parse_voice_mode(request.voice_mode or "warm")
+
+    # Get or create conversation
+    conversation_id = request.conversation_id or uuid4()
+
+    # Get user ID if authenticated
+    user_id = current_user.user_id if current_user else None
+
+    # Check entitlement for authenticated users
+    if user_id:
+        can_chat = await EntitlementService.check_can_chat(user_id)
+        if not can_chat["can_chat"]:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "type": "quota_exceeded",
+                    "message": "今日对话次数已用完",
+                    "remaining": 0,
+                    "tier": can_chat["tier"]
+                }
+            )
+
+    # Get services
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    try:
+        # Get user profile and skill data (v2.0: 合并缓存)
+        profile, skill_data = await get_user_profile_with_skill(user_id, skill.value)
+
+        # Get conversation history
+        history = await get_conversation_history(conversation_id)
+
+        # Build context (without knowledge - RAG via Function Call)
+        system_prompt, messages = await context_builder.build(
+            skill=skill,
+            voice_mode=voice_mode,
+            current_message=request.message,
+            profile=profile,
+            skill_data=skill_data,  # v2.0: 传递 skill_data
+            history=history,
+            knowledge_chunks=[]
+        )
+
+        # Save user message
+        await save_message(conversation_id, "user", request.message)
+
+        # Get tools including RAG search tool
+        tools = [RAGService.get_search_knowledge_tool()]
+
+        # Get response with tool support
+        response = await llm.chat(messages, tools=tools)
+
+        # Handle search_knowledge tool call if present
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            for tool_call in response.tool_calls:
+                if tool_call.get('name') == 'search_knowledge':
+                    query = tool_call.get('args', {}).get('query', request.message)
+                    knowledge_context = await RAGService.get_context_for_chat(
+                        message=query,
+                        profile=profile or {},
+                        skill_id=skill.value,
+                        top_k=3
+                    )
+                    if knowledge_context:
+                        messages.append(create_user_message(
+                            f"以下是检索到的相关知识：\n{knowledge_context}\n\n请基于以上知识回答用户的问题。"
+                        ))
+                        response = await llm.chat(messages, tools=[])
+
+        # Save assistant message
+        await save_message(conversation_id, "assistant", response.content)
+
+        # Trigger portrait update in background (if user is logged in)
+        if user_id:
+            asyncio.create_task(maybe_update_portrait(user_id, skill.value))
+            # Record usage with precise token counts
+            usage = response.usage or {}
+            await UsageService.record_conversation(user_id, skill.value, conversation_id)
+            await UsageService.record_llm_call(
+                user_id=user_id,
+                model=response.model or "unknown",
+                input_tokens=usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0) or usage.get("completion_tokens", 0),
+                skill_id=skill.value,
+                conversation_id=conversation_id
+            )
+
+        return ChatResponse(
+            content=response.content,
+            conversation_id=conversation_id,
+            skill=skill.value,
+            voice_mode=voice_mode.value,
+            metadata={
+                "model": response.model,
+                "usage": response.usage
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/guest")
+async def chat_guest(request: GuestChatRequest):
+    """
+    Guest chat endpoint (no authentication required).
+    For landing page demo with limited functionality.
+    """
+    skill = parse_skill(request.skill)
+
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    try:
+        # Build simple context (no profile, no history)
+        system_prompt, messages = await context_builder.build(
+            skill=skill,
+            voice_mode=VoiceMode.WARM,
+            current_message=request.message,
+            profile=None,
+            history=None
+        )
+
+        # Get response (limited tokens for guest)
+        response = await llm.chat(messages, max_tokens=1024)
+
+        return {
+            "content": response.content,
+            "is_guest": True,
+            "skill": skill.value,
+            "suggestion": "注册后可以获得完整的个性化分析和对话历史保存"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/guest/stream")
+async def chat_guest_stream(request: GuestChatRequest):
+    """
+    Guest streaming chat endpoint.
+    For landing page demo with SSE.
+    """
+    skill = parse_skill(request.skill)
+
+    llm = get_llm_service()
+    context_builder = get_context_builder()
+
+    async def generate():
+        try:
+            # Build simple context
+            system_prompt, messages = await context_builder.build(
+                skill=skill,
+                voice_mode=VoiceMode.WARM,
+                current_message=request.message,
+                profile=None,
+                history=None
+            )
+
+            # Get tools for the current skill
+            tools = get_tools_for_skill(skill.value)
+
+            # Stream response with tool support
+            async for chunk in llm.stream(messages, max_tokens=1024, tools=tools):
+                chunk_type = chunk.get("type")
+
+                if chunk_type == "content":
+                    # Text content chunk - AI SDK 6 format
+                    content = chunk.get("content", "")
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "text-delta",
+                            "textDelta": content
+                        })
+                    }
+
+                elif chunk_type == "tool_call":
+                    # Tool call event - emit to frontend
+                    tool_call_id = chunk.get("tool_call_id")
+                    tool_name = chunk.get("tool_name")
+                    tool_args_str = chunk.get("tool_args", "{}")
+
+                    # Parse args
+                    try:
+                        tool_args = json.loads(tool_args_str)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    # Emit tool_call event
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "tool_call",
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "args": tool_args
+                        })
+                    }
+
+            yield {
+                "event": "message",
+                "data": json.dumps({
+                    "type": "done",
+                    "is_guest": True,
+                    "skill": skill.value
+                })
+            }
+
+        except Exception as e:
+            logger.error(f"Guest chat stream error: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                })
+            }
+
+    return EventSourceResponse(generate())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Guest Tool Invocation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GuestToolRequest(BaseModel):
+    """Guest tool invocation request"""
+    skill: str = "bazi"
+    tool: str
+    birth_date: str
+    birth_time: Optional[str] = None
+    gender: Optional[str] = None
+    birth_location: Optional[str] = None
+
+
+@router.post("/guest/tool")
+async def invoke_guest_tool(request: GuestToolRequest):
+    """
+    Direct tool invocation for guests (landing page).
+    Allows guests to get chart calculations without full chat.
+    """
+    from services.vibe_engine.bazi_service import BaziService
+    from services.vibe_engine.zodiac_service import ZodiacService
+
+    skill = parse_skill(request.skill)
+
+    try:
+        result = {}
+        interpretation = None
+
+        if request.tool == "calculate_bazi" or (skill == Skill.BAZI and request.tool in ("chart", "calculate")):
+            birth_parts = request.birth_date.split("-")
+            year = int(birth_parts[0])
+            month = int(birth_parts[1])
+            day = int(birth_parts[2])
+            hour = 12
+            if request.birth_time:
+                time_parts = request.birth_time.split(":")
+                hour = int(time_parts[0])
+
+            bazi_service = BaziService()
+            chart = await bazi_service.calculate_chart(
+                year=year, month=month, day=day, hour=hour,
+                gender=request.gender or "unknown"
+            )
+            result = {"chart": chart, "skill": "bazi"}
+            interpretation = f"八字排盘完成。日主为{chart.get('day_master', '未知')}。"
+
+        elif request.tool == "calculate_zodiac" or (skill == Skill.ZODIAC and request.tool in ("chart", "calculate")):
+            zodiac_service = ZodiacService()
+            chart = await zodiac_service.calculate_chart(
+                birth_date=request.birth_date,
+                birth_time=request.birth_time or "12:00",
+                birth_place=request.birth_location or "Beijing"
+            )
+            result = {"chart": chart, "skill": "zodiac"}
+            interpretation = f"星盘计算完成。太阳星座为{chart.get('sun_sign', '未知')}。"
+
+        else:
+            return {"success": False, "error": f"Unknown tool: {request.tool}", "is_guest": True}
+
+        return {
+            "success": True,
+            "tool": request.tool,
+            "skill": skill.value,
+            "chart_data": result.get("chart"),
+            "interpretation": interpretation,
+            "is_guest": True,
+            "suggestion": "注册后可以获得完整的个性化分析和对话历史保存"
+        }
+
+    except Exception as e:
+        logger.error(f"Guest tool invocation error: {e}", exc_info=True)
+        return {"success": False, "tool": request.tool, "skill": skill.value, "error": str(e), "is_guest": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Voice Mode Toggle
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VoiceModeRequest(BaseModel):
+    """Voice mode toggle request"""
+    conversation_id: UUID
+    voice_mode: str  # warm | sarcastic
+
+
+@router.post("/voice-mode")
+async def toggle_voice_mode(request: VoiceModeRequest):
+    """
+    Toggle voice mode for a conversation.
+    Changes Vibe's personality between warm and sarcastic.
+    """
+    voice_mode = parse_voice_mode(request.voice_mode)
+
+    # TODO: Update conversation voice_mode in database
+
+    return {
+        "success": True,
+        "conversation_id": str(request.conversation_id),
+        "voice_mode": voice_mode.value,
+        "message": "语气已切换" if voice_mode == VoiceMode.SARCASTIC else "已切换到温暖模式"
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Conversation Management
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/conversations")
+async def list_conversations(
+    skill: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=100)
+):
+    """
+    List user's conversations.
+    TODO: Implement with authentication.
+    """
+    # TODO: Implement with actual database query
+    return {
+        "conversations": [],
+        "total": 0
+    }
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: UUID):
+    """
+    Get conversation details with messages.
+    """
+    # TODO: Implement with actual database query
+    return {
+        "id": str(conversation_id),
+        "messages": [],
+        "skill": None,
+        "voice_mode": "warm",
+        "created_at": None
+    }
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: UUID):
+    """
+    Delete a conversation.
+    """
+    try:
+        await conversation_repo.delete_conversation(conversation_id)
+        return {"success": True, "message": "Conversation deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Interview Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InterviewStartRequest(BaseModel):
+    """Start interview request"""
+    skill: str = "bazi"
+    user_id: Optional[UUID] = None
+
+
+class InterviewAnswerRequest(BaseModel):
+    """Submit answer request"""
+    session_id: UUID
+    answer: str
+
+
+@router.post("/interview/start")
+async def start_interview(request: InterviewStartRequest):
+    """
+    Start an AI interview session.
+    Required before generating reports.
+    """
+    interview_service = get_interview_service()
+
+    session = await interview_service.start_session(
+        skill=request.skill,
+        user_id=request.user_id
+    )
+
+    current_question = interview_service.get_current_question(session)
+
+    return {
+        "session": session.to_dict(),
+        "intro": interview_service.get_intro(),
+        "current_question": {
+            "id": current_question.id,
+            "text": current_question.question_text,
+            "type": current_question.question_type
+        } if current_question else None,
+        "progress": interview_service.get_progress(session)
+    }
+
+
+@router.post("/interview/answer")
+async def submit_interview_answer(request: InterviewAnswerRequest):
+    """
+    Submit an answer to the current interview question.
+    """
+    interview_service = get_interview_service()
+
+    session = await interview_service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    next_question, is_complete = await interview_service.submit_answer(
+        session,
+        request.answer
+    )
+
+    response = {
+        "is_complete": is_complete,
+        "next_question": None,
+        "progress": interview_service.get_progress(session),
+        "result": None
+    }
+
+    if is_complete:
+        result = interview_service.get_result(session)
+        response["result"] = {
+            "success": result.success,
+            "extracted_profile": result.extracted_profile,
+            "summary": result.summary,
+            "questions_answered": result.questions_answered,
+            "total_questions": result.total_questions
+        }
+    elif next_question:
+        response["next_question"] = {
+            "id": next_question.id,
+            "text": next_question.question_text,
+            "type": next_question.question_type
+        }
+
+    return response
+
+
+@router.post("/interview/skip")
+async def skip_interview(session_id: UUID):
+    """
+    Skip the interview (user choice).
+    """
+    interview_service = get_interview_service()
+
+    session = await interview_service.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    warning = await interview_service.skip_session(session)
+    result = interview_service.get_result(session)
+
+    return {
+        "warning": warning,
+        "result": {
+            "success": result.success,
+            "extracted_profile": result.extracted_profile,
+            "summary": result.summary,
+            "questions_answered": result.questions_answered,
+            "total_questions": result.total_questions
+        }
+    }
+
+
+@router.get("/interview/{session_id}")
+async def get_interview_session(session_id: UUID):
+    """
+    Get interview session status.
+    """
+    interview_service = get_interview_service()
+
+    session = await interview_service.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    current_question = interview_service.get_current_question(session)
+
+    return {
+        "session": session.to_dict(),
+        "current_question": {
+            "id": current_question.id,
+            "text": current_question.question_text,
+            "type": current_question.question_type
+        } if current_question else None,
+        "progress": interview_service.get_progress(session)
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# File Upload Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    context_hint: Optional[str] = None
+):
+    """
+    Upload a file for AI extraction.
+
+    Supported formats:
+    - Images (JPG, PNG): Screenshots from other apps, chat records
+    - Documents (PDF, DOCX, TXT): Resumes, diaries
+
+    Returns extracted information that can be merged into user profile.
+    """
+    # Read file data
+    file_data = await file.read()
+
+    # Check file size (10MB limit)
+    if len(file_data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="文件过大，最大支持 10MB")
+
+    # Extract information
+    extraction_service = get_extraction_service()
+
+    result = await extraction_service.extract_from_file(
+        file_data=file_data,
+        filename=file.filename or "unknown",
+        mime_type=file.content_type,
+        context_hint=context_hint
+    )
+
+    return {
+        "success": result.success,
+        "file_type": result.file_type,
+        "content_type": result.content_type,
+        "summary": result.summary,
+        "confidence": result.confidence,
+        "extracted_data": result.extracted_data,
+        "profile_updates": result.profile_updates,
+        "error": result.error
+    }
+
+
+@router.post("/upload/batch")
+async def upload_files_batch(
+    files: List[UploadFile] = File(...)
+):
+    """
+    Upload multiple files for batch extraction.
+    """
+    if len(files) > 5:
+        raise HTTPException(status_code=400, detail="最多同时上传 5 个文件")
+
+    extraction_service = get_extraction_service()
+    results = []
+
+    for file in files:
+        file_data = await file.read()
+
+        if len(file_data) > 10 * 1024 * 1024:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "error": "文件过大"
+            })
+            continue
+
+        result = await extraction_service.extract_from_file(
+            file_data=file_data,
+            filename=file.filename or "unknown",
+            mime_type=file.content_type
+        )
+
+        results.append({
+            "filename": file.filename,
+            "success": result.success,
+            "content_type": result.content_type,
+            "summary": result.summary,
+            "error": result.error
+        })
+
+    return {
+        "total": len(files),
+        "successful": sum(1 for r in results if r["success"]),
+        "results": results
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agent Endpoints (v2.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AgentChatRequest(BaseModel):
+    """Agent chat request model"""
+    message: str = Field(..., description="User message")
+    skill: str = Field("bazi", description="Default skill: bazi or zodiac")
+    conversation_id: Optional[UUID] = Field(None, description="Existing conversation ID")
+    voice_mode: Optional[str] = Field("warm", description="Voice mode: warm, sarcastic, wise")
+    stream: bool = Field(True, description="Whether to use streaming")
+
+
+@router.post("/agent/stream")
+async def agent_chat_stream(
+    request: AgentChatRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user)
+):
+    """
+    Agent-based chat with streaming response (SSE).
+
+    Features:
+    - Orchestrator 自动识别意图
+    - 支持多 Skill 融合分析
+    - 流式输出 Agent 状态和内容
+    """
+    from services.agent import Orchestrator, AgentContext
+    from services.agent.registry import auto_register_agents
+
+    # 自动注册 Agents
+    auto_register_agents()
+
+    # Get user ID
+    user_id = current_user.user_id if current_user else None
+
+    # Check entitlement
+    if user_id:
+        can_chat = await EntitlementService.check_can_chat(user_id)
+        if not can_chat["can_chat"]:
+            async def quota_exceeded():
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "type": "quota_exceeded",
+                        "message": "今日对话次数已用完",
+                        "remaining": 0,
+                        "tier": can_chat["tier"]
+                    })
+                }
+            return EventSourceResponse(quota_exceeded())
+
+    async def generate():
+        try:
+            # Get user profile and skill data
+            profile, skill_data = await get_user_profile_with_skill(
+                user_id, request.skill
+            )
+
+            # Get conversation history
+            conversation_id = request.conversation_id or uuid4()
+            history = await get_conversation_history(conversation_id)
+
+            # Get user tier
+            user_tier = "free"
+            if user_id:
+                entitlements = await EntitlementService.get_entitlements(user_id)
+                user_tier = entitlements.get("tier", "free")
+
+            # Build Agent context
+            context = AgentContext(
+                user_id=str(user_id) if user_id else "guest",
+                user_tier=user_tier,
+                skill=request.skill,
+                profile=profile,
+                skill_data=skill_data,
+                conversation_history=history,
+                voice_mode=request.voice_mode or "warm"
+            )
+
+            # Save user message
+            await save_message(conversation_id, "user", request.message)
+
+            # Run Orchestrator
+            orchestrator = Orchestrator()
+            full_content = ""
+
+            async for event in orchestrator.process(
+                message=request.message,
+                context=context,
+                stream=request.stream
+            ):
+                event_dict = event.to_dict()
+
+                # 转换为 AI SDK 6 兼容格式
+                if event.type == "content":
+                    full_content += event.data.get("content", "")
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "text-delta",
+                            "textDelta": event.data.get("content", "")
+                        })
+                    }
+                elif event.type == "content_delta":
+                    full_content += event.data.get("delta", "")
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "text-delta",
+                            "textDelta": event.data.get("delta", "")
+                        })
+                    }
+                elif event.type == "tool_call":
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "tool-input-available",
+                            "toolCallId": event.data.get("tool_call_id"),
+                            "toolName": event.data.get("tool_name"),
+                            "input": event.data.get("tool_args")
+                        })
+                    }
+                elif event.type == "tool_result":
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "tool-output-available",
+                            "toolCallId": event.data.get("tool_call_id"),
+                            "output": event.data.get("result")
+                        })
+                    }
+                elif event.type == "state_change":
+                    yield {
+                        "event": "status",
+                        "data": json.dumps({
+                            "type": "agent-status",
+                            "agent": event.agent_id,
+                            "state": event.data.get("state"),
+                            "iteration": event.data.get("iteration")
+                        })
+                    }
+                elif event.type in ("done", "orchestrator_done"):
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "finish",
+                            "finishReason": "stop",
+                            "usage": event.data.get("usage") or event.data.get("total_usage")
+                        })
+                    }
+                elif event.type == "error":
+                    yield {
+                        "event": "error",
+                        "data": json.dumps({
+                            "type": "agent-error",
+                            "error": event.data.get("error"),
+                            "agent": event.data.get("agent")
+                        })
+                    }
+
+            # Save assistant message
+            if full_content:
+                await save_message(conversation_id, "assistant", full_content)
+
+            # Record usage (Agent mode)
+            if user_id:
+                await UsageService.record_conversation(user_id, request.skill, conversation_id)
+                await UsageService.record_llm_call(
+                    user_id=user_id,
+                    model="agent",
+                    skill_id=request.skill,
+                    conversation_id=conversation_id
+                )
+
+            # Final done event
+            yield {
+                "event": "done",
+                "data": json.dumps({
+                    "conversation_id": str(conversation_id),
+                    "skill": request.skill
+                })
+            }
+
+        except Exception as e:
+            logger.error(f"Agent chat error: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "type": "internal_error",
+                    "message": str(e)
+                })
+            }
+
+    return EventSourceResponse(generate())

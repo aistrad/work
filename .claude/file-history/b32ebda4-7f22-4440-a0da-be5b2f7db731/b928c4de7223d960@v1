@@ -1,0 +1,262 @@
+-- Migration 022: Cleanup vibe_users - Remove business fields
+-- Created: 2026-01-20
+--
+-- Purpose: Complete the migration by removing business fields from vibe_users
+--          Final state: vibe_users = pure account + billing table
+--
+-- IMPORTANT: This is a DESTRUCTIVE migration. Run after thorough testing.
+--            Requires maintenance window.
+--
+-- Changes:
+-- 1. Create reverse sync trigger (status only)
+-- 2. Drop business columns from vibe_users
+-- 3. Verify final schema structure
+
+BEGIN;
+
+-- ============================================================================
+-- Step 1: Create reverse sync trigger (status only)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION sync_status_from_profile()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Only sync status changes from unified_profiles back to vibe_users
+    -- This ensures vibe_users.status stays in sync for authentication checks
+    IF OLD.profile->'account'->>'status' IS DISTINCT FROM NEW.profile->'account'->>'status' THEN
+        UPDATE vibe_users
+        SET status = NEW.profile->'account'->>'status',
+            updated_at = NOW()
+        WHERE id = NEW.user_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION sync_status_from_profile() IS
+'Reverse sync: keeps vibe_users.status in sync when updated in unified_profiles (for fast auth checks)';
+
+DROP TRIGGER IF EXISTS trigger_sync_status_from_profile ON unified_profiles;
+
+CREATE TRIGGER trigger_sync_status_from_profile
+    AFTER UPDATE OF profile ON unified_profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_status_from_profile();
+
+-- ============================================================================
+-- Step 2: Drop business columns from vibe_users
+-- ============================================================================
+
+-- Verify data has been migrated (safety check)
+DO $$
+DECLARE
+    users_without_profiles INT;
+    mismatched_status INT;
+BEGIN
+    -- Check 1: All users have profiles
+    SELECT COUNT(*) INTO users_without_profiles
+    FROM vibe_users vu
+    LEFT JOIN unified_profiles up ON vu.id = up.user_id
+    WHERE up.user_id IS NULL;
+
+    IF users_without_profiles > 0 THEN
+        RAISE EXCEPTION 'Cannot proceed: % users without unified_profiles!', users_without_profiles;
+    END IF;
+
+    -- Check 2: Status is synced
+    SELECT COUNT(*) INTO mismatched_status
+    FROM vibe_users vu
+    JOIN unified_profiles up ON vu.id = up.user_id
+    WHERE vu.status IS DISTINCT FROM (up.profile->'account'->>'status');
+
+    IF mismatched_status > 0 THEN
+        RAISE EXCEPTION 'Cannot proceed: % users have mismatched status!', mismatched_status;
+    END IF;
+
+    RAISE NOTICE '✓ Safety checks passed. Proceeding with column removal...';
+END $$;
+
+-- Drop business columns (keep only account + billing)
+ALTER TABLE vibe_users
+    DROP COLUMN IF EXISTS display_name CASCADE,
+    DROP COLUMN IF EXISTS avatar_url CASCADE,
+    DROP COLUMN IF EXISTS birth_datetime CASCADE,
+    DROP COLUMN IF EXISTS birth_location CASCADE,
+    DROP COLUMN IF EXISTS gender CASCADE,
+    DROP COLUMN IF EXISTS timezone CASCADE,
+    DROP COLUMN IF EXISTS language CASCADE,
+    DROP COLUMN IF EXISTS deletion_requested_at CASCADE,
+    DROP COLUMN IF EXISTS deletion_scheduled_at CASCADE;
+
+-- Columns retained:
+-- - id (PK, FK target for 19 tables)
+-- - vibe_id (unique identifier)
+-- - status (authentication check)
+-- - tier (billing level)
+-- - daily_quota (billing)
+-- - billing_summary (billing)
+-- - created_at (account creation timestamp)
+-- - updated_at (last modification)
+
+RAISE NOTICE '✓ Business columns dropped from vibe_users';
+
+-- ============================================================================
+-- Step 3: Add comments and constraints
+-- ============================================================================
+
+COMMENT ON TABLE vibe_users IS
+'Account core table - stores ONLY authentication essentials and billing data.
+All business data (profile, preferences, birth_info) is in unified_profiles.';
+
+COMMENT ON COLUMN vibe_users.id IS
+'Primary key. Referenced by 19 tables (FK target).';
+
+COMMENT ON COLUMN vibe_users.vibe_id IS
+'Unique user identifier (VB-XXXXXXXX). Used in API responses.';
+
+COMMENT ON COLUMN vibe_users.status IS
+'Account status for fast auth check: active | pending_deletion | deleted';
+
+COMMENT ON COLUMN vibe_users.tier IS
+'Billing tier: free | basic | pro | enterprise';
+
+COMMENT ON COLUMN vibe_users.daily_quota IS
+'Daily message quota for billing enforcement';
+
+COMMENT ON COLUMN vibe_users.billing_summary IS
+'JSONB: Billing statistics and subscription info';
+
+COMMENT ON COLUMN vibe_users.created_at IS
+'Account creation timestamp (immutable)';
+
+COMMENT ON COLUMN vibe_users.updated_at IS
+'Last modification timestamp (auto-updated by trigger)';
+
+-- ============================================================================
+-- Step 4: Verify final structure
+-- ============================================================================
+
+DO $$
+DECLARE
+    expected_cols TEXT[] := ARRAY['id', 'vibe_id', 'status', 'tier', 'daily_quota', 'billing_summary', 'created_at', 'updated_at'];
+    actual_cols TEXT[];
+    missing_cols TEXT[];
+    extra_cols TEXT[];
+    col_count INT;
+BEGIN
+    -- Get actual columns
+    SELECT array_agg(column_name ORDER BY ordinal_position)
+    INTO actual_cols
+    FROM information_schema.columns
+    WHERE table_name = 'vibe_users'
+    AND table_schema = 'public';
+
+    -- Check for missing expected columns
+    SELECT array_agg(col)
+    INTO missing_cols
+    FROM unnest(expected_cols) AS col
+    WHERE col != ALL(actual_cols);
+
+    -- Check for unexpected columns
+    SELECT array_agg(col)
+    INTO extra_cols
+    FROM unnest(actual_cols) AS col
+    WHERE col != ALL(expected_cols);
+
+    col_count := array_length(actual_cols, 1);
+
+    RAISE NOTICE '';
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'Migration 022 Final Verification:';
+    RAISE NOTICE '  vibe_users columns: %', col_count;
+    RAISE NOTICE '  Expected: %', expected_cols;
+    RAISE NOTICE '  Actual: %', actual_cols;
+
+    IF missing_cols IS NOT NULL THEN
+        RAISE WARNING '  Missing columns: %', missing_cols;
+    END IF;
+
+    IF extra_cols IS NOT NULL THEN
+        RAISE WARNING '  Extra columns: %', extra_cols;
+    END IF;
+
+    IF col_count = 8 AND missing_cols IS NULL AND extra_cols IS NULL THEN
+        RAISE NOTICE '  ✓ Schema structure is correct!';
+    ELSE
+        RAISE EXCEPTION 'Schema structure verification failed!';
+    END IF;
+
+    RAISE NOTICE '========================================';
+END $$;
+
+-- ============================================================================
+-- Step 5: Performance verification
+-- ============================================================================
+
+DO $$
+DECLARE
+    idx_count INT;
+BEGIN
+    -- Count indexes on unified_profiles
+    SELECT COUNT(*)
+    INTO idx_count
+    FROM pg_indexes
+    WHERE tablename = 'unified_profiles'
+    AND indexname LIKE 'idx_profile%';
+
+    RAISE NOTICE '';
+    RAISE NOTICE 'Performance Check:';
+    RAISE NOTICE '  unified_profiles indexes: %', idx_count;
+
+    IF idx_count < 4 THEN
+        RAISE WARNING 'Expected at least 4 JSONB indexes on unified_profiles!';
+    ELSE
+        RAISE NOTICE '  ✓ JSONB indexes are in place';
+    END IF;
+END $$;
+
+-- ============================================================================
+-- Step 6: Record migration
+-- ============================================================================
+
+INSERT INTO migration_log (migration_name, description)
+VALUES (
+    '022_cleanup_vibe_users',
+    'Removed business fields from vibe_users. Final state: account core (id, vibe_id, status, tier, billing) + created_at/updated_at. All business data in unified_profiles.'
+)
+ON CONFLICT DO NOTHING;
+
+-- ============================================================================
+-- Step 7: Post-migration instructions
+-- ============================================================================
+
+DO $$
+BEGIN
+    RAISE NOTICE '';
+    RAISE NOTICE '╔══════════════════════════════════════════════════════════════╗';
+    RAISE NOTICE '║              Migration 022 Completed Successfully            ║';
+    RAISE NOTICE '╚══════════════════════════════════════════════════════════════╝';
+    RAISE NOTICE '';
+    RAISE NOTICE 'vibe_users table is now a pure account core table:';
+    RAISE NOTICE '  - Account fields: id, vibe_id, status';
+    RAISE NOTICE '  - Billing fields: tier, daily_quota, billing_summary';
+    RAISE NOTICE '  - Timestamps: created_at, updated_at';
+    RAISE NOTICE '';
+    RAISE NOTICE 'All business data is now in unified_profiles:';
+    RAISE NOTICE '  - account: vibe_id, display_name, avatar_url, tier, status, deletion_*';
+    RAISE NOTICE '  - birth_info: date, time, place, gender, timezone';
+    RAISE NOTICE '  - preferences: timezone, language, voice_mode, subscriptions, etc.';
+    RAISE NOTICE '  - skill_data: bazi, zodiac, tarot, career, etc.';
+    RAISE NOTICE '  - life_context: goals, events, patterns, etc.';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Post-migration tasks:';
+    RAISE NOTICE '  1. Run verify_migration_021.py to ensure data consistency';
+    RAISE NOTICE '  2. Monitor application logs for any errors';
+    RAISE NOTICE '  3. Test critical user flows (login, profile update, deletion)';
+    RAISE NOTICE '  4. Monitor JSONB query performance';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Rollback: See migration plan for rollback script';
+    RAISE NOTICE '';
+END $$;
+
+COMMIT;
